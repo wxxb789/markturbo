@@ -80,8 +80,8 @@ all 288 tests without altering the timeout or Goal 06 code.
 
 The locked release build was measured with `mt.py probe -- startup --rounds 5
 --warmup 1` using isolated data and configuration directories. Time to the
-first visible titled window was 586.0, 591.9, 572.1, 551.2, and 566.1 ms
-(median 572.1 ms, p95 590.7 ms). This is a startup diagnostic, not a
+first visible titled window was 497.1, 455.8, 792.6, 704.6, and 722.3 ms
+(median 704.6 ms, p95 778.5 ms). This is a startup diagnostic, not a
 quiet-gated regression comparison or native isolation proof.
 
 ### Pending release checks
@@ -91,13 +91,11 @@ no release-bound native isolation evidence.
 
 - On the owner's active, unlocked Windows 11 x64 desktop, run
   `mt.py accept all --exe <release exe> --expect-exe-sha256 <release sha256>`.
-  The Goal 07 phase must see the script's visible effect and confirm that
-  user-style link and form navigation leave the fixture in place. It then
-  attempts deliberate script navigations; those may leave the frame on the
-  browser's blocked page, so the verdict must use fixture markers emitted
-  before those attempts. They must produce zero loopback contacts and open no
-  additional window. The acceptance harness unit tests do not run the desktop
-  phase.
+  The Goal 07 phase must observe the script-start, attempt and completion
+  cells in captured WebView pixels. The automatic probes must produce zero
+  loopback contacts and leave exactly one app window. The nested-frame HTTPS
+  probe does not establish that the preview frame's own HTTPS navigation is
+  blocked. The acceptance harness unit tests do not run the desktop phase.
 - Clause 3b native proof is pending: the fixture must visibly report its
   network attempts and the loopback TCP and UDP listeners must record zero
   contacts on the release build. Unit tests do not verify WebView2 egress,
@@ -106,6 +104,8 @@ no release-bound native isolation evidence.
 - Clause 3c elevated-host check: run the release app at high integrity. The
   web layouts must show the elevated-host reason and create no WebView; the
   native preview remains available.
+- Click a link inside a closed shadow DOM in the release Web preview. Verify
+  that the preview remains in place and no external window or app opens.
 - Verify frame scrolling, text selection, light and dark colours, math and
   diagrams in the actual preview. If WebView2 rejects the frame policy, stop
   and record the result without loosening the sandbox.
@@ -120,8 +120,9 @@ no release-bound native isolation evidence.
   a handler for the bridge messages nsh can deliver.
 - The shared diagram registry runs before the WebView receives the host.
   The PlantUML child gets `PLANTUML_SECURITY_PROFILE=SANDBOX`; browser policy
-  does not govern that subprocess. Include configured external renderers in any
-  document-wide no-network/no-file verification.
+  does not govern that subprocess. A PlantUML launcher that sets its own
+  security profile overrides ours. Include configured external renderers in
+  any document-wide no-network/no-file verification.
 
 ## Run 1 (before the sandboxed-frame amendment)
 

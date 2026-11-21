@@ -8,15 +8,15 @@ reads or writes the Windows Credential Manager: the child process gets one
 fresh synthetic key in its environment only.
 
 One launch opens `security-fixture.html` from argv (a new tab opens in Split),
-checks that its inline script runs, user-style link/form navigation is canceled,
-and script navigation attempts are released only after the visible ready marker;
+checks pixel cells painted by its inline script and each completed attempt,
 then it runs one Review -> answer -> Revision chain against the loopback, across
 two phases, each with its own observation-key prefix and failure-code prefix:
 
-1. `web_security`: the Web pane shows the inline script's effect without a
-   trust action; its popup, top-level/frame navigation and form attempts leave
-   the preview in place, with one visible window in the app's process job.
-   Edit mode then hands the keyboard back before the Review shortcut is sent.
+1. `web_security`: the Web pane shows the inline script's painted status cells
+   without a trust action; its popup, top-level/frame navigation and form
+   attempts leave the preview in place, with one visible window in the app's
+   process job. Edit mode then hands the keyboard back before the Review
+   shortcut is sent.
 2. `decisions`: the proposal holds two hunks, h1 the executable script value
    after the CJK/emoji line and h2 the owner line. Accept(h1) writes across
    the multibyte offsets at once; Reject(h2) reads `2 of 2 decided`; `Undo`
@@ -139,46 +139,97 @@ PHASES = ("web_security", "decisions")
 EXPECTED_REQUEST_COUNT = 2
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
-SCRIPT_EFFECT_TEXT = "Script ran automatically"
 NETWORK_PROBE_HOST = "goal07-egress.invalid"
 TCP_PORT_TOKEN = "__GOAL07_TCP_PORT__"
 UDP_PORT_TOKEN = "__GOAL07_UDP_PORT__"
-NETWORK_PROBE_COUNT = 12
-USER_NAVIGATION_ATTEMPT_COUNT = 2
-SCRIPT_NAVIGATION_ATTEMPT_COUNT = 6
-NAVIGATION_ATTEMPT_COUNT = (
-    USER_NAVIGATION_ATTEMPT_COUNT + SCRIPT_NAVIGATION_ATTEMPT_COUNT
+CELL_GRID_LEFT = 16
+CELL_GRID_TOP = 48
+CELL_SIZE = 16
+CELL_GAP = 3
+CELL_BORDER_WIDTH = 2
+CELL_TOLERANCE = 16
+CELL_PAGE_COLOR = (255, 255, 255)
+CELL_BORDER_COLOR = (20, 20, 20)
+CELL_PENDING_COLOR = (72, 72, 72)
+CELL_SCRIPT_COLOR = (24, 168, 93)
+CELL_ATTEMPT_COLOR = (48, 112, 224)
+CELL_COMPLETE_COLOR = (240, 176, 32)
+
+
+def _css_rgb(color: tuple[int, int, int]) -> str:
+    return f"rgb({color[0]}, {color[1]}, {color[2]})"
+
+
+FIXTURE_ATTEMPT_SOURCE = (
+    "  { run: () => fetchProbe(`${tcpLoopback}/fetch`) },",
+    "  { run: () => fetchProbe(`${tcpHostname}/fetch`) },",
+    "  { run: () => imageProbe(`${tcpLoopback}/image`) },",
+    "  { run: () => imageProbe(`${tcpHostname}/image`) },",
+    "  { run: () => beaconProbe(`${tcpLoopback}/beacon`) },",
+    "  { run: () => beaconProbe(`${tcpHostname}/beacon`) },",
+    "  { run: () => websocketProbe(websocketLoopback) },",
+    "  { run: () => websocketProbe(websocketHostname) },",
+    (
+        "  { run: async () => {\r\n"
+        "    const peer = new RTCPeerConnection({ iceServers: [\r\n"
+        "      { urls: [`stun:127.0.0.1:${udpPort}`, `stun:${probeHost}:${udpPort}`] },\r\n"
+        "      { urls: [`turn:127.0.0.1:${tcpPort}?transport=tcp`, `turn:${probeHost}:${tcpPort}?transport=tcp`], username: \"goal07\", credential: \"goal07\" }\r\n"
+        "    ] });\r\n"
+        "    peer.createDataChannel(\"probe\");\r\n"
+        "    await peer.setLocalDescription(await peer.createOffer());\r\n"
+        "  } },"
+    ),
+    "  { run: () => linkProbe(\"dns-prefetch\", `http://${probeHost}`) },",
+    "  { run: () => linkProbe(\"preconnect\", `https://127.0.0.1:${tcpPort}`) },",
+    "  { run: () => linkProbe(\"preconnect\", `https://${probeHost}:${tcpPort}`) },",
+    "  { run: () => { const link = document.getElementById(\"goal07-user-link\"); let prevented = false; link.href = `${tcpLoopback}/link`; link.addEventListener(\"click\", event => { prevented = event.defaultPrevented; }, { once: true }); link.click(); if (!prevented) throw new Error(); } },",
+    "  { run: () => { const form = document.getElementById(\"goal07-user-form\"); form.action = `${tcpLoopback}/user-form`; const submitEvent = new SubmitEvent(\"submit\", { bubbles: true, cancelable: true }); form.dispatchEvent(submitEvent); form.requestSubmit(); if (!submitEvent.defaultPrevented) throw new Error(); } },",
+    "  { run: () => { if (typeof window.open !== \"function\") throw new Error(); try { window.open(`${tcpLoopback}/popup`, \"_blank\"); } catch (_) {} } },",
+    "  { run: () => { try { top.location = `https://${probeHost}/top`; } catch (_) {} } },",
+    "  { run: () => { const frame = document.createElement(\"iframe\"); frame.src = `https://127.0.0.1:${tcpPort}/subframe`; document.body.appendChild(frame); } },",
+    "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} } },",
+    "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
+    "  { run: () => { try { location = `${tcpLoopback}/frame`; } catch (_) {} } },",
 )
-NETWORK_ATTEMPTS_COMPLETE_TEXT = (
-    f"Network probes complete {NETWORK_PROBE_COUNT}/{NETWORK_PROBE_COUNT}"
-)
-USER_NAVIGATION_BLOCKED_TEXT = (
-    f"User navigation blocked {USER_NAVIGATION_ATTEMPT_COUNT}/{USER_NAVIGATION_ATTEMPT_COUNT}"
-)
-SCRIPT_NAVIGATION_READY_TEXT = (
-    f"Ready to run script navigation probes {SCRIPT_NAVIGATION_ATTEMPT_COUNT}/"
-    f"{SCRIPT_NAVIGATION_ATTEMPT_COUNT}"
-)
-SCRIPT_NAVIGATION_RELEASE_NAME = "Run script navigation probes"
+
+
 # h1 (the executable script value) sits after the CJK/emoji line, so its
 # accepted write proves multibyte and CRLF offsets; h2 is the owner line.
 SOURCE_TEXT = (
     "<!doctype html>\r\n"
     "<p>fixture 文档 🚀</p>\r\n"
-    "<p id=\"goal07-effect\">Script has not run</p>\r\n"
-    "<p id=\"goal07-network\">Network probe not attempted</p>\r\n"
-    "<p id=\"goal07-navigation\">Navigation probe not attempted</p>\r\n"
-    "<p><a id=\"goal07-user-link\" target=\"_self\">User link navigation probe</a></p>\r\n"
-    "<form id=\"goal07-user-form\" method=\"post\" target=\"_blank\">\r\n"
+    "<style>\r\n"
+    "html,body{margin:0;padding:0;background:#fff;}\r\n"
+    "#goal07-cells{position:absolute;left:0;top:0;z-index:1;display:flex;flex-wrap:nowrap;}\r\n"
+    ".goal07-cell{display:block;box-sizing:border-box;flex:none;}\r\n"
+    ".goal07-hidden{display:none;}\r\n"
+    "</style>\r\n"
+    "<div id=\"goal07-cells\"><span id=\"goal07-script-cell\"></span></div>\r\n"
+    "<a id=\"goal07-user-link\" class=\"goal07-hidden\" target=\"_self\"></a>\r\n"
+    "<form id=\"goal07-user-form\" class=\"goal07-hidden\" method=\"post\" target=\"_blank\">\r\n"
     "<button type=\"submit\">User form navigation probe</button>\r\n"
     "</form>\r\n"
-    "<p id=\"goal07-user-navigation\">User navigation not tested</p>\r\n"
-    "<p id=\"goal07-navigation-release-status\">Script navigation probes waiting</p>\r\n"
-    "<button id=\"goal07-navigation-release\" type=\"button\" disabled>Run script navigation probes</button>\r\n"
     "<script>\r\n"
     "window.goal07 = \"old\";\r\n"
-    "document.getElementById(\"goal07-effect\").textContent = "
-    f"\"{SCRIPT_EFFECT_TEXT}\";\r\n"
+    "const cellGrid = document.getElementById(\"goal07-cells\");\r\n"
+    "const scriptCell = document.getElementById(\"goal07-script-cell\");\r\n"
+    "const pixelRatio = window.devicePixelRatio || 1;\r\n"
+    f"const pendingCellColor = \"{_css_rgb(CELL_PENDING_COLOR)}\";\r\n"
+    f"const scriptCellColor = \"{_css_rgb(CELL_SCRIPT_COLOR)}\";\r\n"
+    f"const attemptCellColor = \"{_css_rgb(CELL_ATTEMPT_COLOR)}\";\r\n"
+    f"const completeCellColor = \"{_css_rgb(CELL_COMPLETE_COLOR)}\";\r\n"
+    f"const borderColor = \"{_css_rgb(CELL_BORDER_COLOR)}\";\r\n"
+    f'cellGrid.style.left = ({CELL_GRID_LEFT} / pixelRatio) + "px";\r\n'
+    f'cellGrid.style.top = ({CELL_GRID_TOP} / pixelRatio) + "px";\r\n'
+    f'cellGrid.style.gap = ({CELL_GAP} / pixelRatio) + "px";\r\n'
+    "function prepareCell(cell) {\r\n"
+    "  cell.className = \"goal07-cell\";\r\n"
+    f'  cell.style.width = ({CELL_SIZE} / pixelRatio) + "px";\r\n'
+    f'  cell.style.height = ({CELL_SIZE} / pixelRatio) + "px";\r\n'
+    f'  cell.style.border = ({CELL_BORDER_WIDTH} / pixelRatio) + "px solid " + borderColor;\r\n'
+    "  cell.style.backgroundColor = pendingCellColor;\r\n"
+    "}\r\n"
+    "function createCell() { const cell = document.createElement(\"span\"); prepareCell(cell); cellGrid.appendChild(cell); return cell; }\r\n"
     f'const probeHost = "{NETWORK_PROBE_HOST}";\r\n'
     'const tcpPort = "__GOAL07_TCP_PORT__";\r\n'
     'const udpPort = "__GOAL07_UDP_PORT__";\r\n'
@@ -186,11 +237,6 @@ SOURCE_TEXT = (
     "const tcpHostname = `http://${probeHost}:${tcpPort}`;\r\n"
     "const websocketLoopback = `ws://127.0.0.1:${tcpPort}/socket`;\r\n"
     "const websocketHostname = `ws://${probeHost}:${tcpPort}/socket`;\r\n"
-    "const networkStatus = document.getElementById(\"goal07-network\");\r\n"
-    "const navigationStatus = document.getElementById(\"goal07-navigation\");\r\n"
-    "const userNavigationStatus = document.getElementById(\"goal07-user-navigation\");\r\n"
-    "const navigationReleaseStatus = document.getElementById(\"goal07-navigation-release-status\");\r\n"
-    "const navigationRelease = document.getElementById(\"goal07-navigation-release\");\r\n"
     "const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));\r\n"
     "function submitForm(action) {\r\n"
     "  const form = document.createElement(\"form\");\r\n"
@@ -203,77 +249,26 @@ SOURCE_TEXT = (
     "function websocketProbe(url) { if (typeof WebSocket !== \"function\") throw new Error(); try { const socket = new WebSocket(url); socket.onerror = () => {}; } catch (_) {} }\r\n"
     "function linkProbe(rel, href) { const link = document.createElement(\"link\"); link.rel = rel; link.href = href; document.head.appendChild(link); }\r\n"
     "const networkAttempts = [\r\n"
-    "  { run: () => fetchProbe(`${tcpLoopback}/fetch`) },\r\n"
-    "  { run: () => fetchProbe(`${tcpHostname}/fetch`) },\r\n"
-    "  { run: () => imageProbe(`${tcpLoopback}/image`) },\r\n"
-    "  { run: () => imageProbe(`${tcpHostname}/image`) },\r\n"
-    "  { run: () => beaconProbe(`${tcpLoopback}/beacon`) },\r\n"
-    "  { run: () => beaconProbe(`${tcpHostname}/beacon`) },\r\n"
-    "  { run: () => websocketProbe(websocketLoopback) },\r\n"
-    "  { run: () => websocketProbe(websocketHostname) },\r\n"
-    "  { run: async () => {\r\n"
-    "    const peer = new RTCPeerConnection({ iceServers: [\r\n"
-    "      { urls: [`stun:127.0.0.1:${udpPort}`, `stun:${probeHost}:${udpPort}`] },\r\n"
-    "      { urls: [`turn:127.0.0.1:${tcpPort}?transport=tcp`, `turn:${probeHost}:${tcpPort}?transport=tcp`], username: \"goal07\", credential: \"goal07\" }\r\n"
-    "    ] });\r\n"
-    "    peer.createDataChannel(\"probe\");\r\n"
-    "    await peer.setLocalDescription(await peer.createOffer());\r\n"
-    "  } },\r\n"
-    "  { run: () => linkProbe(\"dns-prefetch\", `http://${probeHost}`) },\r\n"
-    "  { run: () => linkProbe(\"preconnect\", `https://127.0.0.1:${tcpPort}`) },\r\n"
-    "  { run: () => linkProbe(\"preconnect\", `https://${probeHost}:${tcpPort}`) },\r\n"
-    "  { run: () => { const link = document.getElementById(\"goal07-user-link\"); let prevented = false; link.href = `${tcpLoopback}/link`; link.addEventListener(\"click\", event => { prevented = event.defaultPrevented; }, { once: true }); link.click(); if (!prevented) throw new Error(); }, navigation: true, userNavigation: true },\r\n"
-    "  { run: () => { const form = document.getElementById(\"goal07-user-form\"); form.action = `${tcpLoopback}/user-form`; const submitEvent = new SubmitEvent(\"submit\", { bubbles: true, cancelable: true }); form.dispatchEvent(submitEvent); form.requestSubmit(); if (!submitEvent.defaultPrevented) throw new Error(); }, navigation: true, userNavigation: true },\r\n"
-    "  { run: () => { if (typeof window.open !== \"function\") throw new Error(); try { window.open(`${tcpLoopback}/popup`, \"_blank\"); } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
-    "  { run: () => { try { top.location = `https://${probeHost}/top`; } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
-    "  { run: () => { const frame = document.createElement(\"iframe\"); frame.src = `https://127.0.0.1:${tcpPort}/subframe`; document.body.appendChild(frame); }, navigation: true, scriptNavigation: true },\r\n"
-    "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
-    "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
-    "  { run: () => { try { location = `${tcpLoopback}/frame`; } catch (_) {} }, navigation: true, scriptNavigation: true },\r\n"
-    "];\r\n"
-    "const networkProbeCount = networkAttempts.filter(attempt => !attempt.navigation).length;\r\n"
-    "const navigationAttemptCount = networkAttempts.filter(attempt => attempt.navigation).length;\r\n"
-    "const userNavigationAttemptCount = networkAttempts.filter(attempt => attempt.userNavigation).length;\r\n"
-    "const scriptNavigationAttempts = networkAttempts.filter(attempt => attempt.scriptNavigation);\r\n"
+    + "\r\n".join(FIXTURE_ATTEMPT_SOURCE)
+    + "\r\n];\r\n"
+    "prepareCell(scriptCell);\r\n"
+    "const attemptCells = networkAttempts.map(() => createCell());\r\n"
+    "const completeCell = createCell();\r\n"
+    "scriptCell.style.backgroundColor = scriptCellColor;\r\n"
     "async function runAttempts() {\r\n"
-    "  let networkIndex = 0;\r\n"
-    "  let navigationIndex = 0;\r\n"
-    "  let userNavigationIndex = 0;\r\n"
-    "  for (const attempt of networkAttempts) {\r\n"
-    "    if (attempt.scriptNavigation) continue;\r\n"
-    "    if (attempt.navigation) {\r\n"
-    "      navigationIndex += 1;\r\n"
-    "      navigationStatus.textContent = `Navigation attempt ${navigationIndex}/${navigationAttemptCount} attempted`;\r\n"
-    "    } else {\r\n"
-    "      networkIndex += 1;\r\n"
-    "      networkStatus.textContent = `Network probe attempted ${networkIndex}/${networkProbeCount}`;\r\n"
-    "    }\r\n"
+    "  for (let index = 0; index < networkAttempts.length; index += 1) {\r\n"
     "    await delay(50);\r\n"
     "    try {\r\n"
-    "      const result = attempt.run();\r\n"
+    "      const result = networkAttempts[index].run();\r\n"
     "      if (result && typeof result.then === \"function\") {\r\n"
     "        await result;\r\n"
     "      }\r\n"
     "    } catch (_) {\r\n"
-    "      if (attempt.userNavigation) userNavigationStatus.textContent = `User navigation failed ${userNavigationIndex + 1}/${userNavigationAttemptCount}`;\r\n"
-    "      else networkStatus.textContent = `Network probe failed ${networkIndex}/${networkProbeCount}`;\r\n"
     "      return;\r\n"
     "    }\r\n"
-    "    if (attempt.userNavigation) {\r\n"
-    "      userNavigationIndex += 1;\r\n"
-    "      userNavigationStatus.textContent = `User navigation blocked ${userNavigationIndex}/${userNavigationAttemptCount}`;\r\n"
-    "    }\r\n"
-    "    if (!attempt.navigation) {\r\n"
-    "      networkStatus.textContent = `Network probes complete ${networkIndex}/${networkProbeCount}`;\r\n"
-    "    }\r\n"
+    "    attemptCells[index].style.backgroundColor = attemptCellColor;\r\n"
     "  }\r\n"
-    "  navigationRelease.addEventListener(\"click\", () => {\r\n"
-    "    for (const attempt of scriptNavigationAttempts) {\r\n"
-    "      try { attempt.run(); } catch (_) {}\r\n"
-    "    }\r\n"
-    "  }, { once: true });\r\n"
-    "  navigationReleaseStatus.textContent = `Ready to run script navigation probes ${scriptNavigationAttempts.length}/${scriptNavigationAttempts.length}`;\r\n"
-    "  navigationRelease.disabled = false;\r\n"
+    "  completeCell.style.backgroundColor = completeCellColor;\r\n"
     "}\r\n"
     "runAttempts();\r\n"
     "</script>\r\n"
@@ -287,15 +282,9 @@ EDITOR_SOURCE_BYTES = EDITOR_SOURCE_TEXT.encode("utf-8")
 # hunk's part.
 STALE_EDIT = f"{DOCUMENT_SENTINEL}:stale"
 FIXTURE_FILE = "security-fixture.html"
-SCRIPT_NAVIGATION_SETTLE_SECONDS = 1.0
 NETWORK_PROBE_SETTLE_SECONDS = 1.0
 NETWORK_OBSERVATION_KEYS = frozenset(
-    {
-        "web_security_navigation_attempt_count",
-        "web_security_network_attempt_count",
-        "web_security_tcp_contact_count",
-        "web_security_udp_contact_count",
-    }
+    {"web_security_tcp_contact_count", "web_security_udp_contact_count"}
 )
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
@@ -315,7 +304,11 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
 OBSERVATION_KEYS = (
     FINGERPRINT_OBSERVATION_KEYS
     | NETWORK_OBSERVATION_KEYS
-    | {"web_security_script_effect", "web_security_window_count", "provider_request_count"}
+    | {
+        "web_security_cell_results",
+        "web_security_window_count",
+        "provider_request_count",
+    }
 )
 REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
@@ -436,6 +429,73 @@ def fixture_source(network_probes: NetworkProbeListeners) -> str:
         SOURCE_TEXT.replace(TCP_PORT_TOKEN, str(network_probes.tcp_port))
         .replace(UDP_PORT_TOKEN, str(network_probes.udp_port))
     )
+
+
+def _pixel_matches(actual: tuple[int, ...], expected: tuple[int, int, int]) -> bool:
+    return len(actual) >= 3 and max(
+        abs(actual[index] - expected[index]) for index in range(3)
+    ) <= CELL_TOLERANCE
+
+
+def detect_fixture_cells(image: Any) -> list[bool]:
+    """Read the fixture's single-row status grid from a cropped WebView image."""
+    image = image.convert("RGB")
+    width, height = image.size
+    center_y = CELL_GRID_TOP + CELL_SIZE // 2
+    if height <= center_y:
+        return []
+
+    step = CELL_SIZE + CELL_GAP
+    first_center_x = CELL_GRID_LEFT + CELL_SIZE // 2
+    slot_count = max(0, (width - first_center_x - 1) // step + 1)
+    last_cell = -1
+    known_colors = (
+        CELL_PENDING_COLOR,
+        CELL_SCRIPT_COLOR,
+        CELL_ATTEMPT_COLOR,
+        CELL_COMPLETE_COLOR,
+    )
+    for index in range(slot_count):
+        left = CELL_GRID_LEFT + index * step
+        center = image.getpixel((first_center_x + index * step, center_y))
+        border = image.getpixel((left, center_y))
+        if _pixel_matches(border, CELL_BORDER_COLOR) or any(
+            _pixel_matches(center, color) for color in known_colors
+        ):
+            last_cell = index
+
+    if last_cell < 0:
+        return []
+
+    cells = []
+    for index in range(last_cell + 1):
+        center = image.getpixel((first_center_x + index * step, center_y))
+        if index == 0:
+            expected = CELL_SCRIPT_COLOR
+        elif index == last_cell:
+            expected = CELL_COMPLETE_COLOR
+        else:
+            expected = CELL_ATTEMPT_COLOR
+        cells.append(_pixel_matches(center, expected))
+    return cells
+
+
+def fixture_cells_complete(cells: Any) -> bool:
+    return (
+        isinstance(cells, list)
+        and len(cells) == len(FIXTURE_ATTEMPT_SOURCE) + 2
+        and all(type(cell) is bool for cell in cells)
+        and all(cells)
+    )
+
+
+def validate_cell_results(value: Any) -> None:
+    if (
+        not isinstance(value, list)
+        or len(value) != len(FIXTURE_ATTEMPT_SOURCE) + 2
+        or any(type(cell) is not bool for cell in value)
+    ):
+        raise ValueError("invalid WebView pixel-cell observations")
 
 
 def canonicalize_fixture_source(
@@ -597,10 +657,7 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
 def expected_observations() -> dict[str, Any]:
     return {
         **expected_fingerprints(),
-        "web_security_script_effect": True,
         "web_security_window_count": 1,
-        "web_security_navigation_attempt_count": NAVIGATION_ATTEMPT_COUNT,
-        "web_security_network_attempt_count": NETWORK_PROBE_COUNT,
         "web_security_tcp_contact_count": 0,
         "web_security_udp_contact_count": 0,
     }
@@ -670,6 +727,8 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
         if not _same_exact_value(actual, expected):
             kind = "bytes" if key in FINGERPRINT_OBSERVATION_KEYS else "value"
             raise ValueError(f"{key} does not hold the expected {kind}")
+    if not fixture_cells_complete(observations["web_security_cell_results"]):
+        raise ValueError("WebView pixel cells are incomplete")
     if observations["provider_request_count"] != EXPECTED_REQUEST_COUNT:
         raise ValueError("loopback provider did not receive one Review and one Revision")
 
@@ -682,6 +741,7 @@ CONTRACT = evidence.EvidenceContract(
     required_observations=REQUIRED_OBSERVATIONS,
     validate_runtime_scan=validate_runtime_scan,
     validate_passed_case=validate_passed_case,
+    structured={"web_security_cell_results": validate_cell_results},
     private_sentinels=(
         DOCUMENT_SENTINEL,
         provider_fixtures.ANSWER_SENTINEL,
@@ -1034,51 +1094,56 @@ class Goal07Harness(NativeHarness):
         self.click_control(copy, "REVISION_COPY_CLICK_FAILED")
         return self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
 
+    def read_fixture_cell_results(self, app: Any) -> list[bool]:
+        """Capture only the WebView pane and read its content-free status grid."""
+        from .visual import AppWindow, VisualFailure, capture_window
+
+        try:
+            rectangle = AppWindow(self.win32, app.window).webview_rect(self.ui_timeout)
+            image = capture_window(app.hwnd)
+        except VisualFailure as error:
+            raise HarnessFailure(error.code, error.detail) from None
+        left, top, right, bottom = rectangle
+        if (
+            left < 0
+            or top < 0
+            or right > image.width
+            or bottom > image.height
+            or right <= left
+            or bottom <= top
+        ):
+            raise HarnessFailure("WEBVIEW_PIXEL_REGION_INVALID")
+        return detect_fixture_cells(image.crop(rectangle))
+
     def phase_web_security(
         self, app: Any, _provider: provider_fixtures.LoopbackRevisionServer, source: Path
     ) -> dict[str, Any]:
-        """Release script navigation probes only after user-style navigation is blocked."""
+        """Read the fixture's completed pixel cells before checking side effects."""
         observed: dict[str, Any] = {}
         network_probes = self.network_probes
         record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-        self.wait_name(app, SCRIPT_EFFECT_TEXT, "Text", "SCRIPT_EFFECT_TIMEOUT")
-        self.wait_name(
-            app,
-            USER_NAVIGATION_BLOCKED_TEXT,
-            "Text",
-            "USER_NAVIGATION_NOT_BLOCKED",
+
+        def completed_cells() -> list[bool] | None:
+            cells = self.read_fixture_cell_results(app)
+            return cells if fixture_cells_complete(cells) else None
+
+        cell_results = wait_until(
+            completed_cells,
+            self.ui_timeout,
+            "PIXEL_CELLS_TIMEOUT",
+            interval=0.1,
         )
-        self.wait_name(
-            app,
-            NETWORK_ATTEMPTS_COMPLETE_TEXT,
-            "Text",
-            "NETWORK_ATTEMPTS_TIMEOUT",
-        )
-        self.wait_name(
-            app,
-            SCRIPT_NAVIGATION_READY_TEXT,
-            "Text",
-            "SCRIPT_NAVIGATION_READY_TIMEOUT",
-        )
-        release = self.find_named(
-            app,
-            SCRIPT_NAVIGATION_RELEASE_NAME,
-            "Button",
-            "SCRIPT_NAVIGATION_RELEASE_UIA_TIMEOUT",
-            "SCRIPT_NAVIGATION_RELEASE_UIA_MISMATCH",
-            anonymous=False,
-        )
-        self.click_control(release, "SCRIPT_NAVIGATION_RELEASE_CLICK_FAILED")
-        self.win32.sleep(SCRIPT_NAVIGATION_SETTLE_SECONDS)
+        observed["web_security_cell_results"] = cell_results
         if app.process.poll() is not None:
             raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
+        self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
+        record_network_contacts(observed, network_probes)
         windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
         if windows != (app.hwnd,):
             raise HarnessFailure("APP_WINDOW_COUNT_UNEXPECTED")
         if self.win32.foreground_window() != app.hwnd:
             raise HarnessFailure("APP_WINDOW_FOREGROUND_LOST")
-        record(observed, "web_security_script_effect", True)
         record(observed, "web_security_window_count", len(windows))
         # Leaving the Web pane hands keyboard ownership back to the main
         # window before the Review shortcut is sent, without a refocus.
@@ -1089,10 +1154,6 @@ class Goal07Harness(NativeHarness):
             self.ui_timeout,
             "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
         )
-        self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
-        record(observed, "web_security_network_attempt_count", NETWORK_PROBE_COUNT)
-        record(observed, "web_security_navigation_attempt_count", NAVIGATION_ATTEMPT_COUNT)
-        record_network_contacts(observed, network_probes)
         return observed
 
     def phase_decisions(

@@ -13,6 +13,11 @@ const HOST_FRAME_SRC: &str = "; frame-src 'self'";
 // WebView2 NavigateToString limits the UTF-16 htmlContent to 2 * 1024 * 1024 bytes.
 const MAX_HOST_UTF16_UNITS: usize = 1024 * 1024;
 const NAVIGATION_PRELUDE: &str = r#"<script>(() => {
+    if ("navigation" in window) {
+        window.navigation.addEventListener("navigate", event => {
+            if (event.cancelable) event.preventDefault();
+        });
+    }
     const cancelLink = event => {
         if (event.composedPath().some(node =>
             (node.localName === "a" || node.localName === "area") &&
@@ -177,18 +182,22 @@ fn skip_html_trivia(mut source: &str) -> &str {
         let Some(comment) = source.strip_prefix("<!--") else {
             return source;
         };
-        // Do not skip ambiguous comments: the parser can end them early.
-        if comment.starts_with(['-', '>']) {
-            return source;
-        }
-        let Some((_, tail)) = comment.split_once("--") else {
-            return source;
-        };
-        let Some(rest) = tail.strip_prefix('>') else {
+        let Some(rest) = html_comment_end(comment) else {
             return source;
         };
         source = rest;
     }
+}
+
+fn html_comment_end(comment: &str) -> Option<&str> {
+    if comment.starts_with('>') || comment.starts_with("->") {
+        return None;
+    }
+    let (body, rest) = comment.split_once("-->")?;
+    if body.contains("--!>") {
+        return None;
+    }
+    Some(rest)
 }
 
 /// Recognize only ordinary opening tags and attributes, not HTML error recovery.
@@ -373,12 +382,10 @@ fn preserve_inline_scripts<'a>(
             marker.push('X');
         }
         protected.push_str(&source[cursor..start]);
-        // MDX rejects HTML comments, but code spans preserve the marker literally.
+        // Keep MDX markers plain text so adjacent delimiters cannot merge.
         let rendered_marker = if parse_options.constructs.mdx_jsx_text {
-            protected.push('`');
             protected.push_str(&marker);
-            protected.push('`');
-            format!("<code>{marker}</code>")
+            marker
         } else {
             let comment = format!("<!--{marker}-->");
             protected.push_str(&comment);
@@ -842,12 +849,18 @@ mod tests {
     fn installs_the_navigation_prelude_after_csp_and_before_authored_scripts() {
         let author = "<script>author()</script>";
         let registry = registry();
+        let navigation_handler = r#"if ("navigation" in window) {
+        window.navigation.addEventListener("navigate", event => {
+            if (event.cancelable) event.preventDefault();
+        });
+    }"#;
         for kind in [DocType::Html, DocType::Markdown, DocType::Mdx] {
             let doc = Document::with_type(kind, author.into());
             let document = page(&doc, &registry, false);
             let (_, after_policy) = document.split_once(DOCUMENT_POLICY).unwrap();
             let (before_author, _) = after_policy.split_once(author).unwrap();
             assert!(before_author.starts_with("<script>"), "{kind:?}");
+            assert!(before_author.contains(navigation_handler), "{kind:?}");
             assert!(before_author.contains(r#"addEventListener("click", cancelLink, true)"#));
             assert!(before_author.contains(r#"addEventListener("auxclick", cancelLink, true)"#));
             assert!(
@@ -856,6 +869,55 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn html_trivia_accepts_legal_comments_before_doctype_html_and_head() {
+        let registry = registry();
+        let head = r#"<head id="author" data-mode='one'>"#;
+        let author = "<title>Author</title></head>";
+        let policy = format!("{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}");
+
+        let mut failures = Vec::new();
+        for comment in ["<!---->", "<!-- -- -->"] {
+            for (placement, source, expected) in [
+                (
+                    "before doctype",
+                    format!("{comment}<!doctype html><html>{head}{author}"),
+                    format!("{comment}<!doctype html><html>{head}{policy}{author}"),
+                ),
+                (
+                    "before html",
+                    format!("<!doctype html>{comment}<html>{head}{author}"),
+                    format!("<!doctype html>{comment}<html>{head}{policy}{author}"),
+                ),
+                (
+                    "before head",
+                    format!("<!doctype html><html>{comment}{head}{author}"),
+                    format!("<!doctype html><html>{comment}{head}{policy}{author}"),
+                ),
+            ] {
+                let doc = Document::with_type(DocType::Html, source);
+                let actual = page(&doc, &registry, false);
+                if actual != expected {
+                    failures.push(format!("{placement} with {comment:?}: got {actual:?}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "head was not preserved: {failures:#?}");
+    }
+
+    #[test]
+    fn mdx_inline_script_after_code_span_is_not_merged_into_a_delimiter() {
+        let script = r#"<script>document.body.dataset.x="ran"</script>"#;
+        let doc = Document::with_type(DocType::Mdx, format!("`code`{script}"));
+        let rendered_page = page(&doc, &registry(), false);
+        let rendered = body(&rendered_page);
+
+        assert_eq!(
+            rendered.trim_end(),
+            format!("<p><code>code</code>{script}</p>")
+        );
     }
 
     #[test]

@@ -34,6 +34,7 @@ ALL_ACCEPTED = runtime.fingerprint_bytes(HARNESS.apply_edits(HARNESS.EDITOR_SOUR
 DISK = runtime.fingerprint_bytes(HARNESS.SOURCE_BYTES)
 STALE = runtime.fingerprint_text(HARNESS.STALE_EDIT)
 PROPOSAL_AFTER = 'goal07 = "new"'
+PIXEL_CELL_RESULTS = [True] * (len(HARNESS.FIXTURE_ATTEMPT_SOURCE) + 2)
 
 
 def credential_target(endpoint: str) -> str:
@@ -45,6 +46,7 @@ def passing_observations(case_id: str = CASE) -> dict[str, Any]:
     return case_observations(
         HARNESS.CASE_FLOWS[case_id],
         **HARNESS.expected_observations(),
+        web_security_cell_results=list(PIXEL_CELL_RESULTS),
         provider_request_count=HARNESS.EXPECTED_REQUEST_COUNT,
     )
 
@@ -116,22 +118,38 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected bytes"):
                     HARNESS.validate_evidence(evidence)
 
-    def test_script_effect_and_window_count_are_required_and_typed(self) -> None:
-        for key, value in (
-            ("web_security_script_effect", False),
-            ("web_security_window_count", 2),
-            ("web_security_window_count", True),
+    def test_cell_results_and_window_count_are_required_and_typed(self) -> None:
+        invalid_results = list(PIXEL_CELL_RESULTS)
+        invalid_results[1] = False
+        malformed_results = list(PIXEL_CELL_RESULTS)
+        malformed_results[1] = 1
+        for key, value, message in (
+            ("web_security_cell_results", invalid_results, "WebView pixel cells are incomplete"),
+            (
+                "web_security_cell_results",
+                malformed_results,
+                "invalid WebView pixel-cell observations",
+            ),
+            ("web_security_window_count", 2, "web_security_window_count does not hold the expected value"),
+            ("web_security_window_count", True, "web_security_window_count does not hold the expected value"),
         ):
             with self.subTest(key=key, value=value):
                 evidence = valid_evidence()
                 evidence["cases"][0]["observations"][key] = value
-                with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected value"):
+                with self.assertRaisesRegex(ValueError, message):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_passed_evidence_requires_the_exact_dynamic_cell_count(self) -> None:
+        for cell_results in (PIXEL_CELL_RESULTS[:-1], [*PIXEL_CELL_RESULTS, True]):
+            with self.subTest(cell_count=len(cell_results)):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"]["web_security_cell_results"] = cell_results
+                with self.assertRaisesRegex(ValueError, "invalid WebView pixel-cell observations"):
                     HARNESS.validate_evidence(evidence)
 
     def test_each_new_web_observation_is_required_on_its_own(self) -> None:
         for key in (
-            "web_security_navigation_attempt_count",
-            "web_security_network_attempt_count",
+            "web_security_cell_results",
             "web_security_tcp_contact_count",
             "web_security_udp_contact_count",
         ):
@@ -143,10 +161,8 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "incomplete"):
                     HARNESS.validate_evidence(evidence)
 
-    def test_network_observations_require_all_attempts_and_zero_contacts(self) -> None:
+    def test_network_observations_require_zero_listener_contacts(self) -> None:
         for key, value in (
-            ("web_security_navigation_attempt_count", HARNESS.NAVIGATION_ATTEMPT_COUNT - 1),
-            ("web_security_network_attempt_count", HARNESS.NETWORK_PROBE_COUNT - 1),
             ("web_security_tcp_contact_count", 1),
             ("web_security_udp_contact_count", 1),
             ("web_security_tcp_contact_count", False),
@@ -513,7 +529,7 @@ class SessionTests(unittest.TestCase):
         order.launch_app.return_value = app
         order.phase_web_security.return_value = {
             "web_security_disk_before": DISK.evidence(),
-            "web_security_script_effect": True,
+            "web_security_cell_results": list(PIXEL_CELL_RESULTS),
             "web_security_window_count": 1,
         }
         order.phase_decisions.return_value = {"decisions_editor_stale": STALE.evidence()}
@@ -547,11 +563,13 @@ class SessionTests(unittest.TestCase):
 
     def test_a_phase_failure_names_its_phase_and_stops_the_session(self) -> None:
         harness, order, app, provider = self.session_harness()
-        order.phase_web_security.side_effect = runtime.HarnessFailure("SCRIPT_EFFECT_TIMEOUT")
+        order.phase_web_security.side_effect = runtime.HarnessFailure(
+            "WEB_SECURITY_PIXEL_CELLS_TIMEOUT"
+        )
         with (
             mock.patch.object(PROVIDER, "LoopbackRevisionServer", return_value=provider),
             self.assertRaisesRegex(
-                runtime.HarnessFailure, "^WEB_SECURITY_SCRIPT_EFFECT_TIMEOUT$"
+                runtime.HarnessFailure, "^WEB_SECURITY_PIXEL_CELLS_TIMEOUT$"
             ),
         ):
             harness.scenario_revision_session()
@@ -563,7 +581,6 @@ class SessionTests(unittest.TestCase):
     def test_an_unexpected_measurement_fails_with_its_phase_key(self) -> None:
         for key, value, code in (
             ("web_security_disk_before", REVIEWED, "WEB_SECURITY_DISK_BEFORE_UNEXPECTED"),
-            ("web_security_script_effect", False, "WEB_SECURITY_SCRIPT_EFFECT_UNEXPECTED"),
             ("web_security_window_count", 2, "WEB_SECURITY_WINDOW_COUNT_UNEXPECTED"),
             ("web_security_window_count", True, "WEB_SECURITY_WINDOW_COUNT_UNEXPECTED"),
             ("decisions_editor_one_accepted", ALL_ACCEPTED, "DECISIONS_EDITOR_ONE_ACCEPTED_UNEXPECTED"),
@@ -590,8 +607,117 @@ class SessionTests(unittest.TestCase):
             harness.scenario(CASE)
 
 
+class PixelCellObservationTests(unittest.TestCase):
+    def synthetic_grid(
+        self, colors: list[tuple[int, int, int] | None], missing: int | None = None
+    ) -> Any:
+        from PIL import Image, ImageDraw
+
+        size = HARNESS.CELL_SIZE
+        gap = HARNESS.CELL_GAP
+        left = HARNESS.CELL_GRID_LEFT
+        top = HARNESS.CELL_GRID_TOP
+        image = Image.new(
+            "RGB",
+            (left + len(colors) * (size + gap), top + size + gap),
+            HARNESS.CELL_PAGE_COLOR,
+        )
+        draw = ImageDraw.Draw(image)
+        for index, color in enumerate(colors):
+            if index == missing:
+                continue
+            x = left + index * (size + gap)
+            draw.rectangle(
+                (x, top, x + size - 1, top + size - 1),
+                fill=HARNESS.CELL_PENDING_COLOR,
+                outline=HARNESS.CELL_BORDER_COLOR,
+                width=HARNESS.CELL_BORDER_WIDTH,
+            )
+            if color is not None:
+                draw.rectangle(
+                    (
+                        x + HARNESS.CELL_BORDER_WIDTH,
+                        top + HARNESS.CELL_BORDER_WIDTH,
+                        x + size - HARNESS.CELL_BORDER_WIDTH - 1,
+                        top + size - HARNESS.CELL_BORDER_WIDTH - 1,
+                    ),
+                    fill=color,
+                )
+        return image
+
+    def test_detector_reports_each_dynamic_cell_with_color_tolerance(self) -> None:
+        expected = [
+            HARNESS.CELL_SCRIPT_COLOR,
+            HARNESS.CELL_ATTEMPT_COLOR,
+            HARNESS.CELL_ATTEMPT_COLOR,
+            HARNESS.CELL_COMPLETE_COLOR,
+        ]
+        image = self.synthetic_grid(expected)
+        self.assertEqual(HARNESS.detect_fixture_cells(image), [True] * len(expected))
+
+        noisy = self.synthetic_grid(
+            [tuple(channel + 5 for channel in color) for color in expected]
+        )
+        self.assertEqual(HARNESS.detect_fixture_cells(noisy), [True] * len(expected))
+
+    def test_detector_rejects_a_missing_or_wrong_color_cell(self) -> None:
+        expected = [
+            HARNESS.CELL_SCRIPT_COLOR,
+            HARNESS.CELL_ATTEMPT_COLOR,
+            HARNESS.CELL_ATTEMPT_COLOR,
+            HARNESS.CELL_COMPLETE_COLOR,
+        ]
+        missing = self.synthetic_grid(expected, missing=1)
+        self.assertEqual(HARNESS.detect_fixture_cells(missing), [True, False, True, True])
+
+        wrong_color = self.synthetic_grid(
+            [expected[0], (255, 0, 0), *expected[2:]]
+        )
+        self.assertEqual(
+            HARNESS.detect_fixture_cells(wrong_color), [True, False, True, True]
+        )
+
+    def test_unpainted_attempt_cells_cannot_satisfy_the_verdict(self) -> None:
+        complete = list(PIXEL_CELL_RESULTS)
+        unpainted = list(complete)
+        unpainted[1] = False
+        self.assertTrue(HARNESS.fixture_cells_complete(complete))
+        self.assertFalse(HARNESS.fixture_cells_complete(unpainted))
+        self.assertFalse(HARNESS.fixture_cells_complete(complete[:-1]))
+        self.assertFalse(HARNESS.fixture_cells_complete([*complete, True]))
+
+
 class PhaseTests(unittest.TestCase):
     """Each phase's UI steps, in order, against fakes."""
+
+    def test_pixel_capture_locates_webview_before_window_capture(self) -> None:
+        from PIL import Image
+
+        from scripts.markturbo_tools.native import visual
+
+        calls: list[str] = []
+        app = mock.Mock(hwnd=73)
+        app.window = object()
+        win32 = mock.Mock()
+        harness = bare_harness(win32=win32)
+        window = mock.Mock()
+        window.webview_rect.side_effect = lambda _timeout: calls.append("rect") or (10, 20, 50, 60)
+        image = Image.new("RGB", (100, 90), (255, 255, 255))
+
+        def capture(_hwnd: int) -> Any:
+            calls.append("capture")
+            return image
+
+        with (
+            mock.patch.object(visual, "AppWindow", return_value=window),
+            mock.patch.object(visual, "capture_window", side_effect=capture),
+            mock.patch.object(HARNESS, "detect_fixture_cells", return_value=PIXEL_CELL_RESULTS) as detect,
+        ):
+            results = harness.read_fixture_cell_results(app)
+
+        self.assertEqual(calls, ["rect", "capture"])
+        self.assertEqual(results, PIXEL_CELL_RESULTS)
+        self.assertEqual(detect.call_args.args[0].size, (40, 40))
 
     def web_security_harness(
         self, focus_returns: bool
@@ -607,11 +733,12 @@ class PhaseTests(unittest.TestCase):
         probes = mock.Mock()
         probes.snapshot.return_value = {"tcp_contacts": 0, "udp_contacts": 0}
         harness = bare_harness(win32=win32, network_probes=probes)
-        for name in ("menu_command", "wait_name", "find_named", "click_control", "editor_control"):
+        order.read_fixture_cell_results.return_value = list(PIXEL_CELL_RESULTS)
+        for name in ("menu_command", "read_fixture_cell_results", "editor_control"):
             setattr(harness, name, getattr(order, name))
         return harness, order, app
 
-    def test_web_phase_checks_script_navigation_and_window_then_hands_keyboard_back(self) -> None:
+    def test_web_phase_checks_pixel_cells_before_network_and_window_then_hands_keyboard_back(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
@@ -623,38 +750,7 @@ class PhaseTests(unittest.TestCase):
             order.mock_calls,
             [
                 mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
-                mock.call.wait_name(
-                    app, HARNESS.SCRIPT_EFFECT_TEXT, "Text", "SCRIPT_EFFECT_TIMEOUT"
-                ),
-                mock.call.wait_name(
-                    app,
-                    HARNESS.USER_NAVIGATION_BLOCKED_TEXT,
-                    "Text",
-                    "USER_NAVIGATION_NOT_BLOCKED",
-                ),
-                mock.call.wait_name(
-                    app,
-                    HARNESS.NETWORK_ATTEMPTS_COMPLETE_TEXT,
-                    "Text",
-                    "NETWORK_ATTEMPTS_TIMEOUT",
-                ),
-                mock.call.wait_name(
-                    app,
-                    HARNESS.SCRIPT_NAVIGATION_READY_TEXT,
-                    "Text",
-                    "SCRIPT_NAVIGATION_READY_TIMEOUT",
-                ),
-                mock.call.find_named(
-                    app,
-                    HARNESS.SCRIPT_NAVIGATION_RELEASE_NAME,
-                    "Button",
-                    "SCRIPT_NAVIGATION_RELEASE_UIA_TIMEOUT",
-                    "SCRIPT_NAVIGATION_RELEASE_UIA_MISMATCH",
-                    anonymous=False,
-                ),
-                mock.call.click_control(
-                    order.find_named.return_value, "SCRIPT_NAVIGATION_RELEASE_CLICK_FAILED"
-                ),
+                mock.call.read_fixture_cell_results(app),
                 mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
                 mock.call.editor_control(app),
             ],
@@ -663,45 +759,33 @@ class PhaseTests(unittest.TestCase):
             observed,
             {
                 "web_security_disk_before": DISK.evidence(),
-                "web_security_script_effect": True,
+                "web_security_cell_results": list(PIXEL_CELL_RESULTS),
                 "web_security_window_count": 1,
-                "web_security_navigation_attempt_count": HARNESS.NAVIGATION_ATTEMPT_COUNT,
-                "web_security_network_attempt_count": HARNESS.NETWORK_PROBE_COUNT,
                 "web_security_tcp_contact_count": 0,
                 "web_security_udp_contact_count": 0,
             },
         )
         harness.win32.sleep.assert_has_calls(
-            [
-                mock.call(HARNESS.SCRIPT_NAVIGATION_SETTLE_SECONDS),
-                mock.call(HARNESS.NETWORK_PROBE_SETTLE_SECONDS),
-            ]
+            [mock.call(HARNESS.NETWORK_PROBE_SETTLE_SECONDS)]
         )
         harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
         harness.win32.foreground_window.assert_called_once_with()
         harness.network_probes.snapshot.assert_called_once_with()
 
-    def test_interrupted_navigation_order_fails_before_verdict(self) -> None:
+    def test_unpainted_pixel_cell_fails_before_network_or_window_verdict(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
-        harness.network_probes = mock.Mock(
-            snapshot=mock.Mock(return_value={"tcp_contacts": 0, "udp_contacts": 0})
-        )
-
-        def wait_for_marker(_app: Any, _name: str, _kind: str, failure_code: str) -> None:
-            if failure_code == "SCRIPT_NAVIGATION_READY_TIMEOUT":
-                raise runtime.HarnessFailure(failure_code)
-
-        order.wait_name.side_effect = wait_for_marker
+        incomplete = [True, *([False] * (len(PIXEL_CELL_RESULTS) - 1))]
+        order.read_fixture_cell_results.return_value = incomplete
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            self.assertRaisesRegex(runtime.HarnessFailure, "SCRIPT_NAVIGATION_READY_TIMEOUT"),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(runtime.HarnessFailure, "PIXEL_CELLS_TIMEOUT"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
         harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
-        order.find_named.assert_not_called()
-        order.click_control.assert_not_called()
+        order.editor_control.assert_not_called()
         order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
 
     def test_web_phase_fails_closed_when_a_listener_counts_a_contact(self) -> None:
@@ -713,28 +797,16 @@ class PhaseTests(unittest.TestCase):
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
-        harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
-        order.menu_command.assert_has_calls(
-            [
-                mock.call(app, runtime.MENU_WEB_AUTOMATION_ID),
-                mock.call(app, runtime.MENU_EDIT_AUTOMATION_ID),
-            ]
-        )
+        harness.win32.visible_top_level_windows.assert_not_called()
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.editor_control.assert_not_called()
 
-    def test_fixture_attempt_markers_precede_calls_and_use_only_run_targets(self) -> None:
+    def test_fixture_attempts_use_only_the_run_targets(self) -> None:
         with HARNESS.NetworkProbeListeners() as probes:
             source = HARNESS.fixture_source(probes)
             self.assertIn(f'const tcpPort = "{probes.tcp_port}";', source)
             self.assertIn(f'const udpPort = "{probes.udp_port}";', source)
             self.assertIn(HARNESS.NETWORK_PROBE_HOST, source)
-            self.assertEqual(
-                source.count("{ run:"),
-                HARNESS.NETWORK_PROBE_COUNT + HARNESS.NAVIGATION_ATTEMPT_COUNT,
-            )
-            self.assertEqual(source.count("navigation: true"), HARNESS.NAVIGATION_ATTEMPT_COUNT)
-            self.assertEqual(
-                source.count("scriptNavigation: true"), HARNESS.SCRIPT_NAVIGATION_ATTEMPT_COUNT
-            )
             for attempt in (
                 "function fetchProbe",
                 "function imageProbe",
@@ -767,32 +839,6 @@ class PhaseTests(unittest.TestCase):
             ):
                 with self.subTest(script_navigation_before_self_location=attempt):
                     self.assertLess(source.index(attempt), self_location)
-            run_attempts = source[source.index("async function runAttempts()") :]
-            release_handler = run_attempts.index("navigationRelease.addEventListener(\"click\"")
-            deferred_loop = run_attempts.index("for (const attempt of scriptNavigationAttempts)")
-            self.assertLess(
-                run_attempts.index(
-                    "networkStatus.textContent = `Network probes complete ${networkIndex}/${networkProbeCount}`"
-                ),
-                release_handler,
-            )
-            self.assertLess(
-                run_attempts.index("userNavigationStatus.textContent = `User navigation blocked"),
-                release_handler,
-            )
-            self.assertLess(
-                run_attempts.index("navigationReleaseStatus.textContent = `Ready to run script navigation probes"),
-                run_attempts.index("navigationRelease.disabled = false"),
-            )
-            handler_end = run_attempts.index("}, { once: true });", release_handler)
-            self.assertGreater(deferred_loop, release_handler)
-            for marker in (
-                "networkStatus",
-                "navigationStatus",
-                "userNavigationStatus",
-                "navigationReleaseStatus",
-            ):
-                self.assertNotIn(f"{marker}.textContent =", run_attempts[release_handler:handler_end])
 
     def test_equal_dynamic_ports_canonicalize_at_their_declarations_only(self) -> None:
         probes = mock.Mock(tcp_port=43123, udp_port=43123)
@@ -809,109 +855,95 @@ class PhaseTests(unittest.TestCase):
         end = source.index("</script>", start)
         script = source[start:end]
         node_harness = r"""
-const fs = require("node:fs");
 const vm = require("node:vm");
-const source = fs.readFileSync(0, "utf8");
-const runCall = "runAttempts();";
-const callIndex = source.lastIndexOf(runCall);
-if (callIndex < 0 || source.slice(callIndex + runCall.length).trim()) throw new Error("fixture runner call was not found");
-const code = source.slice(0, callIndex) + "globalThis.__run = runAttempts();" + source.slice(callIndex + runCall.length);
-const expectedNetworkCount = Number(process.argv[1]);
-const expectedNavigationCount = Number(process.argv[2]);
-const expectedUserNavigationCount = Number(process.argv[3]);
-const expectedScriptNavigationCount = Number(process.argv[4]);
+const expectedAttempts = Number(process.argv[1]);
+const mode = process.argv[2];
+const [pendingColor, scriptColor, attemptColor, completeColor] = process.argv.slice(3);
+const cells = [];
 const calls = [];
-const effect = { textContent: "" };
-const networkWrites = [];
-const navigationWrites = [];
-const userNavigationWrites = [];
-const navigationReleaseWrites = [];
-const statusNode = writes => ({
-  value: "",
-  get textContent() { return this.value; },
-  set textContent(value) { this.value = value; writes.push([value, calls.length]); },
-});
-const network = statusNode(networkWrites);
-const navigation = statusNode(navigationWrites);
-const userNavigation = statusNode(userNavigationWrites);
-const navigationReleaseStatus = statusNode(navigationReleaseWrites);
-const navigationRelease = {
-  disabled: true,
+const cellWrites = [];
+function makeStyle() {
+  let backgroundColor = "";
+  return {
+    width: "",
+    height: "",
+    border: "",
+    left: "",
+    top: "",
+    gap: "",
+    set backgroundColor(value) {
+      backgroundColor = value;
+      cellWrites.push([value, calls.length]);
+    },
+    get backgroundColor() { return backgroundColor; },
+  };
+}
+function makeCell() {
+  const cell = { style: makeStyle(), className: "" };
+  cells.push(cell);
+  return cell;
+}
+const scriptCell = makeCell();
+const cellGrid = {
+  style: makeStyle(),
+  appendChild(cell) { this.children.push(cell); },
+  children: [scriptCell],
+};
+const userLink = {
+  href: "",
+  target: "_self",
   listeners: {},
   addEventListener(name, callback) { this.listeners[name] = callback; },
   click() {
-    if (this.disabled) throw new Error("navigation release is disabled");
-    if (navigationReleaseStatus.textContent !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("ready marker missing before release");
-    this.listeners.click?.();
+    calls.push(["user-link", this.href, this.target]);
+    this.listeners.click?.({ defaultPrevented: true });
+  },
+};
+const userForm = {
+  action: "",
+  target: "_blank",
+  syntheticSubmitPrevented: false,
+  dispatchEvent(event) {
+    if (event.type !== "submit" || !event.bubbles || !event.cancelable) throw new Error("submit event shape mismatch");
+    event.defaultPrevented = true;
+    this.syntheticSubmitPrevented = event.defaultPrevented;
+    return false;
+  },
+  requestSubmit() {
+    if (!this.syntheticSubmitPrevented) throw new Error("submit cancellation missing");
+    calls.push(["user-form", this.action, this.target]);
   },
 };
 const nodes = new Map([
-  ["goal07-effect", effect],
-  ["goal07-network", network],
-  ["goal07-navigation", navigation],
-  ["goal07-user-link", {
-    href: "",
-    target: "_self",
-    listeners: {},
-    addEventListener(name, callback) { this.listeners[name] = callback; },
-    click() {
-      assertReady(true);
-      calls.push(["user-link", this.href, this.target]);
-      this.listeners.click?.({ defaultPrevented: true });
-    },
-  }],
-  ["goal07-user-form", {
-    action: "",
-    target: "_blank",
-    syntheticSubmitPrevented: false,
-    dispatchEvent(event) {
-      if (event.type !== "submit" || !event.bubbles || !event.cancelable) throw new Error("submit event shape mismatch");
-      event.defaultPrevented = true;
-      this.syntheticSubmitPrevented = event.defaultPrevented;
-      return false;
-    },
-    requestSubmit() {
-      assertReady(true);
-      if (!this.syntheticSubmitPrevented) throw new Error("capture-phase submit cancellation missing");
-      calls.push(["user-form", this.action, this.target]);
-    },
-  }],
-  ["goal07-user-navigation", userNavigation],
-  ["goal07-navigation-release-status", navigationReleaseStatus],
-  ["goal07-navigation-release", navigationRelease],
+  ["goal07-cells", cellGrid],
+  ["goal07-script-cell", scriptCell],
+  ["goal07-user-link", userLink],
+  ["goal07-user-form", userForm],
 ]);
-function assertReady(isNavigation = false, isScriptNavigation = false) {
-  if (isScriptNavigation) {
-    if (network.textContent !== `Network probes complete ${expectedNetworkCount}/${expectedNetworkCount}`) throw new Error("network marker missing before script navigation");
-    if (navigationReleaseStatus.textContent !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("script navigation marker missing");
-    return;
-  }
-  if (!network.textContent.startsWith("Network probe attempted ") && !network.textContent.startsWith("Network probes complete ")) throw new Error("network marker missing");
-  if (isNavigation && !navigation.textContent.startsWith("Navigation attempt ")) throw new Error("navigation marker missing");
-}
 function element(tag) {
-  const value = { tag, action: "", rel: "" };
-  if (tag === "img") Object.defineProperty(value, "src", { set(url) { assertReady(); calls.push(["img", url]); } });
-  if (tag === "link") Object.defineProperty(value, "href", { set(url) { assertReady(); calls.push(["link", value.rel, url]); } });
-  if (tag === "form") value.submit = () => { assertReady(true, true); calls.push(["form", value.action]); throw new Error("blocked"); };
-  if (tag === "iframe") Object.defineProperty(value, "src", { set(url) { assertReady(true, true); calls.push(["iframe", url]); } });
+  const value = { tag, style: {}, action: "", rel: "" };
+  if (tag === "img") Object.defineProperty(value, "src", { set(url) { calls.push(["img", url]); } });
+  if (tag === "link") Object.defineProperty(value, "href", { set(url) { calls.push(["link", value.rel, url]); } });
+  if (tag === "form") value.submit = () => { calls.push(["form", value.action]); throw new Error("blocked"); };
+  if (tag === "iframe") Object.defineProperty(value, "src", { set(url) { calls.push(["iframe", url]); } });
   return value;
 }
 const context = {
   document: {
     getElementById: id => nodes.get(id),
-    createElement: element,
+    createElement: tag => tag === "span" ? makeCell() : element(tag),
     body: { appendChild() {} },
     head: { appendChild() {} },
   },
   window: {
-    open(url) { assertReady(true, true); calls.push(["open", url]); return null; },
+    devicePixelRatio: 1,
+    open(url) { calls.push(["open", url]); return null; },
   },
   navigator: {
-    sendBeacon(url) { assertReady(); calls.push(["beacon", url]); return true; },
+    sendBeacon(url) { calls.push(["beacon", url]); return true; },
   },
-  fetch(url) { assertReady(); calls.push(["fetch", url]); return Promise.resolve(); },
-  WebSocket: function (url) { assertReady(); calls.push(["websocket", url]); },
+  fetch(url) { calls.push(["fetch", url]); return Promise.resolve(); },
+  WebSocket: function (url) { calls.push(["websocket", url]); },
   SubmitEvent: function (type, options) {
     this.type = type;
     this.bubbles = options.bubbles;
@@ -919,74 +951,77 @@ const context = {
     this.defaultPrevented = false;
   },
   RTCPeerConnection: function (configuration) {
-    assertReady();
     calls.push(["rtc"]);
     context.__iceServers = configuration.iceServers;
     this.createDataChannel = () => { context.__dataChannel = true; };
     this.createOffer = () => Promise.resolve({ type: "offer" });
     this.setLocalDescription = () => Promise.resolve();
   },
-  setTimeout(callback) { callback(); return 0; },
+  setTimeout(callback) { if (mode !== "never-run") callback(); return 0; },
 };
 context.top = {};
 Object.defineProperty(context.top, "location", {
-  set(url) { assertReady(true, true); calls.push(["top", url]); throw new Error("blocked"); },
+  set(url) { calls.push(["top", url]); throw new Error("blocked"); },
 });
 Object.defineProperty(context, "location", {
-  set(url) { assertReady(true, true); calls.push(["location", url]); throw new Error("blocked"); },
+  set(url) { calls.push(["location", url]); throw new Error("blocked"); },
 });
 async function main() {
-  await vm.runInNewContext(code, context);
-  if (effect.textContent !== "Script ran automatically") throw new Error("script effect missing");
-  if (navigationRelease.disabled) throw new Error("navigation release was not enabled");
-  if (calls.length !== expectedNetworkCount + expectedUserNavigationCount) throw new Error("script navigation ran before release");
-  if (navigationReleaseStatus.textContent !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("script navigation ready marker missing");
-  navigationRelease.click();
-  const scriptNavigationKinds = new Set(["open", "top", "location", "form", "iframe"]);
-  const userNavigationKinds = new Set(["user-link", "user-form"]);
-  const networkCallCount = calls.filter(([kind]) => !scriptNavigationKinds.has(kind) && !userNavigationKinds.has(kind)).length;
-  const scriptNavigationCalls = calls.filter(([kind]) => scriptNavigationKinds.has(kind));
-  const userNavigationCalls = calls.filter(([kind]) => userNavigationKinds.has(kind));
-  if (networkCallCount !== expectedNetworkCount) throw new Error("not every network probe ran");
-  if (userNavigationCalls.length !== expectedUserNavigationCount) throw new Error("not every user navigation ran");
-  if (scriptNavigationCalls.length !== expectedScriptNavigationCount) throw new Error("not every script navigation ran");
-  if (calls.length !== expectedNetworkCount + expectedNavigationCount) throw new Error("attempt count mismatch");
-  if (network.textContent !== `Network probes complete ${expectedNetworkCount}/${expectedNetworkCount}`) throw new Error("network attempts incomplete");
-  if (navigationWrites.length !== expectedUserNavigationCount) throw new Error("user navigation attempts are not marked");
-  for (let index = 1; index <= expectedUserNavigationCount; index += 1) {
-    if (navigationWrites[index - 1][0] !== `Navigation attempt ${index}/${expectedNavigationCount} attempted` || navigationWrites[index - 1][1] !== expectedNetworkCount + index - 1) throw new Error("user navigation marker ordering invalid");
+  const source = require("node:fs").readFileSync(0, "utf8");
+  const runCall = "runAttempts();";
+  const callIndex = source.lastIndexOf(runCall);
+  if (callIndex < 0 || source.slice(callIndex + runCall.length).trim()) throw new Error("fixture runner call was not found");
+  const code = source.slice(0, callIndex) + "globalThis.__run = runAttempts();" + source.slice(callIndex + runCall.length);
+  const runner = vm.runInNewContext(code, context);
+  if (mode !== "never-run") await runner;
+  const attemptCells = cellGrid.children.slice(1, -1);
+  const completeCell = cellGrid.children[cellGrid.children.length - 1];
+  const results = cellGrid.children.map((cell, index) => {
+    const expected = index === 0 ? scriptColor : index === cellGrid.children.length - 1 ? completeColor : attemptColor;
+    return cell.style.backgroundColor === expected;
+  });
+  if (attemptCells.length !== expectedAttempts) throw new Error("attempt cell count mismatch");
+  if (mode === "never-run") {
+    if (calls.length !== 0) throw new Error("fake browser unexpectedly ran an attempt");
+    if (attemptCells[0].style.backgroundColor !== pendingColor || completeCell.style.backgroundColor !== pendingColor) throw new Error("unstarted attempt painted a cell");
+    if (results.every(Boolean)) throw new Error("unstarted attempt passed the cell verdict");
+    console.log("pixel-cell verdict rejected unstarted attempts");
+    return;
   }
-  if (userNavigation.textContent !== `User navigation blocked ${expectedUserNavigationCount}/${expectedUserNavigationCount}`) throw new Error("user navigation was not blocked");
-  if (navigationReleaseWrites.length !== 1) throw new Error("navigation ready marker missing");
-  if (navigationReleaseWrites[0][0] !== `Ready to run script navigation probes ${expectedScriptNavigationCount}/${expectedScriptNavigationCount}`) throw new Error("navigation ready marker changed");
-  const networkCompletions = networkWrites.filter(([value]) => value.startsWith("Network probes complete "));
-  if (networkCompletions.length !== expectedNetworkCount) throw new Error("network completion markers missing");
-  for (let index = 1; index <= expectedNetworkCount; index += 1) {
-    if (networkCompletions[index - 1][0] !== `Network probes complete ${index}/${expectedNetworkCount}` || networkCompletions[index - 1][1] !== index) throw new Error("network completion ordering invalid");
-  }
-  const firstScriptNavigationCall = calls.findIndex(([kind]) => scriptNavigationKinds.has(kind));
-  if (networkWrites.some(([, callCount]) => callCount > firstScriptNavigationCall) || navigationWrites.some(([, callCount]) => callCount > firstScriptNavigationCall) || userNavigationWrites.some(([, callCount]) => callCount > firstScriptNavigationCall) || navigationReleaseWrites.some(([, callCount]) => callCount > firstScriptNavigationCall)) throw new Error("a marker was written after script navigation began");
+  if (!results.every(Boolean)) throw new Error("automatic attempt cells are incomplete");
+  if (calls.length !== expectedAttempts) throw new Error("not every automatic attempt ran");
+  const attemptWrites = cellWrites.filter(([color]) => color === attemptColor);
+  if (attemptWrites.length !== expectedAttempts) throw new Error("attempt cells were not painted individually");
+  if (attemptWrites.some(([, callCount], index) => callCount !== index + 1)) throw new Error("attempt cell was not painted after its call returned");
+  const completeWrites = cellWrites.filter(([color]) => color === completeColor);
+  if (completeWrites.length !== 1 || completeWrites[0][1] !== expectedAttempts) throw new Error("completion cell was not painted after all calls");
   if (context.__iceServers.length !== 2 || !context.__dataChannel) throw new Error("WebRTC setup incomplete");
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
 """
-        result = subprocess.run(
-            [
-                node,
-                "-e",
-                node_harness,
-                str(HARNESS.NETWORK_PROBE_COUNT),
-                str(HARNESS.NAVIGATION_ATTEMPT_COUNT),
-                str(HARNESS.USER_NAVIGATION_ATTEMPT_COUNT),
-                str(HARNESS.SCRIPT_NAVIGATION_ATTEMPT_COUNT),
-            ],
-            input=script,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        for mode in ("success", "never-run"):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [
+                        node,
+                        "-e",
+                        node_harness,
+                        str(len(HARNESS.FIXTURE_ATTEMPT_SOURCE)),
+                        mode,
+                        HARNESS._css_rgb(HARNESS.CELL_PENDING_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_SCRIPT_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_ATTEMPT_COLOR),
+                        HARNESS._css_rgb(HARNESS.CELL_COMPLETE_COLOR),
+                    ],
+                    input=script,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr.strip())
+                if mode == "never-run":
+                    self.assertIn("pixel-cell verdict rejected unstarted attempts", result.stdout)
 
     def test_probe_listeners_bind_ephemeral_loopback_ports_and_count_only_contacts(self) -> None:
         with HARNESS.NetworkProbeListeners() as probes:
@@ -1014,23 +1049,18 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
         with self.assertRaisesRegex(runtime.HarnessFailure, "NETWORK_PROBE_LISTENER_FAILED"):
             probes.snapshot()
 
-    def test_web_phase_does_not_release_script_navigation_without_the_ready_marker(self) -> None:
+    def test_web_phase_rejects_a_missing_completion_cell(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
-        def fail_ready_check(
-            _app: Any, _name: str, _kind: str, failure_code: str, *_args: Any
-        ) -> None:
-            if failure_code == "SCRIPT_NAVIGATION_READY_TIMEOUT":
-                raise runtime.HarnessFailure(failure_code)
-
-        order.wait_name.side_effect = fail_ready_check
+        order.read_fixture_cell_results.return_value = PIXEL_CELL_RESULTS[:-1]
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            self.assertRaisesRegex(runtime.HarnessFailure, "SCRIPT_NAVIGATION_READY_TIMEOUT"),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(runtime.HarnessFailure, "PIXEL_CELLS_TIMEOUT"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
         order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
-        order.find_named.assert_not_called()
-        order.click_control.assert_not_called()
+        order.read_fixture_cell_results.assert_called_once_with(app)
+        harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
 
     def test_web_phase_fails_if_a_popup_creates_an_extra_owned_window(self) -> None:

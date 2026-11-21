@@ -415,8 +415,10 @@ The preview's policy allows inline scripts and styles and `data:` images and
 fonts. Documents are not allowed to access the network or file system, open
 popups, submit forms, or navigate out of the preview. Remote scripts and
 relative assets in HTML are not supported. The app does not open document
-links in another app. Release-build verification of the isolation policy
-is [pending](docs/goal-15-acceptance.md#pending-release-checks).
+links in another app. PlantUML runs outside the browser policy with
+`PLANTUML_SECURITY_PROFILE=SANDBOX`; a PlantUML launcher that sets its own
+security profile overrides ours. Release-build verification of the isolation
+policy is [pending](docs/goal-15-acceptance.md#pending-release-checks).
 
 ## Keyboard
 

@@ -63,15 +63,9 @@ fn run_app() -> impl std::process::Termination {
 
 #[cfg(target_os = "windows")]
 fn set_webview_environment(name: &str, value: &str) {
-    #[cfg(test)]
-    tests::record_webview_environment(name, value);
-
-    #[cfg(not(test))]
-    {
-        // SAFETY: std::env::set_var is documented as safe on Windows, even when
-        // other threads access the process environment.
-        unsafe { std::env::set_var(name, value) }
-    }
+    // SAFETY: std::env::set_var is documented as safe on Windows, even when
+    // other threads access the process environment.
+    unsafe { std::env::set_var(name, value) }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -114,19 +108,12 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     thread_local! {
-        static WEBVIEW_ARGUMENTS: RefCell<Option<String>> = const { RefCell::new(None) };
         static APP_STARTUP: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     }
 
     #[cfg(target_os = "windows")]
     #[derive(Debug)]
     struct AppStartupReached;
-
-    #[cfg(target_os = "windows")]
-    pub(super) fn record_webview_environment(name: &str, value: &str) {
-        assert_eq!(name, super::WEBVIEW2_ARGUMENTS_ENV);
-        WEBVIEW_ARGUMENTS.with(|arguments| *arguments.borrow_mut() = Some(value.to_owned()));
-    }
 
     #[cfg(target_os = "windows")]
     pub(super) fn observe_app_start() {
@@ -194,13 +181,42 @@ mod tests {
     #[test]
     fn main_applies_webview_network_block_before_starting_the_app() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::process::Command;
 
-        WEBVIEW_ARGUMENTS.with(|arguments| {
-            *arguments.borrow_mut() = Some("--inherited-browser-arguments".to_owned())
-        });
+        const CHILD_MODE: &str = "MT_MAIN_WEBVIEW_NETWORK_BLOCK_CHILD_TEST";
+        const CHILD_SUCCESS: &str = "main-applied-webview-network-block-before-startup";
+
+        if std::env::var_os(CHILD_MODE).is_none() {
+            let output = Command::new(std::env::current_exe().expect("test executable path"))
+                .args([
+                    "--exact",
+                    "tests::main_applies_webview_network_block_before_starting_the_app",
+                    "--nocapture",
+                ])
+                .env(CHILD_MODE, "1")
+                .env(
+                    super::WEBVIEW2_ARGUMENTS_ENV,
+                    "--inherited-browser-arguments",
+                )
+                .output()
+                .expect("run app startup check in an isolated child process");
+            assert!(
+                output.status.success(),
+                "child startup test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(CHILD_SUCCESS),
+                "child process exited successfully without running the startup check\nstdout:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+            );
+            return;
+        }
+
         APP_STARTUP.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|| {
-                let arguments = WEBVIEW_ARGUMENTS.with(|arguments| arguments.borrow().clone());
+                let arguments = std::env::var(super::WEBVIEW2_ARGUMENTS_ENV).ok();
                 assert_eq!(
                     arguments.as_deref(),
                     Some(super::WEBVIEW2_NETWORK_BLOCK_ARGUMENTS)
@@ -211,7 +227,6 @@ mod tests {
 
         let result = catch_unwind(AssertUnwindSafe(super::main));
         APP_STARTUP.with(|hook| *hook.borrow_mut() = None);
-        WEBVIEW_ARGUMENTS.with(|arguments| *arguments.borrow_mut() = None);
 
         let error = match result {
             Err(error) => error,
@@ -221,6 +236,7 @@ mod tests {
             error.is::<AppStartupReached>(),
             "the test reached app startup only after installing the network block"
         );
+        println!("{CHILD_SUCCESS}");
     }
 }
 

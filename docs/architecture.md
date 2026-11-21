@@ -407,6 +407,9 @@ forms and top-level navigation, and the host's additional `frame-src 'self'`
 directive restricts the frame from navigating to external resources. Source
 checks verify the generated policy, not WebView runtime enforcement.
 
+PlantUML runs outside the browser policy with `PLANTUML_SECURITY_PROFILE=SANDBOX`.
+A PlantUML launcher that sets its own security profile overrides ours.
+
 On Windows, the WebView worker requests an InPrivate profile and checks the
 created profile's actual mode through WebView2 before reporting ready or
 accepting document navigation. An unavailable interface, query error or
