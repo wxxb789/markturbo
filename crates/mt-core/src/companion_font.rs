@@ -173,10 +173,12 @@ impl CompanionFont {
     /// Removes abandoned partial downloads left behind by a crashed process.
     pub fn cleanup_stale_parts(&self) -> io::Result<()> {
         let data_dir = self.data_dir();
-        let _lifecycle = match self.lock_lifecycle() {
+        match fs::metadata(data_dir) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            result => result?,
-        };
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let _lifecycle = self.lock_lifecycle()?;
         let entries = match fs::read_dir(data_dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -550,6 +552,17 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(modified))
             .unwrap();
+    }
+
+    #[test]
+    fn startup_cleanup_reports_a_data_root_that_is_a_file() {
+        let data = tempfile::tempdir().unwrap();
+        let data_root = data.path().join("data-root");
+        fs::write(&data_root, b"not a directory").unwrap();
+        let font = CompanionFont::with_source(&data_root, "http://127.0.0.1:9/", b"font");
+
+        font.cleanup_stale_parts()
+            .expect_err("an existing data root that is a file is not an absent directory");
     }
 
     #[test]
