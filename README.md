@@ -411,11 +411,12 @@ MDX and HTML. Inline scripts can run from the first render, without a prompt.
 The app loads a fixed, base-free host page; document content runs only in its
 sandboxed frame.
 
-The frame policy permits inline scripts and styles, plus images and fonts
-embedded as `data:`. It denies network and file resource loads, and the
-sandbox disables popups, form submissions and navigation out of the preview.
-Remote scripts and relative assets in HTML, including images and stylesheets,
-do not load. The app does not open document links in another app.
+The preview's policy allows inline scripts and styles and `data:` images and
+fonts. Documents are not allowed to access the network or file system, open
+popups, submit forms, or navigate out of the preview. Remote scripts and
+relative assets in HTML are not supported. The app does not open document
+links in another app. Release-build verification of the isolation policy
+is [pending](docs/goal-15-acceptance.md#pending-release-checks).
 
 ## Keyboard
 

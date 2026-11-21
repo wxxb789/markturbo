@@ -12,6 +12,24 @@ use nsh_platform_windows as platform;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
+    #[cfg(target_os = "windows")]
+    let result = with_webview_network_block(
+        |name, value| {
+            // SAFETY: std::env::set_var is documented as safe on Windows, even when
+            // other threads access the process environment.
+            unsafe { std::env::set_var(name, value) }
+        },
+        run_app,
+    );
+
+    #[cfg(not(target_os = "windows"))]
+    let result = run_app();
+
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn run_app() -> impl std::process::Termination {
     // `cargo test` builds this binary with the crate's test features, so the
     // copy it leaves in target/<profile>/ keeps keys in memory only. Such a
     // build must never pass for the shipped app or accept a person's key.
@@ -47,6 +65,30 @@ fn main() -> impl std::process::Termination {
     )
 }
 
+#[cfg(any(target_os = "windows", test))]
+const WEBVIEW2_ARGUMENTS_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
+
+// Fail name lookups, including the `.invalid` proxy; route HTTP(S) through that
+// unreachable host; remove Chromium's implicit loopback bypass; and prevent
+// WebRTC from using non-proxied UDP. The reserved host avoids assuming a local
+// port is closed.
+#[cfg(any(target_os = "windows", test))]
+const WEBVIEW2_NETWORK_BLOCK_ARGUMENTS: &str = concat!(
+    "--host-resolver-rules=\"MAP * ^NOTFOUND\" ",
+    "--proxy-server=http://proxy.invalid:9 ",
+    "--proxy-bypass-list=<-loopback> ",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+);
+
+#[cfg(any(target_os = "windows", test))]
+fn with_webview_network_block<T>(
+    set_environment: impl FnOnce(&str, &str),
+    start_app: impl FnOnce() -> T,
+) -> T {
+    set_environment(WEBVIEW2_ARGUMENTS_ENV, WEBVIEW2_NETWORK_BLOCK_ARGUMENTS);
+    start_app()
+}
+
 fn app_capabilities() -> Capabilities {
     // Keep the standalone app's existing capabilities while declaring no
     // external hosts for engine-mediated WebView loads.
@@ -57,8 +99,9 @@ fn app_capabilities() -> Capabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::app_capabilities;
+    use super::{app_capabilities, with_webview_network_block};
     use nsh_core::access::Access;
+    use std::cell::RefCell;
 
     #[test]
     fn engine_webview_capability_allows_inline_documents_but_no_external_hosts() {
@@ -70,6 +113,48 @@ mod tests {
         assert!(access.allows_webview("about:blank"));
         assert!(!access.allows_webview("https://example.com/"));
         assert!(!access.allows_webview("file:///page.html"));
+    }
+
+    #[test]
+    fn webview_network_block_replaces_inherited_arguments_before_startup() {
+        const EXPECTED_ARGUMENTS: &str = "--host-resolver-rules=\"MAP * ^NOTFOUND\" --proxy-server=http://proxy.invalid:9 --proxy-bypass-list=<-loopback> --webrtc-ip-handling-policy=disable_non_proxied_udp";
+
+        let inherited = RefCell::new(Some("--user-supplied-browser-arguments".to_owned()));
+        let observations = RefCell::new(Vec::new());
+
+        with_webview_network_block(
+            |name, arguments| {
+                *inherited.borrow_mut() = Some(arguments.to_owned());
+                observations.borrow_mut().push((
+                    "set".to_owned(),
+                    name.to_owned(),
+                    arguments.to_owned(),
+                ));
+            },
+            || {
+                observations.borrow_mut().push((
+                    "first-webview".to_owned(),
+                    String::new(),
+                    inherited.borrow().as_deref().unwrap_or_default().to_owned(),
+                ));
+            },
+        );
+
+        assert_eq!(
+            observations.into_inner(),
+            [
+                (
+                    "set".to_owned(),
+                    "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS".to_owned(),
+                    EXPECTED_ARGUMENTS.to_owned(),
+                ),
+                (
+                    "first-webview".to_owned(),
+                    String::new(),
+                    EXPECTED_ARGUMENTS.to_owned(),
+                ),
+            ],
+        );
     }
 }
 

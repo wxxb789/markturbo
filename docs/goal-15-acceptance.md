@@ -24,10 +24,8 @@ The Rust root declares an empty external WebView host list. In nsh 0.6.1,
 access for Rust roots. The declaration denies external app-side loads, but
 is not an override for the Windows renderer's native navigation handler.
 
-The literal contract search still reports nine unchanged `ProjectTrust::`
-references in Agent Context and its callers. Adding a word boundary before
-`Trust::` leaves no matches for the document-trust identifiers or UI copy.
-The unrelated project trust type was not renamed.
+The current contract search, with a word boundary before `Trust::`, returns
+zero matches in `crates/`. The unrelated `ProjectTrust` type was not renamed.
 
 ### Candidate gates
 
@@ -77,6 +75,14 @@ Goal 06 clean-close test timed out in two subcases in a 36-test shard.
 A focused replay reproduced one subcase timeout. The full retry passed
 all 288 tests without altering the timeout or Goal 06 code.
 
+### Review-fix startup diagnostic
+
+The locked release build was measured with `mt.py probe -- startup --rounds 5
+--warmup 1` using isolated data and configuration directories. Time to the
+first visible titled window was 278.8, 271.2, 274.0, 296.8, and 295.6 ms
+(median 278.8 ms, p95 296.6 ms). This is a startup diagnostic, not a
+quiet-gated regression comparison or native isolation proof.
+
 ### Pending release checks
 
 The contract stays active. The CI tier has not passed and the candidate has
@@ -87,6 +93,10 @@ no release-bound native isolation evidence.
   The Goal 07 phase must see the script's visible effect, the fixture still in
   the frame after its navigation attempts, and no new window. The acceptance
   harness unit tests do not run the desktop phase.
+- Clause 3b native proof is pending: the fixture must visibly report its
+  network attempts and the loopback TCP and UDP listeners must record zero
+  contacts on the release build. Unit tests do not verify WebView2 egress,
+  and the loopback counters do not observe DNS resolver traffic or file loads.
 - Verify frame scrolling, text selection, light and dark colours, math and
   diagrams in the actual preview. If WebView2 rejects the frame policy, stop
   and record the result without loosening the sandbox.

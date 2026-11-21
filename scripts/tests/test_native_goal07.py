@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import shutil
+import socket
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,6 +121,35 @@ class EvidenceTests(unittest.TestCase):
             ("web_security_script_effect", False),
             ("web_security_window_count", 2),
             ("web_security_window_count", True),
+        ):
+            with self.subTest(key=key, value=value):
+                evidence = valid_evidence()
+                evidence["cases"][0]["observations"][key] = value
+                with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected value"):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_each_new_web_observation_is_required_on_its_own(self) -> None:
+        for key in (
+            "web_security_navigation_attempt_count",
+            "web_security_network_attempt_count",
+            "web_security_tcp_contact_count",
+            "web_security_udp_contact_count",
+        ):
+            with self.subTest(key=key):
+                evidence = valid_evidence()
+                observations = evidence["cases"][0]["observations"]
+                self.assertIn(key, observations)
+                del observations[key]
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    HARNESS.validate_evidence(evidence)
+
+    def test_network_observations_require_all_attempts_and_zero_contacts(self) -> None:
+        for key, value in (
+            ("web_security_navigation_attempt_count", HARNESS.NAVIGATION_ATTEMPT_COUNT - 1),
+            ("web_security_network_attempt_count", HARNESS.NETWORK_PROBE_COUNT - 1),
+            ("web_security_tcp_contact_count", 1),
+            ("web_security_udp_contact_count", 1),
+            ("web_security_tcp_contact_count", False),
         ):
             with self.subTest(key=key, value=value):
                 evidence = valid_evidence()
@@ -324,6 +356,9 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                 (case_root / "config" / "settings.toml").write_bytes(b"keyless")
                 (case_root / "stderr.log").write_bytes(b"")
                 provider = mock.Mock(request_count=2)
+                harness.network_probes = mock.Mock(
+                    snapshot=mock.Mock(return_value={"tcp_contacts": 0, "udp_contacts": 0})
+                )
                 real_scan = HARNESS.scan_case_artifacts
 
                 def scan(*args):
@@ -339,6 +374,7 @@ class PrivacyAndRuntimeTests(unittest.TestCase):
                 self.assertEqual(result["provider_request_count"], 2)
                 self.assertEqual(result["runtime_scan"]["files_scanned"], 3)
                 self.assertCountEqual(kernel.closed, kernel.opened)
+                harness.network_probes.close.assert_called_once_with()
 
     def test_quiescence_failure_never_reaches_provider_finalization_or_privacy_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -434,15 +470,19 @@ class SessionTests(unittest.TestCase):
     ) -> None:
         win32 = mock.Mock()
         harness = bare_harness(win32=win32)
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, HARNESS.NetworkProbeListeners() as probes:
             harness.root = Path(directory)
             case_root, data, config, workspace, stderr = harness.profile(
-                "http://127.0.0.1:43123/v1/"
+                "http://127.0.0.1:43123/v1/", probes
             )
             self.assertEqual(case_root, data.parent)
+            fixture = HARNESS.fixture_source(probes).encode("utf-8")
             self.assertEqual(
                 {path.name: path.read_bytes() for path in workspace.iterdir()},
-                {HARNESS.FIXTURE_FILE: HARNESS.SOURCE_BYTES},
+                {HARNESS.FIXTURE_FILE: fixture},
+            )
+            self.assertEqual(
+                HARNESS.canonicalize_fixture_source(fixture, probes), HARNESS.SOURCE_BYTES
             )
             self.assertEqual(
                 (config / "settings.toml").read_bytes(),
@@ -564,7 +604,9 @@ class PhaseTests(unittest.TestCase):
         win32.visible_top_level_windows.return_value = (app.hwnd,)
         app.process.poll.return_value = None
         app.process.active_process_ids.return_value = (73, 74)
-        harness = bare_harness(win32=win32)
+        probes = mock.Mock()
+        probes.snapshot.return_value = {"tcp_contacts": 0, "udp_contacts": 0}
+        harness = bare_harness(win32=win32, network_probes=probes)
         for name in ("menu_command", "wait_name", "editor_control"):
             setattr(harness, name, getattr(order, name))
         return harness, order, app
@@ -572,7 +614,7 @@ class PhaseTests(unittest.TestCase):
     def test_web_phase_checks_script_navigation_and_window_then_hands_keyboard_back(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
         ):
             observed = harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
@@ -583,6 +625,18 @@ class PhaseTests(unittest.TestCase):
                 mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
                 mock.call.wait_name(
                     app, HARNESS.SCRIPT_EFFECT_TEXT, "Text", "SCRIPT_EFFECT_TIMEOUT"
+                ),
+                mock.call.wait_name(
+                    app,
+                    HARNESS.NETWORK_ATTEMPTS_COMPLETE_TEXT,
+                    "Text",
+                    "NETWORK_ATTEMPTS_TIMEOUT",
+                ),
+                mock.call.wait_name(
+                    app,
+                    HARNESS.NAVIGATION_ATTEMPTS_COMPLETE_TEXT,
+                    "Text",
+                    "NAVIGATION_ATTEMPTS_TIMEOUT",
                 ),
                 mock.call.wait_name(
                     app, HARNESS.SCRIPT_EFFECT_TEXT, "Text", "PREVIEW_LEFT_FIXTURE"
@@ -597,17 +651,247 @@ class PhaseTests(unittest.TestCase):
                 "web_security_disk_before": DISK.evidence(),
                 "web_security_script_effect": True,
                 "web_security_window_count": 1,
+                "web_security_navigation_attempt_count": HARNESS.NAVIGATION_ATTEMPT_COUNT,
+                "web_security_network_attempt_count": HARNESS.NETWORK_PROBE_COUNT,
+                "web_security_tcp_contact_count": 0,
+                "web_security_udp_contact_count": 0,
             },
         )
-        harness.win32.sleep.assert_called_once_with(HARNESS.SCRIPT_NAVIGATION_SETTLE_SECONDS)
+        harness.win32.sleep.assert_has_calls(
+            [
+                mock.call(HARNESS.SCRIPT_NAVIGATION_SETTLE_SECONDS),
+                mock.call(HARNESS.NETWORK_PROBE_SETTLE_SECONDS),
+            ]
+        )
         harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
         harness.win32.foreground_window.assert_called_once_with()
+        harness.network_probes.snapshot.assert_called_once_with()
+
+    def test_interrupted_navigation_order_fails_before_verdict(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        harness.network_probes = mock.Mock(
+            snapshot=mock.Mock(return_value={"tcp_contacts": 0, "udp_contacts": 0})
+        )
+
+        def wait_for_marker(_app: Any, _name: str, _kind: str, failure_code: str) -> None:
+            if failure_code == "NAVIGATION_ATTEMPTS_TIMEOUT":
+                raise runtime.HarnessFailure(failure_code)
+
+        order.wait_name.side_effect = wait_for_marker
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "NAVIGATION_ATTEMPTS_TIMEOUT"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+
+    def test_web_phase_fails_closed_when_a_listener_counts_a_contact(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        harness.network_probes.snapshot.return_value = {"tcp_contacts": 1, "udp_contacts": 0}
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            self.assertRaisesRegex(runtime.HarnessFailure, "TCP_CONTACT_COUNT_UNEXPECTED"),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
+        order.menu_command.assert_has_calls(
+            [
+                mock.call(app, runtime.MENU_WEB_AUTOMATION_ID),
+                mock.call(app, runtime.MENU_EDIT_AUTOMATION_ID),
+            ]
+        )
+
+    def test_fixture_attempt_markers_precede_calls_and_use_only_run_targets(self) -> None:
+        with HARNESS.NetworkProbeListeners() as probes:
+            source = HARNESS.fixture_source(probes)
+            self.assertIn(f'const tcpPort = "{probes.tcp_port}";', source)
+            self.assertIn(f'const udpPort = "{probes.udp_port}";', source)
+            self.assertIn(HARNESS.NETWORK_PROBE_HOST, source)
+            self.assertEqual(source.count("{ run:"), HARNESS.NETWORK_PROBE_COUNT)
+            self.assertEqual(source.count("navigation: true"), HARNESS.NAVIGATION_ATTEMPT_COUNT)
+            for attempt in (
+                "function fetchProbe",
+                "function imageProbe",
+                "navigator.sendBeacon",
+                "new WebSocket",
+                "new RTCPeerConnection",
+                "stun:127.0.0.1:${udpPort}",
+                "turn:127.0.0.1:${tcpPort}",
+                "dns-prefetch",
+                "preconnect",
+                'form.method = "post"',
+            ):
+                with self.subTest(attempt=attempt):
+                    self.assertIn(attempt, source)
+            self.assertIn('`https://127.0.0.1:${tcpPort}`', source)
+            self.assertLess(
+                source.index("networkStatus.textContent = `Network probe attempted"),
+                source.index("const result = attempt.run();"),
+            )
+            self.assertLess(
+                source.index("navigationStatus.textContent = `Navigation attempt"),
+                source.index("const result = attempt.run();"),
+            )
+            self.assertGreater(
+                source.index("navigationStatus.textContent = `Navigation attempts complete"),
+                source.index("const result = attempt.run();"),
+            )
+
+    def test_equal_dynamic_ports_canonicalize_at_their_declarations_only(self) -> None:
+        probes = mock.Mock(tcp_port=43123, udp_port=43123)
+        source = HARNESS.fixture_source(probes).encode("utf-8")
+        self.assertEqual(HARNESS.canonicalize_fixture_source(source, probes), HARNESS.SOURCE_BYTES)
+
+    def test_fixture_script_runs_all_attempts_in_order_with_fake_browser_apis(self) -> None:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node.js is unavailable")
+        with HARNESS.NetworkProbeListeners() as probes:
+            source = HARNESS.fixture_source(probes)
+        start = source.index("<script>\r\n") + len("<script>\r\n")
+        end = source.index("</script>", start)
+        script = source[start:end]
+        node_harness = r"""
+const fs = require("node:fs");
+const vm = require("node:vm");
+const source = fs.readFileSync(0, "utf8");
+const runCall = "runAttempts();";
+const callIndex = source.lastIndexOf(runCall);
+if (callIndex < 0 || source.slice(callIndex + runCall.length).trim()) throw new Error("fixture runner call was not found");
+const code = source.slice(0, callIndex) + "globalThis.__run = runAttempts();" + source.slice(callIndex + runCall.length);
+const expectedNetworkCount = Number(process.argv[1]);
+const expectedNavigationCount = Number(process.argv[2]);
+const calls = [];
+const effect = { textContent: "" };
+const networkWrites = [];
+const navigationWrites = [];
+const statusNode = writes => ({
+  value: "",
+  get textContent() { return this.value; },
+  set textContent(value) { this.value = value; writes.push([value, calls.length]); },
+});
+const network = statusNode(networkWrites);
+const navigation = statusNode(navigationWrites);
+const nodes = new Map([
+  ["goal07-effect", effect],
+  ["goal07-network", network],
+  ["goal07-navigation", navigation],
+]);
+function assertReady(isNavigation = false) {
+  if (!network.textContent.startsWith("Network probe attempted ")) throw new Error("network marker missing");
+  if (isNavigation && !navigation.textContent.startsWith("Navigation attempt ")) throw new Error("navigation marker missing");
+}
+function element(tag) {
+  const value = { tag, action: "", rel: "" };
+  if (tag === "img") Object.defineProperty(value, "src", { set(url) { assertReady(); calls.push(["img", url]); } });
+  if (tag === "link") Object.defineProperty(value, "href", { set(url) { assertReady(); calls.push(["link", value.rel, url]); } });
+  if (tag === "form") value.submit = () => { assertReady(true); calls.push(["form", value.action]); throw new Error("blocked"); };
+  return value;
+}
+const context = {
+  document: {
+    getElementById: id => nodes.get(id),
+    createElement: element,
+    body: { appendChild() {} },
+    head: { appendChild() {} },
+  },
+  window: {
+    open(url) { assertReady(true); calls.push(["open", url]); return null; },
+  },
+  navigator: {
+    sendBeacon(url) { assertReady(); calls.push(["beacon", url]); return true; },
+  },
+  fetch(url) { assertReady(); calls.push(["fetch", url]); return Promise.resolve(); },
+  WebSocket: function (url) { assertReady(); calls.push(["websocket", url]); },
+  RTCPeerConnection: function (configuration) {
+    assertReady();
+    calls.push(["rtc"]);
+    context.__iceServers = configuration.iceServers;
+    this.createDataChannel = () => { context.__dataChannel = true; };
+    this.createOffer = () => Promise.resolve({ type: "offer" });
+    this.setLocalDescription = () => Promise.resolve();
+  },
+  setTimeout(callback) { callback(); return 0; },
+};
+context.top = {};
+Object.defineProperty(context.top, "location", {
+  set(url) { assertReady(true); calls.push(["top", url]); throw new Error("blocked"); },
+});
+Object.defineProperty(context, "location", {
+  set(url) { assertReady(true); calls.push(["location", url]); throw new Error("blocked"); },
+});
+async function main() {
+  await vm.runInNewContext(code, context);
+  if (effect.textContent !== "Script ran automatically") throw new Error("script effect missing");
+  if (calls.length !== expectedNetworkCount) throw new Error("not every network probe ran");
+  if (network.textContent !== `Network probes complete ${expectedNetworkCount}/${expectedNetworkCount}`) throw new Error("network attempts incomplete");
+  if (navigation.textContent !== `Navigation attempts complete ${expectedNavigationCount}/${expectedNavigationCount}`) throw new Error("navigation attempts incomplete");
+  const networkCompletions = networkWrites.filter(([value]) => value.startsWith("Network probes complete "));
+  if (networkCompletions.length !== expectedNetworkCount) throw new Error("network completion markers missing");
+  for (let index = 1; index <= expectedNetworkCount; index += 1) {
+    if (networkCompletions[index - 1][0] !== `Network probes complete ${index}/${expectedNetworkCount}` || networkCompletions[index - 1][1] !== index) throw new Error("network completion ordering invalid");
+  }
+  const navigationCompletions = navigationWrites.filter(([value]) => value.startsWith("Navigation attempts complete "));
+  if (navigationCompletions.length !== expectedNavigationCount) throw new Error("navigation completion markers missing");
+  for (let index = 1; index <= expectedNavigationCount; index += 1) {
+    const expectedCalls = expectedNetworkCount - expectedNavigationCount + index;
+    if (navigationCompletions[index - 1][0] !== `Navigation attempts complete ${index}/${expectedNavigationCount}` || navigationCompletions[index - 1][1] !== expectedCalls) throw new Error("navigation completion ordering invalid");
+  }
+  if (context.__iceServers.length !== 2 || !context.__dataChannel) throw new Error("WebRTC setup incomplete");
+}
+main().catch(error => { console.error(error.message); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            [node, "-e", node_harness, str(HARNESS.NETWORK_PROBE_COUNT), str(HARNESS.NAVIGATION_ATTEMPT_COUNT)],
+            input=script,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+
+    def test_probe_listeners_bind_ephemeral_loopback_ports_and_count_only_contacts(self) -> None:
+        with HARNESS.NetworkProbeListeners() as probes:
+            self.assertGreater(probes.tcp_port, 0)
+            self.assertGreater(probes.udp_port, 0)
+            self.assertEqual(probes._tcp_socket.getsockname()[0], "127.0.0.1")
+            self.assertEqual(probes._udp_socket.getsockname()[0], "127.0.0.1")
+            with socket.create_connection(("127.0.0.1", probes.tcp_port), timeout=1.0):
+                pass
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                udp.sendto(b"probe", ("127.0.0.1", probes.udp_port))
+            finally:
+                udp.close()
+            self.assertEqual(probes.snapshot(), {"tcp_contacts": 1, "udp_contacts": 1})
+
+    def test_listener_failure_cannot_be_reported_as_zero_contacts(self) -> None:
+        class FailingListener:
+            def accept(self):
+                raise OSError("fixture socket failure")
+
+        probes = HARNESS.NetworkProbeListeners()
+        probes._started = True
+        probes._tcp_socket = FailingListener()
+        with self.assertRaisesRegex(runtime.HarnessFailure, "NETWORK_PROBE_LISTENER_FAILED"):
+            probes.snapshot()
 
     def test_web_phase_fails_when_navigation_replaces_the_fixture(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
-        order.wait_name.side_effect = [None, runtime.HarnessFailure("PREVIEW_LEFT_FIXTURE")]
+        def fail_preview_check(
+            _app: Any, _name: str, _kind: str, failure_code: str, *_args: Any
+        ) -> None:
+            if failure_code == "PREVIEW_LEFT_FIXTURE":
+                raise runtime.HarnessFailure(failure_code)
+
+        order.wait_name.side_effect = fail_preview_check
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "PREVIEW_LEFT_FIXTURE"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
@@ -618,7 +902,7 @@ class PhaseTests(unittest.TestCase):
         harness, order, app = self.web_security_harness(focus_returns=True)
         harness.win32.visible_top_level_windows.return_value = (app.hwnd, 93)
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_COUNT_UNEXPECTED"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
@@ -629,7 +913,7 @@ class PhaseTests(unittest.TestCase):
         harness, order, app = self.web_security_harness(focus_returns=True)
         harness.win32.foreground_window.return_value = 93
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_FOREGROUND_LOST"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
@@ -638,7 +922,7 @@ class PhaseTests(unittest.TestCase):
     def test_web_phase_fails_while_the_web_view_keeps_the_keyboard(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=False)
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
             self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"),
         ):
@@ -646,7 +930,7 @@ class PhaseTests(unittest.TestCase):
 
     def decisions_harness(self, accept_offered: bool = False) -> tuple[HARNESS.Goal07Harness, mock.Mock]:
         order = mock.Mock()
-        harness = bare_harness()
+        harness = bare_harness(network_probes=mock.Mock())
         for name in (
             "review_and_revise", "_named_texts", "editor_fingerprint", "decide_hunks",
             "undo_decision", "copy_approved", "replace_editor", "wait_name", "control_absent",
@@ -666,7 +950,7 @@ class PhaseTests(unittest.TestCase):
     def test_decisions_phase_walks_accept_reject_undo_copy_stale_and_done(self) -> None:
         harness, order = self.decisions_harness()
         app, provider = mock.Mock(hwnd=73), order.provider
-        with mock.patch.object(HARNESS, "sha256_file", return_value=DISK):
+        with mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK):
             observed = harness.phase_decisions(app, provider, Path(HARNESS.FIXTURE_FILE))
 
         self.assertEqual(
@@ -713,7 +997,7 @@ class PhaseTests(unittest.TestCase):
         harness, order = self.decisions_harness()
         order.editor_fingerprint.side_effect = [REVIEWED, REVIEWED]
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "^EDITOR_ONE_ACCEPTED_UNEXPECTED$"),
         ):
             harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE))
@@ -723,7 +1007,7 @@ class PhaseTests(unittest.TestCase):
     def test_decisions_phase_fails_when_the_changed_part_still_offers_accept(self) -> None:
         harness, order = self.decisions_harness(accept_offered=True)
         with (
-            mock.patch.object(HARNESS, "sha256_file", return_value=DISK),
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             self.assertRaisesRegex(runtime.HarnessFailure, "^REVISION_OFFERS_ACCEPT$"),
         ):
             harness.phase_decisions(mock.Mock(hwnd=73), order.provider, Path(HARNESS.FIXTURE_FILE))
@@ -770,7 +1054,11 @@ class StepTests(unittest.TestCase):
 
     def test_the_chain_is_bound_to_the_document_before_the_review(self) -> None:
         order = mock.Mock()
-        harness = bare_harness(run_review=order.run_review, request_revision=order.request_revision)
+        harness = bare_harness(
+            run_review=order.run_review,
+            request_revision=order.request_revision,
+            editor_source_text=HARNESS.EDITOR_SOURCE_TEXT,
+        )
         app, provider = mock.Mock(), order.provider
 
         hunks = harness.review_and_revise(app, provider)

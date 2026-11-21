@@ -260,7 +260,6 @@ struct WebDocument {
     html: Signal<String>,
 }
 
-/// What a built page depends on: the document text and the appearance.
 #[derive(Clone, PartialEq)]
 struct Page {
     text: String,
@@ -354,8 +353,12 @@ fn render_diagram(kind: &str, source: &str) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
 
+    use nsh_core::{MountItem, NativeProps, WebSource};
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
 
@@ -648,16 +651,40 @@ mod tests {
     fn the_field_web_pane_follows_the_active_tab() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<SplitWebProbe>()))
             .expect("start the probe");
+        let sources = Arc::new(Mutex::new(HashMap::new()));
+        let observed_sources = Arc::clone(&sources);
+        app.observe(move |_, batch| {
+            let mut sources = observed_sources.lock().unwrap();
+            for item in &batch.items {
+                if let MountItem::NativeProps {
+                    id,
+                    props: NativeProps::WebView(web),
+                } = item
+                {
+                    sources.insert(*id, web.source.clone());
+                }
+            }
+        });
+        let assert_document = |app: &Headless, active: &str, inactive: &str| {
+            let sources = sources.lock().unwrap();
+            let Some(WebSource::Html { html, .. }) = sources.get(&web_view_node_id(app)) else {
+                panic!("the mounted web view did not receive HTML");
+            };
+            assert!(
+                html.contains(active) && !html.contains(inactive),
+                "expected only {active} in the mounted web view"
+            );
+        };
         app.wait_for("id:web-pane").expect("the web pane renders");
         app.settle();
         assert_eq!(web_view_count(&app), 1, "{}", dump(&app));
-        let first_view = web_view_node_id(&app);
+        assert_document(&app, "Document 2", "Document 1");
 
         app.press("label:Probe switch")
             .expect("switch to the first tab");
         app.settle();
         assert_eq!(web_view_count(&app), 1, "{}", dump(&app));
-        assert_ne!(web_view_node_id(&app), first_view, "{}", dump(&app));
+        assert_document(&app, "Document 1", "Document 2");
     }
 
     fn web_view_count(app: &Headless) -> usize {

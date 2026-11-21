@@ -56,6 +56,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import socket
 import uuid
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,7 @@ from . import evidence
 from . import goal07_provider as provider_fixtures
 from .evidence import credential_target, leak_codes
 from .runtime import (
+    EDITOR_NAME,
     INTEGRITY_NAMES,
     MENU_EDIT_AUTOMATION_ID,
     MENU_WEB_AUTOMATION_ID,
@@ -80,7 +82,6 @@ from .runtime import (
     phase,
     preflight,
     safe_exception_name,
-    sha256_file,
     validate_fingerprint,
     wait_until,
     write_durable,
@@ -122,7 +123,8 @@ REVISION_APPLIED = "Approved changes applied to the buffer."
 CASE_REVISION_SESSION = "revision_session"
 CASE_FLOWS = {
     CASE_REVISION_SESSION: (
-        "one launch on sandbox fixture: script effect and blocked navigation -> "
+        "one launch on sandbox fixture: script effect, completed network probes with zero contacts "
+        "and blocked navigation -> "
         "one Review and Revision -> "
         "Accept, Reject, Undo, Copy -> an edit over the open hunk offers no Accept "
         "-> Done; Undo after a write, every hunk accepted and "
@@ -136,24 +138,100 @@ PHASES = ("web_security", "decisions")
 EXPECTED_REQUEST_COUNT = 2
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
+SCRIPT_EFFECT_TEXT = "Script ran automatically"
+NETWORK_PROBE_HOST = "goal07-egress.invalid"
+TCP_PORT_TOKEN = "__GOAL07_TCP_PORT__"
+UDP_PORT_TOKEN = "__GOAL07_UDP_PORT__"
+NETWORK_PROBE_COUNT = 17
+NAVIGATION_ATTEMPT_COUNT = 5
+NETWORK_ATTEMPTS_COMPLETE_TEXT = (
+    f"Network probes complete {NETWORK_PROBE_COUNT}/{NETWORK_PROBE_COUNT}"
+)
+NAVIGATION_ATTEMPTS_COMPLETE_TEXT = (
+    f"Navigation attempts complete {NAVIGATION_ATTEMPT_COUNT}/{NAVIGATION_ATTEMPT_COUNT}"
+)
 # h1 (the executable script value) sits after the CJK/emoji line, so its
 # accepted write proves multibyte and CRLF offsets; h2 is the owner line.
 SOURCE_TEXT = (
     "<!doctype html>\r\n"
     "<p>fixture 文档 🚀</p>\r\n"
     "<p id=\"goal07-effect\">Script has not run</p>\r\n"
+    "<p id=\"goal07-network\">Network probe not attempted</p>\r\n"
+    "<p id=\"goal07-navigation\">Navigation probe not attempted</p>\r\n"
     "<script>\r\n"
     "window.goal07 = \"old\";\r\n"
     "document.getElementById(\"goal07-effect\").textContent = "
-    "\"Script ran automatically\";\r\n"
-    "try { window.open(\"https://127.0.0.1:65535/goal07-popup\", \"_blank\"); } catch (_) {}\r\n"
-    "try { top.location = \"https://127.0.0.1:65535/goal07-top\"; } catch (_) {}\r\n"
-    "try { location = \"https://127.0.0.1:65535/goal07-frame\"; } catch (_) {}\r\n"
-    "const form = document.createElement(\"form\");\r\n"
-    "form.method = \"get\";\r\n"
-    "form.action = \"https://127.0.0.1:65535/goal07-form\";\r\n"
-    "document.body.appendChild(form);\r\n"
-    "try { form.submit(); } catch (_) {}\r\n"
+    f"\"{SCRIPT_EFFECT_TEXT}\";\r\n"
+    f'const probeHost = "{NETWORK_PROBE_HOST}";\r\n'
+    'const tcpPort = "__GOAL07_TCP_PORT__";\r\n'
+    'const udpPort = "__GOAL07_UDP_PORT__";\r\n'
+    "const tcpLoopback = `http://127.0.0.1:${tcpPort}`;\r\n"
+    "const tcpHostname = `http://${probeHost}:${tcpPort}`;\r\n"
+    "const websocketLoopback = `ws://127.0.0.1:${tcpPort}/socket`;\r\n"
+    "const websocketHostname = `ws://${probeHost}:${tcpPort}/socket`;\r\n"
+    "const networkStatus = document.getElementById(\"goal07-network\");\r\n"
+    "const navigationStatus = document.getElementById(\"goal07-navigation\");\r\n"
+    "const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));\r\n"
+    "function submitForm(action) {\r\n"
+    "  const form = document.createElement(\"form\");\r\n"
+    "  form.method = \"post\"; form.action = action; form.hidden = true;\r\n"
+    "  document.body.appendChild(form); form.submit();\r\n"
+    "}\r\n"
+    "function fetchProbe(url) { fetch(url, { mode: \"no-cors\" }).catch(() => {}); }\r\n"
+    "function imageProbe(url) { const image = document.createElement(\"img\"); image.src = url; document.body.appendChild(image); }\r\n"
+    "function beaconProbe(url) { if (typeof navigator.sendBeacon !== \"function\") throw new Error(); navigator.sendBeacon(url, \"probe\"); }\r\n"
+    "function websocketProbe(url) { if (typeof WebSocket !== \"function\") throw new Error(); try { const socket = new WebSocket(url); socket.onerror = () => {}; } catch (_) {} }\r\n"
+    "function linkProbe(rel, href) { const link = document.createElement(\"link\"); link.rel = rel; link.href = href; document.head.appendChild(link); }\r\n"
+    "const networkAttempts = [\r\n"
+    "  { run: () => fetchProbe(`${tcpLoopback}/fetch`) },\r\n"
+    "  { run: () => fetchProbe(`${tcpHostname}/fetch`) },\r\n"
+    "  { run: () => imageProbe(`${tcpLoopback}/image`) },\r\n"
+    "  { run: () => imageProbe(`${tcpHostname}/image`) },\r\n"
+    "  { run: () => beaconProbe(`${tcpLoopback}/beacon`) },\r\n"
+    "  { run: () => beaconProbe(`${tcpHostname}/beacon`) },\r\n"
+    "  { run: () => websocketProbe(websocketLoopback) },\r\n"
+    "  { run: () => websocketProbe(websocketHostname) },\r\n"
+    "  { run: async () => {\r\n"
+    "    const peer = new RTCPeerConnection({ iceServers: [\r\n"
+    "      { urls: [`stun:127.0.0.1:${udpPort}`, `stun:${probeHost}:${udpPort}`] },\r\n"
+    "      { urls: [`turn:127.0.0.1:${tcpPort}?transport=tcp`, `turn:${probeHost}:${tcpPort}?transport=tcp`], username: \"goal07\", credential: \"goal07\" }\r\n"
+    "    ] });\r\n"
+    "    peer.createDataChannel(\"probe\");\r\n"
+    "    await peer.setLocalDescription(await peer.createOffer());\r\n"
+    "  } },\r\n"
+    "  { run: () => linkProbe(\"dns-prefetch\", `http://${probeHost}`) },\r\n"
+    "  { run: () => linkProbe(\"preconnect\", `https://127.0.0.1:${tcpPort}`) },\r\n"
+    "  { run: () => linkProbe(\"preconnect\", `https://${probeHost}:${tcpPort}`) },\r\n"
+    "  { run: () => { if (typeof window.open !== \"function\") throw new Error(); try { window.open(`${tcpLoopback}/popup`, \"_blank\"); } catch (_) {} }, navigation: true },\r\n"
+    "  { run: () => { try { top.location = `https://${probeHost}/top`; } catch (_) {} }, navigation: true },\r\n"
+    "  { run: () => { try { location = `${tcpLoopback}/frame`; } catch (_) {} }, navigation: true },\r\n"
+    "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} }, navigation: true },\r\n"
+    "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} }, navigation: true },\r\n"
+    "];\r\n"
+    "const navigationAttemptCount = networkAttempts.filter(attempt => attempt.navigation).length;\r\n"
+    "async function runAttempts() {\r\n"
+    "  let navigationIndex = 0;\r\n"
+    "  for (let index = 0; index < networkAttempts.length; index += 1) {\r\n"
+    "    networkStatus.textContent = `Network probe attempted ${index + 1}/${networkAttempts.length}`;\r\n"
+    "    const attempt = networkAttempts[index];\r\n"
+    "    if (attempt.navigation) {\r\n"
+    "      navigationIndex += 1;\r\n"
+    "      navigationStatus.textContent = `Navigation attempt ${navigationIndex}/${navigationAttemptCount} attempted`;\r\n"
+    "    }\r\n"
+    "    await delay(50);\r\n"
+    "    try {\r\n"
+    "      const result = attempt.run();\r\n"
+    "      if (result && typeof result.then === \"function\") {\r\n"
+    "        await result;\r\n"
+    "      }\r\n"
+    "    } catch (_) { networkStatus.textContent = `Network probe failed ${index + 1}/${networkAttempts.length}`; return; }\r\n"
+    "    if (attempt.navigation) {\r\n"
+    "      navigationStatus.textContent = `Navigation attempts complete ${navigationIndex}/${navigationAttemptCount}`;\r\n"
+    "    }\r\n"
+    "    networkStatus.textContent = `Network probes complete ${index + 1}/${networkAttempts.length}`;\r\n"
+    "  }\r\n"
+    "}\r\n"
+    "runAttempts();\r\n"
     "</script>\r\n"
     "<p>owner: TBD</p>\r\n"
     f"<!-- {DOCUMENT_SENTINEL} -->\r\n"
@@ -165,8 +243,16 @@ EDITOR_SOURCE_BYTES = EDITOR_SOURCE_TEXT.encode("utf-8")
 # hunk's part.
 STALE_EDIT = f"{DOCUMENT_SENTINEL}:stale"
 FIXTURE_FILE = "security-fixture.html"
-SCRIPT_EFFECT_TEXT = "Script ran automatically"
 SCRIPT_NAVIGATION_SETTLE_SECONDS = 1.0
+NETWORK_PROBE_SETTLE_SECONDS = 1.0
+NETWORK_OBSERVATION_KEYS = frozenset(
+    {
+        "web_security_navigation_attempt_count",
+        "web_security_network_attempt_count",
+        "web_security_tcp_contact_count",
+        "web_security_udp_contact_count",
+    }
+)
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
 # Every fingerprint is compared with exact expected bytes
@@ -182,14 +268,166 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
         "decisions_disk_after",
     }
 )
-OBSERVATION_KEYS = FINGERPRINT_OBSERVATION_KEYS | {
-    "web_security_script_effect",
-    "web_security_window_count",
-    "provider_request_count",
-}
+OBSERVATION_KEYS = (
+    FINGERPRINT_OBSERVATION_KEYS
+    | NETWORK_OBSERVATION_KEYS
+    | {"web_security_script_effect", "web_security_window_count", "provider_request_count"}
+)
 REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
 
+class NetworkProbeListeners:
+    """Count local TCP connections and UDP datagrams synchronously."""
+
+    def __init__(self) -> None:
+        self._tcp_contacts = 0
+        self._udp_contacts = 0
+        self._failure_code: str | None = None
+        self._started = False
+        self._closed = False
+        self._tcp_socket: socket.socket | None = None
+        self._udp_socket: socket.socket | None = None
+
+    @property
+    def tcp_port(self) -> int:
+        if self._tcp_socket is None:
+            raise RuntimeError("network probe listeners are not running")
+        return self._tcp_socket.getsockname()[1]
+
+    @property
+    def udp_port(self) -> int:
+        if self._udp_socket is None:
+            raise RuntimeError("network probe listeners are not running")
+        return self._udp_socket.getsockname()[1]
+
+    def start(self) -> NetworkProbeListeners:
+        if self._started:
+            raise RuntimeError("network probe listeners already started")
+        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            tcp_socket.bind(("127.0.0.1", 0))
+            tcp_socket.listen()
+            tcp_socket.setblocking(False)
+            udp_socket.bind(("127.0.0.1", 0))
+            udp_socket.setblocking(False)
+        except Exception:
+            tcp_socket.close()
+            udp_socket.close()
+            raise
+        self._tcp_socket = tcp_socket
+        self._udp_socket = udp_socket
+        self._started = True
+        return self
+
+    def snapshot(self) -> dict[str, int]:
+        if not self._started:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_UNAVAILABLE")
+        if self._failure_code is not None:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_FAILED", self._failure_code)
+        if not self._closed:
+            self._drain_tcp()
+            self._drain_udp()
+        return {"tcp_contacts": self._tcp_contacts, "udp_contacts": self._udp_contacts}
+
+    def _drain_tcp(self) -> None:
+        listener = self._tcp_socket
+        if listener is None:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_UNAVAILABLE")
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except BlockingIOError:
+                return
+            except OSError:
+                self._fail("TCP")
+            self._tcp_contacts += 1
+            try:
+                connection.close()
+            except OSError:
+                self._fail("TCP")
+
+    def _drain_udp(self) -> None:
+        listener = self._udp_socket
+        if listener is None:
+            raise HarnessFailure("NETWORK_PROBE_LISTENER_UNAVAILABLE")
+        while True:
+            try:
+                listener.recvfrom(65535)
+            except BlockingIOError:
+                return
+            except OSError:
+                self._fail("UDP")
+            self._udp_contacts += 1
+
+    def _fail(self, protocol: str) -> None:
+        self._failure_code = f"{protocol}_LISTENER_FAILED"
+        raise HarnessFailure("NETWORK_PROBE_LISTENER_FAILED", self._failure_code) from None
+
+    def close(self) -> None:
+        if not self._started or self._closed:
+            return
+        try:
+            self.snapshot()
+        finally:
+            self._closed = True
+            try:
+                for listener in (self._tcp_socket, self._udp_socket):
+                    if listener is not None:
+                        listener.close()
+            finally:
+                self._tcp_socket = None
+                self._udp_socket = None
+
+    def __enter__(self) -> NetworkProbeListeners:
+        return self.start()
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _traceback: Any) -> None:
+        self.close()
+
+
+def fixture_source(network_probes: NetworkProbeListeners) -> str:
+    """Bind the static security fixture to this run's loopback listeners."""
+    return (
+        SOURCE_TEXT.replace(TCP_PORT_TOKEN, str(network_probes.tcp_port))
+        .replace(UDP_PORT_TOKEN, str(network_probes.udp_port))
+    )
+
+
+def canonicalize_fixture_source(
+    value: str | bytes, network_probes: NetworkProbeListeners
+) -> str | bytes:
+    """Replace this run's ports before fingerprinting the fixture or editor."""
+    if isinstance(value, bytes):
+        return (
+            value.replace(
+                f'const tcpPort = "{network_probes.tcp_port}";'.encode("ascii"),
+                f'const tcpPort = "{TCP_PORT_TOKEN}";'.encode("ascii"),
+            ).replace(
+                f'const udpPort = "{network_probes.udp_port}";'.encode("ascii"),
+                f'const udpPort = "{UDP_PORT_TOKEN}";'.encode("ascii"),
+            )
+        )
+    return (
+        value.replace(
+            f'const tcpPort = "{network_probes.tcp_port}";',
+            f'const tcpPort = "{TCP_PORT_TOKEN}";',
+        ).replace(
+            f'const udpPort = "{network_probes.udp_port}";',
+            f'const udpPort = "{UDP_PORT_TOKEN}";',
+        )
+    )
+
+
+def fixture_fingerprint(path: Path, network_probes: NetworkProbeListeners) -> Fingerprint:
+    raw = path.read_bytes()
+    expected = fixture_source(network_probes).encode("utf-8")
+    if raw != expected:
+        return fingerprint_bytes(raw)
+    value = canonicalize_fixture_source(raw, network_probes)
+    if not isinstance(value, bytes):
+        raise TypeError("fixture fingerprint must be bytes")
+    return fingerprint_bytes(value)
 def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
     """Apply validated non-overlapping byte edits for expected-preview checks."""
     if not isinstance(source, bytes) or len(source) > MAX_EDIT_OUTPUT_BYTES:
@@ -304,6 +542,10 @@ def expected_observations() -> dict[str, Any]:
         **expected_fingerprints(),
         "web_security_script_effect": True,
         "web_security_window_count": 1,
+        "web_security_navigation_attempt_count": NAVIGATION_ATTEMPT_COUNT,
+        "web_security_network_attempt_count": NETWORK_PROBE_COUNT,
+        "web_security_tcp_contact_count": 0,
+        "web_security_udp_contact_count": 0,
     }
 
 
@@ -368,7 +610,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
             if key in FINGERPRINT_OBSERVATION_KEYS
             else observations[key]
         )
-        if actual != expected or type(actual) is not type(expected):
+        if not _same_exact_value(actual, expected):
             kind = "bytes" if key in FINGERPRINT_OBSERVATION_KEYS else "value"
             raise ValueError(f"{key} does not hold the expected {kind}")
     if observations["provider_request_count"] != EXPECTED_REQUEST_COUNT:
@@ -440,6 +682,10 @@ def _expected_values() -> dict[str, Any]:
     return expected_observations()
 
 
+def _same_exact_value(actual: Any, expected: Any) -> bool:
+    return type(actual) is type(expected) and actual == expected
+
+
 def record(observed: dict[str, Any], key: str, value: Any) -> None:
     """Record one measurement as evidence, failing at once if it is unexpected.
 
@@ -450,11 +696,19 @@ def record(observed: dict[str, Any], key: str, value: Any) -> None:
     """
     recorded = value.evidence() if isinstance(value, Fingerprint) else value
     expected = _expected_values()[key]
-    if recorded != expected or type(recorded) is not type(expected):
+    if not _same_exact_value(recorded, expected):
         phase_name = next((name for name in PHASES if key.startswith(f"{name}_")), None)
         suffix = key.removeprefix(f"{phase_name}_") if phase_name else key.partition("_")[2]
         raise HarnessFailure(f"{suffix.upper()}_UNEXPECTED")
     observed[key] = recorded
+
+
+def record_network_contacts(
+    observed: dict[str, Any], network_probes: NetworkProbeListeners
+) -> None:
+    counts = network_probes.snapshot()
+    record(observed, "web_security_tcp_contact_count", counts["tcp_contacts"])
+    record(observed, "web_security_udp_contact_count", counts["udp_contacts"])
 
 
 class Goal07Harness(NativeHarness):
@@ -465,14 +719,31 @@ class Goal07Harness(NativeHarness):
     def openai_api_key_for_child(self) -> str | None:
         return self._credential
 
-    def profile(self, endpoint: str) -> tuple[Path, Path, Path, Path, Path]:
+    def profile(
+        self, endpoint: str, network_probes: NetworkProbeListeners
+    ) -> tuple[Path, Path, Path, Path, Path]:
         """The session's isolated roots, its one document and its settings."""
         data_root, config_root, workspace_root, stderr_path = self.case_roots(
             CASE_REVISION_SESSION
         )
-        write_durable(workspace_root / FIXTURE_FILE, SOURCE_BYTES)
+        self.network_probes = network_probes
+        self.source_text = fixture_source(network_probes)
+        self.editor_source_text = self.source_text.replace("\r\n", "\n").replace("\r", "\n")
+        write_durable(workspace_root / FIXTURE_FILE, self.source_text.encode("utf-8"))
         write_durable(config_root / "settings.toml", review_settings_document(endpoint))
         return data_root.parent, data_root, config_root, workspace_root, stderr_path
+
+    def read_editor_fingerprint(self, app: Any) -> Fingerprint | None:
+        editor = self.control_by_name(
+            app.hwnd, EDITOR_NAME, "Edit", "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH"
+        )
+        if editor is None or not editor.is_visible() or not editor.is_enabled():
+            return None
+        text = self.read_editor_text(app, editor)
+        text = canonicalize_fixture_source(text, self.network_probes)
+        if not isinstance(text, str):
+            raise HarnessFailure("SOURCE_EDITOR_TEXT_INVALID")
+        return fingerprint_text(text)
 
     def _require_foreground(self, app: Any) -> None:
         self.win32.require_foreground(app.hwnd, self.ui_timeout)
@@ -640,8 +911,9 @@ class Goal07Harness(NativeHarness):
         self, app: Any, provider: provider_fixtures.LoopbackRevisionServer
     ) -> int:
         """The session's Review -> answer -> Revision chain; its hunk count."""
-        provider.begin_chain(EDITOR_SOURCE_TEXT)
-        hunks = len(provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT))
+        source_text = self.editor_source_text
+        provider.begin_chain(source_text)
+        hunks = len(provider_fixtures.fixture_edits(source_text))
         self.run_review(app, provider)
         self.request_revision(app, provider=provider, hunks=hunks)
         return hunks
@@ -710,15 +982,28 @@ class Goal07Harness(NativeHarness):
     ) -> dict[str, Any]:
         """Prove scripts run and navigation attempts stay in the sandboxed preview."""
         observed: dict[str, Any] = {}
-        record(observed, "web_security_disk_before", sha256_file(source))
+        network_probes = self.network_probes
+        record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
         self.wait_name(app, SCRIPT_EFFECT_TEXT, "Text", "SCRIPT_EFFECT_TIMEOUT")
+        self.wait_name(
+            app,
+            NETWORK_ATTEMPTS_COMPLETE_TEXT,
+            "Text",
+            "NETWORK_ATTEMPTS_TIMEOUT",
+        )
+        self.wait_name(
+            app,
+            NAVIGATION_ATTEMPTS_COMPLETE_TEXT,
+            "Text",
+            "NAVIGATION_ATTEMPTS_TIMEOUT",
+        )
         self.win32.sleep(SCRIPT_NAVIGATION_SETTLE_SECONDS)
         self.wait_name(app, SCRIPT_EFFECT_TEXT, "Text", "PREVIEW_LEFT_FIXTURE")
         if app.process.poll() is not None:
             raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
         windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
-        if len(windows) != 1 or windows[0] != app.hwnd:
+        if windows != (app.hwnd,):
             raise HarnessFailure("APP_WINDOW_COUNT_UNEXPECTED")
         if self.win32.foreground_window() != app.hwnd:
             raise HarnessFailure("APP_WINDOW_FOREGROUND_LOST")
@@ -733,6 +1018,10 @@ class Goal07Harness(NativeHarness):
             self.ui_timeout,
             "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
         )
+        self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
+        record(observed, "web_security_network_attempt_count", NETWORK_PROBE_COUNT)
+        record(observed, "web_security_navigation_attempt_count", NAVIGATION_ATTEMPT_COUNT)
+        record_network_contacts(observed, network_probes)
         return observed
 
     def phase_decisions(
@@ -778,7 +1067,7 @@ class Goal07Harness(NativeHarness):
         ):
             raise HarnessFailure("REVISION_OFFERS_ACCEPT")
         self.done(app, REVISION_APPLIED)
-        record(observed, "decisions_disk_after", sha256_file(source))
+        record(observed, "decisions_disk_after", fixture_fingerprint(source, self.network_probes))
         provider.verify_chain()
         return observed
 
@@ -791,38 +1080,43 @@ class Goal07Harness(NativeHarness):
     ) -> dict[str, Any]:
         """Reap the app before the provider's last check and the privacy scan."""
         self.reap(app)
+        self.network_probes.close()
+        record_network_contacts({}, self.network_probes)
         provider.verify_chain()
         observations["provider_request_count"] = provider.request_count
         observations["runtime_scan"] = scan_case_artifacts(case_root, self._credential)
         return observations
 
     def scenario_revision_session(self) -> dict[str, Any]:
-        provider = provider_fixtures.LoopbackRevisionServer().start()
-        app = None
-        try:
-            case_root, data, config, workspace, stderr = self.profile(provider.base_url)
-            source = workspace / FIXTURE_FILE
-            app = self.launch_app(source, data, config, workspace, stderr)
-            observations: dict[str, Any] = {
-                "flow": CASE_FLOWS[CASE_REVISION_SESSION],
-                "process_context": app.security_context.evidence(),
-            }
-            phases = (self.phase_web_security, self.phase_decisions)
-            for run, name_of_phase in zip(phases, PHASES, strict=True):
-                with phase(name_of_phase.upper()):
-                    observations.update(run(app, provider, source))
-            # The tab is dirty: quit through the guard, unsaved.
-            with phase("QUIT"):
-                self.quit_via_menu(app)
-                self.click_lifecycle_decision(app, "Discard")
-                self.wait_process_exit(app)
-            return self._finalize_observations(provider, case_root, app, observations)
-        finally:
+        with NetworkProbeListeners() as network_probes:
+            provider = provider_fixtures.LoopbackRevisionServer().start()
+            app = None
             try:
-                if app is not None and app.process.poll() is None:
-                    self.reap(app)
+                case_root, data, config, workspace, stderr = self.profile(
+                    provider.base_url, network_probes
+                )
+                source = workspace / FIXTURE_FILE
+                app = self.launch_app(source, data, config, workspace, stderr)
+                observations: dict[str, Any] = {
+                    "flow": CASE_FLOWS[CASE_REVISION_SESSION],
+                    "process_context": app.security_context.evidence(),
+                }
+                phases = (self.phase_web_security, self.phase_decisions)
+                for run, name_of_phase in zip(phases, PHASES, strict=True):
+                    with phase(name_of_phase.upper()):
+                        observations.update(run(app, provider, source))
+                # The tab is dirty: quit through the guard, unsaved.
+                with phase("QUIT"):
+                    self.quit_via_menu(app)
+                    self.click_lifecycle_decision(app, "Discard")
+                    self.wait_process_exit(app)
+                return self._finalize_observations(provider, case_root, app, observations)
             finally:
-                provider.close()
+                try:
+                    if app is not None and app.process.poll() is None:
+                        self.reap(app)
+                finally:
+                    provider.close()
 
     def scenario(self, case_id: str) -> dict[str, Any]:
         observations = {CASE_REVISION_SESSION: self.scenario_revision_session}[case_id]()

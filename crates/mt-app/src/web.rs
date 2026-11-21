@@ -3,6 +3,8 @@
 //! The application supplies a static host. Only its sandboxed document frame
 //! contains author markup, with no file base or application bridge.
 
+use std::borrow::Cow;
+
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
 use mt_core::{Block, BlockKind, DocType, Document};
 
@@ -45,29 +47,93 @@ fn csp_meta(extra: &str) -> String {
 fn build_html_raw(source: &str, csp: &str) -> String {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let start = skip_html_trivia(source);
-    let doctype = "<!doctype html>";
-    let after_doctype = if start
-        .get(..doctype.len())
-        .is_some_and(|tag| tag.eq_ignore_ascii_case(doctype))
-    {
-        &start[doctype.len()..]
-    } else {
-        start
+    let (after_doctype, has_doctype) = match html_doctype_end(start) {
+        Some(rest) => (rest, true),
+        None => (start, false),
     };
     let before_html = skip_html_trivia(after_doctype);
     let after_html = opening_tag_end(before_html, "html").unwrap_or(before_html);
     let head = opening_tag_end(skip_html_trivia(after_html), "head");
     let (prefix, rest) = source.split_at(source.len() - head.unwrap_or(after_html).len());
-    let doctype = if start.len() == after_doctype.len() {
-        "<!doctype html>"
-    } else {
-        ""
-    };
+    let doctype = if has_doctype { "" } else { "<!doctype html>" };
     format!("{doctype}{prefix}{csp}{rest}")
 }
 
 fn html_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n' | '\x0c')
+}
+
+fn html_doctype_end(source: &str) -> Option<&str> {
+    let keyword = source.get(..9)?;
+    if !keyword.eq_ignore_ascii_case("<!doctype") {
+        return None;
+    }
+
+    let mut rest = take_html_whitespace(&source[9..])?;
+    let name_end = rest.find(|c: char| html_whitespace(c) || c == '>')?;
+    if !rest[..name_end].eq_ignore_ascii_case("html") {
+        return None;
+    }
+    rest = &rest[name_end..];
+
+    if let Some(tail) = rest.strip_prefix('>') {
+        return Some(tail);
+    }
+    rest = take_html_whitespace(rest)?;
+    if let Some(tail) = rest.strip_prefix('>') {
+        return Some(tail);
+    }
+
+    if let Some(after_public) = take_doctype_keyword(rest, "public") {
+        let public_id = take_quoted_doctype_id(take_html_whitespace(after_public)?)?;
+        let after_id = public_id.trim_start_matches(html_whitespace);
+        let rest = if after_id.starts_with('>') {
+            after_id
+        } else if after_id.len() != public_id.len() {
+            take_quoted_doctype_id(after_id)?
+        } else {
+            public_id
+        };
+        return rest.trim_start_matches(html_whitespace).strip_prefix('>');
+    }
+
+    if let Some(after_system) = take_doctype_keyword(rest, "system") {
+        let system_id = take_quoted_doctype_id(take_html_whitespace(after_system)?)?;
+        return system_id
+            .trim_start_matches(html_whitespace)
+            .strip_prefix('>');
+    }
+
+    None
+}
+
+fn take_html_whitespace(source: &str) -> Option<&str> {
+    let rest = source.trim_start_matches(html_whitespace);
+    (rest.len() != source.len()).then_some(rest)
+}
+
+fn take_doctype_keyword<'a>(source: &'a str, keyword: &str) -> Option<&'a str> {
+    let rest = source.get(..keyword.len())?;
+    if !rest.eq_ignore_ascii_case(keyword) {
+        return None;
+    }
+    let rest = &source[keyword.len()..];
+    rest.chars()
+        .next()
+        .is_some_and(html_whitespace)
+        .then_some(rest)
+}
+
+fn take_quoted_doctype_id(source: &str) -> Option<&str> {
+    let quote = source.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let end = source[quote.len_utf8()..].find(quote)? + quote.len_utf8();
+    if source[quote.len_utf8()..end].contains('>') {
+        return None;
+    }
+    Some(&source[end + quote.len_utf8()..])
 }
 
 fn skip_html_trivia(mut source: &str) -> &str {
@@ -216,25 +282,132 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
         run.clear();
         return;
     }
-    let options = mt_core::document::doc::parse_options(doc.doc_type());
-    match markdown::to_html_with_options(
-        run,
-        &markdown::Options {
-            parse: options,
-            compile: markdown::CompileOptions {
-                // The source is a local file the user opened; raw HTML in it is
-                // authored content, and blocking it would break ordinary
-                // documents. The frame policy governs scripts and loads.
-                allow_dangerous_html: true,
-                allow_dangerous_protocol: false,
-                ..markdown::CompileOptions::default()
-            },
+    let options = markdown::Options {
+        parse: mt_core::document::doc::parse_options(doc.doc_type()),
+        compile: markdown::CompileOptions {
+            // The source is a local file the user opened; raw HTML in it is
+            // authored content, and blocking it would break ordinary
+            // documents. The frame policy governs scripts and loads.
+            allow_dangerous_html: true,
+            allow_dangerous_protocol: false,
+            ..markdown::CompileOptions::default()
         },
-    ) {
-        Ok(html) => out.push_str(&html),
+    };
+    let (source, inline_scripts) = preserve_inline_scripts(run, doc.doc_type(), &options.parse);
+    match markdown::to_html_with_options(source.as_ref(), &options) {
+        Ok(html) => out.push_str(&restore_inline_scripts(html, inline_scripts)),
         Err(message) => out.push_str(&diagnostic_html("markdown", &message.reason, run)),
     }
     run.clear();
+}
+
+fn preserve_inline_scripts<'a>(
+    source: &'a str,
+    doc_type: DocType,
+    parse_options: &markdown::ParseOptions,
+) -> (Cow<'a, str>, Vec<(String, String)>) {
+    if doc_type != DocType::Markdown
+        || !source
+            .as_bytes()
+            .windows(b"<script".len())
+            .any(|tag| tag.eq_ignore_ascii_case(b"<script"))
+    {
+        return (Cow::Borrowed(source), Vec::new());
+    }
+
+    let Ok(ast) = markdown::to_mdast(source, parse_options) else {
+        return (Cow::Borrowed(source), Vec::new());
+    };
+    let mut ranges = Vec::new();
+    collect_inline_script_ranges(&ast, &mut ranges);
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    if ranges.is_empty() {
+        return (Cow::Borrowed(source), Vec::new());
+    }
+
+    let mut protected = String::with_capacity(source.len());
+    let mut scripts = Vec::with_capacity(ranges.len());
+    let mut cursor = 0;
+    for (index, (start, end)) in ranges.into_iter().enumerate() {
+        let Some(script) = source.get(start..end) else {
+            continue;
+        };
+        if start < cursor {
+            continue;
+        }
+        let mut marker = format!("<!--MTMARKDOWNRAWSCRIPT{index}END-->");
+        while source.contains(&marker) {
+            marker.push('X');
+        }
+        protected.push_str(&source[cursor..start]);
+        protected.push_str(&marker);
+        scripts.push((marker, script.to_string()));
+        cursor = end;
+    }
+    protected.push_str(&source[cursor..]);
+    (Cow::Owned(protected), scripts)
+}
+
+fn collect_inline_script_ranges(node: &markdown::mdast::Node, ranges: &mut Vec<(usize, usize)>) {
+    if matches!(node, markdown::mdast::Node::Paragraph(_)) {
+        let mut tags = Vec::new();
+        collect_html_tags(node, &mut tags);
+        tags.sort_unstable_by_key(|(start, _, _)| *start);
+
+        let mut opening = None;
+        for (start, end, tag) in tags {
+            if is_script_tag(tag, false) {
+                opening.get_or_insert(start);
+            } else if is_script_tag(tag, true)
+                && let Some(start) = opening.take()
+            {
+                ranges.push((start, end));
+            }
+        }
+        return;
+    }
+
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_inline_script_ranges(child, ranges);
+        }
+    }
+}
+
+fn collect_html_tags<'a>(node: &'a markdown::mdast::Node, tags: &mut Vec<(usize, usize, &'a str)>) {
+    if let markdown::mdast::Node::Html(html) = node
+        && let Some(position) = &html.position
+    {
+        tags.push((position.start.offset, position.end.offset, &html.value));
+    }
+
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_html_tags(child, tags);
+        }
+    }
+}
+
+fn is_script_tag(tag: &str, closing: bool) -> bool {
+    let prefix = if closing { "</" } else { "<" };
+    let Some(rest) = tag.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some(name) = rest.get(.."script".len()) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("script")
+        && match rest["script".len()..].chars().next() {
+            Some(c) => html_whitespace(c) || c == '>' || (!closing && c == '/'),
+            None => true,
+        }
+}
+
+fn restore_inline_scripts(mut html: String, scripts: Vec<(String, String)>) -> String {
+    for (marker, script) in scripts {
+        html = html.replace(&marker, &script);
+    }
+    html
 }
 
 /// Render a diagram/math block, or a diagnostic with the source preserved.
@@ -523,6 +696,53 @@ mod tests {
     }
 
     #[test]
+    fn html_preserves_doctype_variants_and_inserts_csp_into_attributed_heads() {
+        let doctypes = [
+            "<!DOCTYPE html>",
+            "<!DOCTYPE  html>",
+            "<!DoCtYpE\tHTML>",
+            "<!doctype\nhtml>",
+            "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\">",
+            "<!doctype html PUBLIC  \"-//W3C//DTD HTML 4.01//EN\"  \"http://www.w3.org/TR/html4/strict.dtd\">",
+            "<!DOCTYPE html SYSTEM \"about:legacy-compat\">",
+        ];
+        let heads = [
+            "<head id=\"author\" data-mode='one'>",
+            "<HEAD lang=en data-label=\"the head\">",
+        ];
+        let author = "<title>Author</title><script>run()</script>";
+
+        for doctype in doctypes {
+            for head in heads {
+                let source = format!("{doctype}<html lang=en>{head}{author}</head></html>");
+                let doc = Document::with_type(DocType::Html, source);
+                let expected =
+                    format!("{doctype}<html lang=en>{head}{DOCUMENT_POLICY}{author}</head></html>");
+                assert_eq!(
+                    page(&doc, &registry(), false),
+                    expected,
+                    "doctype: {doctype}, head: {head}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_inline_script_keeps_its_raw_text() {
+        let source = r#"A paragraph with <script>document.body.dataset.x="1"</script> and MTMARKDOWNRAWSCRIP&#84;0END."#;
+        let html = page(&md(source), &registry(), false);
+        let script = r#"<script>document.body.dataset.x="1"</script>"#;
+
+        assert!(
+            html.contains(&format!(
+                "<p>A paragraph with {script} and MTMARKDOWNRAWSCRIPT0END.</p>"
+            )),
+            "inline script was changed during Markdown compilation: {html}"
+        );
+        assert_eq!(html.matches(script).count(), 1, "{html}");
+    }
+
+    #[test]
     fn html_inserts_csp_at_the_start_of_the_real_or_implied_head() {
         let registry = registry();
         let author = r#"<link rel="stylesheet" href="relative.css"><script>run()</script>"#;
@@ -555,6 +775,8 @@ mod tests {
             "<!--><script>early()</script>--><head>",
             "<!-- --!><script>early()</script>--><head>",
             "<!doctype x \"><script>early()</script>\"><head>",
+            "<!DOCTYPE html PUBLIC \"><script>early()</script>\"><head>",
+            "<!DOCTYPE html SYSTEM \"><script>early()</script>\"><head>",
         ] {
             let source = format!("{unsafe_prefix}{author}");
             let doc = Document::with_type(DocType::Html, source.clone());
