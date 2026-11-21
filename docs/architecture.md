@@ -407,6 +407,22 @@ forms and top-level navigation, and the host's additional `frame-src 'self'`
 directive restricts the frame from navigating to external resources. Source
 checks verify the generated policy, not WebView runtime enforcement.
 
+Every frame sets `x-dns-prefetch-control` to `off` and runs a prelude before
+author code that removes WebRTC entry points from its window and prototype
+chain. The frame policy admits no nested-frame or worker source: there is no
+permitted URL in the applicable CSP fallback directives. Non-elevated
+Windows also sets the process-level WebView2 network switch; elevated Windows,
+macOS (WKWebView) and Linux (WebKitGTK) run the same preview with only the in-page
+layers. Those modes depend on the engine honoring the in-page restrictions,
+including the DNS-prefetch opt-out; they have no independent process-level
+backstop for browser network activity. Runtime verification remains pending.
+
+The capture-phase click and submit guard covers document links and forms,
+including links exposed in the event path from open shadow roots. The
+Navigation API is not used in the opaque-origin frame. A link inside a closed
+shadow root is treated like other script-driven navigation: the browser may
+replace the frame with its block page, which the next document update replaces.
+
 PlantUML runs outside the browser policy with `PLANTUML_SECURITY_PROFILE=SANDBOX`.
 A PlantUML launcher that sets its own security profile overrides ours.
 

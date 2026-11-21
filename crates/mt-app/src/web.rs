@@ -12,11 +12,17 @@ const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'un
 const HOST_FRAME_SRC: &str = "; frame-src 'self'";
 // WebView2 NavigateToString limits the UTF-16 htmlContent to 2 * 1024 * 1024 bytes.
 const MAX_HOST_UTF16_UNITS: usize = 1024 * 1024;
-const NAVIGATION_PRELUDE: &str = r#"<script>(() => {
-    if ("navigation" in window) {
-        window.navigation.addEventListener("navigate", event => {
-            if (event.cancelable) event.preventDefault();
-        });
+const FRAME_PRELUDE: &str = r#"<meta http-equiv="x-dns-prefetch-control" content="off"><script>(() => {
+    for (const name of [
+        "RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel",
+        "RTCIceTransport", "RTCIceCandidate", "RTCRtpSender", "RTCRtpReceiver",
+        "RTCRtpTransceiver", "RTCSctpTransport", "RTCDtlsTransport", "RTCSessionDescription"
+    ]) {
+        const disabled = {value: undefined, configurable: false, writable: false};
+        for (let proto = Object.getPrototypeOf(window); proto; proto = Object.getPrototypeOf(proto)) {
+            if (Object.getOwnPropertyDescriptor(proto, name)) Object.defineProperty(proto, name, disabled);
+        }
+        Object.defineProperty(window, name, disabled);
     }
     const cancelLink = event => {
         if (event.composedPath().some(node =>
@@ -32,7 +38,7 @@ const NAVIGATION_PRELUDE: &str = r#"<script>(() => {
 
 /// Build a base-free WebView host; only the opaque-origin frame runs scripts.
 pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> String {
-    let head_prefix = format!("{}{NAVIGATION_PRELUDE}", csp_meta(""));
+    let head_prefix = format!("{}{FRAME_PRELUDE}", csp_meta(""));
     let page = match doc.doc_type() {
         DocType::Html => build_html_raw(doc.source(), &head_prefix),
         kind => {
@@ -226,13 +232,7 @@ fn opening_tag_end<'a>(source: &'a str, name: &str) -> Option<&'a str> {
         if name_end == 0 {
             return None;
         }
-        let attr = &attrs[..name_end];
-        if attr.eq_ignore_ascii_case("manifest")
-            || (name == "head"
-                && attr
-                    .get(..2)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on")))
-        {
+        if attrs[..name_end].eq_ignore_ascii_case("manifest") {
             return None;
         }
         rest = &attrs[name_end..];
@@ -337,36 +337,43 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
             ..markdown::CompileOptions::default()
         },
     };
-    let (source, inline_scripts) = preserve_inline_scripts(run, &options.parse);
-    match markdown::to_html_with_options(source.as_ref(), &options) {
-        Ok(html) => out.push_str(&restore_inline_scripts(html, inline_scripts)),
-        Err(message) => out.push_str(&diagnostic_html("markdown", &message.reason, run)),
+    let rendered = preserve_inline_scripts(run, &options.parse).and_then(|(source, scripts)| {
+        let html = markdown::to_html_with_options(source.as_ref(), &options)
+            .map_err(|message| message.reason)?;
+        restore_inline_scripts(html, scripts)
+    });
+    match rendered {
+        Ok(html) => out.push_str(&html),
+        Err(message) => out.push_str(&diagnostic_html("markdown", &message, run)),
     }
     run.clear();
 }
 
+type ScriptPlaceholders = Vec<(String, String)>;
+
 fn preserve_inline_scripts<'a>(
     source: &'a str,
     parse_options: &markdown::ParseOptions,
-) -> (Cow<'a, str>, Vec<(String, String)>) {
+) -> Result<(Cow<'a, str>, ScriptPlaceholders), String> {
     if !source
         .as_bytes()
         .windows(b"<script".len())
         .any(|tag| tag.eq_ignore_ascii_case(b"<script"))
     {
-        return (Cow::Borrowed(source), Vec::new());
+        return Ok((Cow::Borrowed(source), Vec::new()));
     }
 
     let Ok(ast) = markdown::to_mdast(source, parse_options) else {
-        return (Cow::Borrowed(source), Vec::new());
+        return Ok((Cow::Borrowed(source), Vec::new()));
     };
     let mut ranges = Vec::new();
     collect_inline_script_ranges(&ast, source, &mut ranges);
     ranges.sort_unstable_by_key(|(start, _)| *start);
     if ranges.is_empty() {
-        return (Cow::Borrowed(source), Vec::new());
+        return Ok((Cow::Borrowed(source), Vec::new()));
     }
 
+    let marker_prefix = random_script_marker_prefix()?;
     let mut protected = String::with_capacity(source.len());
     let mut scripts = Vec::with_capacity(ranges.len());
     let mut cursor = 0;
@@ -377,10 +384,7 @@ fn preserve_inline_scripts<'a>(
         if start < cursor {
             continue;
         }
-        let mut marker = format!("MTMARKDOWNRAWSCRIPT{index}END");
-        while source.contains(&marker) {
-            marker.push('X');
-        }
+        let marker = format!("{marker_prefix}{index}END");
         protected.push_str(&source[cursor..start]);
         // Keep MDX markers plain text so adjacent delimiters cannot merge.
         let rendered_marker = if parse_options.constructs.mdx_jsx_text {
@@ -395,7 +399,22 @@ fn preserve_inline_scripts<'a>(
         cursor = end;
     }
     protected.push_str(&source[cursor..]);
-    (Cow::Owned(protected), scripts)
+    Ok((Cow::Owned(protected), scripts))
+}
+
+fn random_script_marker_prefix() -> Result<String, String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|error| format!("could not generate script placeholder nonce: {error}"))?;
+
+    let mut prefix = String::with_capacity("MTMARKDOWNRAWSCRIPT".len() + nonce.len() * 2);
+    prefix.push_str("MTMARKDOWNRAWSCRIPT");
+    for byte in nonce {
+        prefix.push(HEX[usize::from(byte >> 4)] as char);
+        prefix.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    Ok(prefix)
 }
 
 fn collect_inline_script_ranges(
@@ -470,11 +489,21 @@ fn is_script_tag(tag: &str, closing: bool) -> bool {
         }
 }
 
-fn restore_inline_scripts(mut html: String, scripts: Vec<(String, String)>) -> String {
+fn restore_inline_scripts(mut html: String, scripts: ScriptPlaceholders) -> Result<String, String> {
     for (marker, script) in scripts {
-        html = html.replace(&marker, &script);
+        let mut matches = html.match_indices(&marker);
+        let Some((start, _)) = matches.next() else {
+            return Err("an inline script placeholder was lost during Markdown rendering".into());
+        };
+        if matches.next().is_some() {
+            return Err(
+                "an inline script placeholder appeared more than once during Markdown rendering"
+                    .into(),
+            );
+        }
+        html.replace_range(start..start + marker.len(), &script);
     }
-    html
+    Ok(html)
 }
 
 /// Render a diagram/math block, or a diagnostic with the source preserved.
@@ -742,7 +771,7 @@ mod tests {
         let document = frame_document(&host);
         assert_eq!(
             document,
-            format!("<!doctype html>{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}{author}")
+            format!("<!doctype html>{DOCUMENT_POLICY}{FRAME_PRELUDE}{author}")
         );
     }
 
@@ -783,6 +812,10 @@ mod tests {
         let heads = [
             "<head id=\"author\" data-mode='one' style='color: red'>",
             "<HEAD lang=en data-label=\"the head\">",
+            r#"<head id=a onclick="x()">"#,
+            "<head onload='run()'>",
+            "<head onclick=x() data-path=a/b hidden>",
+            r#"<head onclick='x("a>b")' data-label=">">"#,
         ];
         let author = "<title>Author</title><script>run()</script>";
 
@@ -792,7 +825,7 @@ mod tests {
                 let source = format!("{doctype}{html}{head}{author}</head></html>");
                 let doc = Document::with_type(DocType::Html, source);
                 let expected = format!(
-                    "{doctype}{html}{head}{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}{author}</head></html>"
+                    "{doctype}{html}{head}{DOCUMENT_POLICY}{FRAME_PRELUDE}{author}</head></html>"
                 );
                 assert_eq!(
                     page(&doc, &registry(), false),
@@ -846,21 +879,40 @@ mod tests {
     }
 
     #[test]
-    fn installs_the_navigation_prelude_after_csp_and_before_authored_scripts() {
+    fn installs_the_frame_prelude_after_csp_and_before_authored_scripts() {
         let author = "<script>author()</script>";
         let registry = registry();
-        let navigation_handler = r#"if ("navigation" in window) {
-        window.navigation.addEventListener("navigate", event => {
-            if (event.cancelable) event.preventDefault();
-        });
-    }"#;
+        let dns_off = r#"<meta http-equiv="x-dns-prefetch-control" content="off">"#;
         for kind in [DocType::Html, DocType::Markdown, DocType::Mdx] {
             let doc = Document::with_type(kind, author.into());
             let document = page(&doc, &registry, false);
             let (_, after_policy) = document.split_once(DOCUMENT_POLICY).unwrap();
             let (before_author, _) = after_policy.split_once(author).unwrap();
-            assert!(before_author.starts_with("<script>"), "{kind:?}");
-            assert!(before_author.contains(navigation_handler), "{kind:?}");
+            assert!(!before_author.contains("window.navigation"), "{kind:?}");
+            assert!(
+                before_author
+                    .strip_prefix(dns_off)
+                    .is_some_and(|tail| tail.starts_with("<script>")),
+                "{kind:?}"
+            );
+            for name in [
+                "RTCPeerConnection",
+                "webkitRTCPeerConnection",
+                "RTCDataChannel",
+                "RTCIceTransport",
+                "RTCIceCandidate",
+                "RTCRtpSender",
+                "RTCRtpReceiver",
+                "RTCRtpTransceiver",
+                "RTCSctpTransport",
+                "RTCDtlsTransport",
+                "RTCSessionDescription",
+            ] {
+                assert!(
+                    before_author.contains(&format!("\"{name}\"")),
+                    "{kind:?}: {name}"
+                );
+            }
             assert!(before_author.contains(r#"addEventListener("click", cancelLink, true)"#));
             assert!(before_author.contains(r#"addEventListener("auxclick", cancelLink, true)"#));
             assert!(
@@ -876,7 +928,7 @@ mod tests {
         let registry = registry();
         let head = r#"<head id="author" data-mode='one'>"#;
         let author = "<title>Author</title></head>";
-        let policy = format!("{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}");
+        let policy = format!("{DOCUMENT_POLICY}{FRAME_PRELUDE}");
 
         let mut failures = Vec::new();
         for comment in ["<!---->", "<!-- -- -->"] {
@@ -921,6 +973,34 @@ mod tests {
     }
 
     #[test]
+    fn mdx_script_marker_cannot_be_forged_with_character_references() {
+        let script = r#"<script>document.body.dataset.x="ran"</script>"#;
+        let source = format!("`code`{script} and MTMARKDOWNRAWSCRIP&#84;0END.");
+        let doc = Document::with_type(DocType::Mdx, source);
+        let html = page(&doc, &registry(), false);
+        let rendered = body(&html);
+
+        assert_eq!(rendered.matches(script).count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("and MTMARKDOWNRAWSCRIPT0END."),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn inline_script_restoration_rejects_missing_or_duplicate_markers() {
+        let marker = "MTMARKDOWNRAWSCRIPT0123456789abcdef0123456789abcdef0END".to_string();
+        let script = "<script>author()</script>".to_string();
+
+        assert!(
+            restore_inline_scripts(String::new(), vec![(marker.clone(), script.clone())]).is_err()
+        );
+        assert!(
+            restore_inline_scripts(format!("{marker}{marker}"), vec![(marker, script)]).is_err()
+        );
+    }
+
+    #[test]
     fn rejects_host_pages_over_the_windows_string_load_limit() {
         let registry = registry();
         let build = |text| {
@@ -945,7 +1025,7 @@ mod tests {
     fn html_inserts_csp_at_the_start_of_the_real_or_implied_head() {
         let registry = registry();
         let author = r#"<link rel="stylesheet" href="relative.css"><script>run()</script>"#;
-        let policy = format!("{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}");
+        let policy = format!("{DOCUMENT_POLICY}{FRAME_PRELUDE}");
         for (prefix, expected_prefix) in [
             ("<!doctype html><html><head>", "<!doctype html><html><head>"),
             (
@@ -973,7 +1053,6 @@ mod tests {
         for unsafe_prefix in [
             "<head data-x='",
             "<head",
-            "<head onload='run()'>",
             "<!--><script>early()</script>--><head>",
             "<!-- --!><script>early()</script>--><head>",
             "<!doctype x \"><script>early()</script>\"><head>",
@@ -996,7 +1075,7 @@ mod tests {
         let doc = Document::with_type(DocType::Html, format!("{before}{author}"));
         assert_eq!(
             page(&doc, &registry(), true),
-            format!("{before}{DOCUMENT_POLICY}{NAVIGATION_PRELUDE}{author}")
+            format!("{before}{DOCUMENT_POLICY}{FRAME_PRELUDE}{author}")
         );
     }
 

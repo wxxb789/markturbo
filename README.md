@@ -411,6 +411,13 @@ MDX and HTML. Inline scripts can run from the first render, without a prompt.
 The app loads a fixed, base-free host page; document content runs only in its
 sandboxed frame.
 
+The WebView stays enabled in all web layouts. On non-elevated Windows,
+WebView2's process-level network switch backs up the in-page policy. Elevated
+Windows, macOS (WKWebView), and Linux (WebKitGTK) use only the in-page layers:
+the sandbox and CSP, a prelude that removes WebRTC entry points, and a
+DNS-prefetch opt-out. Those layers depend on the browser engine's enforcement
+and are not equivalent to a process-level network block.
+
 The preview's policy allows inline scripts and styles and `data:` images and
 fonts. Documents are not allowed to access the network or file system, open
 popups, submit forms, or navigate out of the preview. Remote scripts and

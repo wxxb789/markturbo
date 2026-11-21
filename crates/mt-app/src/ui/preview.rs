@@ -120,23 +120,6 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
 /// The web compatibility pane: the document as a page, in the column (Web)
 /// or in the field (SplitWeb).
 pub fn web(state: AppState, language: Language) -> AnyElement {
-    web_for_host(state, language, is_high_integrity_host())
-}
-
-fn web_for_host(state: AppState, language: Language, high_integrity_host: bool) -> AnyElement {
-    if high_integrity_host {
-        return view()
-            .test_id("web-preview-disabled")
-            .flex_1()
-            .min_h(px(0.0))
-            .h(relative(1.0))
-            .child(prims::ink(SharedString::from(i18n::t(
-                language,
-                Key::WebPreviewDisabledElevated,
-            ))))
-            .into_element();
-    }
-
     let Some(tab) = state.active_tab() else {
         return quiet_label(move || SharedString::from(i18n::t(language, Key::ModeWeb)))
             .into_element();
@@ -155,49 +138,6 @@ fn web_for_host(state: AppState, language: Language, high_integrity_host: bool) 
                 .flex_1(),
         )
         .into_element()
-}
-
-#[cfg(target_os = "windows")]
-fn is_high_integrity_host() -> bool {
-    use std::ffi::c_void;
-    use windows::Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
-    };
-
-    // SAFETY: GetCurrentProcess returns a valid pseudo-handle for this process.
-    let process = unsafe { GetCurrentProcess() };
-    let mut token = HANDLE::default();
-    // SAFETY: `process` is valid and `token` is a writable output slot.
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_err() {
-        return true;
-    }
-
-    let mut elevation = TOKEN_ELEVATION::default();
-    let mut returned = 0;
-    // SAFETY: `token` is queryable, and `elevation` provides a correctly sized,
-    // aligned output buffer for the TokenElevation information class.
-    let result = unsafe {
-        GetTokenInformation(
-            token,
-            TokenElevation,
-            Some((&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>()),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut returned,
-        )
-    };
-    // SAFETY: `token` is the handle returned by the successful OpenProcessToken call above.
-    let _ = unsafe { CloseHandle(token) };
-
-    result.is_err()
-        || (returned as usize) < std::mem::size_of::<TOKEN_ELEVATION>()
-        || elevation.TokenIsElevated != 0
-}
-
-#[cfg(not(target_os = "windows"))]
-fn is_high_integrity_host() -> bool {
-    false
 }
 
 /// A quiet label for a surface that has nothing else to say.
@@ -748,33 +688,42 @@ mod tests {
     }
 
     #[component]
-    fn ElevatedWebPaneProbe() -> impl IntoElement {
-        web_for_host(probe_state(), Language::English, true)
+    fn WebPaneProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        web(state, Language::English)
     }
 
     #[test]
-    fn elevated_web_pane_shows_reason_without_mounting_a_webview() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ElevatedWebPaneProbe>()))
-            .expect("start the elevated-host probe");
+    fn web_pane_mounts_with_scripts_enabled() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<WebPaneProbe>()))
+            .expect("start the web pane probe");
+        let javascript_enabled = Arc::new(Mutex::new(Vec::new()));
+        let observed_javascript_enabled = Arc::clone(&javascript_enabled);
+        app.observe(move |_, batch| {
+            for item in &batch.items {
+                if let MountItem::NativeProps {
+                    props: NativeProps::WebView(web),
+                    ..
+                } = item
+                {
+                    observed_javascript_enabled
+                        .lock()
+                        .unwrap()
+                        .push(web.javascript_enabled);
+                }
+            }
+        });
         app.settle();
 
-        let nodes = app.screen().layout_nodes();
         assert!(
-            nodes
-                .iter()
-                .any(|node| node.test_id.as_deref() == Some("web-preview-disabled")),
-            "{}",
-            dump(&app)
-        );
-        assert_eq!(
-            web_view_count(&app),
-            0,
-            "an elevated host must not mount a WebView: {}",
+            web_view_count(&app) == 1,
+            "the WebView must remain mounted: {}",
             dump(&app)
         );
         assert!(
-            texts(&app).contains("Web preview is disabled while MarkTurbo runs elevated."),
-            "{}",
+            javascript_enabled.lock().unwrap().contains(&true),
+            "the mounted WebView must run scripts: {}",
             dump(&app)
         );
     }

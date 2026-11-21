@@ -91,22 +91,23 @@ no release-bound native isolation evidence.
 
 - On the owner's active, unlocked Windows 11 x64 desktop, run
   `mt.py accept all --exe <release exe> --expect-exe-sha256 <release sha256>`.
-  The Goal 07 phase must observe the script-start, attempt and completion
-  cells in captured WebView pixels. The fixture marks its final attempt
-  immediately before the preview frame sets its own location to
-  `https://blocked-preview-navigation.invalid/`. The automatic probes
-  must leave the fixture visible, produce zero loopback contacts and leave
-  exactly one app window. The harness unit tests do not run the desktop phase.
+  The Goal 07 phase must first observe the script-start, attempt, completion
+  and self-navigation readiness cells in captured WebView pixels. The fixture
+  then makes its one self-navigation to
+  `https://blocked-preview-navigation.invalid/`. A second capture must no
+  longer show the cells; there must be zero loopback contacts and exactly one
+  app window. The harness unit tests do not run the desktop phase.
 - Clause 3b native proof is pending: the fixture must visibly report its
   network attempts and the loopback TCP and UDP listeners must record zero
   contacts on the release build. Unit tests do not verify WebView2 egress,
   and the loopback counters do not observe hostname DNS resolver traffic or
   file loads. The resolver-rule string test covers hostname DNS egress.
 - Clause 3c elevated-host check: run the release app at high integrity. The
-  web layouts must show the elevated-host reason and create no WebView; the
-  native preview remains available.
+  web layouts must mount the WebView and run the inline fixture while the
+  in-page layers deny the tested egress.
 - Click a link inside a closed shadow DOM in the release Web preview. Verify
-  that the preview remains in place and no external window or app opens.
+  that no request leaves and no external window or app opens. A browser block
+  page is acceptable for this script-driven navigation.
 - Verify frame scrolling, text selection, light and dark colours, math and
   diagrams in the actual preview. If WebView2 rejects the frame policy, stop
   and record the result without loosening the sandbox.

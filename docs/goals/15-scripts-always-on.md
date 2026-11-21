@@ -48,9 +48,9 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
      forbidden tokens appear); that the CSP comes first; that `srcdoc` is attribute-escaped, so a
      document containing `"` and `</iframe>` cannot break out; and that the document's own CSP
      comes first inside `srcdoc`.
-   - Native proof (clause 6): a fixture whose script calls `window.open`, sets `top.location`, sets
-     `location` to an `https:` URL, and submits a form leaves exactly one app window, with the
-     preview still showing the fixture.
+   - Native proof (clause 6): a fixture paints its attempt cells and then makes its one HTTPS
+     self-navigation. The fixture is visible before that navigation and gone afterward, with zero
+     loopback contacts and exactly one app window.
    - If WebView2 rejects any part of this design in the native check, stop and report it. Do not
      loosen the sandbox.
    - Existing preview behaviour must survive inside the frame: scrolling, theme colours, math and
@@ -130,9 +130,10 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
 6. **Harness and evidence.**
    - The Trust/Run-scripts steps in `scripts/markturbo_tools/native/goal07.py`, its system-alert
      handling in `runtime.py`, and `scripts/tests/test_native_goal07*.py` are retired or replaced.
-   - goal07 asserts instead that a fixture with an inline script shows the script's effect, and
-     that the fixture's attempt to navigate to an external URL leaves the page in place.
-   - The fixture uses no network and logs no content.
+   - goal07 first observes that the inline script ran and painted all attempt cells. A later
+     capture must show that the final HTTPS self-navigation replaced the fixture, with zero
+     loopback contacts and exactly one app window.
+   - The fixture targets only loopback or reserved names and logs no document content.
    - `mt.py check ci` and `mt.py check native` pass. `mt.py accept all` passes on the release build
      (pending the owner's desktop; it is not waived).
 

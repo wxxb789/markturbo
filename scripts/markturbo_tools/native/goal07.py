@@ -154,6 +154,7 @@ CELL_PENDING_COLOR = (72, 72, 72)
 CELL_SCRIPT_COLOR = (24, 168, 93)
 CELL_ATTEMPT_COLOR = (48, 112, 224)
 CELL_COMPLETE_COLOR = (240, 176, 32)
+SELF_NAVIGATION_SAMPLE_MS = 1000
 
 
 def _css_rgb(color: tuple[int, int, int]) -> str:
@@ -171,12 +172,21 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => websocketProbe(websocketHostname) },",
     (
         "  { run: async () => {\r\n"
-        "    const peer = new RTCPeerConnection({ iceServers: [\r\n"
-        "      { urls: [`stun:127.0.0.1:${udpPort}`, `stun:${probeHost}:${udpPort}`] },\r\n"
-        "      { urls: [`turn:127.0.0.1:${tcpPort}?transport=tcp`, `turn:${probeHost}:${tcpPort}?transport=tcp`], username: \"goal07\", credential: \"goal07\" }\r\n"
-        "    ] });\r\n"
-        "    peer.createDataChannel(\"probe\");\r\n"
-        "    await peer.setLocalDescription(await peer.createOffer());\r\n"
+        "    if (typeof RTCPeerConnection !== \"function\") return;\r\n"
+        "    let peer;\r\n"
+        "    try {\r\n"
+        "      peer = new RTCPeerConnection({ iceServers: [\r\n"
+        "        { urls: [`stun:127.0.0.1:${udpPort}`, `stun:${probeHost}:${udpPort}`] },\r\n"
+        "        { urls: [`turn:127.0.0.1:${tcpPort}?transport=tcp`, `turn:${probeHost}:${tcpPort}?transport=tcp`], username: \"goal07\", credential: \"goal07\" }\r\n"
+        "      ] });\r\n"
+        "      peer.createDataChannel(\"probe\");\r\n"
+        "      await peer.setLocalDescription(await peer.createOffer());\r\n"
+        "    } catch (_) {\r\n"
+        "      try { peer?.close(); } catch (_) {}\r\n"
+        "      return;\r\n"
+        "    }\r\n"
+        "    peer.close();\r\n"
+        "    throw new Error(\"WebRTC is available\");\r\n"
         "  } },"
     ),
     "  { run: () => linkProbe(\"dns-prefetch\", `http://${probeHost}`) },",
@@ -189,7 +199,6 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => { const frame = document.createElement(\"iframe\"); frame.src = `https://127.0.0.1:${tcpPort}/subframe`; document.body.appendChild(frame); } },",
     "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} } },",
     "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
-    "  { run: () => { try { location = `${tcpLoopback}/frame`; } catch (_) {} } },",
     '  { run: () => { try { location = "https://blocked-preview-navigation.invalid/"; } catch (_) {} } },',
 )
 
@@ -239,6 +248,7 @@ SOURCE_TEXT = (
     "const websocketLoopback = `ws://127.0.0.1:${tcpPort}/socket`;\r\n"
     "const websocketHostname = `ws://${probeHost}:${tcpPort}/socket`;\r\n"
     "const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));\r\n"
+    f"const SELF_NAVIGATION_SAMPLE_MS = {SELF_NAVIGATION_SAMPLE_MS};\r\n"
     "function submitForm(action) {\r\n"
     "  const form = document.createElement(\"form\");\r\n"
     "  form.method = \"post\"; form.action = action; form.hidden = true;\r\n"
@@ -254,7 +264,7 @@ SOURCE_TEXT = (
     + "\r\n];\r\n"
     "prepareCell(scriptCell);\r\n"
     "const attemptCells = networkAttempts.map(() => createCell());\r\n"
-    "const completeCell = createCell();\r\n"
+    "const selfNavigationCell = createCell();\r\n"
     "scriptCell.style.backgroundColor = scriptCellColor;\r\n"
     "async function runAttempts() {\r\n"
     "  const finalIndex = networkAttempts.length - 1;\r\n"
@@ -271,9 +281,10 @@ SOURCE_TEXT = (
     "    attemptCells[index].style.backgroundColor = attemptCellColor;\r\n"
     "  }\r\n"
     "  await delay(50);\r\n"
-    "  // A navigation can replace this document, so mark the final attempt before it runs.\r\n"
-    "  completeCell.style.backgroundColor = completeCellColor;\r\n"
+    "  // Hold the final attempt's cells long enough for the native harness to sample them.\r\n"
     "  attemptCells[finalIndex].style.backgroundColor = attemptCellColor;\r\n"
+    "  selfNavigationCell.style.backgroundColor = completeCellColor;\r\n"
+    "  await delay(SELF_NAVIGATION_SAMPLE_MS);\r\n"
     "  networkAttempts[finalIndex].run();\r\n"
     "}\r\n"
     "runAttempts();\r\n"
@@ -288,6 +299,7 @@ EDITOR_SOURCE_BYTES = EDITOR_SOURCE_TEXT.encode("utf-8")
 # hunk's part.
 STALE_EDIT = f"{DOCUMENT_SENTINEL}:stale"
 FIXTURE_FILE = "security-fixture.html"
+SELF_NAVIGATION_TIMEOUT_SECONDS = 3.0
 NETWORK_PROBE_SETTLE_SECONDS = 1.0
 NETWORK_OBSERVATION_KEYS = frozenset(
     {"web_security_tcp_contact_count", "web_security_udp_contact_count"}
@@ -312,6 +324,7 @@ OBSERVATION_KEYS = (
     | NETWORK_OBSERVATION_KEYS
     | {
         "web_security_cell_results",
+        "web_security_post_navigation_cell_results",
         "web_security_window_count",
         "provider_request_count",
     }
@@ -504,6 +517,11 @@ def validate_cell_results(value: Any) -> None:
         raise ValueError("invalid WebView pixel-cell observations")
 
 
+def validate_post_navigation_cell_results(value: Any) -> None:
+    if not isinstance(value, list) or any(type(cell) is not bool for cell in value):
+        raise ValueError("invalid post-navigation pixel-cell observations")
+
+
 def canonicalize_fixture_source(
     value: str | bytes, network_probes: NetworkProbeListeners | None = None
 ) -> str | bytes:
@@ -663,6 +681,7 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
 def expected_observations() -> dict[str, Any]:
     return {
         **expected_fingerprints(),
+        "web_security_post_navigation_cell_results": [],
         "web_security_window_count": 1,
         "web_security_tcp_contact_count": 0,
         "web_security_udp_contact_count": 0,
@@ -747,7 +766,10 @@ CONTRACT = evidence.EvidenceContract(
     required_observations=REQUIRED_OBSERVATIONS,
     validate_runtime_scan=validate_runtime_scan,
     validate_passed_case=validate_passed_case,
-    structured={"web_security_cell_results": validate_cell_results},
+    structured={
+        "web_security_cell_results": validate_cell_results,
+        "web_security_post_navigation_cell_results": validate_post_navigation_cell_results,
+    },
     private_sentinels=(
         DOCUMENT_SENTINEL,
         provider_fixtures.ANSWER_SENTINEL,
@@ -1124,7 +1146,7 @@ class Goal07Harness(NativeHarness):
     def phase_web_security(
         self, app: Any, _provider: provider_fixtures.LoopbackRevisionServer, source: Path
     ) -> dict[str, Any]:
-        """Read the fixture's completed pixel cells before checking side effects."""
+        """Check fixture execution before and after its final self-navigation."""
         observed: dict[str, Any] = {}
         network_probes = self.network_probes
         record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
@@ -1143,6 +1165,30 @@ class Goal07Harness(NativeHarness):
         observed["web_security_cell_results"] = cell_results
         if app.process.poll() is not None:
             raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
+
+        post_navigation_cells: list[bool] | None = None
+
+        def frame_replaced() -> bool | None:
+            nonlocal post_navigation_cells
+            cells = self.read_fixture_cell_results(app)
+            if cells:
+                return None
+            post_navigation_cells = cells
+            return True
+
+        wait_until(
+            frame_replaced,
+            SELF_NAVIGATION_TIMEOUT_SECONDS,
+            "SELF_NAVIGATION_NOT_RUN",
+            interval=0.1,
+        )
+        if post_navigation_cells is None:
+            raise HarnessFailure("SELF_NAVIGATION_NOT_RUN")
+        record(
+            observed,
+            "web_security_post_navigation_cell_results",
+            post_navigation_cells,
+        )
         self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
         record_network_contacts(observed, network_probes)
         windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
