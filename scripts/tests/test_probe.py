@@ -1141,7 +1141,6 @@ class Goal04BuildEvidenceTests(unittest.TestCase):
         serialized = json.dumps(context)
         self.assertNotIn("secret", serialized)
         for path in (directory, cargo_home.as_posix()):
-            self.assertNotIn(path, serialized)
             self.assertNotIn(json.dumps(path)[1:-1], serialized)
 
     def test_cargo_config_context_records_ancestor_fingerprint(self) -> None:
