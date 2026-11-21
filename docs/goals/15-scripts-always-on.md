@@ -97,6 +97,16 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
    - **Size.** An HTML document whose page exceeds the WebView's `NavigateToString` limit shows a
      visible diagnostic instead of a blank or failed preview. Escape only what a double-quoted
      attribute needs (`&` and `"`), to keep the inflation minimal.
+   - **Non-Windows platforms** (amended 2026-11-21 after review round 3). The macOS (WKWebView)
+     and Linux (WebKitGTK) backends have no equivalent process-level network switch, and WebRTC
+     stays available there. Windows 11 x64 is the only public-quality target, so on macOS and
+     Linux the web layouts fail closed, as an elevated host does: no WebView is created, a visible
+     reason is shown, and the native preview is unaffected.
+   - **In-frame navigation, refined.** The Navigation API does not fire in an opaque-origin
+     (sandboxed) frame, so it is not used. The capture-phase click and submit guard covers links and
+     forms in the document and in open shadow roots. A link inside a **closed** shadow root exists
+     only because the document's own script built it, so it counts as script-driven navigation:
+     it may land on the blocked page, and no request leaves.
    - **What native acceptance cannot see.** DNS egress for a hostname is not observable on
      loopback. The resolver rule's exact string, and the fact that it is applied before the first
      web view on the production entry path, are proven by unit tests; the native proof covers
