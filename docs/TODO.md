@@ -135,8 +135,3 @@
   by that function and a path unit test. The nsh Windows backend computes
   its own profile in `native/web.rs`. Check for external callers before
   removing the public function or its helper.
-- [ ] **Isolate the opt-in Windows credential round-trip**:
-  `goal_05a_credential_lifecycle_windows_round_trip` is excluded from the
-  default suite but uses the current user's Windows Credential Manager when
-  explicitly run. Preserve native round-trip coverage in a disposable Windows
-  environment before running it again.
