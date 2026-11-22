@@ -129,8 +129,3 @@
   per-chain `requests`, and `scripts/tests/test_native_goal07_provider.py`
   still runs a three-chain test (`request_count == 6`). Revalidate that no
   caller needs more than one chain, then drop the extra state and test.
-- [ ] **Isolate the opt-in Windows credential round-trip**:
-  `goal_05a_credential_lifecycle_windows_round_trip` is excluded from the
-  default suite but uses the current user's Windows Credential Manager when
-  explicitly run. Preserve native round-trip coverage in a disposable Windows
-  environment before running it again.

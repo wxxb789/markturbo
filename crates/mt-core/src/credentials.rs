@@ -1549,8 +1549,17 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    #[ignore = "Goal 05A Windows Credential Manager acceptance; run explicitly"]
+    #[ignore = "Requires the disposable GitHub-hosted Windows credential test step"]
     fn goal_05a_credential_lifecycle_windows_round_trip() {
+        if std::env::var("MT_DISPOSABLE_CRED_ENV").as_deref() != Ok("1")
+            || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted")
+        {
+            eprintln!(
+                "Skipping Windows Credential Manager round-trip outside its disposable CI step"
+            );
+            return;
+        }
+
         let host = format!(
             "acceptance-{}-{}.invalid",
             std::process::id(),

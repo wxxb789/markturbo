@@ -361,3 +361,11 @@ jobs:
         # Same parallel runner; the nightly plain `cargo test` run is the
         # doctest backstop, so no extra compile pass is needed here.
         run: cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core
+
+      - name: Test Credential Manager in the disposable runner
+        env:
+          MT_DISPOSABLE_CRED_ENV: '1'
+        run: >-
+          cargo test --locked --profile ci -p mt-core --lib --features model-transport
+          credentials::tests::goal_05a_credential_lifecycle_windows_round_trip
+          -- --ignored --exact --nocapture
