@@ -13,7 +13,11 @@
 //! one colour with that alpha, not a pre-blended grey, so it sits correctly on
 //! both the room and the column ground.
 
-use nsh_core::{Color, element::FontWeight, prelude::*};
+use nsh_core::{
+    Color,
+    element::{AdaptiveColor, FontWeight},
+    prelude::*,
+};
 
 pub fn mono_count<T: Styled>(element: T) -> T {
     element.font_family(FONT_SOURCE)
@@ -203,6 +207,10 @@ pub const LIGHT: Palette = Palette {
 /// that calls it inside a style closure repaints on a theme change.
 pub fn palette() -> &'static Palette {
     if dark() { &DARK } else { &LIGHT }
+}
+
+pub(crate) fn adaptive_color(pick: impl Fn(&Palette) -> Color) -> AdaptiveColor {
+    AdaptiveColor::new(pick(&LIGHT), pick(&DARK))
 }
 
 impl Palette {

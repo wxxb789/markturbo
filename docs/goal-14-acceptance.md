@@ -45,13 +45,15 @@ These are symbolic paths, with no machine-specific profile information.
 |---|---|---|
 | MarkTurbo settings | `%APPDATA%/markturbo/settings.toml` | Same |
 | MarkTurbo recovery | `%LOCALAPPDATA%/markturbo/recovery` | Same |
-| MarkTurbo fonts | Embedded Martian and KaTeX, with system fallback; no companion file | Same |
+| MarkTurbo bundled fonts | Embedded Martian and KaTeX, with system fallback | Same |
+| MarkTurbo companion font | `<data_dir>/fonts/SourceHanSansCN-VF.otf` | Same |
 | nsh engine on Windows (direct Cargo runner) | `%APPDATA%/default` | Same |
 | Windows preview profile | `%LOCALAPPDATA%/com.markturbo.app/WebView2` | Same |
 
-`mt-core` owns settings and recovery resolution, including the existing
+`mt-core` owns settings, recovery, and companion font resolution, including the existing
 `MARKTURBO_CONFIG_DIR` and `MARKTURBO_DATA_DIR` overrides. It does not use
-the new nsh app data directory. In nsh 0.5.1 the Windows runner passed
+the new nsh app data directory. `CompanionFont::locate` resolves the optional
+font via `runtime_paths::data_dir`. In nsh 0.5.1 the Windows runner passed
 the platform data root to the engine, which appended the root's app ID or
 `default`; in 0.6.1 the runner passes the same platform root as `support_dir`
 and the engine applies the same rule when `data_dir` is unset. The direct
@@ -103,7 +105,7 @@ lockfile's source URLs were not changed.
 | `cargo tree -d -p mt-app` | Exit 0; no duplicate nsh crate. |
 | `uv run --locked --project scripts scripts/mt.py check ci` | Exit 0 on the final run: 233 tooling tests passed; 1,041 Rust tests passed (227 mt-app), 0 failed, 7 existing ignores. Optimized Clippy reported 0 mt-app warnings and 2 existing mt-core warnings. |
 | PR-head CI | Pending: this stage has no published PR head. |
-| Native acceptance and visual matrix | Pending: the Windows 11 session could open the input desktop, but `GetForegroundWindow` returned no foreground HWND. No native PASS or capture is claimed. |
+| Native acceptance and visual matrix | Pending. Native acceptance was deferred by the owner on 2026-11-22 and was not run. The Windows 11 session could open the input desktop, but `GetForegroundWindow` returned no foreground HWND. No native PASS or capture is claimed. |
 | Native keyboard focus | Pending: on Windows 11, with Review not configured, focus the editor, click Review, and verify typing does not edit the document until the editor is refocused. Also verify the existing focus requests on the welcome screen, Settings menu and Review Again and Prepare transitions listed above. In Settings, verify that focus lands on Store securely after successfully removing a key. |
 
 The first CI run exited 1 on the consent regression above. After the fix,
@@ -114,7 +116,8 @@ assertion passed on a single-test replay and on the final full run. No
 test or test-runner setting was changed between those runs.
 
 Next checkpoint: run the per-PR pipeline on the actual proposed revision.
-On an unlocked Windows 11 x64 desktop with a foreground window, build the
+When the owner resumes native acceptance on an unlocked Windows 11 x64
+desktop with a foreground window, build the
 release executable and run `mt.py accept all` with its exact SHA-256, then
 `mt.py visual -- --exe <release exe> --out .scratch/goal-14-visual`.
 Keep the goal active until the required evidence exists.

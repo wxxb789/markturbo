@@ -535,8 +535,8 @@ fn path_expand(
                     .bg(Color::TRANSPARENT)
                     .rounded(px(0.0))
                     .cursor_pointer()
-                    .hover(|style| style.text_color(tokens::palette().ink).underline())
-                    .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+                    .hover(|style| style.text_color(|| tokens::palette().ink).underline())
+                    .focus_visible(|style| style.text_color(|| tokens::palette().ink).underline())
                     .on_press(move || {
                         let path = path.clone();
                         expanded.update(move |open| {
@@ -613,8 +613,8 @@ fn quiet_action_named(
             .bg(Color::TRANSPARENT)
             .cursor_pointer()
             .rounded(px(0.0))
-            .hover(|style| style.text_color(tokens::palette().ink).underline())
-            .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+            .hover(|style| style.text_color(|| tokens::palette().ink).underline())
+            .focus_visible(|style| style.text_color(|| tokens::palette().ink).underline())
             .on_press(move |_: &PressEvent| on_press()),
     )
     .child(
@@ -928,8 +928,8 @@ fn inventory_row(
                     .bg(Color::TRANSPARENT)
                     .rounded(px(0.0))
                     .cursor_pointer()
-                    .hover(|style| style.text_color(tokens::palette().ink).underline())
-                    .focus_visible(|style| style.text_color(tokens::palette().ink).underline())
+                    .hover(|style| style.text_color(|| tokens::palette().ink).underline())
+                    .focus_visible(|style| style.text_color(|| tokens::palette().ink).underline())
                     .on_press(move || state.open_file(path.clone())),
             )
             .child(

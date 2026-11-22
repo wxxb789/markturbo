@@ -2,6 +2,13 @@
 
 ## Deferred
 
+- [ ] **Keyboard press feedback on Win32**: nsh 0.6.1 dispatches only `Press`
+  for keyboard activation, so pressables show no press-down visual for keyboard
+  use. Revisit when nsh exposes keyboard press-down and release events.
+- [ ] **Keep consent charge full during the Sent fade**: In
+  `crates/mt-app/src/ui/consent.rs`, `rebuild(None, 0)` clears the charge bar
+  before checking `spent`, so the bar is empty during the 150 ms fade. Keep it
+  full until the card unmounts.
 - [ ] **First-time-user and screen-reader evidence for the shipped UI** — Goal
   09 was accepted on 2026-11-13 without the five first-time-target-user sessions
   and the Windows 11 x64 keyboard/screen-reader smoke its completion evidence
@@ -147,8 +154,3 @@
   Chinese table entries plus the exhaustive key list;
   `git grep WebPreviewRetry -- crates/mt-app/src` also finds the enum declaration, but
   no call site. Revalidate before removing the translations or key.
-- [ ] **Isolate the opt-in Windows credential round-trip**:
-  `goal_05a_credential_lifecycle_windows_round_trip` is excluded from the
-  default suite but uses the current user's Windows Credential Manager when
-  explicitly run. Preserve native round-trip coverage in a disposable Windows
-  environment before running it again.

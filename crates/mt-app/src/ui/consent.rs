@@ -608,7 +608,6 @@ fn buttons(
         )
 }
 
-/// Cancel: default focus, a quiet action, and it authorizes nothing.
 fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl IntoElement {
     let reference = element_ref();
     // Initial focus lands on Cancel, which authorizes nothing.
@@ -662,8 +661,8 @@ fn cancel_action(
                 .underline_offset(px(4.0))
                 .transition_colors()
                 .duration(move || duration.get())
-                .group_hover(|s| s.text_color(tokens::palette().ink).underline())
-                .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
+                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
         ),
         duration,
     )
@@ -692,7 +691,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
             .justify_center()
             .border(px(tokens::HAIRLINE))
             .border_color(move || tokens::palette().ink_caption)
-            .focus_visible(|s| s.border_color(tokens::palette().ink))
+            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
             .cursor_pointer()
             .focusable(true)
             .disabled(move || !is_open(&enabled))
@@ -702,7 +701,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
                 #[cfg(test)]
                 tests::record_focus(tests::FocusStop::Hold);
             })
-            // The window losing the keyboard ends any press in it.
+            // A hold must not authorize once focus leaves Send.
             .on_blur(move || {
                 blur.focused.set(false);
                 blur.release();
@@ -784,23 +783,21 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
             titlebar::bind_mod_enter(&ctrl_enter_state);
         }
     });
-    let escape_state = state.clone();
-    let enter_state = state.clone();
-    let space_state = state.clone();
     effect(move || {
-        if !is_open(&escape_state) {
+        if !is_open(&state) {
             return;
         }
         on_key_with("escape", KeyOptions::default(), {
-            let state = escape_state.clone();
+            let state = state.clone();
             move |_| cancel(&state, is_revision)
         });
-        for key in ["enter", "space"] {
-            let state = if key == "enter" {
-                enter_state.clone()
-            } else {
-                space_state.clone()
-            };
+        for (key, unmodified) in [
+            ("enter", true),
+            ("shift+enter", false),
+            ("space", true),
+            ("shift+space", false),
+        ] {
+            let state = state.clone();
             let hold = hold.clone();
             on_key_with(
                 key,
@@ -813,7 +810,7 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
                     ..KeyOptions::default()
                 },
                 move |_| {
-                    if !is_open(&state) {
+                    if !unmodified || !is_open(&state) {
                         return;
                     }
                     if hold.focused.get() {
@@ -2273,6 +2270,45 @@ mod tests {
     }
 
     #[test]
+    fn a_theme_switch_keeps_consent_hold_progress_and_focus() {
+        use nsh_core::platform::ColorScheme;
+
+        let mut app = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduced motion");
+        app.set_environment("light appearance", |env| {
+            env.color_scheme = ColorScheme::Light;
+        })
+        .expect("light appearance");
+
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab");
+        }
+        app.press_key("space").expect("start the hold");
+        app.wait(Duration::from_millis(350))
+            .expect("the first third of the hold");
+        let progress_before = app.shows("1/3");
+
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("dark appearance");
+        let progress_kept = app.shows("1/3");
+        app.press_key("space")
+            .expect("the focused hold still owns Space");
+        let hold_responds = app.shows("Send for review?");
+
+        assert!(
+            progress_before && progress_kept && hold_responds,
+            "charged before theme change: {progress_before}; charge kept: {progress_kept}; hold responds: {hold_responds}"
+        );
+    }
+
+    #[test]
     fn the_reduced_motion_steps_are_thirds_of_the_charge() {
         assert_eq!(reduced_step(0.0), 0, "nothing yet");
         assert_eq!(reduced_step(0.32), 0, "just short of the first third");
@@ -2324,6 +2360,101 @@ mod tests {
     #[test]
     fn consent_item_bytes_use_mono_figures() {
         assert_mono_consent_bytes("id:consent-row-source >> text:200 B");
+    }
+
+    #[component]
+    fn BackgroundFocusHarness() -> impl IntoElement {
+        let state = AppState::new();
+        let open_state = state.clone();
+        let card_state = state.clone();
+        let presses = signal(0);
+        let background_focused = signal(false);
+        let background = element_ref();
+        effect(move || on_key_with("f6", KeyOptions::default(), move |_| background.focus()));
+        view()
+            .child(
+                view()
+                    .test_id("open-consent")
+                    .element_ref(&background)
+                    .on_focus(move || background_focused.set(true))
+                    .on_blur(move || background_focused.set(false))
+                    .on_press(move |_: &PressEvent| {
+                        presses.update(|count| *count += 1);
+                        open_state
+                            .review_consent
+                            .set(Some(SharedString::from("disclosure text")));
+                        open_state.review_manifest.set(Some(sample_consent()));
+                    })
+                    .child(prims::rest("Open consent")),
+            )
+            .child(text(move || {
+                format!("Background presses: {}", presses.get())
+            }))
+            .child(when(
+                move || background_focused.get(),
+                || text("Background focused"),
+            ))
+            .child(when(
+                move || is_open(&state),
+                move || card(card_state.clone(), Language::English),
+            ))
+    }
+
+    fn shifted_key_keeps_consent_open_without_pressing_the_background(key: &str) {
+        let mut config = EngineConfig::new(Root::of::<BackgroundFocusHarness>());
+        config.environment.os = nsh_core::platform::Os::Windows;
+        config.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = Headless::start(config).expect("start the harness");
+        app.wait_for("id:open-consent").expect("background control");
+        app.press("id:open-consent").expect("open consent");
+        app.wait_for("id:consent-card").expect("the card");
+        app.press_key("f6").expect("focus the background control");
+        assert!(app.shows("Background focused"), "background has focus");
+        assert!(app.shows("Background presses: 1"));
+
+        app.press_key(key).expect("press the shifted key");
+        assert!(
+            app.shows("Background presses: 1"),
+            "{key} pressed the background"
+        );
+        assert_eq!(
+            app.screen().matches("id:consent-card"),
+            Ok(true),
+            "{key} closed the card"
+        );
+        assert!(!app.shows("Sent"), "nothing was sent");
+    }
+
+    #[test]
+    fn shift_enter_is_consumed_with_background_focus() {
+        shifted_key_keeps_consent_open_without_pressing_the_background("shift+enter");
+    }
+
+    #[test]
+    fn shift_space_is_consumed_with_background_focus() {
+        shifted_key_keeps_consent_open_without_pressing_the_background("shift+space");
+    }
+
+    #[test]
+    fn shifted_keys_do_not_charge_the_focused_hold_control() {
+        let mut app = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab to the hold control");
+        }
+
+        for key in ["shift+enter", "shift+space"] {
+            app.press_key(key).expect("press the shifted key");
+            assert!(app.shows("Hold to send"), "{key} changed the hold");
+            assert!(!app.shows("Nothing was sent."), "{key} started charging");
+        }
+
+        app.press_key("space").expect("charge with bare Space");
+        app.wait_for("text:Nothing was sent.")
+            .expect("the focused control charged and cooled");
     }
 
     #[test]

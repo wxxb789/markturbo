@@ -1547,10 +1547,52 @@ mod tests {
         drop(lock_persistent_operations().unwrap());
     }
 
+    fn windows_credential_round_trip_enabled(
+        required: bool,
+        disposable: bool,
+        hosted: bool,
+    ) -> bool {
+        let enabled = disposable && hosted;
+        assert!(
+            !required || enabled,
+            "Required Windows Credential Manager round-trip needs MT_DISPOSABLE_CRED_ENV=1 and RUNNER_ENVIRONMENT=github-hosted"
+        );
+        enabled
+    }
+
+    #[test]
+    fn windows_credential_round_trip_requires_both_isolation_markers() {
+        assert!(windows_credential_round_trip_enabled(true, true, true));
+        assert!(windows_credential_round_trip_enabled(false, true, true));
+        for (disposable, hosted) in [(false, true), (true, false), (false, false)] {
+            assert!(!windows_credential_round_trip_enabled(
+                false, disposable, hosted
+            ));
+            assert!(
+                std::panic::catch_unwind(|| {
+                    windows_credential_round_trip_enabled(true, disposable, hosted)
+                })
+                .is_err()
+            );
+        }
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
-    #[ignore = "Goal 05A Windows Credential Manager acceptance; run explicitly"]
+    #[ignore = "Requires the disposable GitHub-hosted Windows credential test step"]
     fn goal_05a_credential_lifecycle_windows_round_trip() {
+        // The two environment markers prevent accidental local writes; setting both locally is a deliberate opt-in.
+        if !windows_credential_round_trip_enabled(
+            std::env::var("MT_REQUIRE_CRED_ROUNDTRIP").as_deref() == Ok("1"),
+            std::env::var("MT_DISPOSABLE_CRED_ENV").as_deref() == Ok("1"),
+            std::env::var("RUNNER_ENVIRONMENT").as_deref() == Ok("github-hosted"),
+        ) {
+            eprintln!(
+                "Skipping Windows Credential Manager round-trip outside its disposable CI step"
+            );
+            return;
+        }
+
         let host = format!(
             "acceptance-{}-{}.invalid",
             std::process::id(),
@@ -1650,5 +1692,6 @@ mod tests {
         store.delete(&lower).unwrap();
         assert!(store.read(&lower).unwrap().is_none());
         drop(cleanup);
+        println!("\nMT_WINCRED_ROUND_TRIP_COMPLETED");
     }
 }

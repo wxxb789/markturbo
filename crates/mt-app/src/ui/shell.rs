@@ -173,18 +173,38 @@ fn column(
     status: notices::StatusPresence,
 ) -> impl IntoElement {
     let active = state.active;
+    let laid_out_tab = signal(active.get_untracked());
     let content_state = state.clone();
-    let frame_generation = signal(0_u64);
-    let reflow_deadline = Rc::new(Cell::new(None));
+    let recovery_state = state.clone();
+    let recovery_banner_state = state.clone();
+    let recovery_open = computed({
+        let was_open = Cell::new(false);
+        move || {
+            // Win32 cannot tween a new editor's first frame. Lay it out before collapsing.
+            let open = notices::has_recovery(&recovery_state)
+                || (was_open.get()
+                    && active.get() != laid_out_tab.get()
+                    && !motion::reduced_motion());
+            was_open.set(open);
+            open
+        }
+    });
+    let snap_offset = signal(0.0);
+    let recovery_deadline = Rc::new(Cell::new(None));
+    let tab_deadline = Rc::new(Cell::new(None));
     effect({
-        let reflow_deadline = reflow_deadline.clone();
+        let recovery_deadline = recovery_deadline.clone();
+        let tab_deadline = tab_deadline.clone();
         move || {
             if motion::reduced_motion()
-                && reflow_deadline
+                && recovery_deadline
                     .take()
+                    .max(tab_deadline.take())
                     .is_some_and(|deadline| nsh_core::time::now() < deadline)
             {
-                frame_generation.update(|generation| *generation += 1);
+                // Win32 ignores frames equal to an active tween's destination.
+                // A layout round trip stops the tween without replacing the editor.
+                snap_offset.set(1.0);
             }
         }
     });
@@ -194,49 +214,68 @@ fn column(
         .h(relative(1.0))
         .flex_col()
         .px(px(tokens::COLUMN_GAP))
+        .pt(move || Length::from(px(snap_offset.get())))
         .bg(move || tokens::palette().column_ground)
         .when(layout.field_overlays(), |column| {
             column.opacity(Layout::DIMMED)
         })
-        // Win32 ignores frames equal to a running tween's target.
-        // Replacing their nodes drops the tween.
-        .child(each(
-            move || vec![(active.get(), frame_generation.get())],
-            |key| *key,
-            move |_, _| {
-                reflow_deadline.set(None);
-                let reflow_deadline = reflow_deadline.clone();
-                column_content(content_state.clone(), language, move |ms| {
-                    let deadline = nsh_core::time::now() + Duration::from_secs_f32(ms / 1000.0);
-                    reflow_deadline.set(Some(
-                        reflow_deadline
-                            .get()
-                            .map_or(deadline, |old| old.max(deadline)),
-                    ));
-                })
-            },
+        .child(banner_slot(
+            "recovery-banner-slot",
+            move || recovery_open.get(),
+            move || notices::recovery_banner(recovery_banner_state.clone(), language),
+            track_reflow(recovery_deadline),
         ))
+        .child(
+            view()
+                .test_id("document-slot")
+                .flex_1()
+                .min_h(px(0.0))
+                .ml(px(-tokens::COLUMN_GAP))
+                .pl(px(tokens::COLUMN_GAP))
+                .flex_col()
+                .overflow_hidden()
+                .pt(move || Length::from(px(snap_offset.get())))
+                // Key on tab identity only: replacing this subtree discards the editor's undo history.
+                .child(each(
+                    move || vec![active.get()],
+                    |key| *key,
+                    move |tab, _| {
+                        let tab = tab.get_untracked();
+                        tab_deadline.set(None);
+                        column_content(
+                            content_state.clone(),
+                            language,
+                            move || {
+                                laid_out_tab.set(tab);
+                                if snap_offset.get_untracked() != 0.0 {
+                                    snap_offset.set(0.0);
+                                }
+                            },
+                            track_reflow(tab_deadline.clone()),
+                        )
+                    },
+                )),
+        )
         .child(notices::status_line(state, language, status))
+}
+
+fn track_reflow(deadline: Rc<Cell<Option<nsh_core::time::Instant>>>) -> impl Fn(f32) {
+    move |ms| {
+        let end = nsh_core::time::now() + Duration::from_secs_f32(ms / 1000.0);
+        deadline.set(deadline.get().max(Some(end)));
+    }
 }
 
 fn column_content(
     state: AppState,
     language: Language,
-    on_reflow: impl Fn(f32) + Clone + 'static,
-) -> [AnyElement; 3] {
+    on_layout: impl Fn() + 'static,
+    on_reflow: impl Fn(f32) + 'static,
+) -> [AnyElement; 2] {
     let document_state = state.clone();
-    let recovery_state = state.clone();
     let conflict_state = state.clone();
-    let state_for_recovery = state.clone();
     let conflict_banner_state = state.clone();
     [
-        banner_slot(
-            "recovery-banner-slot",
-            move || notices::has_recovery(&recovery_state),
-            move || notices::recovery_banner(state_for_recovery.clone(), language),
-            on_reflow.clone(),
-        )
-        .into_element(),
         banner_slot(
             "conflict-banner-slot",
             move || notices::has_conflict(&conflict_state),
@@ -245,10 +284,11 @@ fn column_content(
         )
         .into_element(),
         view()
-            .test_id("document-slot")
+            .test_id("tab-document-slot")
             .flex_1()
             .min_h(px(0.0))
             .w_full()
+            .on_layout(move |_: &Bounds<Points>| on_layout())
             .child(
                 when(move || document::has_document(&document_state), {
                     let state = state.clone();
@@ -443,6 +483,7 @@ fn banner_slot<E: IntoElement + 'static>(
         .overflow_hidden()
         .pointer_events(move || surface_pointer(open()))
         .child(when(
+            // Keep comparison state mounted through the fade, including reversals.
             move || presence.visible.get(),
             move || {
                 view()
@@ -527,7 +568,7 @@ mod tests {
     use nsh_testing::{Headless, LayoutNode};
 
     use super::*;
-    use crate::state::{GUARD_CANCEL_CHOICE, Pane};
+    use crate::state::{GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, Pane};
 
     /// The document the probes open: a heading on its first line, so the
     /// first glyph the column draws is known.
@@ -683,10 +724,13 @@ mod tests {
                 };
                 state.set_active(next);
             }))
+            .child(control("probe-close-other-tab", &state, move |state| {
+                state.request_close_tab(other);
+            }))
             .child(shell(state, Language::English, Layout::Wide))
     }
 
-    fn conflict_probe() -> Headless {
+    fn file_probe() -> Headless {
         let mut config =
             EngineConfig::new(Root::of::<ConflictBannerProbe>().tokens(tokens::theme()));
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
@@ -694,6 +738,11 @@ mod tests {
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("the probe's window");
         app.wait_for("text:Original buffer").expect("file loaded");
+        app
+    }
+
+    fn conflict_probe() -> Headless {
+        let mut app = file_probe();
         press_without_settling(&mut app, "probe-conflict");
         app.wait_for("id:conflict-banner").expect("conflict banner");
         app
@@ -733,7 +782,7 @@ mod tests {
 
         let mut app = conflict_probe();
         app.settle();
-        let ids = ["conflict-banner-slot", "document-slot"];
+        let ids = ["conflict-banner-slot", "tab-document-slot"];
         let final_bounds = ids.map(|id| node(&app, id).bounds);
         press_without_settling(&mut app, "probe-switch-tab");
         let batches = capture_batches(&mut app);
@@ -771,12 +820,38 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_during_banner_reflow_preserves_editor_undo() {
+        let mut app = file_probe();
+        app.type_text("label:Markdown source", "x")
+            .expect("edit the file");
+        let editor = node(&app, "source-editor").id;
+        press_without_settling(&mut app, "probe-conflict");
+        app.wait(Duration::from_millis(32)).expect("mid-reflow");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduce motion");
+        let same_editor = node(&app, "source-editor").id == editor;
+        app.wait_for("id:source-editor >> text:/x/")
+            .expect("the typed edit is still present");
+        app.type_text("label:Markdown source", "")
+            .expect("focus the editor");
+        app.press_key("mod+z").expect("undo the edit");
+        let undone = app
+            .screen()
+            .matches("id:source-editor >> text:/^Original buffer$/")
+            .expect("read the source text");
+        assert!(
+            same_editor && undone,
+            "editor retained: {same_editor}; undo worked: {undone}"
+        );
+    }
+
+    #[test]
     fn enabling_reduced_motion_snaps_a_running_banner_reflow() {
         use nsh_core::MountItem;
 
         let mut app = conflict_probe();
         app.settle();
-        let ids = ["conflict-banner-slot", "document-slot"];
+        let ids = ["conflict-banner-slot", "tab-document-slot"];
         let final_bounds = ids.map(|id| node(&app, id).bounds);
         press_without_settling(&mut app, "probe-switch-tab");
         let batches = capture_batches(&mut app);
@@ -793,15 +868,13 @@ mod tests {
             .expect("advance partway through reflow");
         app.set_environment("reduced motion", |env| env.reduce_motion = true)
             .expect("reduce motion");
+        app.settle();
         let snapped = ids.map(|id| node(&app, id));
         assert!(
-            snapped.each_ref().map(|node| node.bounds) == final_bounds
+            snapped.each_ref().map(|node| node.id) == moving
+                && snapped.each_ref().map(|node| node.bounds) == final_bounds
                 && batches.try_iter().any(|batch| {
-                    moving.iter().all(|old| {
-                        batch.iter().any(|item| matches!(
-                            item, MountItem::Delete { id } if id == old
-                        ))
-                    }) && snapped.iter().all(|node| {
+                    snapped.iter().all(|node| {
                         batch.iter().any(|item| matches!(
                             item, MountItem::Frame { id, .. } if *id == node.id
                         ))
@@ -809,7 +882,7 @@ mod tests {
                         item, MountItem::LayoutAnimation(animation) if animation.update.is_some()
                     ))
                 }),
-            "reduced motion must replace the in-flight frames with their final frames"
+            "reduced motion must resend the final frames without replacing their nodes"
         );
     }
 
@@ -872,6 +945,29 @@ mod tests {
                 "Compare content was removed or changed during the fade: {expected:?}"
             );
         }
+        app.wait(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("reach the middle of the conflict exit");
+        let comparison = node(&app, "conflict-previous").id;
+        let tab_count = |app: &Headless| {
+            app.screen()
+                .layout_nodes()
+                .iter()
+                .filter(|node| node.test_id.as_deref() == Some("rail-file-row"))
+                .count()
+        };
+        assert_eq!(tab_count(&app), 2);
+        press_without_settling(&mut app, "probe-close-other-tab");
+        assert_eq!(tab_count(&app), 1);
+        assert_eq!(node(&app, "conflict-previous").id, comparison);
+        app.run_for(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("finish the conflict exit on its original schedule");
+        assert!(
+            !app.screen()
+                .layout_nodes()
+                .iter()
+                .any(|node| node.id == comparison),
+            "closing an inactive tab stranded the fading comparison"
+        );
     }
 
     #[component]
@@ -879,9 +975,11 @@ mod tests {
         let state = AppState::new();
         state.new_document();
         let tab = state.active_tab().expect("the untitled tab");
+        tab.text.set("Unsaved draft".into());
         tab.dirty.set(true);
         let presses = signal(0);
         let selection = state.guard.clone();
+        let document_state = state.clone();
         view()
             .w_full()
             .h(relative(1.0))
@@ -899,9 +997,15 @@ mod tests {
             .child(text(move || {
                 match selection.get().map(|guard| guard.choice.get()) {
                     Some(GUARD_CANCEL_CHOICE) => "Guard selection: Cancel",
+                    Some(GUARD_DISCARD_CHOICE) => "Guard selection: Don't save",
                     Some(_) => "Guard selection: not Cancel",
                     None => "Guard closed",
                 }
+            }))
+            .child(text(move || {
+                document_state
+                    .active_tab()
+                    .map_or_else(|| "No active document".into(), |tab| tab.text.get())
             }))
             .child(overlay_layer(state, Language::English))
     }
@@ -1000,8 +1104,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn space_does_not_press_the_focused_control_behind_the_guard() {
+    fn open_guard() -> Headless {
         let mut config = EngineConfig::new(Root::of::<GuardProbe>().tokens(tokens::theme()));
         config.environment.os = nsh_core::platform::Os::Windows;
         config.environment.idiom = nsh_core::platform::Idiom::Desktop;
@@ -1012,10 +1115,15 @@ mod tests {
         press(&mut app, "probe-close");
         app.wait_for("id:guard-cancel").expect("guard open");
         assert!(app.screen().texts().contains(&"Close presses: 1"));
+        app
+    }
 
-        for key in ["space", "shift+space"] {
-            app.press_key(key)
-                .expect("press Space with or without Shift");
+    #[test]
+    fn space_does_not_press_the_focused_control_behind_the_guard() {
+        let mut app = open_guard();
+
+        for key in ["space", "shift+space", "shift+enter"] {
+            app.press_key(key).expect("press a consumed key");
             let screen = app.screen();
             assert!(screen.matches("id:guard-cancel").expect("selector"));
             assert!(
@@ -1028,12 +1136,36 @@ mod tests {
             );
         }
 
-        app.press_key("shift+enter").expect("press Shift+Enter");
+        app.press_key("enter").expect("activate Cancel");
         assert!(app.screen().texts().contains(&"Guard closed"));
         assert!(
             app.screen().texts().contains(&"Close presses: 1"),
-            "Shift+Enter activated the background close control"
+            "Enter activated the background close control"
         );
+    }
+
+    #[test]
+    fn shifted_keys_do_not_discard_the_unsaved_document() {
+        let mut app = open_guard();
+        app.press_key("shift+tab").expect("select Don't save");
+        assert!(app.shows("Guard selection: Don't save"));
+
+        for key in ["shift+space", "shift+enter"] {
+            app.press_key(key).expect("press the shifted key");
+            assert!(
+                app.shows("Guard selection: Don't save"),
+                "{key} changed the guard"
+            );
+            assert!(app.shows("Unsaved draft"), "{key} lost the unsaved text");
+            assert!(
+                app.shows("Close presses: 1"),
+                "{key} pressed the background"
+            );
+        }
+
+        app.press_key("enter").expect("activate Don't save");
+        assert!(app.shows("Guard closed"));
+        assert!(app.shows("No active document"));
     }
 
     #[test]
@@ -1150,10 +1282,10 @@ mod tests {
     }
 
     fn recovery_probe() -> Headless {
-        let mut app = Headless::start(EngineConfig::new(
-            Root::of::<RecoveryBannerProbe>().tokens(tokens::theme()),
-        ))
-        .expect("start the probe");
+        let mut config =
+            EngineConfig::new(Root::of::<RecoveryBannerProbe>().tokens(tokens::theme()));
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("the probe's window");
         app
@@ -1359,6 +1491,116 @@ mod tests {
                     .iter()
                     .any(|frames| frames.contains(&before.id) && frames.contains(&document.id)),
             "the existing banner slot must expand from zero and move the document in the same transition: {transitioned:?}"
+        );
+    }
+
+    #[test]
+    fn restoring_the_last_draft_keeps_the_banner_mounted_during_its_exit() {
+        use nsh_core::{
+            MountItem, ViewStyle,
+            animation::{AnimationOp, Driver},
+            transition::Live,
+        };
+
+        let mut app = recovery_probe();
+        let no_banner_top = node(&app, "document-slot").bounds.origin.y.0;
+        let batches = capture_batches(&mut app);
+        press_without_settling(&mut app, "probe-show-recovery");
+        app.run_for(Duration::from_millis(motion::ENTER_MS as u64))
+            .expect("finish the banner entry");
+        let open_slot = node(&app, "recovery-banner-slot");
+        let slot = open_slot.id;
+        let open_document = node(&app, "document-slot");
+        let banner = node(&app, "recovery-banner").id;
+        let opacity = binding_nodes(
+            &batches.try_iter().flatten().collect::<Vec<_>>(),
+            node(&app, "banner-fade").id,
+        )[0];
+        press_without_settling(&mut app, "recovery-restore-0");
+        assert!(app.screen().shows("Recovered text"));
+
+        app.wait(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("reach the middle of the banner exit");
+        assert_eq!(node(&app, "recovery-banner").id, banner);
+        let exit: Vec<_> = batches.try_iter().collect();
+        let sample = |before: &LayoutNode, after: &LayoutNode| {
+            let mut frame = after.bounds;
+            if before.id == after.id
+                && exit
+                    .iter()
+                    .any(|batch| transitioned_frames(batch, motion::EXIT_MS).contains(&after.id))
+            {
+                let mut live = Live::default();
+                let mut style = Box::<ViewStyle>::default();
+                frame = before.bounds;
+                live.move_frame(
+                    frame,
+                    after.bounds,
+                    motion::ease_out_layout(motion::EXIT_MS),
+                );
+                live.step(0.0, &mut frame, &mut style);
+                live.step(f64::from(motion::EXIT_MS) / 2000.0, &mut frame, &mut style);
+            }
+            frame
+        };
+        let mid_slot = sample(&open_slot, &node(&app, "recovery-banner-slot"));
+        let document = node(&app, "document-slot");
+        let mid_document = sample(&open_document, &document);
+        assert!(
+            mid_slot.size.height.0 > 0.0 && mid_slot.size.height.0 < open_slot.bounds.size.height.0
+        );
+        let mid_bottom = mid_slot.origin.y.0 + mid_slot.size.height.0;
+        assert!(
+            (mid_document.origin.y.0 - mid_bottom).abs() < 0.01,
+            "the document top {} must follow the collapsing banner bottom {mid_bottom}",
+            mid_document.origin.y.0
+        );
+        let editor = node(&app, "source-editor");
+        let mut first_editor = editor.clone();
+        first_editor.bounds.size.height = exit
+            .iter()
+            .flatten()
+            .find_map(|item| match item {
+                MountItem::Frame { id, frame } if *id == editor.id => Some(frame.size.height),
+                _ => None,
+            })
+            .expect("the new editor's first native frame");
+        let mid_editor = sample(&first_editor, &editor);
+        let editor_bottom = mid_document.origin.y.0
+            + (mid_editor.origin.y.0 - document.bounds.origin.y.0)
+            + mid_editor.size.height.0;
+        let document_bottom = mid_document.origin.y.0 + mid_document.size.height.0;
+        assert!(
+            (editor_bottom - document_bottom).abs() < 0.01,
+            "the editor bottom {editor_bottom} must fill the current slot ending at {document_bottom}"
+        );
+        assert!(document.clips, "the document slot must clip its children");
+        assert!(editor.bounds.origin.x.0 >= document.bounds.origin.x.0);
+        assert!(exit.iter().any(|batch| {
+            transitioned_frames(batch, motion::EXIT_MS).contains(&slot)
+                && batch.iter().any(|item| {
+                    matches!(
+                        item,
+                        MountItem::Frame { id, frame } if *id == slot && frame.size.height.0 == 0.0
+                    )
+                })
+        }));
+        assert!(exit.iter().flatten().any(|item| matches!(
+            item,
+            MountItem::Animation(AnimationOp::Start {
+                node,
+                driver: Driver::Timing { to: 0.0, duration_ms, .. },
+                ..
+            }) if *node == opacity && *duration_ms == motion::EXIT_MS
+        )));
+        app.run_for(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("finish the banner exit");
+        assert_eq!(node(&app, "document-slot").bounds.origin.y.0, no_banner_top);
+        assert!(
+            !app.screen()
+                .layout_nodes()
+                .iter()
+                .any(|node| node.test_id.as_deref() == Some("recovery-banner"))
         );
     }
 

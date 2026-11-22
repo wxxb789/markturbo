@@ -24,7 +24,12 @@ use mt_core::{
     settings::Language,
 };
 use nsh_base::input;
-use nsh_core::{Color, EllipsizeMode, element::KeyOptions, keymap::When, prelude::*};
+use nsh_core::{
+    Color, EllipsizeMode,
+    element::{AdaptiveColor, KeyOptions},
+    keymap::When,
+    prelude::*,
+};
 
 use crate::{
     i18n::{self, Key},
@@ -801,7 +806,7 @@ fn questions(
                         row.role(AccessibilityRole::Button)
                             .optional_label(Some(SharedString::from(text)))
                             .cursor_pointer()
-                            .focus_visible(|style| style.text_color(tokens::palette().ink))
+                            .focus_visible(|style| style.text_color(|| tokens::palette().ink))
                             .on_press(reopen),
                     )
                     .into_element()
@@ -856,9 +861,9 @@ fn current_question_block(
                 .font_weight(tokens::WEIGHT_MEDIUM)
                 .text_color(move || tokens::palette().ink)
                 .bind_color(&heat.glyph(
-                    tokens::palette().ember,
-                    tokens::palette().ember,
-                    tokens::palette().hot,
+                    tokens::adaptive_color(|palette| palette.ember),
+                    tokens::adaptive_color(|palette| palette.ember),
+                    tokens::adaptive_color(|palette| palette.hot),
                 )),
         )
         .child(voice(question_text, heat, language, drained(stale)));
@@ -944,8 +949,6 @@ fn reopen_question(session: Signal<Session>, order: &[usize], index: usize) {
         question_heat(&emitters, order, previous).cool();
     }
     ignite_hold(question_heat(&emitters, order, index));
-    // The question is the HOT item again, and the column's light goes back to
-    // the question's own finding.
     glow::focus_finding(None);
     focus_request().set(Some(Focus::Answer(index)));
 }
@@ -1075,7 +1078,7 @@ fn step_control(
             .role(AccessibilityRole::Button)
             .optional_label(Some(SharedString::from(s(label, language))))
             .cursor_pointer()
-            .focus_visible(|style| style.text_color(tokens::palette().ink))
+            .focus_visible(|style| style.text_color(|| tokens::palette().ink))
             .on_press(step),
     )
     .child(prims::kbd(key))
@@ -1553,8 +1556,8 @@ fn question_heat(emitters: &Emitters, order: &[usize], index: usize) -> Heat {
 }
 
 /// The afterimage ink, once the source has moved on.
-fn drained(stale: bool) -> Option<Color> {
-    stale.then(|| tokens::palette().afterimage_ink)
+fn drained(stale: bool) -> Option<AdaptiveColor> {
+    stale.then(|| tokens::adaptive_color(|palette| palette.afterimage_ink))
 }
 
 /// The model's voice: 22/30, and 1.75 line height for Chinese. With
@@ -1563,7 +1566,7 @@ fn voice(
     content: impl IntoReactive<SharedString>,
     heat: Heat,
     language: Language,
-    drained: Option<Color>,
+    drained: Option<AdaptiveColor>,
 ) -> impl IntoElement {
     #[cfg(test)]
     let optics = global::<Option<tokens::CjkOptics>>()
@@ -1571,10 +1574,13 @@ fn voice(
         .unwrap_or(tokens::CJK_OPTICS);
     #[cfg(not(test))]
     let optics = tokens::CJK_OPTICS;
-    let palette = tokens::palette();
     let (ink, ember, hot) = match drained {
         Some(afterimage) => (afterimage, afterimage, afterimage),
-        None => (palette.ink, palette.ember, palette.hot),
+        None => (
+            tokens::adaptive_color(|palette| palette.ink),
+            tokens::adaptive_color(|palette| palette.ember),
+            tokens::adaptive_color(|palette| palette.hot),
+        ),
     };
     prims::script_text(content, TYPE_MODEL, WEIGHT_MODEL, optics)
         .font_family(tokens::FONT_MODEL)
@@ -1596,15 +1602,15 @@ fn heat_line(
     drained: bool,
     one_line: bool,
 ) -> impl IntoElement {
-    let palette = tokens::palette();
     let (ink, ember, hot) = if drained {
-        (
-            palette.afterimage_ink,
-            palette.afterimage_ink,
-            palette.afterimage_ink,
-        )
+        let afterimage = tokens::adaptive_color(|palette| palette.afterimage_ink);
+        (afterimage, afterimage, afterimage)
     } else {
-        (palette.ink, palette.ember, palette.hot)
+        (
+            tokens::adaptive_color(|palette| palette.ink),
+            tokens::adaptive_color(|palette| palette.ember),
+            tokens::adaptive_color(|palette| palette.hot),
+        )
     };
     let line = text(content)
         .font_family(tokens::FONT_UI)
@@ -1649,7 +1655,7 @@ fn answer_field(
         .p(px(FOCUS_RING_OFFSET))
         .border(px(FOCUS_RING))
         .border_color(Color::TRANSPARENT)
-        .focus_within(|style| style.border_color(tokens::palette().ink))
+        .focus_within(|style| style.border_color(|| tokens::palette().ink))
         .child(
             input()
                 .test_id("review-answer-input")
@@ -1667,7 +1673,7 @@ fn answer_field(
                 .bg(move || tokens::palette().room)
                 .border(px(tokens::HAIRLINE))
                 .border_color(move || with_alpha(tokens::palette().ink, 0.16))
-                .focus_visible(|style| style.border_color(tokens::palette().ink)),
+                .focus_visible(|style| style.border_color(|| tokens::palette().ink)),
         )
 }
 

@@ -47,10 +47,24 @@ impl MenuMotion {
         let reduced = motion::reduced_motion();
         let scale = animated_value(if reduced { 1.0 } else { motion::MENU_SCALE });
         let hide_task = Cell::new(None::<Spawned<()>>);
+        let timer_owner = Owner::current();
         let previous = Cell::new(false);
         let previous_reduced = Cell::new(reduced);
 
         effect(move || {
+            let cancel_hide = || {
+                if let Some(hide) = hide_task.take() {
+                    hide.cancel();
+                }
+            };
+            let schedule_hide = |duration: f32| {
+                cancel_hide();
+                hide_task.set(Some(timer_owner.run(|| {
+                    set_timeout(Duration::from_millis(duration as u64), move || {
+                        visible.set(false);
+                    })
+                })));
+            };
             let is_open = open.get();
             let reduced = motion::reduced_motion();
             let open_changed = previous.replace(is_open) != is_open;
@@ -65,18 +79,14 @@ impl MenuMotion {
                     scale.stop();
                     scale.set(1.0);
                     if !is_open && visible.get_untracked() {
-                        let hide = set_timeout(
-                            Duration::from_millis(motion::REDUCED_CROSSFADE_MS as u64),
-                            move || visible.set(false),
-                        );
-                        hide_task.set(Some(hide));
+                        schedule_hide(motion::REDUCED_CROSSFADE_MS);
                     }
                 }
                 return;
             }
 
             if is_open {
-                hide_task.set(None);
+                cancel_hide();
                 let was_visible = visible.get_untracked();
                 visible.set(true);
                 opacity.timing(
@@ -107,10 +117,7 @@ impl MenuMotion {
                 if reduced {
                     scale.set(1.0);
                 }
-                let hide = set_timeout(Duration::from_millis(duration as u64), move || {
-                    visible.set(false);
-                });
-                hide_task.set(Some(hide));
+                schedule_hide(duration);
             }
         });
 
@@ -308,8 +315,8 @@ fn file_name(state: AppState) -> impl IntoElement {
     .gap(px(SPACE_2))
     .flex_shrink(1.0)
     .min_w(px(0.0))
-    .hover(|s| s.text_color(tokens::palette().ink).underline())
-    .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+    .hover(|s| s.text_color(|| tokens::palette().ink).underline())
+    .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
     .child(
         text(move || match folder_state.active_tab() {
             Some(tab) if !tab.untitled => tab
@@ -400,6 +407,7 @@ fn menu_anchor(state: AppState, language: Language, menu: MenuMotion) -> impl In
             }),
         )
         .child(when(
+            // Keep the panel's rows and focus handles alive through a reversal.
             move || menu.is_visible(),
             move || menu_panel(panel_state.clone(), language, menu).into_element(),
         ))
@@ -717,8 +725,8 @@ fn menu_row(
             .truncate()
             .transition_colors()
             .duration(move || duration.get())
-            .group_hover(|s| s.text_color(tokens::palette().ink).underline())
-            .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
+            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
     )
     .children(hint.map(|hint| {
         text(hint)
@@ -763,14 +771,14 @@ fn row_action(
         .transition_colors()
         .duration(move || duration.get())
         .group_hover(|s| {
-            s.text_color(tokens::palette().ink)
+            s.text_color(|| tokens::palette().ink)
                 .underline()
-                .text_decoration_color(tokens::palette().ink)
+                .text_decoration_color(|| tokens::palette().ink)
         })
         .group_focus_visible(|s| {
-            s.text_color(tokens::palette().ink)
+            s.text_color(|| tokens::palette().ink)
                 .underline()
-                .text_decoration_color(tokens::palette().ink)
+                .text_decoration_color(|| tokens::palette().ink)
         });
     if strong {
         label_text = label_text
@@ -892,7 +900,14 @@ mod tests {
                 "Toggle",
                 move || menu.toggle(),
             ))
-            .child(menu_panel_frame(menu, "menu-motion-panel").child(prims::ink("Menu")))
+            .child(when(
+                move || menu.is_visible(),
+                move || {
+                    menu_panel_frame(menu, "menu-motion-panel")
+                        .child(prims::ink("Menu"))
+                        .into_element()
+                },
+            ))
             .child(prims::quiet_action("menu-motion-read", "Read", move || {
                 let samples = samples.clone();
                 read_task.set(Some(spawn(async move {
@@ -1002,6 +1017,69 @@ mod tests {
     }
 
     #[test]
+    fn hovered_titlebar_text_tracks_the_current_theme() {
+        use nsh_core::{platform::ColorScheme, tailwind::state::HOVERED};
+
+        let mut config = EngineConfig::new(Root::of::<ReviewProbe>().tokens(tokens::theme()));
+        config.environment.color_scheme = ColorScheme::Light;
+        config.environment.reduce_motion = true;
+        let mut app = Headless::start(config).expect("start the titlebar");
+        app.set_viewport(nsh_core::Size::new(Points(600.0), Points(400.0)))
+            .expect("set the viewport");
+        app.wait_for("id:title-settings")
+            .expect("the title Settings action");
+        let settings = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("title-settings"))
+            .expect("the title Settings action")
+            .id;
+        app.engine().control().set_states(settings, HOVERED);
+        app.settle();
+        press_without_settling(&app, "id:title-settings");
+        app.wait_for("id:title-menu-open-folder")
+            .expect("the first title menu row");
+        let open_folder = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("title-menu-open-folder"))
+            .expect("the first title menu row")
+            .id;
+        app.engine().control().set_states(open_folder, HOVERED);
+        app.settle();
+        let light_colors = (
+            app.screen()
+                .span_style("id:title-settings >> text:Settings")
+                .expect("the hovered title Settings text")
+                .color,
+            app.screen()
+                .span_style("id:title-menu-open-folder >> text:Open folder")
+                .expect("the hovered menu row text")
+                .color,
+        );
+        assert_eq!(light_colors, (tokens::LIGHT.ink, tokens::LIGHT.ink));
+
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("report OS appearance");
+        app.settle();
+        let dark_colors = (
+            app.screen()
+                .span_style("id:title-settings >> text:Settings")
+                .expect("the hovered title Settings text")
+                .color,
+            app.screen()
+                .span_style("id:title-menu-open-folder >> text:Open folder")
+                .expect("the hovered menu row text")
+                .color,
+        );
+        assert_eq!(dark_colors, (tokens::DARK.ink, tokens::DARK.ink));
+    }
+
+    #[test]
     fn closing_the_welcome_menu_keeps_its_items_frozen_during_exit() {
         let mut app = manual_app(Root::of::<WelcomeMenuProbe>());
         app.wait_for("id:welcome")
@@ -1050,6 +1128,13 @@ mod tests {
         }
 
         assert!(app.screen().matches("id:title-menu").unwrap());
+        assert_eq!(
+            app.screen()
+                .press_target("id:title-menu-edit")
+                .expect("the Source row selector"),
+            None,
+            "closed menu rows cannot receive presses during the exit"
+        );
         assert!(pane_dot_is_in_row(&app, "title-menu-edit"));
         assert!(!pane_dot_is_in_row(&app, "title-menu-preview"));
     }
@@ -1143,6 +1228,46 @@ mod tests {
             "reopened scale advances toward 1: {} to {}",
             reopening.1,
             advancing.1
+        );
+    }
+
+    #[test]
+    fn disabling_reduced_motion_during_menu_exit_still_unmounts_the_panel() {
+        let (sent, _samples) = mpsc::channel();
+        let mut app = manual_app(Root::new::<MenuMotionProbe>(move || {
+            let sent = sent.clone();
+            MenuMotionProbeProps {
+                content: Some(Renderer::new(move |_| menu_motion_contents(sent.clone()))),
+            }
+        }));
+        app.wait_for("id:menu-motion-toggle")
+            .expect("the menu control");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("enable reduced motion");
+
+        press_without_settling(&app, "id:menu-motion-toggle");
+        app.wait_for("id:menu-motion-panel")
+            .expect("the menu panel opens");
+        app.wait(Duration::from_millis(motion::REDUCED_CROSSFADE_MS as u64))
+            .expect("finish the menu entrance");
+
+        press_without_settling(&app, "id:menu-motion-toggle");
+        app.wait(Duration::from_millis(
+            motion::REDUCED_CROSSFADE_MS as u64 / 2,
+        ))
+        .expect("advance partway through the reduced-motion exit");
+        let mounted_mid_exit = app.screen().matches("id:menu-motion-panel").unwrap();
+
+        app.set_environment("motion enabled", |env| env.reduce_motion = false)
+            .expect("disable reduced motion");
+        app.wait(Duration::from_millis(
+            motion::REDUCED_CROSSFADE_MS as u64 / 2 + 20,
+        ))
+        .expect("advance past the original menu exit deadline");
+
+        assert!(
+            mounted_mid_exit && !app.screen().matches("id:menu-motion-panel").unwrap(),
+            "the menu panel must stay mounted during its exit and unmount after it"
         );
     }
 }

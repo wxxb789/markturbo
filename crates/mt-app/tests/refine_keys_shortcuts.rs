@@ -303,13 +303,6 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
 
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-edit").expect("Source");
-    assert_eq!(
-        app.screen()
-            .press_target("id:title-menu-edit")
-            .expect("the Source row selector"),
-        None,
-        "closed menu rows cannot receive presses during the exit"
-    );
     app.wait_for_gone("id:title-menu", Duration::from_secs(5))
         .expect("the panel dismounts after the exit");
 

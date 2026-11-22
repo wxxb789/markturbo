@@ -1014,8 +1014,8 @@ fn choice_button(
             .bg(Color::TRANSPARENT)
             .cursor_pointer()
             .rounded(px(0.0))
-            .hover(|s| s.text_color(tokens::palette().ink).underline())
-            .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+            .hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
             .on_press(move |_: &PressEvent| on_press()),
     )
     .child(
@@ -1052,8 +1052,8 @@ fn reactive_action(
                     .bg(Color::TRANSPARENT)
                     .cursor_pointer()
                     .rounded(px(0.0))
-                    .hover(|s| s.text_color(tokens::palette().ink).underline())
-                    .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                    .hover(|s| s.text_color(|| tokens::palette().ink).underline())
+                    .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
                     .on_press(on_press),
             )
             .child(
