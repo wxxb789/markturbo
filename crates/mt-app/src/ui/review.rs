@@ -764,18 +764,14 @@ fn questions(
                     let priority = question
                         .map(|question| priority_label(question.priority, language))
                         .unwrap_or_default();
-                    let row = cooled_row(&text, priority, heat, language, stale, answered, skipped);
-                    // A cooled question is not dead: pressing it (or reaching it
-                    // with Tab) makes it the current one again, with its answer
-                    // as it was left, so a typo is fixable without re-running
-                    // the whole review. While the result is stale there is
-                    // nothing to edit, and the line stays plain text.
+                    let row = view()
+                        .test_id("review-question-line")
+                        .w_full()
+                        .child(cooled_row(
+                            &text, priority, heat, language, stale, answered, skipped,
+                        ));
                     if stale {
-                        return view()
-                            .test_id("review-question-line")
-                            .w_full()
-                            .child(row)
-                            .into_element();
+                        return row.into_element();
                     }
                     let reopen = {
                         let order = order.to_vec();
@@ -783,16 +779,12 @@ fn questions(
                     };
                     // A pressable wrapper would add an unnamed UIA button.
                     prims::press_feedback(
-                        view()
-                            .test_id("review-question-line")
-                            .role(AccessibilityRole::Button)
-                            .optional_label(Some(SharedString::from(text.clone())))
-                            .w_full()
+                        row.role(AccessibilityRole::Button)
+                            .optional_label(Some(SharedString::from(text)))
                             .cursor_pointer()
                             .focus_visible(|style| style.text_color(tokens::palette().ink))
                             .on_press(reopen),
                     )
-                    .child(row)
                     .into_element()
                 })),
         );
@@ -1454,7 +1446,6 @@ fn reviewing_with(state: &AppState, language: Language) -> SharedString {
     SharedString::from(s(S::ReviewingWith, language).replace("{host}", &host))
 }
 
-/// The localized finding count shown before the optional step controls.
 fn step_hint(findings: usize, language: Language) -> String {
     match language {
         Language::English => match findings {
@@ -1858,21 +1849,12 @@ mod tests {
             .expect("start the review layout probe");
         app.wait_for("id:review-findings-count")
             .expect("the findings count");
-        let nodes = app.screen().layout_nodes();
-        let count = nodes
-            .iter()
-            .find(|node| node.test_id.as_deref() == Some("review-findings-count"))
-            .expect("the count wrapper");
-        let text = nodes
-            .iter()
-            .find(|node| node.parent == count.id && node.text.is_some())
-            .and_then(|node| node.text.as_ref())
-            .expect("the count text");
         assert!(
-            text.text.spans.iter().any(|span| span
-                .style
+            app.screen()
+                .span_style("id:review-findings-count >> text:1 finding")
+                .expect("the count text")
                 .font_variant
-                .has(nsh_core::FontVariant::TABULAR_NUMS)),
+                .has(nsh_core::FontVariant::TABULAR_NUMS),
             "the findings count enables tabular numerals"
         );
     }
@@ -1977,11 +1959,15 @@ mod tests {
         .expect("light mode");
         app.wait_for("text:Provider failed")
             .expect("the provider failure");
-        assert!(
-            rendered_color(&app, "Provider failed") == Some(tokens::LIGHT.danger)
-                && rendered_color(&app, "Cancelled — nothing changed.") == Some(tokens::LIGHT.ink),
-            "error headlines use danger and cancellation remains neutral"
-        );
+        for (selector, color) in [
+            ("text:/^Provider failed$/", tokens::LIGHT.danger),
+            ("text:/^Cancelled — nothing changed\\.$/", tokens::LIGHT.ink),
+        ] {
+            assert_eq!(
+                app.screen().span_style(selector).expect(selector).color,
+                color
+            );
+        }
     }
 
     /// The document the camera probes review: three known lines.
@@ -2104,19 +2090,6 @@ mod tests {
             .h(px(720.0))
             .child(failure_block(state.clone(), Language::English, &failed))
             .child(failure_block(state, Language::English, &cancelled))
-    }
-
-    fn rendered_color(app: &Headless, value: &str) -> Option<nsh_core::Color> {
-        app.screen()
-            .layout_nodes()
-            .into_iter()
-            .find(|node| {
-                node.text
-                    .as_ref()
-                    .is_some_and(|text| text.text.text == value)
-            })
-            .and_then(|node| node.text)
-            .and_then(|text| text.text.spans.first().map(|span| span.style.color))
     }
 
     fn sections_fit(app: &Headless, ids: &[&str]) -> bool {

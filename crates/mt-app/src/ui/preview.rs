@@ -196,24 +196,12 @@ fn empty_preview(language: Language) -> AnyElement {
         .into_element()
 }
 
-fn preview_message(test_id: &str, language: Language, key: Key) -> AnyElement {
+fn web_load_message(test_id: &str, message: impl IntoElement) -> AnyElement {
     view()
         .test_id(test_id)
         .px(px(tokens::SPACE_4))
         .py(px(tokens::SPACE_2))
-        .child(prims::faint(SharedString::from(i18n::t(language, key))))
-        .into_element()
-}
-
-fn preview_failure_message(language: Language) -> AnyElement {
-    view()
-        .test_id("web-preview-failed")
-        .px(px(tokens::SPACE_4))
-        .py(px(tokens::SPACE_2))
-        .child(
-            prims::rest(SharedString::from(i18n::t(language, Key::WebPreviewFailed)))
-                .text_color(move || tokens::palette().danger),
-        )
+        .child(message)
         .into_element()
 }
 
@@ -225,10 +213,15 @@ fn web_document(page: WebDocument, trusted: Signal<bool>, language: Language) ->
         .min_h(px(0.0))
         .flex_col()
         .child(dynamic(move || match status.get() {
-            WebLoadState::Loading => {
-                preview_message("preview-loading", language, Key::PreviewLoading)
-            }
-            WebLoadState::Failed => preview_failure_message(language),
+            WebLoadState::Loading => web_load_message(
+                "preview-loading",
+                prims::faint(i18n::t(language, Key::PreviewLoading)),
+            ),
+            WebLoadState::Failed => web_load_message(
+                "web-preview-failed",
+                prims::rest(i18n::t(language, Key::WebPreviewFailed))
+                    .text_color(move || tokens::palette().danger),
+            ),
             WebLoadState::Ready => view().into_element(),
         }))
         .child(
@@ -364,8 +357,6 @@ const PREVIEW_H2: f32 = 18.0;
 /// A task's box: a 12px square.
 const TASK_BOX: f32 = 12.0;
 
-/// The Markdown the preview shows, with diagrams rendered or labelled and
-/// recomputed when the text changes.
 fn preview_of(tab: &Tab, language: Language) -> Memo<String> {
     let tab = tab.clone();
     computed(move || preprocess_markdown(&tab.text.get(), &tab.path, language))
@@ -444,7 +435,6 @@ fn renderer() -> &'static RendererRegistry {
     &REGISTRY
 }
 
-/// Markdown with renderable diagrams replaced by inline SVG images.
 fn preprocess_markdown(source: &str, path: &std::path::Path, language: Language) -> String {
     let document = Document::new(Some(path.to_path_buf()), source.to_owned());
     let mut out = source.to_owned();
@@ -485,8 +475,6 @@ fn svg_data_uri(markup: &str) -> String {
     uri
 }
 
-/// A diagram or an equation, drawn as its SVG; a failure is labelled and keeps
-/// its source visible.
 fn render_diagram(kind: &str, label: &str, source: &str, language: Language) -> AnyElement {
     match renderer().render(kind, source) {
         RenderOutcome::Svg(markup) => svg(ImageSrc::svg_markup(&markup)).into_element(),

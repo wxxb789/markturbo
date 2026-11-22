@@ -495,7 +495,6 @@ pub const WEIGHT_UI: FontWeight = FontWeight(400);
 /// The few labels that must not be quiet.
 pub const WEIGHT_MEDIUM: FontWeight = FontWeight(500);
 
-/// A CJK run's optical step from the surrounding text.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CjkOptics {
     size_step: f32,
@@ -503,12 +502,10 @@ pub struct CjkOptics {
 }
 
 impl CjkOptics {
-    /// The run's size from an inherited size.
     pub const fn size(self, base: f32, cjk: bool) -> f32 {
         if cjk { base + self.size_step } else { base }
     }
 
-    /// The run's weight from an inherited weight.
     pub const fn weight(self, base: FontWeight, cjk: bool) -> FontWeight {
         if cjk {
             FontWeight(base.0 + self.weight_step)
@@ -517,12 +514,10 @@ impl CjkOptics {
         }
     }
 
-    /// Whether this step selects a different CJK companion weight.
     pub const fn changes_weight(self) -> bool {
         self.weight_step != 0
     }
 
-    /// Whether this step preserves the current rendering.
     pub const fn is_unchanged(self) -> bool {
         self.size_step == 0.0 && self.weight_step == 0
     }
@@ -533,7 +528,6 @@ const CJK_OPTICS_BASELINE: CjkOptics = CjkOptics {
     weight_step: 0,
 };
 
-/// One side of the CJK optical-sizing capture.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CjkOpticsVariant {
     pub label: &'static str,
@@ -544,7 +538,6 @@ pub struct CjkOpticsVariant {
 /// Preserve today's CJK size and weight until the owner selects a capture.
 pub const CJK_OPTICS: CjkOptics = CJK_OPTICS_BASELINE;
 
-/// The owner-pick comparison values; do not make one the default here.
 pub const CJK_OPTICS_CAPTURE_VARIANTS: [CjkOpticsVariant; 3] = [
     CjkOpticsVariant {
         label: "+0",

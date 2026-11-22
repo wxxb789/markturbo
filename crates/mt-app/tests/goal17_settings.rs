@@ -21,6 +21,7 @@ fn start_settings() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let config = tempfile::tempdir().expect("config dir");
     let codex_home = tempfile::tempdir().expect("Codex home");
     let data_dir = config.path().join("data");
+    // SAFETY: TEST_LOCK serializes app lifetimes and environment changes.
     unsafe {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::remove_var("OPENAI_API_KEY");
@@ -44,25 +45,7 @@ fn start_settings() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     (app, config, codex_home)
 }
 
-fn text_style(app: &Headless, value: &str) -> nsh_core::ResolvedTextStyle {
-    let node = app
-        .screen()
-        .layout_nodes()
-        .into_iter()
-        .find(|node| {
-            node.text
-                .as_ref()
-                .is_some_and(|text| text.text.text == value)
-        })
-        .unwrap_or_else(|| panic!("text `{value}` is on screen"));
-    node.text.unwrap().text.spans[0].style
-}
-
 fn make_settings_file_unwritable(config: &tempfile::TempDir) {
-    // SAFETY: the test lock serializes config changes; the next action reads this path.
-    unsafe {
-        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
-    }
     std::fs::create_dir(config.path().join("settings.toml")).expect("block settings file");
 }
 
@@ -126,17 +109,10 @@ fn selected_theme_uses_an_ink_two_pixel_underline() {
         .accessibility_state("id:settings-theme-system")
         .expect("theme selection state");
     assert!(selected.selected, "System is the selected theme");
-    let theme = app
+    let style = app
         .screen()
-        .layout_nodes()
-        .into_iter()
-        .find(|node| {
-            node.text
-                .as_ref()
-                .is_some_and(|text| text.text.text == "System")
-        })
+        .span_style("id:settings-theme-system >> text:/^System$/")
         .expect("selected theme text");
-    let style = theme.text.unwrap().text.spans[0].style;
     assert_eq!(style.color, mt_app::ui::tokens::LIGHT.ink);
     assert!(style.decoration.underline, "selected theme is underlined");
     assert_eq!(style.decoration_thickness, Some(Points(2.0)));
@@ -187,10 +163,10 @@ fn settings_notice_info_uses_neutral_ink() {
         .expect("session credential action");
     app.press("id:settings-credential-session")
         .expect("empty credential reports an info notice");
-    let info = "Enter a credential first.";
-    app.wait_for(&format!("text:{info}")).expect("info notice");
+    let info = "text:Enter a credential first.";
+    app.wait_for(info).expect("info notice");
     assert_eq!(
-        text_style(&app, info).color,
+        app.screen().span_style(info).expect("info notice").color,
         mt_app::ui::tokens::LIGHT.ink_rest
     );
 }
@@ -205,11 +181,11 @@ fn settings_notice_errors_use_danger_ink() {
     app.settle();
     app.press("id:usage-on")
         .expect("enable consent against the unwritable settings file");
-    let error = "Could not save the preference. Recording is off for this session; try again before restarting.";
-    app.wait_for(&format!("text:{error}"))
+    let error = "text:Could not save the preference. Recording is off for this session; try again before restarting.";
+    app.wait_for(error)
         .expect("settings notice reports the persistence failure");
     assert_eq!(
-        text_style(&app, error).color,
+        app.screen().span_style(error).expect("error notice").color,
         mt_app::ui::tokens::LIGHT.danger
     );
 }
@@ -221,11 +197,14 @@ fn settings_save_failure_uses_danger_status_on_the_settings_surface() {
     make_settings_file_unwritable(&config);
     app.press("id:settings-save")
         .expect("save settings to the unwritable settings file");
-    let error = "Could not save settings.";
-    app.wait_for(&format!("id:status >> text:{error}"))
+    let error = "id:status >> text:Could not save settings.";
+    app.wait_for(error)
         .expect("settings save failure on its surface");
     assert_eq!(
-        text_style(&app, error).color,
+        app.screen()
+            .span_style(error)
+            .expect("settings status")
+            .color,
         mt_app::ui::tokens::LIGHT.danger
     );
     let page = node(&app, "settings-page").bounds;

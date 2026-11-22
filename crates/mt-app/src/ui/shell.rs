@@ -2,12 +2,6 @@
 //!
 //! The window shell: one room, four regions, one overlay layer.
 //!
-//! ```text
-//! ┌ title row 32 ───────────────────────────────────────────────────────┐
-//! │ rail 44 │ text column (40 + measure + 40) │ field (rest − 32)      │
-//! └───────────────────────────────────────────────────────────────────┘
-//! ```
-//!
 //! What the shell owns, and what nothing else may take over:
 //!
 //! * the opaque title row and the window's own chrome: the system title bar is
