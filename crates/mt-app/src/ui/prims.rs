@@ -14,6 +14,8 @@
 //!   [`halo`] and [`emitter_plate`] take a [`Heat`] and are the only ways to
 //!   draw with the hot/ember colours.
 
+use std::cell::Cell;
+
 use nsh_base::input;
 use nsh_core::{
     Color, EventKind, EventPayload,
@@ -124,8 +126,8 @@ pub fn quiet_action(
     press_target(test_id, label.clone())
         .px(px(2.0))
         .py(px(4.0))
-        .hover(|s| s.text_color(tokens::palette().ink).underline())
-        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+        .hover(|s| s.text_color(|| tokens::palette().ink).underline())
+        .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
         .on_press(on_press)
         .child(
             text(label)
@@ -193,11 +195,13 @@ pub(crate) fn press_feedback_with_duration<T: PressControl<Kind>, Kind>(
     duration: Signal<f32>,
 ) -> T {
     let pressed = signal(false);
-    let appearance = signal(tokens::palette().is_dark);
+    let appearance = Cell::new(None::<bool>);
     effect(move || {
         let is_dark = tokens::palette().is_dark;
-        if appearance.get() != is_dark {
-            appearance.set(is_dark);
+        if appearance
+            .replace(Some(is_dark))
+            .is_some_and(|appearance| appearance != is_dark)
+        {
             duration.set(0.0);
         }
     });

@@ -47,10 +47,24 @@ impl MenuMotion {
         let reduced = motion::reduced_motion();
         let scale = animated_value(if reduced { 1.0 } else { motion::MENU_SCALE });
         let hide_task = Cell::new(None::<Spawned<()>>);
+        let timer_owner = Owner::current();
         let previous = Cell::new(false);
         let previous_reduced = Cell::new(reduced);
 
         effect(move || {
+            let cancel_hide = || {
+                if let Some(hide) = hide_task.take() {
+                    hide.cancel();
+                }
+            };
+            let schedule_hide = |duration: f32| {
+                cancel_hide();
+                hide_task.set(Some(timer_owner.run(|| {
+                    set_timeout(Duration::from_millis(duration as u64), move || {
+                        visible.set(false);
+                    })
+                })));
+            };
             let is_open = open.get();
             let reduced = motion::reduced_motion();
             let open_changed = previous.replace(is_open) != is_open;
@@ -65,18 +79,14 @@ impl MenuMotion {
                     scale.stop();
                     scale.set(1.0);
                     if !is_open && visible.get_untracked() {
-                        let hide = set_timeout(
-                            Duration::from_millis(motion::REDUCED_CROSSFADE_MS as u64),
-                            move || visible.set(false),
-                        );
-                        hide_task.set(Some(hide));
+                        schedule_hide(motion::REDUCED_CROSSFADE_MS);
                     }
                 }
                 return;
             }
 
             if is_open {
-                hide_task.set(None);
+                cancel_hide();
                 let was_visible = visible.get_untracked();
                 visible.set(true);
                 opacity.timing(
@@ -107,10 +117,7 @@ impl MenuMotion {
                 if reduced {
                     scale.set(1.0);
                 }
-                let hide = set_timeout(Duration::from_millis(duration as u64), move || {
-                    visible.set(false);
-                });
-                hide_task.set(Some(hide));
+                schedule_hide(duration);
             }
         });
 
@@ -893,7 +900,14 @@ mod tests {
                 "Toggle",
                 move || menu.toggle(),
             ))
-            .child(menu_panel_frame(menu, "menu-motion-panel").child(prims::ink("Menu")))
+            .child(when(
+                move || menu.is_visible(),
+                move || {
+                    menu_panel_frame(menu, "menu-motion-panel")
+                        .child(prims::ink("Menu"))
+                        .into_element()
+                },
+            ))
             .child(prims::quiet_action("menu-motion-read", "Read", move || {
                 let samples = samples.clone();
                 read_task.set(Some(spawn(async move {
@@ -1144,6 +1158,46 @@ mod tests {
             "reopened scale advances toward 1: {} to {}",
             reopening.1,
             advancing.1
+        );
+    }
+
+    #[test]
+    fn disabling_reduced_motion_during_menu_exit_still_unmounts_the_panel() {
+        let (sent, _samples) = mpsc::channel();
+        let mut app = manual_app(Root::new::<MenuMotionProbe>(move || {
+            let sent = sent.clone();
+            MenuMotionProbeProps {
+                content: Some(Renderer::new(move |_| menu_motion_contents(sent.clone()))),
+            }
+        }));
+        app.wait_for("id:menu-motion-toggle")
+            .expect("the menu control");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("enable reduced motion");
+
+        press_without_settling(&app, "id:menu-motion-toggle");
+        app.wait_for("id:menu-motion-panel")
+            .expect("the menu panel opens");
+        app.wait(Duration::from_millis(motion::REDUCED_CROSSFADE_MS as u64))
+            .expect("finish the menu entrance");
+
+        press_without_settling(&app, "id:menu-motion-toggle");
+        app.wait(Duration::from_millis(
+            motion::REDUCED_CROSSFADE_MS as u64 / 2,
+        ))
+        .expect("advance partway through the reduced-motion exit");
+        let mounted_mid_exit = app.screen().matches("id:menu-motion-panel").unwrap();
+
+        app.set_environment("motion enabled", |env| env.reduce_motion = false)
+            .expect("disable reduced motion");
+        app.wait(Duration::from_millis(
+            motion::REDUCED_CROSSFADE_MS as u64 / 2 + 20,
+        ))
+        .expect("advance past the original menu exit deadline");
+
+        assert!(
+            mounted_mid_exit && !app.screen().matches("id:menu-motion-panel").unwrap(),
+            "the menu panel must stay mounted during its exit and unmount after it"
         );
     }
 }

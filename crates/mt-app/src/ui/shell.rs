@@ -377,7 +377,6 @@ pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoEle
                 move || {
                     let state = consent_state.clone();
                     dynamic(move || {
-                        // Only a new authorization session can replace the hold control.
                         session.get();
                         consent::card(state.clone(), language)
                     })

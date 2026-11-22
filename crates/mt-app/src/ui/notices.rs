@@ -1271,6 +1271,7 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
     // Effect reruns dispose their tasks; notice deadlines belong to the app owner.
     let owner = Owner::current();
     let active_fade = Cell::new(None::<Spawned<()>>);
+    let entry_deadline = Cell::new(None::<nsh_core::time::Instant>);
     let exit_deadline = Rc::new(Cell::new(None::<nsh_core::time::Instant>));
     let previous = Cell::new(None::<(u64, bool, bool)>);
     let opacity = presence.opacity;
@@ -1289,13 +1290,15 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
                 && !message.is_empty()
             {
                 rise.set(0.0);
+                let now = nsh_core::time::now();
+                let duration = Duration::from_secs_f32(motion::REDUCED_CROSSFADE_MS / 1000.0);
+                let reduced_deadline = now + duration;
                 if let Some(deadline) = exit_deadline.get() {
-                    let now = nsh_core::time::now();
-                    let duration = Duration::from_secs_f32(motion::REDUCED_CROSSFADE_MS / 1000.0);
-                    let reduced_deadline = now + duration;
                     if deadline > reduced_deadline {
                         exit_deadline.set(Some(reduced_deadline));
-                        active_fade.set(None);
+                        if let Some(fade) = active_fade.take() {
+                            fade.cancel();
+                        }
                         let clearing = watched.clone();
                         let exit_deadline = Rc::clone(&exit_deadline);
                         active_fade.set(Some(owner.run(|| {
@@ -1310,11 +1313,20 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
                             })
                         })));
                     }
+                } else if entry_deadline
+                    .get()
+                    .is_some_and(|deadline| deadline > reduced_deadline)
+                {
+                    entry_deadline.set(Some(reduced_deadline));
+                    opacity.timing(1.0, motion::REDUCED_CROSSFADE_MS, motion::EASE_OUT);
                 }
             }
             return;
         }
-        active_fade.set(None);
+        if let Some(fade) = active_fade.take() {
+            fade.cancel();
+        }
+        entry_deadline.set(None);
         exit_deadline.set(None);
         opacity.stop();
         rise.stop();
@@ -1328,20 +1340,20 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
         } else {
             motion::ENTER_MS
         };
+        let entry_end = nsh_core::time::now() + Duration::from_millis(enter_ms as u64);
+        entry_deadline.set(Some(entry_end));
         if reduced {
             rise.set(0.0);
-            opacity.timing(1.0, enter_ms, motion::EASE_OUT);
         } else {
             rise.timing(0.0, motion::ENTER_MS, motion::EASE_OUT);
-            opacity.timing(1.0, enter_ms, motion::EASE_OUT);
         }
+        opacity.timing(1.0, enter_ms, motion::EASE_OUT);
         if held {
             return;
         }
         let clearing = watched.clone();
         let exit_deadline = Rc::clone(&exit_deadline);
-        let hold_deadline =
-            nsh_core::time::now() + Duration::from_millis(motion::STATUS_HOLD_MS + enter_ms as u64);
+        let hold_deadline = entry_end + Duration::from_millis(motion::STATUS_HOLD_MS);
         active_fade.set(Some(owner.run(|| {
             spawn(async move {
                 nsh_core::element::timer_until(hold_deadline).await;
@@ -1370,7 +1382,6 @@ pub fn banner_rule() -> impl IntoElement {
 
 // ─── the comparison's keys ────────────────────────────────────────────────
 
-/// Closing releases shortcuts while the resolved comparison remains visible in its exit.
 fn bind_compare_keys(state: &AppState) {
     for (key, delta) in [("j", 1isize), ("k", -1isize)] {
         let state = state.clone();
@@ -1662,6 +1673,26 @@ mod tests {
     }
 
     #[test]
+    fn a_held_status_stays_opaque_after_the_previous_hold_expires() {
+        let (sent, samples) = mpsc::channel();
+        let mut app = status_app(sent);
+        press_without_settling(&mut app, "id:status-start");
+        app.wait(Duration::from_millis(motion::ENTER_MS as u64 + 16))
+            .expect("advance into the first status hold");
+        press_without_settling(&mut app, "id:status-takeover");
+
+        app.wait(Duration::from_millis(motion::STATUS_HOLD_MS))
+            .expect("cross the old hold deadline");
+        app.wait(Duration::from_millis(motion::EXIT_MS as u64 + 16))
+            .expect("advance past the old fade");
+        let opacity = status_opacity(&mut app, &samples);
+        assert!(
+            app.screen().shows("Second status") && (opacity - 1.0).abs() < 0.001,
+            "the held replacement must stay fully visible, got opacity {opacity}"
+        );
+    }
+
+    #[test]
     fn reduced_motion_does_not_restart_a_fading_status() {
         let (sent, samples) = mpsc::channel();
         let mut app = status_app(sent);
@@ -1771,14 +1802,27 @@ mod tests {
                 MountItem::Animation(AnimationOp::Set { node, value: 0.0 }) if *node == rise
             )
         });
-        let reset_opacity = interrupted.iter().any(|item| matches!(
-            item,
-            MountItem::Animation(AnimationOp::Start { node, .. }
-                | AnimationOp::Set { node, .. } | AnimationOp::Stop { node }) if *node == opacity
-        ));
+        let opacity_ops: Vec<_> = interrupted
+            .iter()
+            .filter_map(|item| match item {
+                MountItem::Animation(
+                    op @ (AnimationOp::Start { node, .. }
+                    | AnimationOp::Set { node, .. }
+                    | AnimationOp::Stop { node }),
+                ) if *node == opacity => Some(op),
+                _ => None,
+            })
+            .collect();
         assert!(
-            snapped && !reset_opacity,
-            "reduced motion must snap the rise without restarting opacity"
+            snapped
+                && matches!(
+                    opacity_ops.as_slice(),
+                    [AnimationOp::Start {
+                        driver: Driver::Timing { to: 1.0, duration_ms, .. },
+                        ..
+                    }] if *duration_ms > 0.0 && *duration_ms <= motion::REDUCED_CROSSFADE_MS
+                ),
+            "reduced motion must snap the rise and retarget the live opacity within 100ms: {opacity_ops:?}"
         );
 
         let exit_started = || {

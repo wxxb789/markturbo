@@ -663,8 +663,8 @@ fn cancel_action(
                 .underline_offset(px(4.0))
                 .transition_colors()
                 .duration(move || duration.get())
-                .group_hover(|s| s.text_color(tokens::palette().ink).underline())
-                .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
+                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
         ),
         duration,
     )
@@ -693,7 +693,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
             .justify_center()
             .border(px(tokens::HAIRLINE))
             .border_color(move || tokens::palette().ink_caption)
-            .focus_visible(|s| s.border_color(tokens::palette().ink))
+            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
             .cursor_pointer()
             .focusable(true)
             .disabled(move || !is_open(&enabled))
@@ -2266,6 +2266,45 @@ mod tests {
         assert!(
             progress_kept && focus_kept,
             "progress kept: {progress_kept}; hold kept focus: {focus_kept}"
+        );
+    }
+
+    #[test]
+    fn a_theme_switch_keeps_consent_hold_progress_and_focus() {
+        use nsh_core::platform::ColorScheme;
+
+        let mut app = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduced motion");
+        app.set_environment("light appearance", |env| {
+            env.color_scheme = ColorScheme::Light;
+        })
+        .expect("light appearance");
+
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab");
+        }
+        app.press_key("space").expect("start the hold");
+        app.wait(Duration::from_millis(350))
+            .expect("the first third of the hold");
+        let progress_before = app.shows("1/3");
+
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("dark appearance");
+        let progress_kept = app.shows("1/3");
+        app.press_key("space")
+            .expect("the focused hold still owns Space");
+        let hold_responds = app.shows("Send for review?");
+
+        assert!(
+            progress_before && progress_kept && hold_responds,
+            "charged before theme change: {progress_before}; charge kept: {progress_kept}; hold responds: {hold_responds}"
         );
     }
 
