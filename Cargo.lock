@@ -3175,7 +3175,6 @@ dependencies = [
  "html5ever",
  "log",
  "markdown",
- "markup5ever_rcdom",
  "mt-app",
  "mt-core",
  "nsh-base",

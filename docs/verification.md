@@ -236,8 +236,12 @@ the app only where the behaviour itself needs a restart.
 - Goal 07, one case `revision_session`, one launch on `security-fixture.html` from
   argv, one Review→Revision chain (two loopback provider requests) over a
   two-hunk HTML fixture. `WEB_SECURITY`: the inline script changes a visible
-  marker without a prompt, attempts popup, top-level and frame navigation
-  and form submission, and leaves the marker in the one live app window.
+  marker without a prompt and attempts popup, top-level and frame navigation
+  and form submission. The first screenshot shows the attempt cells and the
+  pre-navigation cell; the second detects no fixture cells, consistent with a
+  browser block page. Exactly one app window remains, and the counted
+  loopback listeners record no contacts, including on the final HTTPS port.
+  Browser argument-string tests verify configuration only.
   Edit mode then hands the keyboard back. `DECISIONS`:
   Accept(h1), the executable script value after the CJK/emoji line, writes at
   once across the multibyte offsets; Reject(h2) reads `2 of 2 decided`;

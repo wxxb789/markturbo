@@ -1,16 +1,13 @@
-//! The WebView compatibility path for browser-only document semantics.
-//!
-//! The application supplies a static host. Only its sandboxed document frame
-//! contains author markup, with no file base or application bridge.
-
 use std::borrow::Cow;
 
 use html5ever::buffer_queue::BufferQueue;
+use html5ever::tendril::StrTendril;
 use html5ever::tokenizer::{
     Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerResult,
 };
+use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
 use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts};
-use markup5ever_rcdom::{Handle, RcDom};
+use html5ever::{Attribute, ExpandedName, QualName};
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
 use mt_core::{Block, BlockKind, DocType, Document};
 
@@ -60,23 +57,35 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
             )
         }
     };
-    let page = strip_resource_hints(&page);
-    let host = format!(
+    let host_prefix = format!(
         "<!doctype html><html><head>{host_csp}<meta charset=\"utf-8\">\
          <style>iframe{{position:fixed;inset:0;width:100%;height:100%;border:0}}</style>\
-         </head><body><iframe sandbox=\"allow-scripts\" srcdoc=\"{}\"></iframe></body></html>",
-        escape_srcdoc(&page),
+         </head><body><iframe sandbox=\"allow-scripts\" srcdoc=\"",
         host_csp = csp_meta(HOST_FRAME_SRC),
     );
-    if host.encode_utf16().count() > MAX_HOST_UTF16_UNITS {
-        format!(
+    const HOST_SUFFIX: &str = "\"></iframe></body></html>";
+    if host_exceeds_utf16_limit(&host_prefix, &page, HOST_SUFFIX) {
+        return format!(
             "<!doctype html><html><head>{}<meta charset=\"utf-8\"></head>\
              <body><p role=\"alert\">This preview is too large to display.</p></body></html>",
             csp_meta("")
-        )
-    } else {
-        host
+        );
     }
+    let page = strip_resource_hints(&page);
+    format!("{host_prefix}{}{HOST_SUFFIX}", escape_srcdoc(&page))
+}
+
+fn host_exceeds_utf16_limit(prefix: &str, page: &str, suffix: &str) -> bool {
+    let escaped_page_units = page
+        .chars()
+        .map(|character| match character {
+            '&' => 5,
+            '"' => 6,
+            other => other.len_utf16(),
+        })
+        .sum::<usize>();
+    prefix.encode_utf16().count() + escaped_page_units + suffix.encode_utf16().count()
+        > MAX_HOST_UTF16_UNITS
 }
 
 fn strip_resource_hints(page: &str) -> Cow<'_, str> {
@@ -137,7 +146,7 @@ fn queued_bytes(input: &mut BufferQueue) -> usize {
 }
 
 struct ResourceHintTokens {
-    tree: TreeBuilder<Handle, RcDom>,
+    tree: TreeBuilder<usize, ResourceHintSink>,
     candidate: Option<usize>,
     hint_start: Option<usize>,
 }
@@ -146,7 +155,7 @@ impl Default for ResourceHintTokens {
     fn default() -> Self {
         Self {
             tree: TreeBuilder::new(
-                RcDom::default(),
+                ResourceHintSink::default(),
                 TreeBuilderOpts {
                     iframe_srcdoc: true,
                     ..TreeBuilderOpts::default()
@@ -159,7 +168,7 @@ impl Default for ResourceHintTokens {
 }
 
 impl TokenSink for ResourceHintTokens {
-    type Handle = Option<Handle>;
+    type Handle = Option<usize>;
 
     fn process_token(&mut self, token: Token, line: u64) -> TokenSinkResult<Self::Handle> {
         if !matches!(token, Token::ParseError(_)) {
@@ -183,6 +192,124 @@ impl TokenSink for ResourceHintTokens {
     fn adjusted_current_node_present_but_not_in_html_namespace(&self) -> bool {
         self.tree
             .adjusted_current_node_present_but_not_in_html_namespace()
+    }
+}
+
+#[derive(Default)]
+struct ResourceNode {
+    name: Option<QualName>,
+    template_contents: Option<usize>,
+    mathml_annotation_xml_integration_point: bool,
+}
+
+struct ResourceHintSink {
+    nodes: Vec<ResourceNode>,
+}
+
+impl Default for ResourceHintSink {
+    fn default() -> Self {
+        Self {
+            nodes: vec![ResourceNode::default()],
+        }
+    }
+}
+
+impl ResourceHintSink {
+    fn push_node(&mut self, node: ResourceNode) -> usize {
+        let id = self.nodes.len();
+        self.nodes.push(node);
+        id
+    }
+}
+
+impl TreeSink for ResourceHintSink {
+    type Handle = usize;
+    type Output = ();
+
+    fn finish(self) {}
+
+    fn parse_error(&mut self, _message: Cow<'static, str>) {}
+
+    fn get_document(&mut self) -> Self::Handle {
+        0
+    }
+
+    fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> ExpandedName<'a> {
+        self.nodes[*target]
+            .name
+            .as_ref()
+            .expect("element names are only requested for elements")
+            .expanded()
+    }
+
+    fn create_element(
+        &mut self,
+        name: QualName,
+        _attrs: Vec<Attribute>,
+        flags: ElementFlags,
+    ) -> Self::Handle {
+        let id = self.push_node(ResourceNode {
+            name: Some(name),
+            mathml_annotation_xml_integration_point: flags.mathml_annotation_xml_integration_point,
+            ..ResourceNode::default()
+        });
+        if flags.template {
+            let contents = self.push_node(ResourceNode::default());
+            self.nodes[id].template_contents = Some(contents);
+        }
+        id
+    }
+
+    fn create_comment(&mut self, _text: StrTendril) -> Self::Handle {
+        self.push_node(ResourceNode::default())
+    }
+
+    fn create_pi(&mut self, _target: StrTendril, _data: StrTendril) -> Self::Handle {
+        self.push_node(ResourceNode::default())
+    }
+
+    // Token decisions use element metadata only; structural mutations never affect parsing.
+    fn append(&mut self, _parent: &Self::Handle, _child: NodeOrText<Self::Handle>) {}
+
+    fn append_based_on_parent_node(
+        &mut self,
+        _element: &Self::Handle,
+        _prev_element: &Self::Handle,
+        _child: NodeOrText<Self::Handle>,
+    ) {
+    }
+
+    fn append_doctype_to_document(
+        &mut self,
+        _name: StrTendril,
+        _public_id: StrTendril,
+        _system_id: StrTendril,
+    ) {
+    }
+
+    fn get_template_contents(&mut self, target: &Self::Handle) -> Self::Handle {
+        self.nodes[*target]
+            .template_contents
+            .expect("template contents are created with their element")
+    }
+
+    fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
+        x == y
+    }
+
+    fn set_quirks_mode(&mut self, _mode: QuirksMode) {}
+
+    fn append_before_sibling(&mut self, _sibling: &Self::Handle, _child: NodeOrText<Self::Handle>) {
+    }
+
+    fn add_attrs_if_missing(&mut self, _target: &Self::Handle, _attrs: Vec<Attribute>) {}
+
+    fn remove_from_parent(&mut self, _target: &Self::Handle) {}
+
+    fn reparent_children(&mut self, _node: &Self::Handle, _new_parent: &Self::Handle) {}
+
+    fn is_mathml_annotation_xml_integration_point(&self, target: &Self::Handle) -> bool {
+        self.nodes[*target].mathml_annotation_xml_integration_point
     }
 }
 
@@ -340,7 +467,6 @@ fn html_comment_end(comment: &str) -> Option<&str> {
     Some(rest)
 }
 
-/// Recognize only ordinary opening tags and attributes, not HTML error recovery.
 fn opening_tag_end<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     let source = source.strip_prefix('<')?;
     if !source.get(..name.len())?.eq_ignore_ascii_case(name) {
@@ -389,7 +515,6 @@ fn opening_tag_end<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     }
 }
 
-/// The original Light and Dark reading palettes, independent of UI toolkit.
 fn css_variables(dark: bool) -> &'static str {
     if dark {
         r#":root {
@@ -432,7 +557,6 @@ fn css_variables(dark: bool) -> &'static str {
     }
 }
 
-/// Render an ordinary Markdown document to HTML.
 fn render_markdown_body(doc: &Document, registry: &RendererRegistry) -> String {
     let mut out = String::new();
     let mut markdown_run = String::new();
@@ -463,22 +587,21 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
     let mut options = markdown::Options {
         parse: mt_core::document::doc::parse_options(doc.doc_type()),
         compile: markdown::CompileOptions {
-            // The source is a local file the user opened; raw HTML in it is
-            // authored content, and blocking it would break ordinary
-            // documents. The frame policy governs scripts and loads.
+            // Author HTML is allowed; the sandboxed frame policy governs scripts and loads.
             allow_dangerous_html: true,
             allow_dangerous_protocol: false,
             ..markdown::CompileOptions::default()
         },
     };
-    let rendered = preserve_inline_scripts(run, &options.parse).and_then(|(source, scripts)| {
-        if !scripts.is_empty() {
-            options.parse.constructs.html_text = true;
-        }
-        let html = markdown::to_html_with_options(source.as_ref(), &options)
-            .map_err(|message| message.reason)?;
-        restore_inline_scripts(html, scripts)
-    });
+    let rendered =
+        preserve_inline_scripts(run, &mut options.parse).and_then(|(source, scripts)| {
+            if !scripts.is_empty() {
+                options.parse.constructs.html_text = true;
+            }
+            let html = markdown::to_html_with_options(source.as_ref(), &options)
+                .map_err(|message| message.reason)?;
+            restore_inline_scripts(html, scripts)
+        });
     match rendered {
         Ok(html) => out.push_str(&html),
         Err(message) => out.push_str(&diagnostic_html("markdown", &message, run)),
@@ -487,10 +610,11 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
 }
 
 type ScriptPlaceholders = Vec<(String, String)>;
+type InlineScriptRange = (usize, usize, String);
 
 fn preserve_inline_scripts<'a>(
     source: &'a str,
-    parse_options: &markdown::ParseOptions,
+    parse_options: &mut markdown::ParseOptions,
 ) -> Result<(Cow<'a, str>, ScriptPlaceholders), String> {
     if !source
         .as_bytes()
@@ -505,8 +629,8 @@ fn preserve_inline_scripts<'a>(
     };
     let mut ranges = Vec::new();
     let mut jsx_names = Vec::new();
-    collect_inline_script_ranges(&ast, source, &mut ranges, &mut jsx_names);
-    ranges.sort_unstable_by_key(|(start, _)| *start);
+    collect_inline_script_ranges(&ast, source, parse_options, &mut ranges, &mut jsx_names)?;
+    ranges.sort_unstable_by_key(|(start, _, _)| *start);
     if ranges.is_empty() {
         return Ok((Cow::Borrowed(source), Vec::new()));
     }
@@ -517,7 +641,7 @@ fn preserve_inline_scripts<'a>(
     jsx_names.sort_unstable();
     let mut jsx_names = jsx_names.into_iter().peekable();
     let mut cursor = 0;
-    for (index, (start, end)) in ranges.into_iter().enumerate() {
+    for (index, (start, end, script)) in ranges.into_iter().enumerate() {
         if start < cursor {
             continue;
         }
@@ -537,7 +661,7 @@ fn preserve_inline_scripts<'a>(
         };
         let marker = format!("{guard}{marker_prefix}:{index}-->");
         protected.push_str(&marker);
-        scripts.push((marker, source[start..end].to_string()));
+        scripts.push((marker, script));
         cursor = end;
     }
     copy_mdx_text(&mut protected, source, cursor, source.len(), &mut jsx_names);
@@ -579,9 +703,10 @@ fn random_script_marker_prefix() -> Result<String, String> {
 fn collect_inline_script_ranges(
     node: &markdown::mdast::Node,
     source: &str,
-    ranges: &mut Vec<(usize, usize)>,
+    parse_options: &mut markdown::ParseOptions,
+    ranges: &mut Vec<InlineScriptRange>,
     jsx_names: &mut Vec<usize>,
-) {
+) -> Result<(), String> {
     use markdown::mdast::Node;
     if let Node::MdxJsxTextElement(jsx) = node
         && let Some(position) = &jsx.position
@@ -589,8 +714,8 @@ fn collect_inline_script_ranges(
     {
         let start = position.start.offset;
         if jsx.name.as_deref() == Some("script") && !raw.ends_with("/>") {
-            ranges.push((start, position.end.offset));
-            return;
+            ranges.push((start, position.end.offset, raw.to_string()));
+            return Ok(());
         }
         jsx_names.push(start + 1);
         if !raw.ends_with("/>")
@@ -604,6 +729,13 @@ fn collect_inline_script_ranges(
         node,
         Node::Paragraph(_) | Node::Heading(_) | Node::TableCell(_)
     ) {
+        let paragraph_start = match node {
+            Node::Paragraph(paragraph) => paragraph
+                .position
+                .as_ref()
+                .map(|position| position.start.offset),
+            _ => None,
+        };
         let mut tags = Vec::new();
         collect_html_tags(node, &mut tags);
         tags.sort_unstable_by_key(|(start, _, _)| *start);
@@ -615,16 +747,63 @@ fn collect_inline_script_ranges(
             } else if is_script_tag(tag, true)
                 && let Some(start) = opening.take()
             {
-                ranges.push((start, end));
+                let raw = &source[start..end];
+                let script = if raw.contains('\n') {
+                    parsed_script_value(source, paragraph_start, start, end, parse_options)?
+                } else {
+                    raw.to_string()
+                };
+                ranges.push((start, end, script));
             }
         }
     }
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_inline_script_ranges(child, source, ranges, jsx_names);
+            collect_inline_script_ranges(child, source, parse_options, ranges, jsx_names)?;
         }
     }
+    Ok(())
+}
+
+fn parsed_script_value(
+    source: &str,
+    paragraph_start: Option<usize>,
+    start: usize,
+    end: usize,
+    parse_options: &mut markdown::ParseOptions,
+) -> Result<String, String> {
+    let prefix = paragraph_start.map_or("", |offset| {
+        let line_start = source[..offset]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        &source[line_start..offset]
+    });
+    let mut projection = String::with_capacity(prefix.len() + end - start);
+    projection.push_str(prefix);
+    projection.push_str(&source[start..end]);
+    let html_flow = parse_options.constructs.html_flow;
+    parse_options.constructs.html_flow = true;
+    let ast = markdown::to_mdast(&projection, parse_options);
+    parse_options.constructs.html_flow = html_flow;
+    let ast = ast.map_err(|message| message.reason)?;
+    let Some(html) = first_html_node(&ast) else {
+        return Err("an inline script was not recovered from parsed HTML".into());
+    };
+    let Some(position) = &html.position else {
+        return Err("an inline script had no parsed HTML position".into());
+    };
+    if position.end.offset != projection.len() {
+        return Err("parsed HTML ended before the inline script".into());
+    }
+    Ok(html.value.clone())
+}
+
+fn first_html_node(node: &markdown::mdast::Node) -> Option<&markdown::mdast::Html> {
+    if let markdown::mdast::Node::Html(html) = node {
+        return Some(html);
+    }
+    node.children()?.iter().find_map(first_html_node)
 }
 
 fn collect_html_tags<'a>(node: &'a markdown::mdast::Node, tags: &mut Vec<(usize, usize, &'a str)>) {
@@ -680,7 +859,6 @@ fn restore_inline_scripts(mut html: String, scripts: ScriptPlaceholders) -> Resu
     Ok(html)
 }
 
-/// Render a diagram/math block, or a diagnostic with the source preserved.
 fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> String {
     match registry.render(id, &block.content) {
         RenderOutcome::Svg(markup) => {
@@ -690,9 +868,6 @@ fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> S
     }
 }
 
-/// Render an MDX document.
-///
-/// Raw script elements reach the frame; other JSX uses the shared placeholders.
 fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
     let mut out = String::new();
     let mut markdown_run = String::new();
@@ -745,7 +920,6 @@ fn mdx_placeholder(kind: mt_core::document::block::MdxKind, source: &str) -> Str
     )
 }
 
-/// An inline diagnostic that always keeps the original source visible.
 fn diagnostic_html(source: &str, message: &str, original: &str) -> String {
     let original = if original.trim().is_empty() {
         String::new()
@@ -774,10 +948,6 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// The document stylesheet.
-///
-/// Colors consume the light/dark variables above; translucent fallbacks keep
-/// individual rules legible if document-authored styles override a variable.
 const STYLE: &str = r#"
 body { font-family: var(--body-font, -apple-system, "Segoe UI", system-ui, sans-serif);
        line-height: var(--body-line-height, 1.6);
@@ -1026,6 +1196,26 @@ mod tests {
     }
 
     #[test]
+    fn markdown_inline_scripts_drop_blockquote_and_list_container_prefixes() {
+        let expected = "<script>\nvoid 0;\n</script>";
+        let mut failures = Vec::new();
+        for source in [
+            "> Note <script>\n> void 0;\n> </script>",
+            "- Note <script>\n  void 0;\n  </script>",
+        ] {
+            let html = page(&md(source), &registry(), false);
+            let count = html.matches(expected).count();
+            if count != 1 {
+                failures.push((source, count));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "script restoration failed: {failures:?}"
+        );
+    }
+
+    #[test]
     fn markdown_heading_and_table_scripts_keep_their_raw_text() {
         let script = r#"<script>document.body.dataset.x="A & B"</script>"#;
         let registry = registry();
@@ -1201,6 +1391,31 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn misnested_tables_near_the_host_limit_filter_within_a_bounded_time() {
+        let trailing = "</table><link rel=preload>";
+        let target_len = MAX_HOST_UTF16_UNITS - 1;
+        let mut source = String::with_capacity(target_len);
+        source.push_str("<table>");
+        while source.len() + "<p></p>".len() + trailing.len() <= target_len {
+            source.push_str("<p></p>");
+        }
+        let fill = target_len - source.len() - trailing.len();
+        source.push_str(&"x".repeat(fill));
+        source.push_str(trailing);
+        assert_eq!(source.len(), target_len);
+
+        let started = std::time::Instant::now();
+        std::hint::black_box(strip_resource_hints(&source));
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "filter took {elapsed:?} for {} UTF-16 units",
+            source.encode_utf16().count()
+        );
     }
 
     #[test]

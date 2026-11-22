@@ -71,10 +71,7 @@ fn set_webview_environment(name: &str, value: &str) {
 #[cfg(any(target_os = "windows", test))]
 const WEBVIEW2_ARGUMENTS_ENV: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 
-// Fail name lookups, including the `.invalid` proxy; route HTTP(S) through that
-// unreachable host; remove Chromium's implicit loopback bypass; and prevent
-// WebRTC from using non-proxied UDP. The reserved host avoids assuming a local
-// port is closed.
+// WebView2 reads these browser arguments when its environment is created.
 #[cfg(any(target_os = "windows", test))]
 const WEBVIEW2_NETWORK_BLOCK_ARGUMENTS: &str = concat!(
     "--host-resolver-rules=\"MAP * ^NOTFOUND\" ",
@@ -93,8 +90,6 @@ fn with_webview_network_block<T>(
 }
 
 fn app_capabilities() -> Capabilities {
-    // Keep the standalone app's existing capabilities while declaring no
-    // external hosts for engine-mediated WebView loads.
     let mut capabilities = Capabilities::all();
     capabilities.webview = Some(Vec::new());
     capabilities

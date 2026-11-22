@@ -97,13 +97,8 @@ INTEGRITY_NAMES = {
 #   editor's own Select All + Copy, which writes the exact text
 #   (system.rs `set_clipboard_text`). SetFocus supports inputs and focusable
 #   views (access/uia.rs and access.rs).
-# * System alerts (`nsh::alert_dialog()`: the Overwrite confirmation in
-#   `state.rs`) are not in the UIA tree. They are drawn inside
-#   the surface as hosted items (system.rs), and the UIA tree walks views only.
-#   While one shows, it owns keyboard input. Enter presses its selected button,
-#   initially the last Default-styled button, else the first.
-#   `confirm_system_alert` answers with Enter; each caller proves the
-#   confirmed effect, so a cancelling Enter fails its wait.
+# * UIA cannot inspect system alerts; Enter selects the last Default-styled
+#   button or the first, so callers verify the effect after `confirm_system_alert`.
 SYSTEM_ALERT_SETTLE_SECONDS = 0.5
 # How long one Enter's effect is awaited before the alert is answered again.
 SYSTEM_ALERT_ANSWER_SECONDS = 1.0
@@ -1280,7 +1275,6 @@ class Win32:
         return int(info.hwndFocus or 0)
 
     def foreground_window(self) -> int:
-        """The visible top-level window receiving native input."""
         return int(self.user32.GetForegroundWindow() or 0)
 
     def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
@@ -1313,7 +1307,6 @@ class Win32:
         return dialogs
 
     def visible_top_level_windows(self, process_ids: tuple[int, ...]) -> tuple[int, ...]:
-        """Visible desktop windows belonging to one app's owned process job."""
         owned_processes = frozenset(process_id for process_id in process_ids if process_id > 0)
         if not owned_processes:
             raise HarnessFailure("PROCESS_JOB_EMPTY")

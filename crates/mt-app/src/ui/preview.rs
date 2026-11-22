@@ -8,11 +8,6 @@
 //! places whichever the pane asks for; [`is_open`] tells the shell whether the
 //! field is showing a preview at all. [`web`] is the compatibility pane.
 //!
-//! The document lane owns: Martian Grotesk 16/27 for the preview body, the
-//! preview's diagram and math rendering (ported here from the old `app.rs`,
-//! which is why the helpers below already work), and the web pane's
-//! `web_dirty` deferral (never mutate a WebView from render).
-//!
 //! The preview body uses [`tokens::FONT_UI`], which leads with the Regular
 //! instance's legacy family so DirectWrite finds the registered face.
 //! The Windows editor probe (`document::tests::the_editor_draws_the_registered_source_font`)
@@ -20,12 +15,6 @@
 //! 884 for both `FONT_UI` and the registered Regular face, 755 for a missing
 //! family, and 727 for DengXian.
 //!
-//! The web pane never navigates from render: its [`WebDocument`] watches the
-//! document text and the appearance, marks the page dirty and builds it from
-//! an effect, whose write the web view applies at the next
-//! commit. A pane that is not on screen is not there to watch, so a hidden tab
-//! is never navigated behind the user's back.
-
 use std::sync::LazyLock;
 
 use mt_core::{
@@ -98,9 +87,7 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
                             .is_some_and(|tab| matches!(tab.pane.get(), Pane::SplitWeb))
                     }
                 },
-                // Keyed by the active tab, as the column and the native
-                // preview are: switching between two SplitWeb tabs remounts
-                // the pane on the new document.
+                // Re-key on tab switch so the WebView binds to the new document.
                 move || {
                     let tabs_state = web_state.clone();
                     let pane_state = web_state.clone();
@@ -117,8 +104,6 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
         .into_element()
 }
 
-/// The web compatibility pane: the document as a page, in the column (Web)
-/// or in the field (SplitWeb).
 pub fn web(state: AppState, language: Language) -> AnyElement {
     let Some(tab) = state.active_tab() else {
         return quiet_label(move || SharedString::from(i18n::t(language, Key::ModeWeb)))
@@ -267,11 +252,7 @@ struct Page {
 }
 
 impl WebDocument {
-    /// Watches the tab's text and the appearance, and rebuilds the page from
-    /// an effect when either changes: the write to
-    /// [`Self::html`] is what marks it dirty, and the web view applies it after
-    /// the commit that sees the change, so a WebView is never navigated from
-    /// render.
+    /// Writing from the effect defers WebView navigation until after render.
     fn new(tab: Tab) -> WebDocument {
         let html = signal(String::new());
         let written = signal(None::<Page>);
@@ -431,7 +412,6 @@ mod tests {
             .child(rendered(state, Language::English))
     }
 
-    /// Two documents in SplitWeb and a button that switches to the first.
     #[component]
     fn SplitWebProbe() -> impl IntoElement {
         let state = AppState::new();
@@ -645,8 +625,6 @@ mod tests {
         assert!(texts(&app).contains("Release plan"), "{}", dump(&app));
     }
 
-    /// Switching straight between two SplitWeb tabs rebinds the field's web
-    /// pane to the new document without mounting a second view.
     #[test]
     fn the_field_web_pane_follows_the_active_tab() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<SplitWebProbe>()))

@@ -1834,8 +1834,6 @@ impl AppState {
         });
     }
 
-    /// Replace the tab's buffer with the file as it is on disk, which the
-    /// tab now tracks.
     fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
@@ -1847,8 +1845,6 @@ impl AppState {
         self.recovery_tracks.borrow_mut().remove(&tab.id);
     }
 
-    /// Write model-produced text (a translation, a Revision decision) into
-    /// the tab as one unsaved edit.
     fn write_model_text(&self, tab: &Tab, text: String) {
         tab.text.set(SharedString::from(text));
         tab.dirty.set(true);
@@ -3782,7 +3778,6 @@ mod tests {
 
     const SOURCE: &str = "compiles but no check\n";
 
-    /// What the probe saw after the accept and undo.
     type Outcome = (String, String);
 
     static OUTCOME: std::sync::Mutex<Option<Outcome>> = std::sync::Mutex::new(None);
@@ -3791,7 +3786,6 @@ mod tests {
         tab.text.get().to_string()
     }
 
-    /// Accepts, then undoes, one Revision change, as the hunk card does.
     #[component]
     fn RevisionWriteProbe() -> impl IntoElement {
         let (state, tab) = proposed();
@@ -4081,8 +4075,6 @@ mod tests {
 
     static REPLACED: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
-    /// Lands a translation, then takes the disk version (the conflict's
-    /// `Use disk version`).
     #[component]
     fn ReplaceProbe() -> impl IntoElement {
         let dir = tempfile::tempdir().expect("a temp dir");

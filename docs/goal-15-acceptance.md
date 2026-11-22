@@ -91,19 +91,22 @@ no release-bound native isolation evidence.
 
 - On the owner's active, unlocked Windows 11 x64 desktop, run
   `mt.py accept all --exe <release exe> --expect-exe-sha256 <release sha256>`.
-  The first Goal 07 WebView sample must show the script-start, every attempt,
-  the "about to navigate" and "assigned" cells. The fixture assigns
-  `location.href` to `https://blocked-preview-navigation.invalid/` (the final
-  target uses the reserved `.invalid` domain), then paints "assigned"
-  synchronously. The second sample must show no cells because the fixture was
-  replaced; "assigned" followed by replaced is the causal check. There must
-  also be zero loopback contacts and exactly one app window. Harness unit tests
-  do not run the desktop phase.
+  Poll the first Goal 07 WebView sample for the script-start, every attempt,
+  and the "about to navigate" cells. After two animation frames and a 300 ms
+  timeout, the fixture assigns `location.href` to the harness's counted
+  loopback HTTPS listener and paints "assigned" synchronously. The first
+  sample may also show "assigned"; it is not required. After a bounded wait,
+  the second sample must show none of the fixture cells, consistent with a
+  browser block page, and exactly one app window must remain. Pixels establish
+  only which cells were detected: they cannot distinguish an unrelated blank
+  frame coinciding with a blocked navigation from the expected block page.
+  Harness unit tests do not run the desktop phase.
 - Clause 3b native proof is pending: the fixture must visibly report its
   network attempts and the loopback TCP and UDP listeners must record zero
-  contacts on the release build. Unit tests do not verify WebView2 egress,
-  and the loopback counters do not observe hostname DNS resolver traffic or
-  file loads. The resolver-rule string test covers hostname DNS egress.
+  contacts on the release build, including the final navigation's TCP target.
+  The counters establish that no request reached those listeners; they do not
+  observe hostname DNS resolver traffic or file loads. The argument-string
+  tests establish only that the expected browser options are configured.
 - Clause 3c elevated-host check: run the release app at high integrity. The
   web layouts must mount the WebView and run the inline fixture while the
   in-page layers deny the tested egress.

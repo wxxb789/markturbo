@@ -74,7 +74,6 @@ fn compatibility_layouts_are_progressively_disclosed() {
         .expect("the compatibility layout is hidden again");
     assert!(!app.shows("Web preview"), "the disclosed layout stayed");
 
-    // Reopened, the disclosed layout mounts the document in the WebView.
     app.press("id:title-settings")
         .expect("open the glyph's menu");
     app.press("id:title-menu-web")

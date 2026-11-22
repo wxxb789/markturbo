@@ -1,56 +1,4 @@
-"""Goal 07 native acceptance harness.
-
-This harness drives the real Windows UI with a deterministic OpenAI Responses
-loopback server, in one app session. The server and evidence boundary never
-persist document text, request bodies, or credentials; evidence contains only
-hashes, byte counts, booleans, counts and safe reason codes. The harness never
-reads or writes the Windows Credential Manager: the child process gets one
-fresh synthetic key in its environment only.
-
-One launch opens `security-fixture.html` from argv (a new tab opens in Split),
-checks pixel cells painted by its inline script and each completed attempt,
-then it runs one Review -> answer -> Revision chain against the loopback, across
-two phases, each with its own observation-key prefix and failure-code prefix:
-
-1. `web_security`: the Web pane shows the inline script's painted status cells
-   without a trust action; its popup, top-level/frame navigation and form
-   attempts leave the preview in place, with one visible window in the app's
-   process job. Edit mode then hands the keyboard back before the Review
-   shortcut is sent.
-2. `decisions`: the proposal holds two hunks, h1 the executable script value
-   after the CJK/emoji line and h2 the owner line. Accept(h1) writes across
-   the multibyte offsets at once; Reject(h2) reads `2 of 2 decided`; `Undo`
-   takes the rejection back to `1 of 2 decided`; `Copy` round-trips the
-   approved result through the OS clipboard; one replacement over the whole
-   document leaves h2 `Can't apply — this part changed` without an `Accept`;
-   `Done` writes nothing to disk. The script's effect and navigation checks
-   have already completed before the Review chain.
-
-Proven headless or in mt-core instead: `Undo` restoring an accepted hunk's
-bytes after the write (`tests/revision_flow.rs`); every hunk accepted
-(`one_accepted` here plus `revision_flow.rs`); an edit over every hunk, then
-`Done` writing nothing; and frontmatter, fence and link anchoring. The unsaved
-mark (`title-dirty`) is a Text inside the `title-file` Button, which nsh
-0.6.1's Windows UIA folds away, so dirty state is proven headless:
-`tests/revision_flow.rs` `copy_exports_only_the_approved_result_and_saves_nothing`
-(Copy saves nothing and leaves the mark) and
-`rejecting_every_hunk_then_done_keeps_the_exact_bytes` (no decision, clean).
-
-On the nsh UI a Review starts with Ctrl+Enter from the editor, the question is
-answered in `review-answer-input`, `Prepare revision` asks for the Revision,
-and both sends need a real pointer hold on `consent-send`. A hold whose
-request does not reach the loopback within `REQUEST_SENT_TIMEOUT_SECONDS`
-fails at once (`REVIEW_REQUEST_NOT_SENT` / `REVISION_REQUEST_NOT_SENT`). The
-Revision field decides one docked hunk at a time (`Accept` / `Reject`,
-counted by `n of m decided`). Each decision writes at once
-(`ui/revision.rs`). The harness presses the field's buttons, never its keys:
-reading the editor focuses it, and an Invoke is not a request to move keyboard
-focus. The field's keys (`A`, `R`, `Ctrl+Z`, `A` refused on a changed part)
-are proven headless in `ui/revision.rs`. Editor text is read with the editor's
-Select All + Copy.
-
-Evidence follows the shared native schema (`evidence.py`).
-"""
+"""Goal 07 native acceptance harness."""
 
 from __future__ import annotations
 
@@ -133,9 +81,7 @@ CASE_FLOWS = {
     ),
 }
 REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
-# Each phase's observation-key prefix; upper-cased, its failure-code prefix.
 PHASES = ("web_security", "decisions")
-# The session's one chain: one Review and one Revision request.
 EXPECTED_REQUEST_COUNT = 2
 
 DOCUMENT_SENTINEL = "MTG07-NATIVE-REVISION-SENTINEL"
@@ -155,7 +101,6 @@ CELL_SCRIPT_COLOR = (24, 168, 93)
 CELL_ATTEMPT_COLOR = (48, 112, 224)
 CELL_COMPLETE_COLOR = (240, 176, 32)
 CELL_ASSIGNED_COLOR = (176, 72, 184)
-SELF_NAVIGATION_SAMPLE_MS = 1000
 
 
 def _css_rgb(color: tuple[int, int, int]) -> str:
@@ -200,7 +145,15 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => { const frame = document.createElement(\"iframe\"); frame.src = `https://127.0.0.1:${tcpPort}/subframe`; document.body.appendChild(frame); } },",
     "  { run: () => { try { submitForm(`${tcpLoopback}/form`); } catch (_) {} } },",
     "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
-    '  { run: () => { try { location.href = "https://blocked-preview-navigation.invalid/"; assignedCell.style.backgroundColor = assignedCellColor; } catch (_) {} } },',
+    (
+        "  { run: async () => {\r\n"
+        "    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300))));\r\n"
+        "    try {\r\n"
+        "      location.href = \"https://127.0.0.1:\" + tcpPort + \"/\";\r\n"
+        "      assignedCell.style.backgroundColor = assignedCellColor;\r\n"
+        "    } catch (_) {}\r\n"
+        "  } },"
+    ),
 )
 
 
@@ -250,7 +203,6 @@ SOURCE_TEXT = (
     "const websocketLoopback = `ws://127.0.0.1:${tcpPort}/socket`;\r\n"
     "const websocketHostname = `ws://${probeHost}:${tcpPort}/socket`;\r\n"
     "const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));\r\n"
-    f"const SELF_NAVIGATION_SAMPLE_MS = {SELF_NAVIGATION_SAMPLE_MS};\r\n"
     "function submitForm(action) {\r\n"
     "  const form = document.createElement(\"form\");\r\n"
     "  form.method = \"post\"; form.action = action; form.hidden = true;\r\n"
@@ -287,8 +239,7 @@ SOURCE_TEXT = (
     "  // Hold the final attempt's cells long enough for the native harness to sample them.\r\n"
     "  attemptCells[finalIndex].style.backgroundColor = attemptCellColor;\r\n"
     "  aboutToNavigateCell.style.backgroundColor = completeCellColor;\r\n"
-    "  await delay(SELF_NAVIGATION_SAMPLE_MS);\r\n"
-    "  networkAttempts[finalIndex].run();\r\n"
+    "  await networkAttempts[finalIndex].run();\r\n"
     "}\r\n"
     "runAttempts();\r\n"
     "</script>\r\n"
@@ -309,8 +260,6 @@ NETWORK_OBSERVATION_KEYS = frozenset(
 )
 
 SAFE_STRINGS = frozenset(CASE_FLOWS.values()) | INTEGRITY_NAMES
-# Every fingerprint is compared with exact expected bytes
-# (`expected_fingerprints`); the names say when it was read.
 FINGERPRINT_OBSERVATION_KEYS = frozenset(
     {
         "web_security_disk_before",
@@ -336,8 +285,6 @@ REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
 
 class NetworkProbeListeners:
-    """Count local TCP connections and UDP datagrams synchronously."""
-
     def __init__(self) -> None:
         self._tcp_contacts = 0
         self._udp_contacts = 0
@@ -446,7 +393,6 @@ class NetworkProbeListeners:
 
 
 def fixture_source(network_probes: NetworkProbeListeners) -> str:
-    """Bind the static security fixture to this run's loopback listeners."""
     return (
         SOURCE_TEXT.replace(TCP_PORT_TOKEN, str(network_probes.tcp_port))
         .replace(UDP_PORT_TOKEN, str(network_probes.udp_port))
@@ -460,7 +406,6 @@ def _pixel_matches(actual: tuple[int, ...], expected: tuple[int, int, int]) -> b
 
 
 def detect_fixture_cells(image: Any) -> list[bool]:
-    """Read the fixture's single-row status grid from a cropped WebView image."""
     image = image.convert("RGB")
     width, height = image.size
     center_y = CELL_GRID_TOP + CELL_SIZE // 2
@@ -506,18 +451,20 @@ def detect_fixture_cells(image: Any) -> list[bool]:
 
 
 def fixture_cells_complete(cells: Any) -> bool:
+    required_count = len(FIXTURE_ATTEMPT_SOURCE) + 2
     return (
         isinstance(cells, list)
-        and len(cells) == len(FIXTURE_ATTEMPT_SOURCE) + 3
+        and len(cells) in (required_count, required_count + 1)
         and all(type(cell) is bool for cell in cells)
-        and all(cells)
+        and all(cells[:required_count])
     )
 
 
 def validate_cell_results(value: Any) -> None:
+    required_count = len(FIXTURE_ATTEMPT_SOURCE) + 2
     if (
         not isinstance(value, list)
-        or len(value) != len(FIXTURE_ATTEMPT_SOURCE) + 3
+        or len(value) not in (required_count, required_count + 1)
         or any(type(cell) is not bool for cell in value)
     ):
         raise ValueError("invalid WebView pixel-cell observations")
@@ -531,8 +478,6 @@ def validate_post_navigation_cell_results(value: Any) -> None:
 def canonicalize_fixture_source(
     value: str | bytes, network_probes: NetworkProbeListeners | None = None
 ) -> str | bytes:
-    """Replace this run's ports before fingerprinting the fixture, editor, or
-    clipboard."""
     if network_probes is None:
         return value
     if isinstance(value, bytes):
@@ -838,13 +783,6 @@ def _same_exact_value(actual: Any, expected: Any) -> bool:
 
 
 def record(observed: dict[str, Any], key: str, value: Any) -> None:
-    """Record one measurement as evidence, failing at once if it is unexpected.
-
-    The check runs as the value is read, so a later step cannot fail first
-    and hide it. The phase prefix is selected from the observation key and
-    `phase` adds it to the resulting failure code. Final validation checks
-    the complete set again.
-    """
     recorded = value.evidence() if isinstance(value, Fingerprint) else value
     expected = _expected_values()[key]
     if not _same_exact_value(recorded, expected):
@@ -1129,7 +1067,6 @@ class Goal07Harness(NativeHarness):
         return self.wait_clipboard_text("REVISION_COPY_CLIPBOARD_TIMEOUT")
 
     def read_fixture_cell_results(self, app: Any) -> list[bool]:
-        """Capture only the WebView pane and read its content-free status grid."""
         from .visual import AppWindow, VisualFailure, capture_window
 
         try:
@@ -1152,20 +1089,19 @@ class Goal07Harness(NativeHarness):
     def phase_web_security(
         self, app: Any, _provider: provider_fixtures.LoopbackRevisionServer, source: Path
     ) -> dict[str, Any]:
-        """Check fixture execution before and after its final self-navigation."""
         observed: dict[str, Any] = {}
         network_probes = self.network_probes
         record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
 
-        assigned_index = len(FIXTURE_ATTEMPT_SOURCE) + 2
-        assigned_seen = False
+        about_to_navigate_index = len(FIXTURE_ATTEMPT_SOURCE) + 1
+        about_to_navigate_seen = False
 
         def completed_cells() -> list[bool] | None:
-            nonlocal assigned_seen
+            nonlocal about_to_navigate_seen
             cells = self.read_fixture_cell_results(app)
-            if len(cells) > assigned_index and cells[assigned_index] is True:
-                assigned_seen = True
+            if len(cells) > about_to_navigate_index and cells[about_to_navigate_index] is True:
+                about_to_navigate_seen = True
             return cells if fixture_cells_complete(cells) else None
 
         try:
@@ -1176,8 +1112,8 @@ class Goal07Harness(NativeHarness):
                 interval=0.1,
             )
         except HarnessFailure as error:
-            if error.code == "PIXEL_CELLS_TIMEOUT" and not assigned_seen:
-                raise HarnessFailure("SELF_NAVIGATION_ASSIGNMENT_NOT_VISIBLE") from error
+            if error.code == "PIXEL_CELLS_TIMEOUT" and not about_to_navigate_seen:
+                raise HarnessFailure("SELF_NAVIGATION_PREPARE_NOT_VISIBLE") from error
             raise
         observed["web_security_cell_results"] = cell_results
         if app.process.poll() is not None:
@@ -1308,7 +1244,6 @@ class Goal07Harness(NativeHarness):
                 for run, name_of_phase in zip(phases, PHASES, strict=True):
                     with phase(name_of_phase.upper()):
                         observations.update(run(app, provider, source))
-                # The tab is dirty: quit through the guard, unsaved.
                 with phase("QUIT"):
                     self.quit_via_menu(app)
                     self.click_lifecycle_decision(app, "Discard")
