@@ -787,7 +787,7 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
             let state = state.clone();
             move |_| cancel(&state, is_revision)
         });
-        for (key, cancel_when_unfocused) in [
+        for (key, unmodified) in [
             ("enter", true),
             ("shift+enter", false),
             ("space", true),
@@ -806,12 +806,12 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
                     ..KeyOptions::default()
                 },
                 move |_| {
-                    if !is_open(&state) {
+                    if !unmodified || !is_open(&state) {
                         return;
                     }
                     if hold.focused.get() {
                         hold.key_press();
-                    } else if cancel_when_unfocused {
+                    } else {
                         cancel(&state, is_revision);
                     }
                 },
@@ -2200,6 +2200,28 @@ mod tests {
     #[test]
     fn shift_space_is_consumed_with_background_focus() {
         shifted_key_keeps_consent_open_without_pressing_the_background("shift+space");
+    }
+
+    #[test]
+    fn shifted_keys_do_not_charge_the_focused_hold_control() {
+        let mut app = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab to the hold control");
+        }
+
+        for key in ["shift+enter", "shift+space"] {
+            app.press_key(key).expect("press the shifted key");
+            assert!(app.shows("Hold to send"), "{key} changed the hold");
+            assert!(!app.shows("Nothing was sent."), "{key} started charging");
+        }
+
+        app.press_key("space").expect("charge with bare Space");
+        app.wait_for("text:Nothing was sent.")
+            .expect("the focused control charged and cooled");
     }
 
     #[test]

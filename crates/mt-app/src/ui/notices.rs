@@ -994,10 +994,6 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .into_element()
 }
 
-/// The guard's keys, bound while the card is up (they die with it): Escape
-/// cancels whatever is selected and Enter takes the selected decision. Space
-/// is consumed without acting. Enter and Space work the same with Shift held.
-/// Left/Right or Tab/Shift+Tab move the card's selection, not native focus.
 fn bind_guard_keys(state: &AppState) {
     let escape = state.clone();
     on_key_with(
@@ -1010,7 +1006,7 @@ fn bind_guard_keys(state: &AppState) {
     );
     for (key, activate) in [
         ("enter", true),
-        ("shift+enter", true),
+        ("shift+enter", false),
         ("space", false),
         ("shift+space", false),
     ] {

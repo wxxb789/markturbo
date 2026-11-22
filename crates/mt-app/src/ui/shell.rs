@@ -351,7 +351,7 @@ mod tests {
     use nsh_testing::{Headless, LayoutNode};
 
     use super::*;
-    use crate::state::{GUARD_CANCEL_CHOICE, Pane};
+    use crate::state::{GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, Pane};
 
     /// The document the probes open: a heading on its first line, so the
     /// first glyph the column draws is known.
@@ -447,9 +447,11 @@ mod tests {
         let state = AppState::new();
         state.new_document();
         let tab = state.active_tab().expect("the untitled tab");
+        tab.text.set("Unsaved draft".into());
         tab.dirty.set(true);
         let presses = signal(0);
         let selection = state.guard.clone();
+        let document_state = state.clone();
         view()
             .w_full()
             .h(relative(1.0))
@@ -461,15 +463,20 @@ mod tests {
             .child(text(move || {
                 match selection.get().map(|guard| guard.choice.get()) {
                     Some(GUARD_CANCEL_CHOICE) => "Guard selection: Cancel",
+                    Some(GUARD_DISCARD_CHOICE) => "Guard selection: Don't save",
                     Some(_) => "Guard selection: not Cancel",
                     None => "Guard closed",
                 }
             }))
+            .child(text(move || {
+                document_state
+                    .active_tab()
+                    .map_or_else(|| "No active document".into(), |tab| tab.text.get())
+            }))
             .child(overlay_layer(state, Language::English))
     }
 
-    #[test]
-    fn space_does_not_press_the_focused_control_behind_the_guard() {
+    fn open_guard() -> Headless {
         let mut config = EngineConfig::new(Root::of::<GuardProbe>().tokens(tokens::theme()));
         config.environment.os = nsh_core::platform::Os::Windows;
         config.environment.idiom = nsh_core::platform::Idiom::Desktop;
@@ -480,10 +487,15 @@ mod tests {
         press(&mut app, "probe-close");
         app.wait_for("id:guard-cancel").expect("guard open");
         assert!(app.screen().texts().contains(&"Close presses: 1"));
+        app
+    }
 
-        for key in ["space", "shift+space"] {
-            app.press_key(key)
-                .expect("press Space with or without Shift");
+    #[test]
+    fn space_does_not_press_the_focused_control_behind_the_guard() {
+        let mut app = open_guard();
+
+        for key in ["space", "shift+space", "shift+enter"] {
+            app.press_key(key).expect("press a consumed key");
             let screen = app.screen();
             assert!(screen.matches("id:guard-cancel").expect("selector"));
             assert!(
@@ -496,12 +508,36 @@ mod tests {
             );
         }
 
-        app.press_key("shift+enter").expect("press Shift+Enter");
+        app.press_key("enter").expect("activate Cancel");
         assert!(app.screen().texts().contains(&"Guard closed"));
         assert!(
             app.screen().texts().contains(&"Close presses: 1"),
-            "Shift+Enter activated the background close control"
+            "Enter activated the background close control"
         );
+    }
+
+    #[test]
+    fn shifted_keys_do_not_discard_the_unsaved_document() {
+        let mut app = open_guard();
+        app.press_key("shift+tab").expect("select Don't save");
+        assert!(app.shows("Guard selection: Don't save"));
+
+        for key in ["shift+space", "shift+enter"] {
+            app.press_key(key).expect("press the shifted key");
+            assert!(
+                app.shows("Guard selection: Don't save"),
+                "{key} changed the guard"
+            );
+            assert!(app.shows("Unsaved draft"), "{key} lost the unsaved text");
+            assert!(
+                app.shows("Close presses: 1"),
+                "{key} pressed the background"
+            );
+        }
+
+        app.press_key("enter").expect("activate Don't save");
+        assert!(app.shows("Guard closed"));
+        assert!(app.shows("No active document"));
     }
 
     /// `root` started in a `width` x 900 window, the editor up, in Source.
