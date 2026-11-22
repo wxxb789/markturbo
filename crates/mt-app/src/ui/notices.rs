@@ -1246,10 +1246,20 @@ impl StatusPresence {
 
 pub(crate) fn status_line(
     state: AppState,
-    language: Language,
+    _language: Language,
     presence: StatusPresence,
 ) -> impl IntoElement {
-    let _ = language;
+    status_line_at(state, presence, crate::state::StatusSurface::Editor)
+}
+
+pub(crate) fn status_line_at(
+    state: AppState,
+    presence: StatusPresence,
+    surface: crate::state::StatusSurface,
+) -> impl IntoElement {
+    let error = state.status_error;
+    let message = state.status;
+    let owner = state.status_surface;
     view().test_id("status").w_full().pt(px(SPACE_3)).child(
         view()
             .w_full()
@@ -1259,12 +1269,24 @@ pub(crate) fn status_line(
                 line.bind_translate_y(&presence.rise)
             })
             .child(
-                text(move || state.status.get())
-                    .font_family(tokens::FONT_UI)
-                    .text_size(px(tokens::TYPE_UI))
-                    .line_height(px(tokens::TYPE_UI_LINE))
-                    .number_of_lines(1)
-                    .text_color(move || tokens::palette().ink_rest),
+                tokens::tabular_nums(text(move || {
+                    if owner.get() == surface {
+                        message.get()
+                    } else {
+                        SharedString::default()
+                    }
+                }))
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .number_of_lines(1)
+                .text_color(move || {
+                    if error.get() {
+                        tokens::palette().danger
+                    } else {
+                        tokens::palette().ink_rest
+                    }
+                }),
             ),
     )
 }

@@ -407,7 +407,9 @@ fn source_block(
         .child(
             view()
                 .pl(px(ORDINAL_W + SPACE_2))
-                .child(prims::faint(move || detail_row.get().detail.clone())),
+                .child(tokens::tabular_nums(prims::faint(move || {
+                    detail_row.get().detail.clone()
+                }))),
         )
         .child(when(
             move || expanded.get().as_deref() == Some(row.get_untracked().path.as_path()),
@@ -1437,6 +1439,13 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("Applies under docs/"), "{shown}");
+        assert!(
+            app.screen()
+                .span_style("text:Applies under docs/ · 12 B")
+                .expect("the nested source's byte count")
+                .font_variant
+                .has(nsh_core::FontVariant::TABULAR_NUMS)
+        );
         assert!(shown.contains("Include in review"), "{shown}");
         assert!(shown.contains("Not applied by Codex"), "{shown}");
         assert!(shown.contains("CLAUDE.md"), "{shown}");

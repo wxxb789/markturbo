@@ -20,10 +20,12 @@ use nsh_core::{
     element::effect,
     element::{
         Accessible, AdaptiveColor, AnimatedNode, ComponentBuilder, Element, Interactive,
-        IntoListener, IntoReactive, ParentElement, SharedString, Signal, StyleRefinement, Styled,
+        IntoListener, IntoReactive, ParentElement, ReadSignal, SharedString, Signal,
+        StyleRefinement, Styled, Text,
     },
     prelude::*,
 };
+use unicode_script::{Script, UnicodeScript};
 
 use crate::ui::{
     motion::{self, HOVER_MS, Heat, PRESS_RELEASE_MS},
@@ -63,7 +65,7 @@ pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 }
 
 /// Resting ink: quiet local actions and captions.
-pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
@@ -73,7 +75,7 @@ pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 
 /// Caption ink: the quietest text that must still be read (hints,
 /// disclosures, secondary lines), at 4.5:1 or better on every ground.
-pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
@@ -108,6 +110,115 @@ pub fn model_voice(content: impl IntoReactive<SharedString>, heat: Heat) -> impl
             tokens::palette().ember,
             tokens::palette().hot,
         ))
+}
+
+pub(crate) fn script_text(
+    content: impl IntoReactive<SharedString>,
+    base_size: f32,
+    base_weight: nsh_core::element::FontWeight,
+    optics: tokens::CjkOptics,
+) -> Text {
+    if optics.is_unchanged() {
+        return text(content);
+    }
+    let runs = content.into_reactive().map(|content| script_runs(&content));
+    text("").child(each(
+        move || runs.get(),
+        |run: &ScriptRun| (run.index, run.is_cjk),
+        move |run: ReadSignal<ScriptRun>, _| {
+            let current = run.get();
+            let span = text(move || run.get().text.clone())
+                .text_size(px(optics.size(base_size, current.is_cjk)))
+                .font_weight(optics.weight(base_weight, current.is_cjk));
+            if current.is_cjk && optics.changes_weight() {
+                // FONT_MODEL's Windows fallback starts with a fixed DengXian Light face.
+                span.font_family(FONT_UI)
+            } else {
+                span
+            }
+        },
+    ))
+}
+
+#[derive(Clone, PartialEq)]
+struct ScriptRun {
+    index: usize,
+    is_cjk: bool,
+    text: String,
+}
+
+fn script_runs(content: &str) -> Vec<ScriptRun> {
+    let mut classified: Vec<_> = content
+        .chars()
+        .map(|character| (character, cjk_script(character)))
+        .collect();
+    let mut previous = None;
+    for (_, is_cjk) in &mut classified {
+        if let Some(script) = *is_cjk {
+            previous = Some(script);
+        } else {
+            *is_cjk = previous;
+        }
+    }
+    let mut next = None;
+    for (_, is_cjk) in classified.iter_mut().rev() {
+        if let Some(script) = *is_cjk {
+            next = Some(script);
+        } else {
+            *is_cjk = next;
+        }
+    }
+
+    let mut runs: Vec<ScriptRun> = Vec::new();
+    for (character, is_cjk) in classified {
+        let is_cjk = is_cjk.unwrap_or(false);
+        match runs.last_mut() {
+            Some(run) if run.is_cjk == is_cjk => run.text.push(character),
+            _ => runs.push(ScriptRun {
+                index: runs.len(),
+                is_cjk,
+                text: character.to_string(),
+            }),
+        }
+    }
+    runs
+}
+
+fn cjk_script(character: char) -> Option<bool> {
+    let script = character.script();
+    let extension = character.script_extension();
+    let cjk_extension = !extension.is_common()
+        && !extension.is_inherited()
+        && [
+            Script::Bopomofo,
+            Script::Han,
+            Script::Hangul,
+            Script::Hiragana,
+            Script::Katakana,
+            Script::Nushu,
+            Script::Tangut,
+            Script::Yi,
+        ]
+        .into_iter()
+        .any(|cjk_script| extension.contains_script(cjk_script));
+    let cjk = matches!(
+        script,
+        Script::Bopomofo
+            | Script::Han
+            | Script::Hangul
+            | Script::Hiragana
+            | Script::Katakana
+            | Script::Nushu
+            | Script::Tangut
+            | Script::Yi
+    ) || cjk_extension;
+    if cjk {
+        Some(true)
+    } else if script == Script::Inherited || extension.is_inherited() {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 /// A quiet local action: resting ink that steps to full ink with an underline

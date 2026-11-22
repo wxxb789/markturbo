@@ -5,7 +5,7 @@
 //! ```text
 //! ┌ title row 32 ───────────────────────────────────────────────────────┐
 //! │ rail 44 │ text column (40 + measure + 40) │ field (rest − 32)      │
-//! └──────────────────── status line ──────────────────────────────────┘
+//! └───────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! What the shell owns, and what nothing else may take over:
@@ -165,7 +165,7 @@ fn workspace(
         .flex_row()
         .child(rail::rail(state.clone(), language))
         .child(column(state.clone(), language, layout, status))
-        .child(field(state, language, layout))
+        .child(field(state, language, layout, status))
 }
 
 /// The text column: the document's ground, its measure, its two 40px insets,
@@ -276,7 +276,12 @@ fn column_content(
 ///
 /// Below 1040 client width it is an opaque overlay across the right 46% of the
 /// window, over the dimmed column.
-fn field(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
+fn field(
+    state: AppState,
+    language: Language,
+    layout: Layout,
+    status: notices::StatusPresence,
+) -> impl IntoElement {
     let area = view()
         .h(relative(1.0))
         .pl(px(tokens::FIELD_GAP))
@@ -298,13 +303,33 @@ fn field(state: AppState, language: Language, layout: Layout) -> impl IntoElemen
             // The field's full height reaches its surface: a surface that
             // scrolls (the preview) fills it rather than collapsing to 0.
             .h(relative(1.0))
-            .child(field_surface(state, language)),
+            .child(field_surface(state, language, status)),
     )
 }
 
 /// The one surface the field shows, in [`surface`]'s order of precedence.
-fn field_surface(state: AppState, language: Language) -> impl IntoElement {
-    let mut field = view().test_id("field").w_full().h(relative(1.0)).flex_col();
+fn field_surface(
+    state: AppState,
+    language: Language,
+    status: notices::StatusPresence,
+) -> impl IntoElement {
+    use crate::state::StatusSurface;
+    let condition = state.clone();
+    let notice = state.clone();
+    let mut field = view()
+        .test_id("field")
+        .w_full()
+        .h(relative(1.0))
+        .flex_col()
+        .child(when(
+            move || {
+                condition.status_surface.get() == StatusSurface::Review
+                    && !condition.status.get().is_empty()
+                    && (surface(&condition) == FieldSurface::Review
+                        || condition.revision_busy.get())
+            },
+            move || notices::status_line_at(notice.clone(), status, StatusSurface::Review),
+        ));
     for want in [
         FieldSurface::Revision,
         FieldSurface::Review,
@@ -1550,6 +1575,117 @@ mod tests {
         app.wait_for("label:Markdown source")
             .expect("the saved document");
         app
+    }
+
+    #[component]
+    fn RoutedStatusProbe() -> impl IntoElement {
+        use crate::state::{StatusKind, StatusSurface};
+        let state = AppState::new();
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(
+                view()
+                    .flex_row()
+                    .child(control("status-editor", &state, |state| {
+                        state.notify_held("Waiting for the editor")
+                    }))
+                    .child(control("status-review", &state, |state| {
+                        state.review_open.set(true);
+                        state.notify_at(StatusSurface::Review, StatusKind::Error, "Review failed");
+                    }))
+                    .child(control("status-settings", &state, |state| {
+                        state.settings_open.set(true);
+                        state.notify_at(
+                            StatusSurface::Settings,
+                            StatusKind::Success,
+                            "Settings saved",
+                        );
+                    }))
+                    .child(control("status-review-bytes", &state, |state| {
+                        state.notify_at(StatusSurface::Review, StatusKind::Success, "Sent 120 B");
+                    })),
+            )
+            .child(shell(state, Language::English, Layout::Wide))
+    }
+
+    fn routed_status_app() -> Headless {
+        let mut config = EngineConfig::new(Root::of::<RoutedStatusProbe>());
+        config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
+        let mut app = Headless::start(config).expect("status surfaces");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("wide viewport");
+        app
+    }
+
+    #[test]
+    fn status_stays_with_its_surface() {
+        let mut app = routed_status_app();
+        for (control, selector, message) in [
+            (
+                "status-editor",
+                "id:column >> text:Waiting for the editor",
+                "text:Waiting for the editor",
+            ),
+            (
+                "status-review",
+                "id:field >> text:Review failed",
+                "text:Review failed",
+            ),
+            (
+                "status-settings",
+                "id:settings-page >> text:Settings saved",
+                "text:Settings saved",
+            ),
+        ] {
+            app.press(&format!("id:{control}")).expect(control);
+            app.wait_for(selector).expect(selector);
+            assert_eq!(app.screen().count(message).expect(message), 1);
+        }
+    }
+
+    #[test]
+    fn status_only_errors_use_danger() {
+        let mut app = routed_status_app();
+        for (control, selector, expected) in [
+            (
+                "status-editor",
+                "text:Waiting for the editor",
+                tokens::LIGHT.ink_rest,
+            ),
+            ("status-review", "text:Review failed", tokens::LIGHT.danger),
+            (
+                "status-settings",
+                "text:Settings saved",
+                tokens::LIGHT.ink_rest,
+            ),
+        ] {
+            app.press(&format!("id:{control}")).expect(control);
+            app.wait_for(selector).expect(selector);
+            assert_eq!(
+                app.screen().span_style(selector).expect(selector).color,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn status_byte_counts_use_tabular_figures() {
+        let mut app = routed_status_app();
+        app.press("id:status-review")
+            .expect("open the review field");
+        app.press("id:status-review-bytes")
+            .expect("show sent bytes");
+        let selector = "text:Sent 120 B";
+        app.wait_for(selector).expect(selector);
+        assert!(
+            app.screen()
+                .span_style(selector)
+                .expect(selector)
+                .font_variant
+                .has(nsh_core::FontVariant::TABULAR_NUMS)
+        );
     }
 
     fn return_from_settings(

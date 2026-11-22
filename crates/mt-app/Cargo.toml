@@ -40,6 +40,7 @@ log.workspace = true
 tracing.workspace = true
 markdown.workspace = true
 encoding_rs.workspace = true
+unicode-script.workspace = true
 dirs.workspace = true
 rust-embed.workspace = true
 

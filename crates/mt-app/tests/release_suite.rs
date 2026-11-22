@@ -30,6 +30,8 @@ mod conflict;
 mod conflict_compare;
 #[path = "ctrl_enter_editor.rs"]
 mod ctrl_enter_editor;
+#[path = "goal17_settings.rs"]
+mod goal17_settings;
 #[path = "hierarchy_layouts.rs"]
 mod hierarchy_layouts;
 #[path = "hierarchy_welcome.rs"]

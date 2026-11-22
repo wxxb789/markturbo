@@ -3186,6 +3186,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "unicode-script",
 ]
 
 [[package]]

@@ -135,6 +135,18 @@
   by that function and a path unit test. The nsh Windows backend computes
   its own profile in `native/web.rs`. Check for external callers before
   removing the public function or its helper.
+- [ ] **Dead-code candidate: `ui::prims::model_voice`** —
+  `rg -n 'model_voice\(' crates/mt-app/src -g '*.rs'` and
+  `git grep -n 'model_voice(' -- crates/mt-app/src` return only the definition
+  at `crates/mt-app/src/ui/prims.rs:101` (the file header also links it as a
+  doc symbol, but there are no call sites); the active review path is
+  `ui::review::voice`. Revalidate that no downstream consumer uses this
+  public helper before removing or consolidating it.
+- [ ] **Dead-code candidate: `Key::WebPreviewRetry`** —
+  `rg -n 'Key::WebPreviewRetry' crates/mt-app/src` finds its English and
+  Chinese table entries plus the exhaustive key list;
+  `git grep WebPreviewRetry -- crates/mt-app/src` also finds the enum declaration, but
+  no call site. Revalidate before removing the translations or key.
 - [ ] **Isolate the opt-in Windows credential round-trip**:
   `goal_05a_credential_lifecycle_windows_round_trip` is excluded from the
   default suite but uses the current user's Windows Credential Manager when

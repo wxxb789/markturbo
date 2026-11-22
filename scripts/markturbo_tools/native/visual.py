@@ -30,6 +30,12 @@ packaged `MarkTurbo.exe` built from the same source revision::
         --exe target/release/markturbo.exe \\
         --out target/native-acceptance/goal-09
 
+Capture the Goal 17 CJK optical-size comparison separately::
+
+    uv run --locked --project scripts scripts/mt.py visual -- \\
+        --goal17-cjk-optics --exe target/release/markturbo.exe \\
+        --out target/native-acceptance/goal-17-cjk-optics
+
 `--out` names a scratch directory: the capture rewrites the cells it writes and
 has no existing-output guard, so it never points at retained evidence.
 
@@ -90,6 +96,13 @@ from .runtime import (
 
 SCHEMA = "markturbo.goal-09-visual-matrix"
 RECEIPT_SCHEMA = "markturbo.goal-09-visual-cell"
+CJK_OPTICS_STATE = "cjk-optics"
+CJK_OPTICS_ENV = "MARKTURBO_GOAL17_CJK_OPTICS"
+CJK_OPTICS_VARIANTS = (
+    ("cjk-optics-plus-0", "+0"),
+    ("cjk-optics-plus-1px", "+1px"),
+    ("cjk-optics-plus-1px-next-weight", "+1px / next companion weight"),
+)
 STATES = (
     "clean-profile-welcome",
     "new-unsaved-document",
@@ -420,6 +433,10 @@ def matrix_cells(
         for viewport in viewports
         for mode in modes
     ]
+
+
+def cjk_optics_cell() -> Cell:
+    return Cell(CJK_OPTICS_STATE, "zh-cn", "default", "light")
 
 
 def state_code(state: str) -> str:
@@ -1265,12 +1282,14 @@ def capture_cell(
     ui_types: tuple[Any, ...],
     parent_context: Any,
 ) -> dict[str, Any]:
+    cjk_optics = cell.state == CJK_OPTICS_STATE
     started = utc_now()
     case_root = out / "cells" / cell.cell_id
     case_root.mkdir(parents=True, exist_ok=True)
     for stale in ("capture.png", "failure.png"):
         (case_root / stale).unlink(missing_ok=True)
-    profile = Path(tempfile.mkdtemp(prefix="markturbo-goal09-")).resolve()
+    prefix = "markturbo-goal17-cjk-" if cjk_optics else "markturbo-goal09-"
+    profile = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
     config, data, workspace, codex_home, local_app_data = (
         profile / name
         for name in ("config", "data", "workspace", "codex-home", "local-app-data")
@@ -1286,6 +1305,8 @@ def capture_cell(
     # cell, so a cell never joins the previous cell's still-exiting browser
     # (which ignores this cell's debugging port) nor the user's own profile.
     overrides = {"CODEX_HOME": str(codex_home), "LOCALAPPDATA": str(local_app_data)}
+    if cjk_optics:
+        overrides[CJK_OPTICS_ENV] = "1"
     web_port = free_port() if cell.state == "web-compatibility-preview" else None
     if web_port is not None:
         overrides["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
@@ -1315,7 +1336,7 @@ def capture_cell(
     try:
         with child_environment(overrides):
             app = harness.launch_app(
-                None if cell.state in EMPTY_STATES else plan,
+                None if cell.state in EMPTY_STATES or cjk_optics else plan,
                 data,
                 config,
                 workspace,
@@ -1326,7 +1347,42 @@ def capture_cell(
         dpi = int(win32.user32.GetDpiForWindow(window.hwnd))
         width, height = physical_viewport(cell.viewport, dpi)
         window.resize_client(width, height, dpi_awareness()[2])
-        markers = harness.prepare(app, cell, plan, server)
+        if cjk_optics:
+            harness.require(
+                app,
+                "goal17-cjk-optics",
+                "CJK_OPTICS_VIEW_MISSING",
+                control_type="Group",
+            )
+            for variant_id, _ in CJK_OPTICS_VARIANTS:
+                harness.require(
+                    app,
+                    variant_id,
+                    "CJK_OPTICS_VARIANT_GROUP_MISSING",
+                    control_type="Group",
+                )
+            wait_until(
+                lambda: harness.shows_text(app, "CJK optical sizing"),
+                UI_TIMEOUT,
+                "CJK_OPTICS_VIEW_MISSING",
+                interval=0.1,
+            )
+            expected_names = (
+                "中文",
+                "Latin",
+                "かな",
+                "한글",
+                *(label for _, label in CJK_OPTICS_VARIANTS),
+            )
+            visible = lambda: all(harness.shows_text(app, name) for name in expected_names)
+            wait_until(visible, UI_TIMEOUT, "CJK_OPTICS_VARIANTS_MISSING", interval=0.1)
+            markers = {
+                "comparison_view": "goal17-cjk-optics",
+                "variant_ids": [variant_id for variant_id, _ in CJK_OPTICS_VARIANTS],
+                "paragraph_visible": True,
+            }
+        else:
+            markers = harness.prepare(app, cell, plan, server)
         # Kept on a later failure too: the state was reached, and the
         # `failure.png` shows it.
         receipt["state_markers"] = markers
@@ -1451,7 +1507,7 @@ def parse_csv(value: str, allowed: Sequence[str]) -> list[str]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="mt.py visual",
-        description="Capture the Goal 09 visual-acceptance matrix.",
+        description="Capture the Goal 09 matrix or Goal 17 CJK optics comparison.",
     )
     result.add_argument("--exe", required=True, type=Path)
     result.add_argument("--out", required=True, type=Path)
@@ -1459,6 +1515,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--languages", default=",".join(LANGUAGES))
     result.add_argument("--viewports", default=",".join(VIEWPORTS))
     result.add_argument("--modes", default=",".join(MODES))
+    result.add_argument(
+        "--goal17-cjk-optics",
+        action="store_true",
+        help="capture the three CJK optical-size variants side by side",
+    )
     result.add_argument(
         "--allow-dirty",
         action="store_true",
@@ -1470,7 +1531,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     if sys.platform != "win32":
-        print("error: Goal 09 visual capture requires Windows", file=sys.stderr)
+        print("error: native visual capture requires Windows", file=sys.stderr)
         return 2
     arguments = parser().parse_args(argv)
     global DEBUG
@@ -1500,7 +1561,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001
         print(f"error: Windows APIs unavailable: {safe_exception_name(error)}", file=sys.stderr)
         return 2
-    cells = matrix_cells(states, languages, viewports, modes)
+    cells = (
+        [cjk_optics_cell()]
+        if arguments.goal17_cjk_optics
+        else matrix_cells(states, languages, viewports, modes)
+    )
     summary: dict[str, Any] = {
         "schema": SCHEMA,
         "started_at": utc_now(),

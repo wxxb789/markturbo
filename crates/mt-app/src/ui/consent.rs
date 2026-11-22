@@ -290,7 +290,7 @@ fn disclosure_body(
                         .gap(px(tokens::SPACE_2))
                         .child(view().flex_1().child(prims::rest(S::Total.text(language))))
                         .child(
-                            text(SharedString::from(bytes_label(rows.total)))
+                            tokens::tabular_nums(text(SharedString::from(bytes_label(rows.total))))
                                 .font_family(tokens::FONT_UI)
                                 .text_size(px(tokens::TYPE_UI))
                                 .line_height(px(tokens::TYPE_UI_LINE))
@@ -549,13 +549,13 @@ fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
             )
             .child(view().flex_1())
             .child(
-                text(move || {
+                tokens::tabular_nums(text(move || {
                     if has_bytes {
                         SharedString::from(bytes_label(bytes))
                     } else {
                         SharedString::from("")
                     }
-                })
+                }))
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
@@ -1418,11 +1418,15 @@ impl Hold {
         } else {
             HoldLabel::Sent
         });
-        self.state.notify(format!(
-            "{} · {}",
-            S::Sent.text(self.language),
-            sent_bytes(self.language, self.total.get())
-        ));
+        self.state.notify_at(
+            crate::state::StatusSurface::Review,
+            crate::state::StatusKind::Success,
+            format!(
+                "{} · {}",
+                S::Sent.text(self.language),
+                sent_bytes(self.language, self.total.get())
+            ),
+        );
         if self.is_revision {
             self.state.send_revision();
         } else {
@@ -2301,6 +2305,26 @@ mod tests {
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("the first press cancelled the card");
         assert!(!app.shows("Sent"), "nothing was sent");
+    }
+
+    fn assert_tabular_consent_bytes(selector: &str) {
+        let mut app = start_harness();
+        app.wait_for("id:consent-total").expect("consent total");
+        let style = app.screen().span_style(selector).expect(selector);
+        assert!(
+            style.font_variant.has(nsh_core::FontVariant::TABULAR_NUMS),
+            "{selector}"
+        );
+    }
+
+    #[test]
+    fn consent_total_bytes_use_tabular_figures() {
+        assert_tabular_consent_bytes("id:consent-total >> text:800 B");
+    }
+
+    #[test]
+    fn consent_item_bytes_use_tabular_figures() {
+        assert_tabular_consent_bytes("id:consent-row-source >> text:200 B");
     }
 
     #[test]

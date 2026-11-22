@@ -1305,11 +1305,19 @@ impl GenAiReviewer {
             })?
             .block_on(async {
                 tokio::time::timeout(timeout, async {
-                    let response = future.await.map_err(|_| ReviewError::RequestFailed {
-                        provider,
-                        endpoint: endpoint.clone(),
-                        hint: "the endpoint rejected the streaming request",
-                    })?;
+                    let response = tokio::select! {
+                        response = future => response.map_err(|_| ReviewError::RequestFailed {
+                            provider,
+                            endpoint: endpoint.clone(),
+                            hint: "the endpoint rejected the streaming request",
+                        })?,
+                        _ = super::wait_for_cancel(cancelled) => {
+                            return Err(ReviewError::Cancelled {
+                                provider,
+                                endpoint: endpoint.clone(),
+                            });
+                        }
+                    };
                     let response_model = response.model_iden.model_name.to_string();
                     let mut stream = response.stream;
                     let mut text = String::new();

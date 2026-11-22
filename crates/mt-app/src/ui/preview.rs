@@ -131,6 +131,7 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
     };
     let page = WebDocument::new(tab.clone());
     let trusted = tab.web_trusted;
+    let text = tab.text;
     let banner_state = state.clone();
     let banner_tab = tab.clone();
     view()
@@ -168,11 +169,11 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
                 })),
         )
         .child(
-            web_view_html(move || page.html.get(), None)
-                .test_id("web-view")
-                .label(SharedString::from(i18n::t(language, Key::ModeWeb)))
-                .java_script_enabled(move || trusted.get())
-                .flex_1(),
+            when(
+                move || text.get().trim().is_empty(),
+                move || empty_preview(language),
+            )
+            .otherwise(move || web_document(page, trusted, language)),
         )
         .into_element()
 }
@@ -180,6 +181,81 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
 /// A quiet label for a surface that has nothing else to say.
 fn quiet_label(label: impl IntoReactive<SharedString>) -> impl IntoElement {
     view().pt(px(tokens::SPACE_2)).child(prims::rest(label))
+}
+
+fn empty_preview(language: Language) -> AnyElement {
+    view()
+        .test_id("preview-empty")
+        .flex_1()
+        .min_h(px(0.0))
+        .p(px(tokens::SPACE_4))
+        .child(prims::faint(SharedString::from(i18n::t(
+            language,
+            Key::PreviewEmpty,
+        ))))
+        .into_element()
+}
+
+fn preview_message(test_id: &str, language: Language, key: Key) -> AnyElement {
+    view()
+        .test_id(test_id)
+        .px(px(tokens::SPACE_4))
+        .py(px(tokens::SPACE_2))
+        .child(prims::faint(SharedString::from(i18n::t(language, key))))
+        .into_element()
+}
+
+fn preview_failure_message(language: Language) -> AnyElement {
+    view()
+        .test_id("web-preview-failed")
+        .px(px(tokens::SPACE_4))
+        .py(px(tokens::SPACE_2))
+        .child(
+            prims::rest(SharedString::from(i18n::t(language, Key::WebPreviewFailed)))
+                .text_color(move || tokens::palette().danger),
+        )
+        .into_element()
+}
+
+fn web_document(page: WebDocument, trusted: Signal<bool>, language: Language) -> AnyElement {
+    let WebDocument { html, status } = page;
+    view()
+        .test_id("web-content")
+        .flex_1()
+        .min_h(px(0.0))
+        .flex_col()
+        .child(dynamic(move || match status.get() {
+            WebLoadState::Loading => {
+                preview_message("preview-loading", language, Key::PreviewLoading)
+            }
+            WebLoadState::Failed => preview_failure_message(language),
+            WebLoadState::Ready => view().into_element(),
+        }))
+        .child(
+            web_view_html(move || html.get(), None)
+                .test_id("web-view")
+                .label(SharedString::from(i18n::t(language, Key::ModeWeb)))
+                .java_script_enabled(move || trusted.get())
+                .on_load_start(move |_: &WebNavigation| web_load_started(status))
+                .on_load(move |_: &WebNavigation| web_load_finished(status))
+                .on_error(move |_: &str| web_load_failed(status))
+                .flex_1(),
+        )
+        .into_element()
+}
+
+fn web_load_started(status: Signal<WebLoadState>) {
+    if status.get() != WebLoadState::Ready {
+        status.set(WebLoadState::Loading);
+    }
+}
+
+fn web_load_finished(status: Signal<WebLoadState>) {
+    status.set(WebLoadState::Ready);
+}
+
+fn web_load_failed(status: Signal<WebLoadState>) {
+    status.set(WebLoadState::Failed);
 }
 
 /// The active document, rendered: Markdown with its diagrams inlined, in
@@ -193,7 +269,8 @@ fn rendered(state: AppState, language: Language) -> impl IntoElement {
         |tab: &Tab| tab.id,
         move |tab: ReadSignal<Tab>, _| {
             let tab = tab.get();
-            let preview = preview_of(&tab);
+            let preview = preview_of(&tab, language);
+            let text = tab.text;
             provide_context(preview_parts());
             view()
                 .test_id("preview")
@@ -201,23 +278,30 @@ fn rendered(state: AppState, language: Language) -> impl IntoElement {
                 .min_h(px(0.0))
                 .h(relative(1.0))
                 .child(
-                    scroll()
-                        .test_id("preview-text")
-                        .label(SharedString::from(i18n::t(language, Key::ModeNative)))
-                        .flex_1()
-                        .child(
-                            text_view()
-                                .markdown(move || Some(SharedString::from(preview.get())))
-                                .selectable(true)
-                                .render_math(|math: &TextViewMath| {
-                                    render_diagram("math", math.tex.as_ref())
-                                })
-                                .font_family(tokens::FONT_UI)
-                                .text_size(px(tokens::TYPE_PREVIEW))
-                                .line_height(px(tokens::TYPE_PREVIEW_LINE))
-                                .text_color(move || tokens::palette().ink)
-                                .pb(px(tokens::SPACE_7)),
-                        ),
+                    when(
+                        move || text.get().trim().is_empty(),
+                        move || empty_preview(language),
+                    )
+                    .otherwise(move || {
+                        scroll()
+                            .test_id("preview-text")
+                            .label(SharedString::from(i18n::t(language, Key::ModeNative)))
+                            .flex_1()
+                            .child(
+                                text_view()
+                                    .markdown(move || Some(SharedString::from(preview.get())))
+                                    .selectable(true)
+                                    .render_math(move |math: &TextViewMath| {
+                                        render_diagram("math", "Math", math.tex.as_ref(), language)
+                                    })
+                                    .font_family(tokens::FONT_UI)
+                                    .text_size(px(tokens::TYPE_PREVIEW))
+                                    .line_height(px(tokens::TYPE_PREVIEW_LINE))
+                                    .text_color(move || tokens::palette().ink)
+                                    .pb(px(tokens::SPACE_7)),
+                            )
+                            .into_element()
+                    }),
                 )
                 .into_element()
         },
@@ -280,11 +364,11 @@ const PREVIEW_H2: f32 = 18.0;
 /// A task's box: a 12px square.
 const TASK_BOX: f32 = 12.0;
 
-/// The Markdown the preview shows: the tab's text with every diagram block
-/// replaced by its SVG, recomputed when the text changes.
-fn preview_of(tab: &Tab) -> Memo<String> {
+/// The Markdown the preview shows, with diagrams rendered or labelled and
+/// recomputed when the text changes.
+fn preview_of(tab: &Tab, language: Language) -> Memo<String> {
     let tab = tab.clone();
-    computed(move || preprocess_markdown(&tab.text.get(), &tab.path))
+    computed(move || preprocess_markdown(&tab.text.get(), &tab.path, language))
 }
 
 // ─── the web pane's deferred document ─────────────────────────────────────
@@ -292,9 +376,18 @@ fn preview_of(tab: &Tab) -> Memo<String> {
 /// The page a web pane shows: [`Self::html`] is what the web view binds, and
 /// it is written only from an effect — never during render — once the
 /// [`Page`] it was built from differs from the one on screen.
+#[derive(Clone, Copy)]
 struct WebDocument {
     /// What the web view binds; a new value reaches it at the next commit.
     html: Signal<String>,
+    status: Signal<WebLoadState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WebLoadState {
+    Loading,
+    Ready,
+    Failed,
 }
 
 /// What a built page depends on: the document text, the trust level and the
@@ -314,6 +407,7 @@ impl WebDocument {
     /// render.
     fn new(tab: Tab) -> WebDocument {
         let html = signal(String::new());
+        let status = signal(WebLoadState::Loading);
         let written = signal(None::<Page>);
         let watch = tab.clone();
         let build = tab.clone();
@@ -336,7 +430,7 @@ impl WebDocument {
             written.set(Some(page));
             html.set(built);
         });
-        WebDocument { html }
+        WebDocument { html, status }
     }
 }
 
@@ -350,22 +444,27 @@ fn renderer() -> &'static RendererRegistry {
     &REGISTRY
 }
 
-/// Markdown with its diagram blocks replaced by inline SVG images.
-fn preprocess_markdown(source: &str, path: &std::path::Path) -> String {
+/// Markdown with renderable diagrams replaced by inline SVG images.
+fn preprocess_markdown(source: &str, path: &std::path::Path, language: Language) -> String {
     let document = Document::new(Some(path.to_path_buf()), source.to_owned());
     let mut out = source.to_owned();
     for block in document.blocks().iter().rev() {
         let BlockKind::Diagram(kind) = &block.kind else {
             continue;
         };
-        let RenderOutcome::Svg(markup) = renderer().render(kind.id(), &block.content) else {
-            continue;
+        let replacement = match renderer().render(kind.id(), &block.content) {
+            RenderOutcome::Svg(markup) => format!(
+                "\n<img src=\"{}\" alt=\"{}\">\n",
+                svg_data_uri(&markup),
+                kind
+            ),
+            RenderOutcome::Failed(_) => format!(
+                "\n> **{} {}.**\n\n{}",
+                kind,
+                i18n::t(language, Key::DiagramCouldNotRender),
+                &source[block.range.clone()]
+            ),
         };
-        let replacement = format!(
-            "\n<img src=\"{}\" alt=\"{}\">\n",
-            svg_data_uri(&markup),
-            kind
-        );
         out.replace_range(block.range.clone(), &replacement);
     }
     out
@@ -386,14 +485,23 @@ fn svg_data_uri(markup: &str) -> String {
     uri
 }
 
-/// A diagram or an equation, drawn as its SVG; a failure shows the source in
-/// mono rather than nothing.
-fn render_diagram(kind: &str, source: &str) -> AnyElement {
+/// A diagram or an equation, drawn as its SVG; a failure is labelled and keeps
+/// its source visible.
+fn render_diagram(kind: &str, label: &str, source: &str, language: Language) -> AnyElement {
     match renderer().render(kind, source) {
         RenderOutcome::Svg(markup) => svg(ImageSrc::svg_markup(&markup)).into_element(),
-        RenderOutcome::Failed(_diagnostic) => {
-            prims::source_ink(source.to_owned(), move || tokens::palette().ink_rest).into_element()
-        }
+        RenderOutcome::Failed(_) => view()
+            .test_id("diagram-failure")
+            .flex_col()
+            .gap(px(tokens::SPACE_2))
+            .child(prims::faint(SharedString::from(format!(
+                "{label} {}.",
+                i18n::t(language, Key::DiagramCouldNotRender)
+            ))))
+            .child(prims::source_ink(source.to_owned(), move || {
+                tokens::palette().ink_rest
+            }))
+            .into_element(),
     }
 }
 
@@ -439,6 +547,29 @@ mod tests {
         state
     }
 
+    fn failure_path() -> &'static std::path::Path {
+        static FIXTURE: OnceLock<(tempfile::TempDir, std::path::PathBuf)> = OnceLock::new();
+        FIXTURE
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().expect("temp dir");
+                let path = dir.path().join("failure.md");
+                std::fs::write(&path, "```mermaid\nnot a diagram\n```\n")
+                    .expect("write the invalid diagram");
+                (dir, path)
+            })
+            .1
+            .as_path()
+    }
+
+    fn failure_state() -> AppState {
+        let state = AppState::new();
+        if let Some(parent) = failure_path().parent() {
+            state.open_folder(parent.to_path_buf());
+        }
+        state.open_file(failure_path().to_path_buf());
+        state
+    }
+
     /// The rendered document in the column, in a column-sized box.
     #[component]
     fn ColumnProbe() -> impl IntoElement {
@@ -473,6 +604,70 @@ mod tests {
             .child(rendered(state, Language::English))
     }
 
+    #[component]
+    fn EmptyProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        if let Some(tab) = state.active_tab() {
+            tab.text.set(SharedString::from(" \n\t"));
+        }
+        view()
+            .test_id("probe-empty")
+            .w(px(352.0))
+            .h(px(700.0))
+            .child(rendered(state, Language::English))
+    }
+
+    #[component]
+    fn EmptyWebProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        view()
+            .test_id("probe-empty-web")
+            .w(px(680.0))
+            .h(px(700.0))
+            .child(web(state, Language::English))
+    }
+
+    #[component]
+    fn PendingWebProbe() -> impl IntoElement {
+        let page = WebDocument {
+            html: signal("<!doctype html><html></html>".to_owned()),
+            status: signal(WebLoadState::Loading),
+        };
+        let status = page.status;
+        view()
+            .test_id("probe-pending-web")
+            .w(px(352.0))
+            .h(px(700.0))
+            .flex_col()
+            .child(prims::quiet_action(
+                "probe-web-ready",
+                "Mark preview loaded",
+                move || web_load_finished(status),
+            ))
+            .child(prims::quiet_action(
+                "probe-web-edit",
+                "Simulate edit load",
+                move || web_load_started(status),
+            ))
+            .child(prims::quiet_action(
+                "probe-web-failed",
+                "Mark preview failed",
+                move || web_load_failed(status),
+            ))
+            .child(web_document(page, signal(false), Language::English))
+    }
+
+    #[component]
+    fn DiagramFailureProbe() -> impl IntoElement {
+        view()
+            .test_id("probe-diagram-failure")
+            .w(px(680.0))
+            .h(px(700.0))
+            .child(rendered(failure_state(), Language::English))
+    }
+
     /// Two documents in SplitWeb: the first trusted, the second (active)
     /// restricted, and a button that switches to the first.
     #[component]
@@ -484,6 +679,8 @@ mod tests {
         for tab in &tabs {
             tab.pane.set(Pane::SplitWeb);
         }
+        tabs[0].text.set(SharedString::from("Trusted page"));
+        tabs[1].text.set(SharedString::from("Restricted page"));
         tabs[0].web_trusted.set(true);
         let first = tabs[0].id;
         let switch = state.clone();
@@ -524,12 +721,17 @@ mod tests {
         app.screen().texts().join("\n")
     }
 
+    fn matches(app: &Headless, selector: &str) -> bool {
+        app.screen().matches(selector).expect("selector")
+    }
+
     /// A diagram block leaves the preview as an inline SVG image the text view
     /// can load, not as its fence; the rest of the document is untouched.
     #[test]
     fn a_diagram_becomes_an_inline_image() {
         let source = "# Plan\n\n```mermaid\ngraph LR\n  A --> B\n```\n\nAfter.\n";
-        let rendered = preprocess_markdown(source, std::path::Path::new("plan.md"));
+        let rendered =
+            preprocess_markdown(source, std::path::Path::new("plan.md"), Language::English);
         assert!(rendered.contains("data:image/svg+xml,"), "{rendered}");
         assert!(!rendered.contains("```mermaid"), "{rendered}");
         assert!(rendered.starts_with("# Plan\n\n"), "{rendered}");
@@ -542,8 +744,96 @@ mod tests {
     fn an_unknown_fence_stays_verbatim() {
         let source = "```nonexistent\nkeep me\n```\n";
         assert_eq!(
-            preprocess_markdown(source, std::path::Path::new("plan.md")),
+            preprocess_markdown(source, std::path::Path::new("plan.md"), Language::English),
             source
+        );
+    }
+
+    #[test]
+    fn an_empty_preview_has_a_designed_state() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<EmptyProbe>())).expect("start the probe");
+        app.wait_for("id:preview").expect("the preview exists");
+        app.settle();
+        assert!(
+            matches(&app, "id:preview-empty")
+                && texts(&app).contains(i18n::t(Language::English, Key::PreviewEmpty))
+                && !matches(&app, "id:preview-text"),
+            "{}",
+            dump(&app)
+        );
+    }
+
+    #[test]
+    fn an_empty_web_preview_has_a_designed_state() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<EmptyWebProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:web-pane").expect("the web pane renders");
+        app.settle();
+        assert!(
+            matches(&app, "id:preview-empty")
+                && texts(&app).contains(i18n::t(Language::English, Key::PreviewEmpty))
+                && !matches(&app, "id:web-view"),
+            "{}",
+            dump(&app)
+        );
+    }
+
+    #[test]
+    fn a_web_preview_tracks_loading_success_and_failure() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<PendingWebProbe>()))
+            .expect("start the probe");
+        app.settle();
+        assert!(
+            matches(&app, "id:preview-loading")
+                && texts(&app).contains(i18n::t(Language::English, Key::PreviewLoading))
+                && matches(&app, "id:web-view"),
+            "{}",
+            dump(&app)
+        );
+        app.press("id:probe-web-ready")
+            .expect("simulate the page load completing");
+        app.settle();
+        assert!(
+            matches(&app, "id:web-view") && !matches(&app, "id:preview-loading"),
+            "{}",
+            dump(&app)
+        );
+        app.press("id:probe-web-edit")
+            .expect("simulate editing the loaded page");
+        app.settle();
+        assert!(
+            matches(&app, "id:web-view")
+                && !matches(&app, "id:preview-loading")
+                && !matches(&app, "id:web-preview-failed"),
+            "later edits do not repeat the initial loading state: {}",
+            dump(&app)
+        );
+        app.press("id:probe-web-failed")
+            .expect("simulate the page load failing");
+        app.settle();
+        assert!(
+            matches(&app, "id:web-view")
+                && matches(&app, "id:web-preview-failed")
+                && !matches(&app, "id:preview-loading"),
+            "{}",
+            dump(&app)
+        );
+    }
+
+    #[test]
+    fn a_failed_diagram_is_labelled_and_keeps_its_source() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<DiagramFailureProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the probe");
+        app.wait_for("id:preview").expect("the preview exists");
+        app.settle();
+        let shown = texts(&app);
+        assert!(
+            shown.contains("Mermaid could not render") && shown.contains("not a diagram"),
+            "{}",
+            dump(&app)
         );
     }
 
@@ -697,6 +987,11 @@ mod tests {
             .expect("start the probe");
         app.wait_for("id:web-pane").expect("the web pane renders");
         app.settle();
+        assert!(
+            matches(&app, "id:web-view") && matches(&app, "id:preview-loading"),
+            "the first page stays mounted while it loads: {}",
+            dump(&app)
+        );
         let shown = texts(&app);
         assert!(shown.contains(restricted), "{}", dump(&app));
         assert!(!shown.contains(trusted), "{}", dump(&app));
@@ -704,6 +999,11 @@ mod tests {
         app.press("label:Probe switch")
             .expect("switch to the first tab");
         app.settle();
+        assert!(
+            matches(&app, "id:web-view") && matches(&app, "id:preview-loading"),
+            "the next tab's page stays mounted while it loads: {}",
+            dump(&app)
+        );
         let shown = texts(&app);
         assert!(shown.contains(trusted), "{}", dump(&app));
         assert!(!shown.contains(restricted), "{}", dump(&app));

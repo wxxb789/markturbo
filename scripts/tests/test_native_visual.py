@@ -30,6 +30,23 @@ class MatrixTests(unittest.TestCase):
             set(visual.LANGUAGES),
         )
 
+    def test_goal17_cjk_recipe_is_opt_in_and_separate_from_the_default_matrix(self) -> None:
+        cell = visual.cjk_optics_cell()
+        self.assertEqual(cell.cell_id, "zh-cn-cjk-optics-default-light")
+        self.assertNotIn(cell.state, visual.STATES)
+        self.assertEqual(
+            visual.CJK_OPTICS_VARIANTS,
+            (
+                ("cjk-optics-plus-0", "+0"),
+                ("cjk-optics-plus-1px", "+1px"),
+                ("cjk-optics-plus-1px-next-weight", "+1px / next companion weight"),
+            ),
+        )
+        arguments = visual.parser().parse_args(
+            ["--exe", "markturbo.exe", "--out", "captures", "--goal17-cjk-optics"]
+        )
+        self.assertTrue(arguments.goal17_cjk_optics)
+
     def test_physical_viewports_convert_dip_to_the_window_dpi(self) -> None:
         self.assertEqual(visual.physical_viewport("minimum", 120), (900, 600))
         self.assertEqual(visual.physical_viewport("default", 120), (1750, 1125))
