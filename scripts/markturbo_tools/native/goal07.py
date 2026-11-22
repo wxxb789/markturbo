@@ -114,8 +114,8 @@ def _css_rgb(color: tuple[int, int, int]) -> str:
     return f"rgb({color[0]}, {color[1]}, {color[2]})"
 
 
-SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS = 300
-SELF_NAVIGATION_ASSIGNMENT_DELAY_SECONDS = SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS / 1000
+SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS = 2000
+SELF_NAVIGATION_EMPTY_FRAME_STABILITY_SECONDS = 0.3
 SELF_NAVIGATION_SAMPLE_INTERVAL_SECONDS = 0.1
 
 
@@ -1212,7 +1212,7 @@ class Goal07Harness(NativeHarness):
             if fixture_absent_since is None:
                 fixture_absent_since = now
                 return None
-            if now - fixture_absent_since < SELF_NAVIGATION_ASSIGNMENT_DELAY_SECONDS:
+            if now - fixture_absent_since < SELF_NAVIGATION_EMPTY_FRAME_STABILITY_SECONDS:
                 return None
             if not navigation_assigned_seen:
                 raise HarnessFailure("SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED")

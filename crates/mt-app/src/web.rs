@@ -1,11 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use html5ever::buffer_queue::BufferQueue;
-use html5ever::tokenizer::states::RawKind;
-use html5ever::tokenizer::{
-    Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerResult,
-};
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
 use mt_core::{Block, BlockKind, DocType, Document};
 
@@ -62,7 +57,7 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
         host_csp = csp_meta(HOST_FRAME_SRC),
     );
     const HOST_SUFFIX: &str = "\"></iframe></body></html>";
-    let page = strip_resource_hints(&page);
+    let page = neutralize_document_links(&page);
     let host = format!("{host_prefix}{}{HOST_SUFFIX}", escape_srcdoc(&page));
     if host.encode_utf16().count() > MAX_HOST_UTF16_UNITS {
         return format!(
@@ -74,112 +69,29 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
     host
 }
 
-fn strip_resource_hints(page: &str) -> Cow<'_, str> {
-    let candidates = page.match_indices('<').filter_map(|(start, _)| {
-        let tag = page.as_bytes().get(start + 1..start + 6)?;
-        (tag[..4].eq_ignore_ascii_case(b"link")
-            && (html_whitespace(char::from(tag[4])) || matches!(tag[4], b'/' | b'>')))
-        .then_some(start)
-    });
-    let mut candidates = candidates.peekable();
+fn neutralize_document_links(page: &str) -> Cow<'_, str> {
+    let mut candidates = page
+        .match_indices('<')
+        .filter_map(|(start, _)| {
+            let tag = page.as_bytes().get(start + 1..start + 6)?;
+            (tag[..4].eq_ignore_ascii_case(b"link")
+                && (html_whitespace(char::from(tag[4])) || matches!(tag[4], b'/' | b'>')))
+            .then_some(start)
+        })
+        .peekable();
     if candidates.peek().is_none() {
         return Cow::Borrowed(page);
     }
 
-    let mut tokenizer = Tokenizer::new(ResourceHintTokens::default(), Default::default());
-    let mut input = BufferQueue::default();
-    let mut previous = 0;
     let mut copied = 0;
-    let mut filtered = String::new();
-    for (end, next_link) in candidates
-        .map(|start| (start + 1, Some(start)))
-        .chain(std::iter::once((page.len(), None)))
-    {
-        input.push_back(page[previous..end].into());
-        while let TokenizerResult::Script(start) = tokenizer.feed(&mut input) {
-            filtered.push_str(&page[copied..start]);
-            filtered.push_str("<!---->");
-            copied = end - queued_bytes(&mut input);
-        }
-        if tokenizer.sink.candidate.is_none() {
-            tokenizer.sink.candidate = next_link;
-        }
-        previous = end;
+    let mut neutralized = String::with_capacity(page.len());
+    for start in candidates {
+        neutralized.push_str(&page[copied..start]);
+        neutralized.push_str("<mt-link");
+        copied = start + "<link".len();
     }
-    if copied == 0 {
-        Cow::Borrowed(page)
-    } else {
-        filtered.push_str(&page[copied..]);
-        Cow::Owned(filtered)
-    }
-}
-
-fn queued_bytes(input: &mut BufferQueue) -> usize {
-    let mut tail = Vec::new();
-    while let Some(chunk) = input.pop_front() {
-        tail.push(chunk);
-    }
-    let bytes = tail.iter().map(|chunk| chunk.len()).sum();
-    for chunk in tail {
-        input.push_back(chunk);
-    }
-    bytes
-}
-
-#[derive(Default)]
-struct ResourceHintTokens {
-    candidate: Option<usize>,
-}
-
-impl TokenSink for ResourceHintTokens {
-    type Handle = usize;
-
-    fn process_token(&mut self, token: Token, _line: u64) -> TokenSinkResult<Self::Handle> {
-        if matches!(token, Token::ParseError(_)) {
-            return TokenSinkResult::Continue;
-        }
-        let candidate = self.candidate.take();
-        let Token::TagToken(tag) = token else {
-            return TokenSinkResult::Continue;
-        };
-        if tag.kind != TagKind::StartTag {
-            return TokenSinkResult::Continue;
-        }
-        if let Some(start) = candidate
-            && is_resource_hint(&tag)
-        {
-            return TokenSinkResult::Script(start);
-        }
-        match tag.name.as_ref() {
-            "script" => TokenSinkResult::RawData(RawKind::ScriptData),
-            "title" | "textarea" => TokenSinkResult::RawData(RawKind::Rcdata),
-            "style" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript" => {
-                TokenSinkResult::RawData(RawKind::Rawtext)
-            }
-            "plaintext" => TokenSinkResult::Plaintext,
-            _ => TokenSinkResult::Continue,
-        }
-    }
-}
-
-fn is_resource_hint(tag: &Tag) -> bool {
-    const HINTS: [&str; 6] = [
-        "preconnect",
-        "dns-prefetch",
-        "prefetch",
-        "preload",
-        "modulepreload",
-        "prerender",
-    ];
-    tag.kind == TagKind::StartTag
-        && tag.name.as_ref() == "link"
-        && tag.attrs.iter().any(|attr| {
-            attr.name.local.as_ref() == "rel"
-                && attr
-                    .value
-                    .split(html_whitespace)
-                    .any(|token| HINTS.iter().any(|hint| token.eq_ignore_ascii_case(hint)))
-        })
+    neutralized.push_str(&page[copied..]);
+    Cow::Owned(neutralized)
 }
 
 fn escape_srcdoc(page: &str) -> String {
@@ -653,9 +565,8 @@ fn collect_inline_script_ranges(
     };
     if context.inline_start.is_none()
         && let Node::Html(html) = node
-        && let Some(range) = markdown_flow_script(html)
     {
-        ranges.push(range);
+        collect_markdown_flow_scripts(html, source, ranges);
         return;
     }
     let jsx = match node {
@@ -719,22 +630,68 @@ fn collect_inline_script_ranges(
     }
 }
 
-fn markdown_flow_script(html: &markdown::mdast::Html) -> Option<ScriptRange> {
+fn collect_markdown_flow_scripts(
+    html: &markdown::mdast::Html,
+    source: &str,
+    ranges: &mut Vec<ScriptRange>,
+) {
     const CLOSE: &[u8] = b"</script>";
-    let position = html.position.as_ref()?;
-    let value = html.value.trim_start_matches([' ', '\t']);
-    let content = opening_tag_end(value, "script")?;
-    let close = content
+    let Some(position) = &html.position else {
+        return;
+    };
+    let value = &html.value;
+    let mut remaining = value.trim_start_matches([' ', '\t']);
+    let Some(mut content) = opening_tag_end(remaining, "script") else {
+        return;
+    };
+    let mut line_ends = value
+        .split_inclusive(['\r', '\n'])
+        .zip(source[position.start.offset..position.end.offset].split_inclusive(['\r', '\n']))
+        .scan(
+            (0, position.start.offset),
+            |(value_end, source_end), (line, raw)| {
+                *value_end += line.len();
+                *source_end += raw.len();
+                Some((*value_end, *source_end))
+            },
+        )
+        .peekable();
+    let mut source_offset = |offset| {
+        while let Some(&(value_end, source_end)) = line_ends.peek() {
+            if offset < value_end || offset == value_end && offset == value.len() {
+                return source_end.checked_sub(value_end - offset);
+            }
+            line_ends.next();
+        }
+        None
+    };
+    while let Some(close) = content
         .as_bytes()
         .windows(CLOSE.len())
-        .position(|tag| tag.eq_ignore_ascii_case(CLOSE))?;
-    let script_end = value.len() - content.len() + close + CLOSE.len();
-    Some(ScriptRange {
-        start: position.start.offset,
-        end: position.end.offset - (value.len() - script_end),
-        script: value[..script_end].to_string(),
-        flow: true,
-    })
+        .position(|tag| tag.eq_ignore_ascii_case(CLOSE))
+    {
+        let start = value.len() - remaining.len();
+        let tail = &content[close + CLOSE.len()..];
+        let end = value.len() - tail.len();
+        let (Some(source_start), Some(source_end)) = (source_offset(start), source_offset(end))
+        else {
+            break;
+        };
+        ranges.push(ScriptRange {
+            start: source_start,
+            end: source_end,
+            script: value[start..end].to_string(),
+            flow: true,
+        });
+        let Some((next, next_content)) = tail.match_indices('<').find_map(|(offset, _)| {
+            let candidate = &tail[offset..];
+            opening_tag_end(candidate, "script").map(|content| (candidate, content))
+        }) else {
+            break;
+        };
+        remaining = next;
+        content = next_content;
+    }
 }
 
 fn line_start(source: &str, offset: usize) -> usize {
@@ -1441,26 +1398,103 @@ mod tests {
     }
 
     #[test]
-    fn strips_static_resource_hints_without_editing_other_markup() {
+    fn markdown_html_blocks_keep_all_scripts_in_order() {
+        let consecutive = "<script>void 0;</script><script>void 1;</script>";
+        let three = "<script>void 0;</script><script>void 1;</script><SCRIPT>void 2;</SCRIPT>";
+        let separated = "<script>void 0;</script><em>kept</em><script>void 1;</script>";
+        for (source, expected) in [
+            (consecutive, consecutive),
+            (three, three),
+            (separated, separated),
+            (
+                "> <script>\r\n> void 0;\r\n> </script><em>kept</em><script>void 1;</script>",
+                "<script>\r\nvoid 0;\r\n</script><em>kept</em><script>void 1;</script>",
+            ),
+        ] {
+            let html = page(&md(source), &registry(), false);
+            assert!(body(&html).contains(expected), "{:?}", body(&html));
+        }
+    }
+
+    #[test]
+    fn document_links_are_made_inert_in_every_context() {
+        let source = concat!(
+            "<link rel=preconnect><LINK rel=dns-prefetch><link/rel=preload>",
+            "<svg><title><link rel=preload></title></svg>",
+            "<linker><link-data><link\u{e9}>",
+        );
+        let expected = concat!(
+            "<mt-link rel=preconnect><mt-link rel=dns-prefetch><mt-link/rel=preload>",
+            "<svg><title><mt-link rel=preload></title></svg>",
+            "<linker><link-data><link\u{e9}>",
+        );
+        let html = page(
+            &Document::with_type(DocType::Html, source.into()),
+            &registry(),
+            false,
+        );
+        assert!(html.ends_with(expected), "{html}");
+    }
+
+    #[test]
+    fn document_link_with_many_attributes_is_made_inert() {
+        use std::fmt::Write as _;
+
+        let mut attributes = String::new();
+        for index in 0..50_000 {
+            write!(attributes, " a{index}").unwrap();
+        }
+        let source = format!("<link rel=preload{attributes}>");
+        let started = std::time::Instant::now();
+        let html = page(
+            &Document::with_type(DocType::Html, source),
+            &registry(),
+            false,
+        );
+        let elapsed = started.elapsed();
+        assert!(html.ends_with(&format!("<mt-link rel=preload{attributes}>")));
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "50,000 attributes took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn makes_document_links_inert_without_editing_other_markup() {
         let cases = [
-            ("<LiNk ReL=PrEcOnNeCt href='about:blank'>", "<!---->"),
+            (
+                "<LiNk ReL=PrEcOnNeCt href='about:blank'>",
+                "<mt-link ReL=PrEcOnNeCt href='about:blank'>",
+            ),
             (
                 "<link href='about:blank' rel='alternate\tDNS-prefetch'>",
-                "<!---->",
+                "<mt-link href='about:blank' rel='alternate\tDNS-prefetch'>",
             ),
-            ("<link disabled rel=prefetch href='about:blank'>", "<!---->"),
-            ("<link rel='preload' href='about:blank' />", "<!---->"),
-            ("<link href='about:blank' rel=modulepreload>", "<!---->"),
-            ("<link rel=prerender>", "<!---->"),
+            (
+                "<link disabled rel=prefetch href='about:blank'>",
+                "<mt-link disabled rel=prefetch href='about:blank'>",
+            ),
+            (
+                "<link rel='preload' href='about:blank' />",
+                "<mt-link rel='preload' href='about:blank' />",
+            ),
+            (
+                "<link href='about:blank' rel=modulepreload>",
+                "<mt-link href='about:blank' rel=modulepreload>",
+            ),
+            ("<link rel=prerender>", "<mt-link rel=prerender>"),
             (
                 "<link rel=preload data-label='<link rel=preload>'><link rel=prefetch>",
-                "<!----><!---->",
+                "<mt-link rel=preload data-label='<mt-link rel=preload>'><mt-link rel=prefetch>",
             ),
             (
                 "<link rel=stylesheet href='theme.css'>",
-                "<link rel=stylesheet href='theme.css'>",
+                "<mt-link rel=stylesheet href='theme.css'>",
             ),
-            ("<!-- <link rel=preload> -->", "<!-- <link rel=preload> -->"),
+            (
+                "<!-- <link rel=preload> -->",
+                "<!-- <mt-link rel=preload> -->",
+            ),
         ];
         let registry = registry();
         let mut failures = Vec::new();
@@ -1477,26 +1511,29 @@ mod tests {
     }
 
     #[test]
-    fn preserves_resource_hint_text_in_raw_and_escaped_text_elements() {
-        let inert = concat!(
+    fn makes_link_text_inert_in_raw_and_escaped_text_elements() {
+        let source = concat!(
             "<script>const tag = '<link rel=preload>';</script>",
             "<style>p::before{content:'<link rel=preload>'}</style>",
             "<textarea><link rel=preload></textarea>",
+            "<link rel=preload>",
         );
-        let source = format!("{inert}<link rel=preload>");
-        assert_eq!(strip_resource_hints(&source), format!("{inert}<!---->"));
+        assert_eq!(
+            neutralize_document_links(source),
+            source.replace("<link", "<mt-link")
+        );
     }
 
     #[test]
-    fn deeply_nested_markup_filters_resource_hints_within_a_bounded_time() {
+    fn deeply_nested_markup_neutralizes_links_within_a_bounded_time() {
         let opening = "<div>".repeat(50_000);
         let closing = "</div>".repeat(50_000);
         let source = format!("{opening}<link rel=preload>{closing}");
         let started = std::time::Instant::now();
-        let filtered = strip_resource_hints(&source);
+        let filtered = neutralize_document_links(&source);
         let elapsed = started.elapsed();
 
-        assert_eq!(filtered, format!("{opening}<!---->{closing}"));
+        assert_eq!(filtered, format!("{opening}<mt-link rel=preload>{closing}"));
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "filter took {elapsed:?} for {} UTF-16 units",
@@ -1505,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn misnested_tables_near_the_host_limit_filter_within_a_bounded_time() {
+    fn misnested_tables_near_the_host_limit_neutralize_links_within_a_bounded_time() {
         let trailing = "</table><link rel=preload>";
         let target_len = MAX_HOST_UTF16_UNITS - 1;
         let mut source = String::with_capacity(target_len);
@@ -1519,11 +1556,11 @@ mod tests {
         assert_eq!(source.len(), target_len);
 
         let started = std::time::Instant::now();
-        let filtered = strip_resource_hints(&source);
+        let filtered = neutralize_document_links(&source);
         let elapsed = started.elapsed();
 
         assert_eq!(
-            filtered.strip_suffix("<!---->"),
+            filtered.strip_suffix("<mt-link rel=preload>"),
             source.strip_suffix("<link rel=preload>")
         );
         assert!(
@@ -1672,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_page_that_fits_after_stripping_resource_hints() {
+    fn checks_host_size_after_making_document_links_inert() {
         let registry = registry();
         let build = |source| {
             build_html(
@@ -1681,14 +1718,16 @@ mod tests {
                 false,
             )
         };
-        let overhead = build("<p><!----></p>".into()).encode_utf16().count();
-        let text = "a".repeat(MAX_HOST_UTF16_UNITS - overhead);
         let hint = r#"<link rel="preload" href="fixture.css" as="style">"#;
-        let expected = build(format!("<p><!---->{text}</p>"));
-        assert!(
-            expected.contains("srcdoc=\"") && build(format!("<p>{hint}{text}</p>")) == expected,
-            "the stripped page should load unchanged"
-        );
+        let inert = hint.replacen("<link", "<mt-link", 1);
+        let overhead = build(format!("<p>{inert}</p>")).encode_utf16().count();
+        let text = "a".repeat(MAX_HOST_UTF16_UNITS - overhead);
+        let exact = build(format!("<p>{hint}{text}</p>"));
+        assert!(exact.contains("srcdoc=\""));
+        assert_eq!(exact.encode_utf16().count(), MAX_HOST_UTF16_UNITS);
+        assert_eq!(exact, build(format!("<p>{inert}{text}</p>")));
+        let above = build(format!("<p>{hint}{text}a</p>"));
+        assert!(above.contains("This preview is too large to display."));
     }
 
     #[test]
@@ -1735,6 +1774,7 @@ mod tests {
     fn html_inserts_csp_at_the_start_of_the_real_or_implied_head() {
         let registry = registry();
         let author = r#"<link rel="stylesheet" href="relative.css"><script>run()</script>"#;
+        let inert = author.replacen("<link", "<mt-link", 1);
         let policy = format!("{DOCUMENT_POLICY}{FRAME_PRELUDE}");
         for (prefix, expected_prefix) in [
             ("<!doctype html><html><head>", "<!doctype html><html><head>"),
@@ -1757,7 +1797,7 @@ mod tests {
             let doc = Document::with_type(DocType::Html, format!("{prefix}{author}"));
             assert_eq!(
                 page(&doc, &registry, true),
-                format!("{expected_prefix}{policy}{author}")
+                format!("{expected_prefix}{policy}{inert}")
             );
         }
         for unsafe_prefix in [
@@ -1769,11 +1809,10 @@ mod tests {
             "<!DOCTYPE html PUBLIC \"><script>early()</script>\"><head>",
             "<!DOCTYPE html SYSTEM \"><script>early()</script>\"><head>",
         ] {
-            let source = format!("{unsafe_prefix}{author}");
-            let doc = Document::with_type(DocType::Html, source.clone());
+            let doc = Document::with_type(DocType::Html, format!("{unsafe_prefix}{author}"));
             assert_eq!(
                 page(&doc, &registry, false),
-                format!("<!doctype html>{policy}{source}")
+                format!("<!doctype html>{policy}{unsafe_prefix}{inert}")
             );
         }
     }

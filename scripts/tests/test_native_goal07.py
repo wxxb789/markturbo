@@ -976,6 +976,60 @@ class PhaseTests(unittest.TestCase):
         harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
 
+    def test_web_phase_observes_assignment_with_slow_samples(self) -> None:
+        sample_duration = 0.45
+        for assigned in (True, False):
+            with self.subTest(assigned=assigned):
+                harness, order, app = self.web_security_harness(focus_returns=True)
+                now = 0.0
+                sample_count = 0
+                assigned_at: float | None = None
+
+                def read_sample(_app: Any) -> list[bool]:
+                    nonlocal now, sample_count, assigned_at
+                    now += sample_duration
+                    if sample_count == 0:
+                        if assigned:
+                            assigned_at = now
+                        sample_count += 1
+                        return list(PIXEL_REQUIRED_CELL_RESULTS)
+                    sample_count += 1
+                    if (
+                        assigned_at is not None
+                        and now - assigned_at
+                        < HARNESS.SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS / 1000
+                    ):
+                        return list(PIXEL_CELL_RESULTS)
+                    return []
+
+                def replay(check: Callable[[], Any], _timeout: float, code: str, **_kwargs: Any) -> Any:
+                    for _ in range(20):
+                        value = check()
+                        if value:
+                            return value
+                    raise runtime.HarnessFailure(code)
+
+                order.read_fixture_cell_results.side_effect = read_sample
+                with (
+                    mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+                    mock.patch.object(HARNESS, "wait_until", side_effect=replay),
+                    mock.patch.object(HARNESS.time, "monotonic", side_effect=lambda: now),
+                ):
+                    if assigned:
+                        observed = harness.phase_web_security(
+                            app, order.provider, Path(HARNESS.FIXTURE_FILE)
+                        )
+                        self.assertIs(observed["web_security_navigation_assigned_observed"], True)
+                        harness.network_probes.snapshot.assert_called_once_with()
+                    else:
+                        with self.assertRaisesRegex(
+                            runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED"
+                        ):
+                            harness.phase_web_security(
+                                app, order.provider, Path(HARNESS.FIXTURE_FILE)
+                            )
+                        harness.network_probes.snapshot.assert_not_called()
+
     def test_web_phase_does_not_treat_a_failed_sample_two_capture_as_empty(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
         order.read_fixture_cell_results.side_effect = [
@@ -1341,7 +1395,7 @@ const context = {
     return animationFrameCount;
   },
   setTimeout(callback, milliseconds) {
-    if (milliseconds === 300) navigationTiming.push("timeout-300");
+    if (milliseconds === samplePauseMilliseconds) navigationTiming.push(`timeout-${milliseconds}`);
     if (milliseconds === samplePauseMilliseconds) {
       if (mode === "missing-navigation") return 0;
     }
@@ -1405,7 +1459,7 @@ async function main() {
   const [lastKind, lastUrl] = calls.at(-1);
   if (lastKind !== "location" || lastUrl !== expectedSelfNavigationUrl) throw new Error("HTTPS self-navigation did not target the counted loopback port");
   const locationIndex = navigationTiming.indexOf("location");
-  if (animationFrameCount !== 2 || navigationTiming.slice(locationIndex - 4, locationIndex).join(",") !== "assigned-marker,animation-frame,animation-frame,timeout-300") throw new Error("fixture did not paint the assigned marker and wait before HTTPS self-navigation");
+  if (animationFrameCount !== 2 || navigationTiming.slice(locationIndex - 4, locationIndex).join(",") !== `assigned-marker,animation-frame,animation-frame,timeout-${samplePauseMilliseconds}`) throw new Error("fixture did not paint the assigned marker and wait before HTTPS self-navigation");
   if (!sampleOne || !sampleOne.every(Boolean)) throw new Error("sample 1 was incomplete before HTTPS self-navigation");
   if (mode === "success" && results.length !== 0) throw new Error("browser block page did not replace the fixture");
   if (mode === "cancelled-navigation" && !results.every(Boolean)) throw new Error("cancelled navigation unexpectedly replaced the fixture");
@@ -1455,7 +1509,7 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
                         str(len(HARNESS.FIXTURE_ATTEMPT_SOURCE)),
                         mode,
                         str(webrtc_index),
-                        "300",
+                        str(HARNESS.SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS),
                         HARNESS._css_rgb(HARNESS.CELL_PENDING_COLOR),
                         HARNESS._css_rgb(HARNESS.CELL_SCRIPT_COLOR),
                         HARNESS._css_rgb(HARNESS.CELL_ATTEMPT_COLOR),

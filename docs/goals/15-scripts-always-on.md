@@ -93,7 +93,8 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
        `RTCRtpSender`/`Receiver`, `RTCSctpTransport`, and so on) from the frame's realm, so author
        code cannot reach them. No fresh realm is available: nested frames and blob/data workers
        are refused by the CSP;
-     - `<meta http-equiv="x-dns-prefetch-control" content="off">`.
+     - `<meta http-equiv="x-dns-prefetch-control" content="off">`;
+     - document `<link>` elements are made inert before loading the frame.
 
      On Windows, the process-level switch remains the primary layer wherever WebView2 honours it.
      Document the residual risk of these platforms and modes in the README and architecture

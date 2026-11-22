@@ -419,7 +419,7 @@ The WebView stays enabled in all web layouts. On non-elevated Windows,
 WebView2's process-level network switch backs up the in-page policy. Elevated
 Windows, macOS (WKWebView), and Linux (WebKitGTK) use only the in-page layers:
 the sandbox and CSP, a prelude that removes WebRTC entry points, and a
-DNS-prefetch opt-out. The preview removes static resource-hint links before
+DNS-prefetch opt-out. The preview makes document `<link>` elements inert before
 loading the frame. On macOS, Linux, and elevated Windows, a script-inserted
 resource hint can still trigger a connection attempt. The owner accepts this
 residual risk; the in-page layers are not a process-level network block.

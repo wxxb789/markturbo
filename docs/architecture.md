@@ -419,8 +419,8 @@ Windows also sets the process-level WebView2 network switch; elevated Windows,
 macOS (WKWebView) and Linux (WebKitGTK) run the same preview with only the in-page
 layers. Those modes depend on the engine honoring the in-page restrictions,
 including the DNS-prefetch opt-out; they have no independent process-level
-backstop for browser network activity. The app removes static resource-hint
-links before loading the frame. On macOS, Linux, and elevated Windows, a
+backstop for browser network activity. The app makes document `<link>` elements
+inert before loading the frame. On macOS, Linux, and elevated Windows, a
 script-inserted resource hint can still trigger a connection attempt. The owner
 accepts this residual risk. Runtime verification remains pending.
 
