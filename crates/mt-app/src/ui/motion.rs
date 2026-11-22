@@ -10,8 +10,9 @@ use std::{cell::Cell, sync::OnceLock};
 use nsh_core::{
     Color, LayoutCurve, LayoutTransition,
     element::{
-        AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming, Signal, Spawned,
-        Styled, animated_value, effect, reduce_motion, sample_easing, signal, spawn,
+        AdaptiveColor, AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming,
+        Signal, Spawned, Styled, animated_value, effect, reduce_motion, sample_easing, signal,
+        spawn,
     },
 };
 
@@ -307,9 +308,16 @@ impl Heat {
     /// A glyph colour that follows the heat: `cold` when nothing is emitting,
     /// `ember` when the model's output has cooled, `hot` for the one current
     /// item.
-    pub fn glyph(&self, cold: Color, ember: Color, hot: Color) -> AnimatedNode {
-        self.0
-            .interpolate_colors(&[0.0, EMBER, 1.0], &[cold, ember, hot])
+    pub fn glyph(
+        &self,
+        cold: impl Into<AdaptiveColor>,
+        ember: impl Into<AdaptiveColor>,
+        hot: impl Into<AdaptiveColor>,
+    ) -> AnimatedNode {
+        self.0.interpolate_colors::<AdaptiveColor>(
+            &[0.0, EMBER, 1.0],
+            &[cold.into(), ember.into(), hot.into()],
+        )
     }
 
     /// A plate's colour that follows the heat (an under-bloom, a tick, an

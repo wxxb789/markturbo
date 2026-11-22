@@ -702,9 +702,9 @@ fn docked_proposal(
                                             |(index, _): &(usize, SharedString)| *index,
                                             move |line: ReadSignal<(usize, SharedString)>, _| {
                                                 let added = heat.glyph(
-                                                    tokens::palette().ink,
-                                                    tokens::palette().ember,
-                                                    tokens::palette().added,
+                                                    tokens::adaptive_color(|palette| palette.ink),
+                                                    tokens::adaptive_color(|palette| palette.ember),
+                                                    tokens::adaptive_color(|palette| palette.added),
                                                 );
                                                 text(move || line.with(|(_, line)| line.clone()))
                                                     .font_family(tokens::FONT_SOURCE)

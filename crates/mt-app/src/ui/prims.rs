@@ -106,9 +106,9 @@ pub fn model_voice(content: impl IntoReactive<SharedString>, heat: Heat) -> impl
         .line_height(px(TYPE_MODEL_LINE))
         .text_color(move || tokens::palette().ink)
         .bind_color(&heat.glyph(
-            tokens::palette().ink,
-            tokens::palette().ember,
-            tokens::palette().hot,
+            tokens::adaptive_color(|palette| palette.ink),
+            tokens::adaptive_color(|palette| palette.ember),
+            tokens::adaptive_color(|palette| palette.hot),
         ))
 }
 
@@ -151,8 +151,8 @@ pub fn primary_action(
         .py(px(tokens::SPACE_2))
         .border(px(HAIRLINE))
         .border_color(move || tokens::palette().ink_caption)
-        .hover(|s| s.border_color(tokens::palette().ink))
-        .focus_visible(|s| s.border_color(tokens::palette().ink))
+        .hover(|s| s.border_color(|| tokens::palette().ink))
+        .focus_visible(|s| s.border_color(|| tokens::palette().ink))
         .on_press(on_press)
         .child(
             text(label)

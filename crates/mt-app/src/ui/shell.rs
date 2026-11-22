@@ -218,20 +218,29 @@ fn column(
             move || notices::recovery_banner(recovery_banner_state.clone(), language),
             track_reflow(recovery_deadline),
         ))
-        // Key on tab identity only: replacing this subtree discards the editor's undo history.
-        .child(each(
-            move || vec![active.get()],
-            |key| *key,
-            move |_, _| {
-                tab_deadline.set(None);
-                column_content(
-                    content_state.clone(),
-                    language,
-                    snap_offset,
-                    track_reflow(tab_deadline.clone()),
-                )
-            },
-        ))
+        .child(
+            view()
+                .test_id("document-slot")
+                .flex_1()
+                .min_h(px(0.0))
+                .w_full()
+                .flex_col()
+                .pt(move || Length::from(px(snap_offset.get())))
+                // Key on tab identity only: replacing this subtree discards the editor's undo history.
+                .child(each(
+                    move || vec![active.get()],
+                    |key| *key,
+                    move |_, _| {
+                        tab_deadline.set(None);
+                        column_content(
+                            content_state.clone(),
+                            language,
+                            snap_offset,
+                            track_reflow(tab_deadline.clone()),
+                        )
+                    },
+                )),
+        )
         .child(notices::status_line(state, language, status))
 }
 
@@ -260,7 +269,7 @@ fn column_content(
         )
         .into_element(),
         view()
-            .test_id("document-slot")
+            .test_id("tab-document-slot")
             .flex_1()
             .min_h(px(0.0))
             .w_full()
@@ -735,7 +744,7 @@ mod tests {
 
         let mut app = conflict_probe();
         app.settle();
-        let ids = ["conflict-banner-slot", "document-slot"];
+        let ids = ["conflict-banner-slot", "tab-document-slot"];
         let final_bounds = ids.map(|id| node(&app, id).bounds);
         press_without_settling(&mut app, "probe-switch-tab");
         let batches = capture_batches(&mut app);
@@ -804,7 +813,7 @@ mod tests {
 
         let mut app = conflict_probe();
         app.settle();
-        let ids = ["conflict-banner-slot", "document-slot"];
+        let ids = ["conflict-banner-slot", "tab-document-slot"];
         let final_bounds = ids.map(|id| node(&app, id).bounds);
         press_without_settling(&mut app, "probe-switch-tab");
         let batches = capture_batches(&mut app);
@@ -1427,16 +1436,20 @@ mod tests {
     #[test]
     fn restoring_the_last_draft_keeps_the_banner_mounted_during_its_exit() {
         use nsh_core::{
-            MountItem,
+            MountItem, ViewStyle,
             animation::{AnimationOp, Driver},
+            transition::Live,
         };
 
         let mut app = recovery_probe();
+        let no_banner_top = node(&app, "document-slot").bounds.origin.y.0;
         let batches = capture_batches(&mut app);
         press_without_settling(&mut app, "probe-show-recovery");
         app.run_for(Duration::from_millis(motion::ENTER_MS as u64))
             .expect("finish the banner entry");
-        let slot = node(&app, "recovery-banner-slot").id;
+        let open_slot = node(&app, "recovery-banner-slot");
+        let slot = open_slot.id;
+        let open_document = node(&app, "document-slot");
         let banner = node(&app, "recovery-banner").id;
         let opacity = binding_nodes(
             &batches.try_iter().flatten().collect::<Vec<_>>(),
@@ -1449,6 +1462,37 @@ mod tests {
             .expect("reach the middle of the banner exit");
         assert_eq!(node(&app, "recovery-banner").id, banner);
         let exit: Vec<_> = batches.try_iter().collect();
+        let sample = |before: &LayoutNode, after: &LayoutNode| {
+            let mut frame = after.bounds;
+            if before.id == after.id
+                && exit
+                    .iter()
+                    .any(|batch| transitioned_frames(batch, motion::EXIT_MS).contains(&after.id))
+            {
+                let mut live = Live::default();
+                let mut style = Box::<ViewStyle>::default();
+                frame = before.bounds;
+                live.move_frame(
+                    frame,
+                    after.bounds,
+                    motion::ease_out_layout(motion::EXIT_MS),
+                );
+                live.step(0.0, &mut frame, &mut style);
+                live.step(f64::from(motion::EXIT_MS) / 2000.0, &mut frame, &mut style);
+            }
+            frame
+        };
+        let mid_slot = sample(&open_slot, &node(&app, "recovery-banner-slot"));
+        let mid_document = sample(&open_document, &node(&app, "document-slot"));
+        assert!(
+            mid_slot.size.height.0 > 0.0 && mid_slot.size.height.0 < open_slot.bounds.size.height.0
+        );
+        let mid_bottom = mid_slot.origin.y.0 + mid_slot.size.height.0;
+        assert!(
+            (mid_document.origin.y.0 - mid_bottom).abs() < 0.01,
+            "the document top {} must follow the collapsing banner bottom {mid_bottom}",
+            mid_document.origin.y.0
+        );
         assert!(exit.iter().any(|batch| {
             transitioned_frames(batch, motion::EXIT_MS).contains(&slot)
                 && batch.iter().any(|item| {
@@ -1468,6 +1512,7 @@ mod tests {
         )));
         app.run_for(Duration::from_millis(motion::EXIT_MS as u64 / 2))
             .expect("finish the banner exit");
+        assert_eq!(node(&app, "document-slot").bounds.origin.y.0, no_banner_top);
         assert!(
             !app.screen()
                 .layout_nodes()
