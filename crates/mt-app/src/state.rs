@@ -123,6 +123,9 @@ pub struct AppState {
     pub tabs: Signal<Vec<Tab>>,
     pub active: Signal<Option<u64>>,
     pub status: Signal<SharedString>,
+    /// Distinguishes notifications even when their text is identical, so an
+    /// older fade cannot clear a newer status line.
+    pub(crate) status_generation: Signal<u64>,
     /// Whether the status line's message holds until the next one (an error,
     /// a refusal, a wait) rather than fading after a moment (something done).
     /// Write both through [`AppState::notify`] and [`AppState::notify_held`].
@@ -457,16 +460,16 @@ pub struct ReviewView {
     pub partial: bool,
 }
 
-/// The column's camera: the document line a surface asked the source editor to
-/// level with its docked reading position (a review's racked finding, a
-/// revision's current hunk). The document lane's `ui::document` scrolls to it;
-/// nothing here changes the document.
+/// A request to align one source line with the column's reading position.
+/// The request scrolls the source view only; document contents are unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DocumentFocus {
     /// The tab the line belongs to; another tab's request is ignored.
     pub tab: u64,
     /// The line, from 0.
     pub line: u32,
+    /// Whether this request may glide; frequent and keyboard navigation cuts.
+    pub animated: bool,
     /// Bumped by every request, so asking again for the same line levels it
     /// again.
     pub request: u64,
@@ -594,6 +597,7 @@ impl AppState {
             tabs: signal(Vec::new()),
             active: signal(None),
             status: signal(status),
+            status_generation: signal(0_u64),
             status_held: signal(notice.is_some()),
             search_query: signal(String::new()),
             search_results: signal(Vec::new()),
@@ -703,6 +707,8 @@ impl AppState {
     /// Say something the app did on the status line; it fades after a moment.
     pub fn notify(&self, message: impl Into<SharedString>) {
         self.status_held.set(false);
+        self.status_generation
+            .set(self.status_generation.get_untracked().wrapping_add(1));
         self.status.set(message.into());
     }
 
@@ -710,6 +716,8 @@ impl AppState {
     /// still happening: the line holds it until the next message.
     pub fn notify_held(&self, message: impl Into<SharedString>) {
         self.status_held.set(true);
+        self.status_generation
+            .set(self.status_generation.get_untracked().wrapping_add(1));
         self.status.set(message.into());
     }
 
@@ -1270,16 +1278,24 @@ impl AppState {
         }
     }
 
-    /// Ask the source column to level `line` (from 0) of tab `tab_id` with
-    /// its docked reading position — the review's racked finding, a
-    /// revision's current hunk. The document lane's `ui::document` does the
-    /// scrolling, so the anchored lines and the field's docked explanation
-    /// sit level; the document itself is never touched.
+    /// Ask the column to align `line` in `tab_id` with its reading position.
+    /// Use [`Self::focus_document_line_instant`] for frequent or keyboard navigation.
     pub fn focus_document_line(&self, tab_id: u64, line: u32) {
+        self.request_document_line(tab_id, line, true);
+    }
+
+    /// Ask the source column to level `line` (from 0) of tab `tab_id` at once.
+    /// Use for frequent or keyboard-driven navigation.
+    pub fn focus_document_line_instant(&self, tab_id: u64, line: u32) {
+        self.request_document_line(tab_id, line, false);
+    }
+
+    fn request_document_line(&self, tab_id: u64, line: u32, animated: bool) {
         let request = self.document_focus.get().request.wrapping_add(1);
         self.document_focus.set(DocumentFocus {
             tab: tab_id,
             line,
+            animated,
             request,
         });
     }
@@ -1775,9 +1791,7 @@ impl AppState {
 
     /// The guard's Cancel: nothing changes and the guard goes.
     pub fn guard_cancel(&self) {
-        if let Some(request) = self.guard.get() {
-            request.busy.set(false);
-            request.notice.set(None);
+        if self.guard.get().is_some() {
             self.guard.set(None);
         }
     }
@@ -1837,9 +1851,12 @@ impl AppState {
     fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
-        tab.text.set(SharedString::from(text));
-        tab.dirty.set(false);
-        tab.conflict.set(false);
+        // The retiring comparison must not diff the reloaded buffer.
+        batch(|| {
+            tab.text.set(SharedString::from(text));
+            tab.dirty.set(false);
+            tab.conflict.set(false);
+        });
         tab.revision.update(|revision| *revision += 1);
         self.retire_tab_recovery(tab);
         self.recovery_tracks.borrow_mut().remove(&tab.id);
@@ -2206,6 +2223,43 @@ impl AppState {
     /// whose live selection `Review selection` reviews.
     pub fn attach_source_editor(&self, tab: u64, editor: ComponentRef<Editor>) {
         self.source_editor.set(Some((tab, editor)));
+    }
+
+    /// Return a local action's keyboard focus without moving the caret.
+    pub fn focus_editor(&self) {
+        let Some(active) = self.active.get() else {
+            return;
+        };
+        if self.focus_mounted_editor(active) {
+            return;
+        }
+        // A tab switch can replace the editor in the next commit.
+        let state = self.clone();
+        request_animation_frame(move |_| {
+            if state.active.get() == Some(active) {
+                state.focus_mounted_editor(active);
+            }
+        });
+    }
+
+    fn focus_mounted_editor(&self, active: u64) -> bool {
+        if self.settings_open.get()
+            || self.guard.get().is_some()
+            || self.review_consent.get().is_some()
+            || self.revision_consent.get().is_some()
+        {
+            return false;
+        }
+        let Some(api) = self
+            .source_editor
+            .get()
+            .filter(|(tab, _)| *tab == active)
+            .and_then(|(_, editor)| editor.api::<EditorApi>())
+        else {
+            return false;
+        };
+        api.focus();
+        true
     }
 
     /// Take the keyboard focus from the mounted source editor, if it has it:

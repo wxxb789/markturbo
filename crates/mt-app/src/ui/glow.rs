@@ -48,32 +48,14 @@ use crate::{
     state::{AppState, ReviewFindingView, ReviewView, Tab},
     ui::{
         motion::{
-            AFTERIMAGE_MS, COOL_MS, COOL_TAU_MS, EMBER, IGNITE_MS, REDUCED_CROSSFADE_MS,
-            STAGGER_MS, reduced_motion,
+            AFTERIMAGE_MS, COOL_MS, COOL_TAU_MS, EMBER, HEAT_TICK_MS, HEAT_WATCH_MS, IGNITE_MS,
+            REDUCED_CROSSFADE_MS, reduced_motion,
         },
         tokens::{self, Palette, with_alpha},
     },
 };
 
-/// How long the stepped clock waits between steps while the column is
-/// moving: about 30 a second, near the display's rate without repainting
-/// decorations every frame.
-const TICK_MS: u64 = 33;
-
-/// How long the clock waits between beats once the column has settled: a
-/// decoration's style is a snapshot of the palette, and nsh-base's
-/// decorations effect does not re-run when the appearance changes, so the
-/// clock samples the palette while a result is live and repaints only when
-/// it differs.
-const WATCH_MS: u64 = 250;
-
-/// One review's emission in the column: which result it belongs to, when the
-/// arrival sequence began, which finding is HOT, and the anchors resolved
-/// once against the text the review was made from.
-///
-/// One per window (a [`global`]), so it survives the shell being rebuilt
-/// across a language or layout change. The decorations read it; [`observe`]
-/// and [`focus_finding`] write it.
+/// Per-window emission state survives shell reconstruction.
 #[derive(Clone, Default)]
 struct Emission {
     /// The result the schedule belongs to; `None` when nothing is live.
@@ -84,7 +66,6 @@ struct Emission {
     /// One slot per finding, in the field's order; `None` for a finding
     /// with no anchor in this document (document-wide, another file).
     anchors: Vec<Option<Anchor>>,
-    /// When the arrival sequence began.
     arrived: Option<Instant>,
     /// The finding whose words are HOT, and when it took the focus, in ms
     /// from the arrival.
@@ -121,8 +102,6 @@ struct Anchor {
     range: EditorRange,
     /// The anchored glyphs themselves emit; else the air beside them does.
     stated: bool,
-    /// When this finding ignites, in ms from the arrival (reading order).
-    at_ms: f32,
 }
 
 /// The emission of this window.
@@ -139,13 +118,7 @@ fn ticker_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
 }
 
-/// Registers the result the field is showing: a new one starts the arrival
-/// sequence and resolves its anchors against `tab`'s text — the tab the
-/// review was made from, and its text as it stands at arrival; a result that
-/// just went stale begins the afterimage drain; `None` ends everything.
-///
-/// Called from an effect, never from a render: it writes the emission the
-/// decorations read.
+/// Register the visible result from an effect; never write emission state during render.
 pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
     let signal = emission();
     let current = signal.get_untracked();
@@ -171,10 +144,7 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
         }
         return;
     }
-    // A new result: resolve its anchors and start the arrival in reading
-    // order. The anchors are resolved here, once, against the text the
-    // review was made from; a repaint never re-resolves them, and the editor
-    // carries them through edits.
+    // Resolve anchors against reviewed text, never the current text on repaint.
     let Some(tab) = tab else {
         signal.set(Emission::default());
         return;
@@ -186,17 +156,12 @@ pub fn observe(view: Option<&ReviewView>, tab: Option<&Tab>) {
     let anchors = if view.stale {
         vec![None; view.findings_anchored.len()]
     } else {
-        resolve_anchors(view, &tab.text.get_untracked(), reduced)
+        resolve_anchors(view, &tab.text.get_untracked())
     };
-    let motion_until = anchors
-        .iter()
-        .flatten()
-        .map(|anchor| anchor.at_ms)
-        .fold(0.0_f32, f32::max);
     let motion_until = if anchors.is_empty() {
         0.0
     } else {
-        motion_until + ignition_ms(reduced) + cooling_ms(reduced)
+        ignition_ms(reduced) + cooling_ms(reduced)
     };
     // A result that arrives already stale is drained from the start.
     let stale_ms = view.stale.then_some(-afterimage_ms(reduced));
@@ -343,34 +308,16 @@ fn twin_decoration(anchor: &Anchor) -> EditorDecoration {
 
 /// Resolves every finding's anchor against `text`: the quote's words for a
 /// stated finding, the anchored range otherwise.
-fn resolve_anchors(view: &ReviewView, text: &str, reduced: bool) -> Vec<Option<Anchor>> {
-    let questions = view.questions_detail.len();
+fn resolve_anchors(view: &ReviewView, text: &str) -> Vec<Option<Anchor>> {
     view.findings_anchored
         .iter()
-        .enumerate()
-        .map(|(index, finding)| {
+        .map(|finding| {
             Some(Anchor {
                 range: finding_range(text, finding)?,
                 stated: finding.stated,
-                at_ms: ignition_at(questions, index, reduced),
             })
         })
         .collect()
-}
-
-/// When the `index`-th finding ignites, in ms from the arrival: the first one
-/// with the first question (their simultaneous ignition is the link), the
-/// rest after the questions, in reading order, 70ms apart.
-fn ignition_at(questions: usize, index: usize, reduced: bool) -> f32 {
-    if reduced {
-        return 0.0;
-    }
-    let slot = if index == 0 {
-        1
-    } else {
-        2 + questions + index - 1
-    };
-    slot as f32 * STAGGER_MS
 }
 
 /// The range one finding lights up, in the editor's coordinates.
@@ -501,19 +448,17 @@ fn elapsed_ms(e: &Emission) -> f32 {
 /// The heat of finding `index` at `now`: `1.0` HOT, [`EMBER`] cooled,
 /// `0.0` not emitting.
 fn heat_at(e: &Emission, index: usize, now: f32, reduced: bool) -> f32 {
-    let Some(anchor) = e.anchors.get(index).and_then(Option::as_ref) else {
+    if e.anchors.get(index).and_then(Option::as_ref).is_none() {
         return 0.0;
-    };
+    }
     let live = if e.focus == Some(index) {
         rise(now - e.focus_ms, reduced)
     } else if let Some(since) = e.cooling_since.get(index).copied().flatten() {
         // It was HOT and lost the focus: it cools from there, not from the
         // arrival's own curve.
         cooling(now - since, reduced)
-    } else if now < anchor.at_ms {
-        0.0
     } else {
-        cooling(now - anchor.at_ms, reduced)
+        cooling(now, reduced)
     };
     match e.stale_ms {
         Some(stale) => {
@@ -599,7 +544,7 @@ fn tick() {
         });
     }
     let step = set_timeout(
-        Duration::from_millis(if settled { WATCH_MS } else { TICK_MS }),
+        Duration::from_millis(if settled { HEAT_WATCH_MS } else { HEAT_TICK_MS }),
         tick,
     );
     // Replacing the handle drops the step that just ran (its timer is
@@ -858,7 +803,7 @@ mod tests {
         };
         let text = "q";
         let mut e = Emission {
-            anchors: resolve_anchors(&view, text, false),
+            anchors: resolve_anchors(&view, text),
             view: Some(view),
             tab_id: Some(1),
             arrived: Some(now()),
@@ -871,29 +816,23 @@ mod tests {
             pulse: false,
             now_ms: 0.0,
         };
-        // Before its slot, nothing emits; at the rise it reaches HOT.
         assert_eq!(heat_at(&e, 0, 0.0, false), 0.0);
-        let first = e.anchors[0].as_ref().expect("an anchor").at_ms;
-        assert!((heat_at(&e, 0, first + IGNITE_MS, false) - 1.0).abs() < 0.001);
-        // It cools toward EMBER and stays there.
-        let second = e.anchors[1].as_ref().expect("an anchor").at_ms;
-        let cooled = heat_at(&e, 1, second + IGNITE_MS + COOL_MS, false);
+        assert_eq!(heat_at(&e, 1, 0.0, false), 0.0);
+        assert!((heat_at(&e, 0, IGNITE_MS, false) - 1.0).abs() < 0.001);
+        assert!((heat_at(&e, 1, IGNITE_MS, false) - 1.0).abs() < 0.001);
+        let cooled = heat_at(&e, 1, IGNITE_MS + COOL_MS, false);
         assert!((cooled - EMBER).abs() < 0.01, "cooled to {cooled}");
-        // The focused finding holds HOT.
         e.focus = Some(1);
         e.focus_ms = 1000.0;
         assert_eq!(heat_at(&e, 1, 1000.0 + IGNITE_MS + COOL_MS, false), 1.0);
-        // The one that lost the focus cools from the moment it did.
         e.cooling_since[0] = Some(1000.0);
         let losing = heat_at(&e, 0, 1000.0 + IGNITE_MS + COOL_TAU_MS, false);
         assert!(losing < 0.5 && losing > EMBER, "cooling from hot: {losing}");
-        // Stale drains everything to the afterimage.
         e.stale_ms = Some(2000.0);
         assert_eq!(heat_at(&e, 1, 2000.0 + AFTERIMAGE_MS + 1.0, false), 0.0);
-        // Reduced motion steps to ember at once.
         e.stale_ms = None;
         e.focus = None;
-        let stepped = heat_at(&e, 1, second + REDUCED_CROSSFADE_MS + 1.0, true);
+        let stepped = heat_at(&e, 1, REDUCED_CROSSFADE_MS + 1.0, true);
         assert_eq!(stepped, EMBER);
     }
 
@@ -930,7 +869,6 @@ mod tests {
             let anchor = Anchor {
                 range: EditorRange::new(EditorPosition::new(0, 0), EditorPosition::new(0, 1)),
                 stated: false,
-                at_ms: 0.0,
             };
             let decoration = inferred_decoration(&anchor, 1.0, palette);
             assert!(decoration.style.is_none(), "the glyphs stay ink");
@@ -945,7 +883,6 @@ mod tests {
             let anchor = Anchor {
                 range: EditorRange::new(EditorPosition::new(0, 0), EditorPosition::new(0, 1)),
                 stated: true,
-                at_ms: 0.0,
             };
             let hot = stated_decoration(&anchor, 1.0, palette);
             assert!(hot.style.is_some() && hot.gutter.is_some());
@@ -993,7 +930,6 @@ mod tests {
         let anchor = Anchor {
             range: EditorRange::new(EditorPosition::new(0, 0), EditorPosition::new(0, 1)),
             stated: true,
-            at_ms: 0.0,
         };
         let twin = twin_decoration(&anchor);
         assert_eq!(twin.range, anchor.range);
@@ -1022,12 +958,8 @@ mod tests {
             let anchor = Anchor {
                 range: EditorRange::new(EditorPosition::new(0, 0), EditorPosition::new(0, 1)),
                 stated: true,
-                at_ms: 0.0,
             };
 
-            // A HOT stated finding: the glyphs in the hot colour, and the
-            // under-bloom as the span's background (over the emitter plate,
-            // one flat colour).
             let hot = stated_decoration(&anchor, 1.0, palette);
             let style = hot.style.as_ref().expect("a span style");
             let decls = style.decls();

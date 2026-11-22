@@ -13,7 +13,11 @@
 //! one colour with that alpha, not a pre-blended grey, so it sits correctly on
 //! both the room and the column ground.
 
-use nsh_core::{Color, element::FontWeight, prelude::*};
+use nsh_core::{
+    Color,
+    element::{AdaptiveColor, FontWeight},
+    prelude::*,
+};
 
 /// `0xRRGGBB`, opaque.
 const fn hex(rgb: u32) -> Color {
@@ -201,6 +205,10 @@ pub fn palette() -> &'static Palette {
     if dark() { &DARK } else { &LIGHT }
 }
 
+pub(crate) fn adaptive_color(pick: impl Fn(&Palette) -> Color) -> AdaptiveColor {
+    AdaptiveColor::new(pick(&LIGHT), pick(&DARK))
+}
+
 impl Palette {
     /// The room at 70%: what dims everything under the consent card, because
     /// the room dims to 30% while something is about to leave the device.
@@ -278,9 +286,6 @@ pub const HAIRLINE: f32 = 1.0;
 /// The focus ring: a designed 1px ink ring, offset from the control.
 pub const FOCUS_RING: f32 = 1.0;
 pub const FOCUS_RING_OFFSET: f32 = 2.0;
-/// The rail's hover widening, and the 4px the consent card rises.
-pub const RAIL_WIDEN_MS: f32 = 160.0;
-pub const CARD_RISE: f32 = 4.0;
 
 /// The type scale: 12.5, 14, 16, 22 (with their line heights).
 pub const TYPE_UI: f32 = 12.5;

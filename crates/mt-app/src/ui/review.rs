@@ -4,10 +4,8 @@
 //! (the current one HOT with its `Why it matters:` and its answer field), the
 //! cooled question list, `All fields`, loading, stale and the diagnostics.
 //!
-//! Contract: [`is_open`] says whether the field is the review's; [`field`]
-//! draws it. The shell routes to it and gives it the field's box; everything
-//! inside — the docked reading position, the ignition order, the stagger, the
-//! focus on the answer field — belongs here.
+//! The shell chooses this field surface and gives it its box;
+//! review owns its reading position and contents.
 //!
 //! The session this file keeps ([`session`], [`emitters`]) is UI state the
 //! state has no name for: which question the user is on, which they answered
@@ -26,7 +24,12 @@ use mt_core::{
     settings::Language,
 };
 use nsh_base::input;
-use nsh_core::{Color, EllipsizeMode, element::KeyOptions, keymap::When, prelude::*};
+use nsh_core::{
+    Color, EllipsizeMode,
+    element::{AdaptiveColor, KeyOptions},
+    keymap::When,
+    prelude::*,
+};
 
 use crate::{
     i18n::{self, Key},
@@ -36,7 +39,7 @@ use crate::{
     },
     ui::{
         glow,
-        motion::{Heat, IGNITE_MS, REDUCED_CROSSFADE_MS, reduced_motion, stagger},
+        motion::{EASE_IN_OUT, Heat, IGNITE_MS, LINEAR, REDUCED_CROSSFADE_MS, reduced_motion},
         prims,
         tokens::{
             self, FOCUS_RING, FOCUS_RING_OFFSET, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
@@ -158,8 +161,6 @@ fn hint_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
 }
 
-/// Watches the state's result: a new one resets the session, builds the
-/// emitters, ignites them in reading order and hands the column its anchors.
 fn observe(state: &AppState, session: Signal<Session>) {
     let state = state.clone();
     effect(move || {
@@ -204,28 +205,21 @@ fn observe(state: &AppState, session: Signal<Session>) {
                         .collect(),
                 });
                 emitters.set(built.clone());
-                // The reading order: the goal, then the question to answer —
-                // the one that stays HOT — then the rest of the questions.
-                // The column's findings ignite on the same clock, and exactly
-                // one thing is HOT by the time the sequence is done.
-                built.goal.ignite(stagger(0));
+                built.goal.ignite();
                 for (slot, index) in order.iter().enumerate() {
                     let Some(heat) = built.questions.get(slot).copied() else {
                         continue;
                     };
                     if Some(*index) == current {
-                        ignite_hold(heat, stagger(1));
+                        ignite_hold(heat);
                     } else {
-                        heat.ignite(stagger(2 + slot));
+                        heat.ignite();
                     }
                 }
                 // Nothing is focused yet: the question is the one HOT item
                 // until `J`/`K` (or the stepper) steps to a finding.
                 glow::focus_finding(None);
-                // The first finding ignites with the first question (their
-                // simultaneous ignition is the link): the column moves so the
-                // anchored lines sit level with the docked question.
-                level_finding(&state, view.tab_id, 0);
+                level_finding(&state, view.tab_id, 0, true);
                 focus_request().set(Some(match (view.stale, current) {
                     (true, _) => Focus::ReviewAgain,
                     (false, Some(index)) => Focus::Answer(index),
@@ -303,8 +297,6 @@ fn keys(state: &AppState, session: Signal<Session>) {
     }
 }
 
-/// `J`/`K`: the next finding's words go HOT, the previous one cools, and its
-/// explanation takes the docked position.
 fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
     let Some(view) = state.review_view.get_untracked() else {
         return;
@@ -332,9 +324,7 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
         session.showing_finding = true;
     });
     glow::focus_finding(Some(to));
-    // The column re-centres so the finding's anchored lines sit level with
-    // its explanation, docked in the field (document.rs reveals the line).
-    level_finding(state, view.tab_id, to);
+    level_finding(state, view.tab_id, to, false);
     let heats = emitters().get_untracked().findings;
     if let Some(from) = from
         && from != to
@@ -343,39 +333,32 @@ fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
         heat.cool();
     }
     if let Some(heat) = heats.get(to).copied() {
-        ignite_hold(heat, 0.0);
+        ignite_hold(heat);
     }
 }
 
-/// Asks the column's camera for the finding the field just made HOT: the
-/// source editor levels the anchored line with the docked explanation
-/// ([`AppState::focus_document_line`]). Nothing is asked when the finding is
-/// not anchored in this document (document-wide, or another file's).
-fn level_finding(state: &AppState, tab_id: Option<u64>, finding: usize) {
+fn level_finding(state: &AppState, tab_id: Option<u64>, finding: usize, animated: bool) {
     if let Some(tab_id) = tab_id
         && let Some(line) = glow::anchor_line(finding)
     {
-        state.focus_document_line(tab_id, line);
+        if animated {
+            state.focus_document_line(tab_id, line);
+        } else {
+            state.focus_document_line_instant(tab_id, line);
+        }
     }
 }
 
 /// Ignites `heat` and holds it HOT: a plain [`Heat::ignite`] would cool to
 /// ember, and the one current item must stay hot.
-fn ignite_hold(heat: Heat, delay_ms: f32) {
+fn ignite_hold(heat: Heat) {
     let value = heat.value();
     value.stop();
     if reduced_motion() {
-        let timing = Timing::new(REDUCED_CROSSFADE_MS, Easing::EaseInOut);
-        if delay_ms > 0.0 {
-            value.timing_with(1.0, Timing { delay_ms, ..timing });
-        } else {
-            value.timing_with(1.0, timing);
-        }
+        value.timing_with(1.0, Timing::new(REDUCED_CROSSFADE_MS, EASE_IN_OUT));
         return;
     }
-    let mut timing = Timing::new(IGNITE_MS, Easing::Linear);
-    timing.delay_ms = delay_ms;
-    value.timing_with(1.0, timing);
+    value.timing_with(1.0, Timing::new(IGNITE_MS, LINEAR));
 }
 
 // ─── the body, by state ──────────────────────────────────────────────────
@@ -789,19 +772,19 @@ fn questions(
                     let order = order.to_vec();
                     move || reopen_question(session, &order, index)
                 };
-                // The line is the button itself, as `prims::press_target` is: a
-                // pressable view around a named button reads as a second,
-                // unnamed button to UIA.
-                view()
-                    .test_id("review-question-line")
-                    .role(AccessibilityRole::Button)
-                    .optional_label(Some(SharedString::from(text.clone())))
-                    .w_full()
-                    .cursor_pointer()
-                    .focus_visible(|style| style.text_color(tokens::palette().ink))
-                    .on_press(reopen)
-                    .child(row)
-                    .into_element()
+                // A pressable wrapper would add an unnamed UIA button.
+                prims::press_feedback(
+                    view()
+                        .test_id("review-question-line")
+                        .role(AccessibilityRole::Button)
+                        .optional_label(Some(SharedString::from(text.clone())))
+                        .w_full()
+                        .cursor_pointer()
+                        .focus_visible(|style| style.text_color(|| tokens::palette().ink))
+                        .on_press(reopen),
+                )
+                .child(row)
+                .into_element()
             })),
     );
     block
@@ -852,9 +835,9 @@ fn current_question_block(
                 .font_weight(tokens::WEIGHT_MEDIUM)
                 .text_color(move || tokens::palette().ink)
                 .bind_color(&heat.glyph(
-                    tokens::palette().ember,
-                    tokens::palette().ember,
-                    tokens::palette().hot,
+                    tokens::adaptive_color(|palette| palette.ember),
+                    tokens::adaptive_color(|palette| palette.ember),
+                    tokens::adaptive_color(|palette| palette.hot),
                 )),
         )
         .child(voice(question_text, heat, language, drained(stale)));
@@ -939,9 +922,7 @@ fn reopen_question(session: Signal<Session>, order: &[usize], index: usize) {
     {
         question_heat(&emitters, order, previous).cool();
     }
-    ignite_hold(question_heat(&emitters, order, index), 0.0);
-    // The question is the HOT item again, and the column's light goes back to
-    // the question's own finding.
+    ignite_hold(question_heat(&emitters, order, index));
     glow::focus_finding(None);
     focus_request().set(Some(Focus::Answer(index)));
 }
@@ -995,7 +976,7 @@ fn advance_question(session: Signal<Session>, order: &[usize], index: usize) {
     question_heat(&emitters, order, index).cool();
     let next = current_question(&session.get_untracked(), order);
     if let Some(next) = next {
-        ignite_hold(question_heat(&emitters, order, next), 0.0);
+        ignite_hold(question_heat(&emitters, order, next));
     }
     // The next thing to do takes the focus: the next answer field, or
     // `Prepare revision` once every question is done.
@@ -1058,18 +1039,18 @@ fn step_control(
 ) -> AnyElement {
     let state = state.clone();
     let step = move || step_finding(&state, session, delta);
-    // The control is the button itself, as `prims::press_target` is: a
-    // pressable view around a named button reads as a second, unnamed button
-    // to UIA.
-    view()
-        .test_id(id)
-        .role(AccessibilityRole::Button)
-        .optional_label(Some(SharedString::from(s(label, language))))
-        .cursor_pointer()
-        .focus_visible(|style| style.text_color(tokens::palette().ink))
-        .on_press(step)
-        .child(prims::kbd(key))
-        .into_element()
+    // A pressable wrapper would add an unnamed UIA button.
+    prims::press_feedback(
+        view()
+            .test_id(id)
+            .role(AccessibilityRole::Button)
+            .optional_label(Some(SharedString::from(s(label, language))))
+            .cursor_pointer()
+            .focus_visible(|style| style.text_color(|| tokens::palette().ink))
+            .on_press(step),
+    )
+    .child(prims::kbd(key))
+    .into_element()
 }
 
 /// The legend, and the state's one next action once every question is
@@ -1177,7 +1158,10 @@ fn footer(
                 .child(prims::quiet_action(
                     "review-close",
                     s(S::Close, language),
-                    move || close_state.close_review(),
+                    move || {
+                        close_state.close_review();
+                        close_state.focus_editor();
+                    },
                 )),
         )
 }
@@ -1289,7 +1273,10 @@ fn unavailable(state: AppState, language: Language, reason: ReviewUnavailable) -
                 .child(prims::quiet_action(
                     "review-close",
                     s(S::Close, language),
-                    move || close.close_review(),
+                    move || {
+                        close.close_review();
+                        close.focus_editor();
+                    },
                 )),
         )
 }
@@ -1513,8 +1500,8 @@ fn question_heat(emitters: &Emitters, order: &[usize], index: usize) -> Heat {
 }
 
 /// The afterimage ink, once the source has moved on.
-fn drained(stale: bool) -> Option<Color> {
-    stale.then(|| tokens::palette().afterimage_ink)
+fn drained(stale: bool) -> Option<AdaptiveColor> {
+    stale.then(|| tokens::adaptive_color(|palette| palette.afterimage_ink))
 }
 
 /// The model's voice: 22/30, and 1.75 line height for Chinese. With
@@ -1523,12 +1510,15 @@ fn voice(
     content: impl IntoReactive<SharedString>,
     heat: Heat,
     language: Language,
-    drained: Option<Color>,
+    drained: Option<AdaptiveColor>,
 ) -> impl IntoElement {
-    let palette = tokens::palette();
     let (ink, ember, hot) = match drained {
         Some(afterimage) => (afterimage, afterimage, afterimage),
-        None => (palette.ink, palette.ember, palette.hot),
+        None => (
+            tokens::adaptive_color(|palette| palette.ink),
+            tokens::adaptive_color(|palette| palette.ember),
+            tokens::adaptive_color(|palette| palette.hot),
+        ),
     };
     text(content)
         .font_family(tokens::FONT_MODEL)
@@ -1550,15 +1540,15 @@ fn heat_line(
     drained: bool,
     one_line: bool,
 ) -> impl IntoElement {
-    let palette = tokens::palette();
     let (ink, ember, hot) = if drained {
-        (
-            palette.afterimage_ink,
-            palette.afterimage_ink,
-            palette.afterimage_ink,
-        )
+        let afterimage = tokens::adaptive_color(|palette| palette.afterimage_ink);
+        (afterimage, afterimage, afterimage)
     } else {
-        (palette.ink, palette.ember, palette.hot)
+        (
+            tokens::adaptive_color(|palette| palette.ink),
+            tokens::adaptive_color(|palette| palette.ember),
+            tokens::adaptive_color(|palette| palette.hot),
+        )
     };
     let line = text(content)
         .font_family(tokens::FONT_UI)
@@ -1603,7 +1593,7 @@ fn answer_field(
         .p(px(FOCUS_RING_OFFSET))
         .border(px(FOCUS_RING))
         .border_color(Color::TRANSPARENT)
-        .focus_within(|style| style.border_color(tokens::palette().ink))
+        .focus_within(|style| style.border_color(|| tokens::palette().ink))
         .child(
             input()
                 .test_id("review-answer-input")
@@ -1621,7 +1611,7 @@ fn answer_field(
                 .bg(move || tokens::palette().room)
                 .border(px(tokens::HAIRLINE))
                 .border_color(move || with_alpha(tokens::palette().ink, 0.16))
-                .focus_visible(|style| style.border_color(tokens::palette().ink)),
+                .focus_visible(|style| style.border_color(|| tokens::palette().ink)),
         )
 }
 
@@ -1757,7 +1747,11 @@ mod tests {
             std::sync::LazyLock::new(|| {
                 let dir = tempfile::tempdir().expect("temp dir");
                 let path = dir.path().join("camera.md");
-                std::fs::write(&path, "alpha\nbeta\ngamma\n").expect("write the fixture");
+                let mut text = String::from("alpha\nbeta\ngamma\n");
+                for line in 3..64 {
+                    text.push_str(&format!("line {line}\n"));
+                }
+                std::fs::write(&path, text).expect("write the fixture");
                 (dir, path)
             });
         FIXTURE.1.as_path()
@@ -1849,6 +1843,23 @@ mod tests {
             )
     }
 
+    #[component]
+    fn KeyboardCameraProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.open_file(camera_fixture().to_path_buf());
+        state.review_open.set(true);
+        load_result(state.clone());
+        keys(&state, session());
+        view()
+            .test_id("keyboard-camera-probe")
+            .flex_col()
+            .w(px(760.0))
+            .h(px(700.0))
+            .child(camera_tab(&state))
+            .child(camera_request(&state))
+            .child(crate::ui::document::column(state, Language::English))
+    }
+
     /// A review that arrives through the field's own result watcher, so the
     /// camera request comes from the arrival path itself.
     #[component]
@@ -1938,8 +1949,64 @@ mod tests {
         );
     }
 
-    /// A result's arrival asks the camera for the first finding's line: its
-    /// simultaneous ignition with the first question is the link.
+    #[test]
+    fn keyboard_finding_step_levels_the_line_on_the_next_frame() {
+        let mut config = EngineConfig::new(Root::of::<KeyboardCameraProbe>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_environment("motion enabled", |env| env.reduce_motion = false)
+            .expect("enable motion");
+        app.wait_for("label:Markdown source")
+            .expect("the source editor renders");
+        app.settle();
+
+        let tab = text_of(&app, "camera-tab");
+        let tab = (!tab.is_empty())
+            .then_some(tab)
+            .expect("the fixture's tab opens");
+        let start = camera_level_offset(&app, "alpha");
+
+        let frame_start = app.clock().now();
+        app.press_key("j").expect("step to the first finding");
+        let request = text_of(&app, "camera-request");
+        let elapsed = app.clock().now().saturating_duration_since(frame_start);
+        if elapsed.is_zero() {
+            app.next_frame(Duration::from_millis(17))
+                .expect("the key's next frame");
+        }
+
+        let elapsed = app.clock().now().saturating_duration_since(frame_start);
+        let offset = camera_level_offset(&app, "alpha");
+        assert!(
+            start.abs() > 2.0
+                && request == format!("{tab}:0")
+                && elapsed <= Duration::from_millis(17)
+                && offset.abs() <= tokens::TYPE_SOURCE_LINE,
+            "J must level its finding within one frame; start {start}, request {request}, elapsed {elapsed:?}, offset {offset}"
+        );
+    }
+
+    fn camera_level_offset(app: &Headless, line: &str) -> f32 {
+        let nodes = app.screen().layout_nodes();
+        let editor = nodes
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some("source-editor"))
+            .expect("the source editor is laid out")
+            .bounds;
+        let row = nodes
+            .iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == line)
+            })
+            .unwrap_or_else(|| panic!("the row `{line}` is in view"))
+            .bounds;
+        let row_middle = row.origin.y.0 + row.size.height.0 / 2.0;
+        let editor_middle = editor.origin.y.0 + editor.size.height.0 / 2.0;
+        row_middle - editor_middle
+    }
+
     #[test]
     fn the_arrival_levels_the_first_finding() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<ArrivalProbe>()))

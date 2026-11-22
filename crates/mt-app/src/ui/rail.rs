@@ -4,10 +4,7 @@
 //! (plain ink; the dot turns ember only while the file holds live model
 //! output), widening to 240px on hover to show names.
 //!
-//! Contract: [`rail`] is the strip's whole column — the shell places it beside
-//! the text column and gives it no width of its own, so the width, the hover
-//! widening (160ms `cubic-bezier(0.2, 0, 0, 1)`) and the names all belong
-//! here.
+//! The shell gives `rail` no width; `rail` owns the strip's width.
 //!
 //! The rail also carries the app's file lists: `Ctrl+P` opens the workspace's
 //! files and `Ctrl+Shift+F` opens a content search as one input line at the
@@ -24,7 +21,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Tab},
     ui::{
-        motion::{RAIL_WIDEN_MS, rail_easing, reduced_motion},
+        motion::{EASE_OUT, RAIL_WIDEN_MS, reduced_motion},
         prims, shell,
         tokens::{
             self, COLUMN_GAP, FIELD_GAP, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT,
@@ -39,7 +36,7 @@ const MAX_ROWS: usize = 200;
 /// The rail: one dot per open file, the active file's at full ink.
 pub fn rail(state: AppState, language: Language) -> impl IntoElement {
     let hovered = signal(false);
-    let slide = animated_value(0.0);
+    let names_opacity = animated_value(0.0);
     let palette = Palette {
         open: signal(false),
         mode: signal(PaletteMode::Files),
@@ -108,26 +105,26 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         .w(px(RAIL_W))
         .h(relative(1.0))
         .bg(move || tokens::palette().room)
-        .child(strip(state.clone(), language, hovered, slide, palette))
+        .child(strip(
+            state.clone(),
+            language,
+            hovered,
+            names_opacity,
+            palette,
+        ))
         .child(when(move || palette.open.get(), {
             let state = state.clone();
             move || palette_line(state.clone(), language, palette).into_element()
         }))
 }
 
-/// The 44px strip itself: the ground that widens, the dots, and the names
-/// that appear with it.
 fn strip(
     state: AppState,
     language: Language,
     hovered: Signal<bool>,
-    slide: AnimatedValue,
+    names_opacity: AnimatedValue,
     palette: Palette,
 ) -> impl IntoElement {
-    let offset = slide
-        .node()
-        .mul(RAIL_HOVER_W - RAIL_W)
-        .sub(RAIL_HOVER_W - RAIL_W);
     view()
         .test_id("rail-hover")
         .absolute()
@@ -145,22 +142,19 @@ fn strip(
         .on_mouse_enter(move |_: &MouseEvent| {
             hovered.set(true);
             if reduced_motion() {
-                slide.set(1.0);
+                names_opacity.set(1.0);
             } else {
-                slide.timing(1.0, RAIL_WIDEN_MS, rail_easing());
+                names_opacity.timing(1.0, RAIL_WIDEN_MS, EASE_OUT);
             }
         })
         .on_mouse_leave(move |_: &MouseEvent| {
             hovered.set(false);
             if reduced_motion() {
-                slide.set(0.0);
+                names_opacity.set(0.0);
             } else {
-                slide.timing(0.0, RAIL_WIDEN_MS, rail_easing());
+                names_opacity.timing(0.0, RAIL_WIDEN_MS, EASE_OUT);
             }
         })
-        // The widened ground slides out from under the dots; the names it
-        // uncovers fade in with it. Nothing moves: the dots stay where they
-        // are, and the column does not move at all.
         .child(
             view()
                 .test_id("rail-ground")
@@ -169,12 +163,17 @@ fn strip(
                 .bottom(px(0.0))
                 .left(px(0.0))
                 .w(px(RAIL_HOVER_W))
-                .bg(move || tokens::palette().room)
-                .bind_translate_x(&offset),
+                .bg(move || tokens::palette().room),
         )
         // Painted over the invisible names, so a press in the 44px strip is
         // always a press on a dot.
-        .child(names(state.clone(), language, hovered, slide, palette))
+        .child(names(
+            state.clone(),
+            language,
+            hovered,
+            names_opacity,
+            palette,
+        ))
         .child(dots(state, palette))
 }
 
@@ -199,7 +198,7 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                 let press_state = state.clone();
                 let live_state = state.clone();
                 let live_dot_state = state.clone();
-                view()
+                prims::press_feedback(view())
                     .test_id("rail-file-row")
                     .role(AccessibilityRole::Button)
                     .optional_label(Some(tab.title.clone()))
@@ -211,13 +210,14 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                     .cursor_pointer()
                     .border(px(HAIRLINE))
                     .border_color(Color::TRANSPARENT)
-                    .focus_visible(|s| s.border_color(tokens::palette().ink))
+                    .focus_visible(|s| s.border_color(|| tokens::palette().ink))
                     .on_press(move |event: &PressEvent| {
                         press_state.set_active(id);
                         if event.clicks >= 2 {
                             press_state.pin_tab(id);
                         }
                         palette.close(&press_state);
+                        press_state.focus_editor();
                     })
                     .child(
                         view()
@@ -262,7 +262,7 @@ fn names(
     state: AppState,
     language: Language,
     hovered: Signal<bool>,
-    slide: AnimatedValue,
+    names_opacity: AnimatedValue,
     palette: Palette,
 ) -> impl IntoElement {
     let list_state = state.clone();
@@ -276,7 +276,7 @@ fn names(
         .overflow_hidden()
         .pt(px(SPACE_5))
         .flex_col()
-        .bind_opacity(&slide)
+        .bind_opacity(&names_opacity)
         .child(each(
             move || list_state.tabs.get(),
             |tab| tab.id,
@@ -296,7 +296,7 @@ fn names(
                     .flex_row()
                     .items_center()
                     .child(
-                        view()
+                        prims::press_feedback(view())
                             .test_id("rail-name")
                             // The dot row is this tab's keyboard stop: the
                             // name is the pointer's way into the strip, and
@@ -316,6 +316,7 @@ fn names(
                                     press_state.pin_tab(id);
                                 }
                                 palette.close(&press_state);
+                                press_state.focus_editor();
                             })
                             .child(
                                 text(title.clone())
@@ -329,12 +330,12 @@ fn names(
                                             tokens::palette().ink_rest
                                         }
                                     })
-                                    .hover(|s| s.text_color(tokens::palette().ink))
+                                    .hover(|s| s.text_color(|| tokens::palette().ink))
                                     .truncate(),
                             ),
                     )
                     .child(
-                        view()
+                        prims::press_feedback(view())
                             .test_id("rail-close")
                             .w(px(16.0))
                             .h(px(16.0))
@@ -353,15 +354,18 @@ fn names(
                             .focusable(move || hovered.get())
                             .border(px(HAIRLINE))
                             .border_color(Color::TRANSPARENT)
-                            .focus_visible(|s| s.border_color(tokens::palette().ink))
-                            .on_press(move || close_state.request_close_tab(id))
+                            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
+                            .on_press(move || {
+                                close_state.request_close_tab(id);
+                                close_state.focus_editor();
+                            })
                             .child(
                                 text("\u{00D7}")
                                     .font_family(FONT_UI)
                                     .text_size(px(TYPE_UI))
                                     .line_height(px(TYPE_UI_LINE))
                                     .text_color(move || tokens::palette().ink_caption)
-                                    .hover(|s| s.text_color(tokens::palette().ink)),
+                                    .hover(|s| s.text_color(|| tokens::palette().ink)),
                             ),
                     )
             },
@@ -656,7 +660,7 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
                     // element with its index read once, so an index would
                     // point at whatever moved into that place.
                     let key = row.key.clone();
-                    view()
+                    prims::press_feedback(view())
                         .test_id("palette-row")
                         .w_full()
                         .flex_row()
@@ -665,7 +669,7 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
                         .px(px(SPACE_2))
                         .py(px(SPACE_1))
                         .cursor_pointer()
-                        .hover(|s| s.text_color(tokens::palette().ink))
+                        .hover(|s| s.text_color(|| tokens::palette().ink))
                         .on_press(move |event: &PressEvent| {
                             palette.close(&open_state);
                             // Shift keeps the tab: the plain press opens in
@@ -762,5 +766,157 @@ fn s(key: S, language: Language) -> &'static str {
             S::FindFile => "查找文件",
             S::Close => "关闭",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use nsh_core::{
+        MountItem, Points,
+        platform::{ColorScheme, Idiom, Os},
+    };
+    use nsh_engine::{EngineConfig, Root};
+    use nsh_testing::Headless;
+
+    use super::*;
+
+    #[component]
+    fn PaletteProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        state
+            .tabs
+            .update(|tabs| tabs[0].title = SharedString::from("Inactive"));
+        state.new_document();
+        view()
+            .w(px(640.0))
+            .h(px(400.0))
+            .flex_row()
+            .child(rail(state, Language::English))
+            .child(prims::primary_action("palette-primary", "Primary", || {}))
+    }
+
+    fn node_with(app: &Headless, test_id: &str) -> nsh_core::NodeId {
+        app.screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some(test_id))
+            .unwrap_or_else(|| panic!("the `{test_id}` view is mounted"))
+            .id
+    }
+
+    fn rail_name_color(app: &Headless) -> Color {
+        app.screen()
+            .span_style("text:Inactive")
+            .expect("the hovered inactive rail name style")
+            .color
+    }
+
+    #[test]
+    fn hovered_rail_and_focused_actions_track_the_current_theme() {
+        let mut config = EngineConfig::new(Root::of::<PaletteProbe>().tokens(tokens::theme()));
+        config.environment.color_scheme = ColorScheme::Light;
+        config.environment.idiom = Idiom::Desktop;
+        config.environment.os = Os::Windows;
+        config.environment.reduce_motion = true;
+        let mut app = Headless::start(config).expect("start the palette probe");
+        app.set_viewport(nsh_core::Size::new(Points(640.0), Points(400.0)))
+            .expect("set the viewport");
+        app.wait_for("id:rail-hover").expect("the collapsed rail");
+        app.hover("id:rail-hover").expect("open the rail names");
+        app.settle();
+        app.wait_for("text:Inactive")
+            .expect("the inactive rail name");
+        app.hover("text:Inactive")
+            .expect("hover the inactive rail name");
+        app.settle();
+
+        let rail_close = node_with(&app, "rail-close");
+        let primary = node_with(&app, "palette-primary");
+
+        let border_colors = Arc::new(Mutex::new(Vec::new()));
+        app.observe({
+            let border_colors = border_colors.clone();
+            move |_, batch| {
+                for item in &batch.items {
+                    if let MountItem::ViewStyle { id, style } = item
+                        && (*id == rail_close || *id == primary)
+                    {
+                        border_colors
+                            .lock()
+                            .expect("lock the border record")
+                            .push((*id, style.borders.colors[0]));
+                    }
+                }
+            }
+        });
+        let border_color = |node| {
+            border_colors
+                .lock()
+                .expect("lock the border record")
+                .iter()
+                .rev()
+                .find(|(id, _)| *id == node)
+                .map(|(_, color)| *color)
+        };
+
+        for _ in 0..8 {
+            if border_color(rail_close) == Some(tokens::LIGHT.ink) {
+                break;
+            }
+            app.press_key("tab").expect("focus the rail close control");
+        }
+        let light_name_before_switch = rail_name_color(&app);
+        let light_close_before_switch = border_color(rail_close);
+
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("report OS appearance");
+        app.settle();
+
+        let dark_name_color = rail_name_color(&app);
+        let dark_close_color = border_color(rail_close);
+
+        for _ in 0..8 {
+            if [tokens::LIGHT.ink, tokens::DARK.ink]
+                .contains(&border_color(primary).unwrap_or(Color::TRANSPARENT))
+            {
+                break;
+            }
+            app.press_key("tab").expect("focus the primary action");
+        }
+        let dark_primary_color = border_color(primary);
+
+        app.set_environment("system appearance becomes light", |env| {
+            env.color_scheme = ColorScheme::Light;
+        })
+        .expect("report OS appearance");
+        app.settle();
+
+        let light_name_after_switch = rail_name_color(&app);
+        let light_primary_color = border_color(primary);
+        assert_eq!(
+            (
+                light_name_before_switch,
+                light_close_before_switch,
+                dark_name_color,
+                dark_close_color,
+                dark_primary_color,
+                light_name_after_switch,
+                light_primary_color
+            ),
+            (
+                tokens::LIGHT.ink,
+                Some(tokens::LIGHT.ink),
+                tokens::DARK.ink,
+                Some(tokens::DARK.ink),
+                Some(tokens::DARK.ink),
+                tokens::LIGHT.ink,
+                Some(tokens::LIGHT.ink)
+            )
+        );
     }
 }
