@@ -92,12 +92,12 @@ no release-bound native isolation evidence.
 - On the owner's active, unlocked Windows 11 x64 desktop, run
   `mt.py accept all --exe <release exe> --expect-exe-sha256 <release sha256>`.
   Poll the first Goal 07 WebView sample for the script-start, every attempt,
-  and the "about to navigate" cells. After two animation frames and a 300 ms
-  timeout, the fixture assigns `location.href` to the harness's counted
-  loopback HTTPS listener and paints "assigned" synchronously. The first
-  sample may also show "assigned"; it is not required. After a bounded wait,
-  the second sample must show none of the fixture cells, consistent with a
-  browser block page, and exactly one app window must remain. Pixels establish
+  and the "about to navigate" cells. The fixture paints "assigned" before
+  waiting for two animation frames and assigning `location.href` to the
+  harness's counted loopback HTTPS listener. The harness must observe
+  "assigned" and record that observation before accepting a stable window
+  with no fixture cells, consistent with a browser block page. Exactly one
+  app window must remain. Pixels establish
   only which cells were detected: they cannot distinguish an unrelated blank
   frame coinciding with a blocked navigation from the expected block page.
   Harness unit tests do not run the desktop phase.

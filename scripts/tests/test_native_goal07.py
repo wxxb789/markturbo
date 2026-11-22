@@ -107,6 +107,10 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["status"], "PASS")
         self.assertEqual(evidence["transport"]["request_count"], 2)
         self.assertEqual(evidence["summary"]["passed_case_count"], 1)
+        self.assertIs(
+            evidence["cases"][0]["observations"]["web_security_navigation_assigned_observed"],
+            True,
+        )
 
     def test_every_fingerprint_has_one_exact_expected_value(self) -> None:
         expected = HARNESS.expected_fingerprints()
@@ -171,6 +175,11 @@ class EvidenceTests(unittest.TestCase):
             ),
             ("web_security_window_count", 2, "web_security_window_count does not hold the expected value"),
             ("web_security_window_count", True, "web_security_window_count does not hold the expected value"),
+            (
+                "web_security_navigation_assigned_observed",
+                False,
+                "web_security_navigation_assigned_observed does not hold the expected value",
+            ),
         ):
             with self.subTest(key=key, value=value):
                 evidence = valid_evidence()
@@ -196,6 +205,7 @@ class EvidenceTests(unittest.TestCase):
     def test_each_new_web_observation_is_required_on_its_own(self) -> None:
         for key in (
             "web_security_cell_results",
+            "web_security_navigation_assigned_observed",
             "web_security_post_navigation_cell_results",
             "web_security_tcp_contact_count",
             "web_security_udp_contact_count",
@@ -886,6 +896,7 @@ class PhaseTests(unittest.TestCase):
                 "web_security_disk_before": DISK.evidence(),
                 "web_security_cell_results": list(PIXEL_CELL_RESULTS),
                 "web_security_post_navigation_cell_results": [],
+                "web_security_navigation_assigned_observed": True,
                 "web_security_window_count": 1,
                 "web_security_tcp_contact_count": 0,
                 "web_security_udp_contact_count": 0,
@@ -935,6 +946,36 @@ class PhaseTests(unittest.TestCase):
         harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
 
+    def test_web_phase_reports_stable_empty_frame_without_observing_assignment(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [
+            list(PIXEL_REQUIRED_CELL_RESULTS),
+            *([[]] * 30),
+        ]
+
+        def replay_empty_frames(check: Callable[[], Any], timeout: float, code: str, **kwargs: Any) -> Any:
+            if timeout == harness.ui_timeout:
+                return wait_once(check, timeout, code, **kwargs)
+            for _ in range(30):
+                value = check()
+                if value:
+                    return value
+            raise runtime.HarnessFailure(code)
+
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=replay_empty_frames),
+            mock.patch.object(HARNESS.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        self.assertEqual(order.read_fixture_cell_results.call_count, 5)
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
     def test_web_phase_does_not_treat_a_failed_sample_two_capture_as_empty(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
         order.read_fixture_cell_results.side_effect = [
@@ -972,6 +1013,7 @@ class PhaseTests(unittest.TestCase):
             observed = harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
         self.assertEqual(observed["web_security_cell_results"], PIXEL_REQUIRED_CELL_RESULTS)
+        self.assertIs(observed["web_security_navigation_assigned_observed"], True)
         self.assertEqual(order.read_fixture_cell_results.call_count, 7)
         harness.network_probes.snapshot.assert_called_once_with()
         harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
@@ -1136,6 +1178,13 @@ class PhaseTests(unittest.TestCase):
             final_navigation = 'location.href = "https://127.0.0.1:" + tcpPort + "/";'
             self.assertEqual(source.count(final_navigation), 1)
             self_location = source.index(final_navigation)
+            assigned_marker = "assignedCell.style.backgroundColor = assignedCellColor;"
+            marker_location = source.index(assigned_marker)
+            first_animation_frame = source.index("requestAnimationFrame(")
+            self.assertLess(marker_location, first_animation_frame)
+            self.assertLess(first_animation_frame, self_location)
+            self.assertLess(marker_location, self_location)
+            self.assertGreaterEqual(source[first_animation_frame:self_location].count("requestAnimationFrame("), 2)
             for attempt in (
                 'window.open(`${tcpLoopback}/popup`',
                 "top.location = `https://${probeHost}/top`",
@@ -1175,7 +1224,6 @@ const cellWrites = [];
 const navigationTiming = [];
 let animationFrameCount = 0;
 let sampleOne = null;
-let replaceAfterAssigned = false;
 let cellGrid;
 function makeStyle() {
   let backgroundColor = "";
@@ -1190,8 +1238,8 @@ function makeStyle() {
       backgroundColor = value;
       cellWrites.push([value, calls.length]);
       if (value === assignedColor) {
+        navigationTiming.push("assigned-marker");
         sampleOne = sampleCells();
-        if (replaceAfterAssigned) cellGrid.children.length = 0;
       }
     },
     get backgroundColor() { return backgroundColor; },
@@ -1311,7 +1359,7 @@ Object.defineProperty(location, "href", {
     navigationTiming.push("location");
     calls.push(["location", url]);
     if (mode === "setter-throws") throw new Error("blocked");
-    replaceAfterAssigned = mode === "success" || mode === "rtc-fails";
+    if (mode === "success" || mode === "rtc-fails") cellGrid.children.length = 0;
   },
 });
 context.location = location;
@@ -1337,8 +1385,8 @@ async function main() {
     return;
   }
   if (mode === "setter-throws") {
-    if (sampleOne !== null || assignedCell.style.backgroundColor !== pendingColor) throw new Error("throwing navigation painted the assigned marker");
-    console.log("throwing navigation did not paint the assigned marker");
+    if (!sampleOne || !sampleOne.every(Boolean) || assignedCell.style.backgroundColor !== assignedColor || cellGrid.children.length === 0) throw new Error("throwing navigation did not preserve the assigned marker on the fixture");
+    console.log("throwing navigation preserved the assigned marker on the fixture");
     return;
   }
   if (mode === "rtc-available") {
@@ -1347,8 +1395,8 @@ async function main() {
     return;
   }
   if (mode === "missing-navigation") {
-    if (sampleOne !== null || calls.some(([kind]) => kind === "location") || assignedCell.style.backgroundColor !== pendingColor) throw new Error("missing self-navigation reached the assigned marker");
-    console.log("fixture did not reach the assigned marker");
+    if (!sampleOne || !sampleOne.every(Boolean) || calls.some(([kind]) => kind === "location") || assignedCell.style.backgroundColor !== assignedColor) throw new Error("missing self-navigation did not hold after painting the assigned marker");
+    console.log("fixture painted the assigned marker without navigating");
     return;
   }
   if (mode === "rtc-fails") {
@@ -1357,7 +1405,7 @@ async function main() {
   const [lastKind, lastUrl] = calls.at(-1);
   if (lastKind !== "location" || lastUrl !== expectedSelfNavigationUrl) throw new Error("HTTPS self-navigation did not target the counted loopback port");
   const locationIndex = navigationTiming.indexOf("location");
-  if (animationFrameCount !== 2 || navigationTiming.slice(locationIndex - 3, locationIndex).join(",") !== "animation-frame,animation-frame,timeout-300") throw new Error("self-navigation did not wait for two animation frames and 300 ms");
+  if (animationFrameCount !== 2 || navigationTiming.slice(locationIndex - 4, locationIndex).join(",") !== "assigned-marker,animation-frame,animation-frame,timeout-300") throw new Error("fixture did not paint the assigned marker and wait before HTTPS self-navigation");
   if (!sampleOne || !sampleOne.every(Boolean)) throw new Error("sample 1 was incomplete before HTTPS self-navigation");
   if (mode === "success" && results.length !== 0) throw new Error("browser block page did not replace the fixture");
   if (mode === "cancelled-navigation" && !results.every(Boolean)) throw new Error("cancelled navigation unexpectedly replaced the fixture");
@@ -1368,7 +1416,7 @@ async function main() {
   const completeWrites = cellWrites.filter(([color]) => color === completeColor);
   if (completeWrites.length !== 1 || completeWrites[0][1] !== calls.length - 1) throw new Error("about-to-self-navigate cell was not painted before HTTPS self-navigation");
   const assignedWrites = cellWrites.filter(([color]) => color === assignedColor);
-  if (assignedWrites.length !== 1 || assignedWrites[0][1] !== calls.length) throw new Error("assigned cell was not painted after HTTPS self-navigation returned");
+  if (assignedWrites.length !== 1 || assignedWrites[0][1] !== calls.length - 1) throw new Error("assigned cell was not painted before HTTPS self-navigation");
   if (calls.length !== expectedAttempts - 1) throw new Error("not every automatic attempt ran");
   if (mode === "cancelled-navigation") {
     console.log(JSON.stringify({
@@ -1434,9 +1482,9 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
                 elif mode == "rtc-available":
                     self.assertIn("working WebRTC did not reach self-navigation", result.stdout)
                 elif mode == "missing-navigation":
-                    self.assertIn("fixture did not reach the assigned marker", result.stdout)
+                    self.assertIn("fixture painted the assigned marker without navigating", result.stdout)
                 elif mode == "setter-throws":
-                    self.assertIn("throwing navigation did not paint the assigned marker", result.stdout)
+                    self.assertIn("throwing navigation preserved the assigned marker on the fixture", result.stdout)
 
     def test_probe_listeners_bind_ephemeral_loopback_ports_and_count_only_contacts(self) -> None:
         with HARNESS.NetworkProbeListeners() as probes:

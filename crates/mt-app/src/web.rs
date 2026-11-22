@@ -2,13 +2,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use html5ever::buffer_queue::BufferQueue;
-use html5ever::tendril::StrTendril;
+use html5ever::tokenizer::states::RawKind;
 use html5ever::tokenizer::{
     Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerResult,
 };
-use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use html5ever::tree_builder::{TreeBuilder, TreeBuilderOpts};
-use html5ever::{Attribute, ExpandedName, QualName};
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
 use mt_core::{Block, BlockKind, DocType, Document};
 
@@ -99,15 +96,10 @@ fn strip_resource_hints(page: &str) -> Cow<'_, str> {
         .chain(std::iter::once((page.len(), None)))
     {
         input.push_back(page[previous..end].into());
-        while let TokenizerResult::Script(_) = tokenizer.feed(&mut input) {
-            if let Some(start) = tokenizer.sink.hint_start.take() {
-                filtered.push_str(&page[copied..start]);
-                filtered.push_str("<!---->");
-                copied = opening_tag_end(&page[start..], "link").map_or_else(
-                    || end - queued_bytes(&mut input),
-                    |rest| page.len() - rest.len(),
-                );
-            }
+        while let TokenizerResult::Script(start) = tokenizer.feed(&mut input) {
+            filtered.push_str(&page[copied..start]);
+            filtered.push_str("<!---->");
+            copied = end - queued_bytes(&mut input);
         }
         if tokenizer.sink.candidate.is_none() {
             tokenizer.sink.candidate = next_link;
@@ -134,171 +126,39 @@ fn queued_bytes(input: &mut BufferQueue) -> usize {
     bytes
 }
 
+#[derive(Default)]
 struct ResourceHintTokens {
-    tree: TreeBuilder<usize, ResourceHintSink>,
     candidate: Option<usize>,
-    hint_start: Option<usize>,
-}
-
-impl Default for ResourceHintTokens {
-    fn default() -> Self {
-        Self {
-            tree: TreeBuilder::new(
-                ResourceHintSink::default(),
-                TreeBuilderOpts {
-                    iframe_srcdoc: true,
-                    ..TreeBuilderOpts::default()
-                },
-            ),
-            candidate: None,
-            hint_start: None,
-        }
-    }
 }
 
 impl TokenSink for ResourceHintTokens {
-    type Handle = Option<usize>;
-
-    fn process_token(&mut self, token: Token, line: u64) -> TokenSinkResult<Self::Handle> {
-        if !matches!(token, Token::ParseError(_)) {
-            let candidate = self.candidate.take();
-            if let Token::TagToken(tag) = &token
-                && is_resource_hint(tag)
-            {
-                self.hint_start = candidate;
-                // Pause after the tag to measure its original end in the input queue.
-                return TokenSinkResult::Script(None);
-            }
-        }
-        match self.tree.process_token(token, line) {
-            TokenSinkResult::Continue => TokenSinkResult::Continue,
-            TokenSinkResult::Plaintext => TokenSinkResult::Plaintext,
-            TokenSinkResult::RawData(kind) => TokenSinkResult::RawData(kind),
-            TokenSinkResult::Script(handle) => TokenSinkResult::Script(Some(handle)),
-        }
-    }
-
-    fn adjusted_current_node_present_but_not_in_html_namespace(&self) -> bool {
-        self.tree
-            .adjusted_current_node_present_but_not_in_html_namespace()
-    }
-}
-
-#[derive(Default)]
-struct ResourceNode {
-    name: Option<QualName>,
-    template_contents: Option<usize>,
-    mathml_annotation_xml_integration_point: bool,
-}
-
-struct ResourceHintSink {
-    nodes: Vec<ResourceNode>,
-}
-
-impl Default for ResourceHintSink {
-    fn default() -> Self {
-        Self {
-            nodes: vec![ResourceNode::default()],
-        }
-    }
-}
-
-impl ResourceHintSink {
-    fn push_node(&mut self, node: ResourceNode) -> usize {
-        let id = self.nodes.len();
-        self.nodes.push(node);
-        id
-    }
-}
-
-impl TreeSink for ResourceHintSink {
     type Handle = usize;
-    type Output = ();
 
-    fn finish(self) {}
-
-    fn parse_error(&mut self, _message: Cow<'static, str>) {}
-
-    fn get_document(&mut self) -> Self::Handle {
-        0
-    }
-
-    fn elem_name<'a>(&'a self, target: &'a Self::Handle) -> ExpandedName<'a> {
-        self.nodes[*target]
-            .name
-            .as_ref()
-            .expect("element names are only requested for elements")
-            .expanded()
-    }
-
-    fn create_element(
-        &mut self,
-        name: QualName,
-        _attrs: Vec<Attribute>,
-        flags: ElementFlags,
-    ) -> Self::Handle {
-        let id = self.push_node(ResourceNode {
-            name: Some(name),
-            mathml_annotation_xml_integration_point: flags.mathml_annotation_xml_integration_point,
-            ..ResourceNode::default()
-        });
-        if flags.template {
-            let contents = self.push_node(ResourceNode::default());
-            self.nodes[id].template_contents = Some(contents);
+    fn process_token(&mut self, token: Token, _line: u64) -> TokenSinkResult<Self::Handle> {
+        if matches!(token, Token::ParseError(_)) {
+            return TokenSinkResult::Continue;
         }
-        id
-    }
-
-    fn create_comment(&mut self, _text: StrTendril) -> Self::Handle {
-        self.push_node(ResourceNode::default())
-    }
-
-    fn create_pi(&mut self, _target: StrTendril, _data: StrTendril) -> Self::Handle {
-        self.push_node(ResourceNode::default())
-    }
-
-    // Token decisions use element metadata only; structural mutations never affect parsing.
-    fn append(&mut self, _parent: &Self::Handle, _child: NodeOrText<Self::Handle>) {}
-
-    fn append_based_on_parent_node(
-        &mut self,
-        _element: &Self::Handle,
-        _prev_element: &Self::Handle,
-        _child: NodeOrText<Self::Handle>,
-    ) {
-    }
-
-    fn append_doctype_to_document(
-        &mut self,
-        _name: StrTendril,
-        _public_id: StrTendril,
-        _system_id: StrTendril,
-    ) {
-    }
-
-    fn get_template_contents(&mut self, target: &Self::Handle) -> Self::Handle {
-        self.nodes[*target]
-            .template_contents
-            .expect("template contents are created with their element")
-    }
-
-    fn same_node(&self, x: &Self::Handle, y: &Self::Handle) -> bool {
-        x == y
-    }
-
-    fn set_quirks_mode(&mut self, _mode: QuirksMode) {}
-
-    fn append_before_sibling(&mut self, _sibling: &Self::Handle, _child: NodeOrText<Self::Handle>) {
-    }
-
-    fn add_attrs_if_missing(&mut self, _target: &Self::Handle, _attrs: Vec<Attribute>) {}
-
-    fn remove_from_parent(&mut self, _target: &Self::Handle) {}
-
-    fn reparent_children(&mut self, _node: &Self::Handle, _new_parent: &Self::Handle) {}
-
-    fn is_mathml_annotation_xml_integration_point(&self, target: &Self::Handle) -> bool {
-        self.nodes[*target].mathml_annotation_xml_integration_point
+        let candidate = self.candidate.take();
+        let Token::TagToken(tag) = token else {
+            return TokenSinkResult::Continue;
+        };
+        if tag.kind != TagKind::StartTag {
+            return TokenSinkResult::Continue;
+        }
+        if let Some(start) = candidate
+            && is_resource_hint(&tag)
+        {
+            return TokenSinkResult::Script(start);
+        }
+        match tag.name.as_ref() {
+            "script" => TokenSinkResult::RawData(RawKind::ScriptData),
+            "title" | "textarea" => TokenSinkResult::RawData(RawKind::Rcdata),
+            "style" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript" => {
+                TokenSinkResult::RawData(RawKind::Rawtext)
+            }
+            "plaintext" => TokenSinkResult::Plaintext,
+            _ => TokenSinkResult::Continue,
+        }
     }
 }
 
@@ -578,6 +438,7 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
         compile: markdown::CompileOptions {
             allow_dangerous_html: true,
             allow_dangerous_protocol: false,
+            gfm_tagfilter: true,
             ..markdown::CompileOptions::default()
         },
     };
@@ -790,6 +651,13 @@ fn collect_inline_script_ranges(
         }
         _ => context,
     };
+    if context.inline_start.is_none()
+        && let Node::Html(html) = node
+        && let Some(range) = markdown_flow_script(html)
+    {
+        ranges.push(range);
+        return;
+    }
     let jsx = match node {
         Node::MdxJsxTextElement(jsx) => Some((&jsx.name, &jsx.position, true)),
         Node::MdxJsxFlowElement(jsx) => Some((&jsx.name, &jsx.position, false)),
@@ -849,6 +717,24 @@ fn collect_inline_script_ranges(
             collect_inline_script_ranges(child, source, ranges, jsx_names, context);
         }
     }
+}
+
+fn markdown_flow_script(html: &markdown::mdast::Html) -> Option<ScriptRange> {
+    const CLOSE: &[u8] = b"</script>";
+    let position = html.position.as_ref()?;
+    let value = html.value.trim_start_matches([' ', '\t']);
+    let content = opening_tag_end(value, "script")?;
+    let close = content
+        .as_bytes()
+        .windows(CLOSE.len())
+        .position(|tag| tag.eq_ignore_ascii_case(CLOSE))?;
+    let script_end = value.len() - content.len() + close + CLOSE.len();
+    Some(ScriptRange {
+        start: position.start.offset,
+        end: position.end.offset - (value.len() - script_end),
+        script: value[..script_end].to_string(),
+        flow: true,
+    })
 }
 
 fn line_start(source: &str, offset: usize) -> usize {
@@ -1567,6 +1453,10 @@ mod tests {
             ("<link href='about:blank' rel=modulepreload>", "<!---->"),
             ("<link rel=prerender>", "<!---->"),
             (
+                "<link rel=preload data-label='<link rel=preload>'><link rel=prefetch>",
+                "<!----><!---->",
+            ),
+            (
                 "<link rel=stylesheet href='theme.css'>",
                 "<link rel=stylesheet href='theme.css'>",
             ),
@@ -1587,6 +1477,34 @@ mod tests {
     }
 
     #[test]
+    fn preserves_resource_hint_text_in_raw_and_escaped_text_elements() {
+        let inert = concat!(
+            "<script>const tag = '<link rel=preload>';</script>",
+            "<style>p::before{content:'<link rel=preload>'}</style>",
+            "<textarea><link rel=preload></textarea>",
+        );
+        let source = format!("{inert}<link rel=preload>");
+        assert_eq!(strip_resource_hints(&source), format!("{inert}<!---->"));
+    }
+
+    #[test]
+    fn deeply_nested_markup_filters_resource_hints_within_a_bounded_time() {
+        let opening = "<div>".repeat(50_000);
+        let closing = "</div>".repeat(50_000);
+        let source = format!("{opening}<link rel=preload>{closing}");
+        let started = std::time::Instant::now();
+        let filtered = strip_resource_hints(&source);
+        let elapsed = started.elapsed();
+
+        assert_eq!(filtered, format!("{opening}<!---->{closing}"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "filter took {elapsed:?} for {} UTF-16 units",
+            source.encode_utf16().count()
+        );
+    }
+
+    #[test]
     fn misnested_tables_near_the_host_limit_filter_within_a_bounded_time() {
         let trailing = "</table><link rel=preload>";
         let target_len = MAX_HOST_UTF16_UNITS - 1;
@@ -1601,9 +1519,13 @@ mod tests {
         assert_eq!(source.len(), target_len);
 
         let started = std::time::Instant::now();
-        std::hint::black_box(strip_resource_hints(&source));
+        let filtered = strip_resource_hints(&source);
         let elapsed = started.elapsed();
 
+        assert_eq!(
+            filtered.strip_suffix("<!---->"),
+            source.strip_suffix("<link rel=preload>")
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "filter took {elapsed:?} for {} UTF-16 units",
@@ -1783,22 +1705,30 @@ mod tests {
     }
 
     #[test]
+    fn markdown_filters_stray_raw_tags_before_later_blocks() {
+        let script = "<ScRiPt>\nvoid 0;\n\nvoid 1;\n</sCrIpT>";
+        let source = format!(
+            "Intro <script>\n\n    </script>\n\n# After\n\n{script}<style>p{{display:none}}</style>"
+        );
+        let html = page(&md(&source), &registry(), false);
+        let rendered = body(&html);
+        assert!(rendered.contains("Intro &lt;script>"), "{rendered}");
+        assert!(rendered.contains("<h1>After</h1>"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("{script}&lt;style>")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn markdown_script_spanning_paragraphs_follows_commonmark() {
         let source =
             "Before <script>\nvoid 0;\n\nvoid 1;\n</script>\n\nAfter\n\n<script>later()</script>";
-        let expected = markdown::to_html_with_options(
-            source,
-            &markdown::Options {
-                compile: markdown::CompileOptions {
-                    allow_dangerous_html: true,
-                    ..markdown::CompileOptions::default()
-                },
-                ..markdown::Options::default()
-            },
-        )
-        .unwrap();
         let html = page(&md(source), &registry(), false);
-        assert_eq!(body(&html).trim(), expected.trim());
+        assert_eq!(
+            body(&html).trim(),
+            "<p>Before &lt;script>\nvoid 0;</p>\n<p>void 1;\n&lt;/script></p>\n<p>After</p>\n<script>later()</script>"
+        );
     }
 
     #[test]

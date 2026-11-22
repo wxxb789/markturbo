@@ -159,10 +159,10 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
     (
         "  { run: async () => {\r\n"
+        "    assignedCell.style.backgroundColor = assignedCellColor;\r\n"
         f"    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, {SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS}))));\r\n"
         "    try {\r\n"
         "      location.href = \"https://127.0.0.1:\" + tcpPort + \"/\";\r\n"
-        "      assignedCell.style.backgroundColor = assignedCellColor;\r\n"
         "    } catch (_) {}\r\n"
         "  } },"
     ),
@@ -288,6 +288,7 @@ OBSERVATION_KEYS = (
     | NETWORK_OBSERVATION_KEYS
     | {
         "web_security_cell_results",
+        "web_security_navigation_assigned_observed",
         "web_security_post_navigation_cell_results",
         "web_security_window_count",
         "provider_request_count",
@@ -700,6 +701,7 @@ def expected_fingerprints() -> dict[str, dict[str, Any]]:
 def expected_observations() -> dict[str, Any]:
     return {
         **expected_fingerprints(),
+        "web_security_navigation_assigned_observed": True,
         "web_security_post_navigation_cell_results": [],
         "web_security_window_count": 1,
         "web_security_tcp_contact_count": 0,
@@ -1203,7 +1205,7 @@ class Goal07Harness(NativeHarness):
                 raise
             if len(cells) > assigned_index and cells[assigned_index] is True:
                 navigation_assigned_seen = True
-            if cells or not navigation_assigned_seen:
+            if cells:
                 fixture_absent_since = None
                 return None
             now = time.monotonic()
@@ -1212,6 +1214,8 @@ class Goal07Harness(NativeHarness):
                 return None
             if now - fixture_absent_since < SELF_NAVIGATION_ASSIGNMENT_DELAY_SECONDS:
                 return None
+            if not navigation_assigned_seen:
+                raise HarnessFailure("SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED")
             post_navigation_cells = cells
             return True
 
@@ -1223,6 +1227,7 @@ class Goal07Harness(NativeHarness):
         )
         if post_navigation_cells is None:
             raise HarnessFailure("SELF_NAVIGATION_SAMPLE_TWO_NOT_OBSERVED")
+        observed["web_security_navigation_assigned_observed"] = navigation_assigned_seen
         self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
         post_navigation_cells = self.read_fixture_cell_results(app)
         if post_navigation_cells:
