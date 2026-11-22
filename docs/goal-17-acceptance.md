@@ -7,8 +7,10 @@ Contract: [Layout and content polish](goals/17-layout-content-polish.md).
 The light ember is `#8D6240`: OKLCH lightness 0.534 and chroma 0.074, with
 4.66:1 contrast against the light room. The previous lightness was 0.535.
 
-The locked nsh 0.6.1 text API exposes `Styled::tabular_nums()`. Headless
-checks inspect the resolved text styles, not screenshots or widget source.
+Headless checks inspect the resolved text styles, not screenshots or widget
+source.
+The bundled Martian Grotesk Regular has no `tnum` feature in GSUB/GPOS, so
+Goal 17 changing counts use bundled Martian Mono at the surrounding size.
 
 The Revision loopback test withholds the response headers, presses Cancel,
 and checks that the client disconnects and the prior Review returns. This
@@ -55,5 +57,5 @@ native pass is claimed.
   changing the default in a follow-up.
 
 ```powershell
-uv run --locked --project scripts scripts/mt.py visual --goal17-cjk-optics --exe <release-exe> --out .scratch/goal-17-cjk
+uv run --locked --project scripts scripts/mt.py visual -- --goal17-cjk-optics --exe <release-exe> --out .scratch/goal-17-cjk
 ```

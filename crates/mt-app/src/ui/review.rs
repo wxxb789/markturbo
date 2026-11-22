@@ -491,7 +491,6 @@ fn failure_block(state: AppState, language: Language, review: &ReviewView) -> im
     }))
 }
 
-/// 'Text changed since this review' with `Review again`.
 fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
     let again = state.clone();
     // 'Review again' takes the focus when the result goes stale: it is the
@@ -509,7 +508,6 @@ fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
         .w_full()
         .flex_col()
         .gap(px(SPACE_2))
-        .pt(px(SPACE_3))
         .child(
             view()
                 .flex_row()
@@ -525,15 +523,12 @@ fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
         )
 }
 
-/// 'Partial review': the reviewed package omitted a normally in-scope
-/// supporting file, so the result never presents itself as covering it all.
 fn partial_banner(language: Language) -> impl IntoElement {
     view()
         .test_id("review-partial")
         .w_full()
         .flex_col()
         .gap(px(SPACE_1))
-        .pt(px(SPACE_3))
         .child(prims::ink(i18n::t(language, Key::ReviewPartial)))
         .child(prims::faint(s(S::PartialHint, language)))
 }
@@ -571,8 +566,6 @@ fn reviewed_tab(state: &AppState, review: &ReviewView) -> Option<Tab> {
         .cloned()
 }
 
-/// The understood intent: the goal in the model's voice, then what the model
-/// understood beyond it behind `All fields`.
 fn intent(
     language: Language,
     session: Signal<Session>,
@@ -598,7 +591,11 @@ fn intent(
         .w_full()
         .flex_col()
         .gap(px(SPACE_2))
-        .pt(px(SPACE_4))
+        .pt(px(if stale || review.partial {
+            0.0
+        } else {
+            SPACE_4
+        }))
         .child(prims::rest(s(S::Understood, language)))
         .child(voice(goal, emitters.goal, language, drained(stale)));
     if !sections.is_empty() {
@@ -992,10 +989,6 @@ fn advance_question(session: Signal<Session>, order: &[usize], index: usize) {
 
 // ─── the footer ──────────────────────────────────────────────────────────
 
-/// The pointer's way through the findings: `J`/`K` fire only while no text
-/// input edits, and the answer field holds the focus by design, so each key is
-/// its own control — a press (or Tab and Enter) steps that way. `J` walks
-/// forward, `K` back, both clamped at the ends ([`step_finding`]).
 fn findings_stepper(
     state: &AppState,
     session: Signal<Session>,
@@ -1010,7 +1003,7 @@ fn findings_stepper(
         .child(
             view()
                 .test_id("review-findings-count")
-                .child(tokens::tabular_nums(prims::rest(step_hint(
+                .child(tokens::mono_count(prims::rest(step_hint(
                     findings, language,
                 )))),
         );
@@ -1844,19 +1837,45 @@ mod tests {
     }
 
     #[test]
-    fn findings_count_uses_tabular_numbers() {
+    fn findings_count_uses_the_mono_family() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewLayoutProbe>()))
             .expect("start the review layout probe");
         app.wait_for("id:review-findings-count")
             .expect("the findings count");
-        assert!(
+        assert_eq!(
             app.screen()
                 .span_style("id:review-findings-count >> text:1 finding")
                 .expect("the count text")
-                .font_variant
-                .has(nsh_core::FontVariant::TABULAR_NUMS),
-            "the findings count enables tabular numerals"
+                .font_family
+                .expect("the count font")
+                .name()
+                .as_ref(),
+            tokens::FONT_SOURCE
         );
+    }
+
+    #[test]
+    fn review_voice_uses_the_cjk_script_text_entry() {
+        let source = include_str!("review.rs");
+        let voice = source
+            .split("fn voice(")
+            .nth(1)
+            .expect("the production Review voice")
+            .split("fn heat_line(")
+            .next()
+            .expect("the Review voice body");
+        assert!(voice.contains("prims::script_text"), "{voice}");
+        assert!(voice.contains("tokens::CJK_OPTICS"), "{voice}");
+    }
+
+    #[test]
+    fn production_cjk_optics_stays_at_plus_zero_and_same_weight() {
+        let optics = tokens::CJK_OPTICS;
+        for is_cjk in [false, true] {
+            assert_eq!(optics.size(TYPE_MODEL, is_cjk), TYPE_MODEL);
+            assert_eq!(optics.weight(WEIGHT_MODEL, is_cjk), WEIGHT_MODEL);
+        }
+        assert!(!optics.changes_weight());
     }
 
     #[test]
@@ -1919,6 +1938,118 @@ mod tests {
                 && stepped_sections_fit
                 && stepped_sections_present,
             "visible sections align within {SPACE_XL}px; narrow legend wraps at the left edge"
+        );
+    }
+
+    #[test]
+    fn review_section_gaps_include_notice_padding_in_each_state() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewSpacingProbe>()))
+            .expect("start the review spacing probe");
+        app.wait_for("id:review-intent")
+            .expect("the intent section");
+        let intent_label = s(S::Understood, Language::English);
+        let partial_label = i18n::t(Language::English, Key::ReviewPartial);
+        let partial_hint = s(S::PartialHint, Language::English);
+        let legend_label = s(S::StatedInTheText, Language::English);
+        let mut gaps = Vec::new();
+        gaps.push((
+            "empty result: intent to legend",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-partial").expect("show partial state");
+        app.wait_for("id:review-partial")
+            .expect("partial notice detail");
+        gaps.push((
+            "partial notice to intent",
+            vertical_gap(
+                text_extent(&app, partial_hint),
+                text_extent(&app, intent_label),
+            ),
+        ));
+        gaps.push((
+            "partial result sections",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-stale").expect("show stale state");
+        app.wait_for("id:review-stale").expect("stale notice");
+        gaps.push((
+            "stale notice to intent",
+            vertical_gap(
+                section_extent(&app, "review-stale"),
+                text_extent(&app, intent_label),
+            ),
+        ));
+        gaps.push((
+            "stale result sections",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-both")
+            .expect("show both notice states");
+        app.wait_for("id:review-partial")
+            .expect("partial notice beside stale notice");
+        gaps.push((
+            "stale notice to partial notice",
+            vertical_gap(
+                section_extent(&app, "review-stale"),
+                text_extent(&app, partial_label),
+            ),
+        ));
+        gaps.push((
+            "partial notice to intent",
+            vertical_gap(
+                text_extent(&app, partial_hint),
+                text_extent(&app, intent_label),
+            ),
+        ));
+        gaps.push((
+            "combined result sections",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-findings")
+            .expect("show a result with findings");
+        app.wait_for("id:review-findings-step")
+            .expect("finding step control");
+        app.press("id:review-findings-step")
+            .expect("show the selected finding");
+        app.wait_for("id:review-docked").expect("docked finding");
+        gaps.push((
+            "intent to finding",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                section_extent(&app, "review-docked"),
+            ),
+        ));
+        gaps.push((
+            "finding to legend",
+            vertical_gap(
+                section_extent(&app, "review-docked"),
+                section_extent(&app, "review-legend"),
+            ),
+        ));
+        let over_limit: Vec<_> = gaps
+            .iter()
+            .copied()
+            .filter(|(_, gap)| !(-0.5..=SPACE_XL + 0.5).contains(gap))
+            .collect();
+        assert!(
+            over_limit.is_empty(),
+            "visible section gaps are at most {SPACE_XL}px: {over_limit:?}; measured={gaps:?}"
         );
     }
 
@@ -2029,6 +2160,31 @@ mod tests {
         }
     }
 
+    fn spacing_review(partial: bool, stale: bool, with_findings: bool) -> ReviewView {
+        let mut review = layout_review();
+        review.partial = partial;
+        review.stale = stale;
+        if !with_findings {
+            review.findings_anchored.clear();
+        }
+        review
+    }
+
+    fn review_spacing_control(
+        id: &'static str,
+        state: &AppState,
+        partial: bool,
+        stale: bool,
+        with_findings: bool,
+    ) -> impl IntoElement {
+        let state = state.clone();
+        view().test_id(id).w(px(8.0)).h(px(8.0)).on_press(move || {
+            state
+                .review_view
+                .set(Some(spacing_review(partial, stale, with_findings)))
+        })
+    }
+
     #[component]
     fn ReviewLayoutProbe() -> impl IntoElement {
         let state = AppState::new();
@@ -2038,6 +2194,51 @@ mod tests {
             .flex_col()
             .w(px(220.0))
             .h(px(720.0))
+            .child(field(state, Language::English))
+    }
+
+    #[component]
+    fn ReviewSpacingProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state
+            .review_view
+            .set(Some(spacing_review(false, false, false)));
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .flex_row()
+                    .child(review_spacing_control(
+                        "spacing-partial",
+                        &state,
+                        true,
+                        false,
+                        false,
+                    ))
+                    .child(review_spacing_control(
+                        "spacing-stale",
+                        &state,
+                        false,
+                        true,
+                        false,
+                    ))
+                    .child(review_spacing_control(
+                        "spacing-both",
+                        &state,
+                        true,
+                        true,
+                        false,
+                    ))
+                    .child(review_spacing_control(
+                        "spacing-findings",
+                        &state,
+                        false,
+                        false,
+                        true,
+                    )),
+            )
             .child(field(state, Language::English))
     }
 
@@ -2110,6 +2311,34 @@ mod tests {
             && sections
                 .windows(2)
                 .all(|pair| pair[1].1 - pair[0].1 - pair[0].2 <= SPACE_XL)
+    }
+
+    fn section_extent(app: &Headless, id: &str) -> (f32, f32) {
+        let nodes = app.screen().layout_nodes();
+        let bounds = nodes
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("the `{id}` section is laid out"))
+            .bounds;
+        (bounds.origin.y.0, bounds.origin.y.0 + bounds.size.height.0)
+    }
+
+    fn text_extent(app: &Headless, content: &str) -> (f32, f32) {
+        let nodes = app.screen().layout_nodes();
+        let bounds = nodes
+            .iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == content)
+            })
+            .unwrap_or_else(|| panic!("the text `{content}` is laid out"))
+            .bounds;
+        (bounds.origin.y.0, bounds.origin.y.0 + bounds.size.height.0)
+    }
+
+    fn vertical_gap(after: (f32, f32), before: (f32, f32)) -> f32 {
+        before.0 - after.1
     }
 
     /// The camera request the state holds, drawn as `<tab>:<line>`: a signal

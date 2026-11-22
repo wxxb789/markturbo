@@ -478,10 +478,9 @@ fn compare_panel(
                                 difference_text(index + 1, total, language)
                             })
                     })
-                    .font_family(tokens::FONT_UI)
+                    .font_family(tokens::FONT_SOURCE)
                     .text_size(px(tokens::TYPE_UI))
                     .line_height(px(tokens::TYPE_UI_LINE))
-                    .tabular_nums()
                     .text_color(move || tokens::palette().ink_rest),
                 )
                 .child(view().flex_1())
@@ -1269,14 +1268,13 @@ pub(crate) fn status_line_at(
                 line.bind_translate_y(&presence.rise)
             })
             .child(
-                tokens::tabular_nums(text(move || {
+                tokens::mono_count(text(move || {
                     if owner.get() == surface {
                         message.get()
                     } else {
                         SharedString::default()
                     }
                 }))
-                .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
                 .number_of_lines(1)

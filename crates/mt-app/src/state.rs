@@ -3427,21 +3427,27 @@ impl AppState {
     }
 
     pub fn close_settings(&self) {
-        self.settings_open.set(false);
-        self.save_settings();
+        if self.persist_settings() {
+            self.settings_open.set(false);
+        }
     }
 
     pub fn save_settings(&self) {
+        self.persist_settings();
+    }
+
+    fn persist_settings(&self) -> bool {
         use crate::i18n::{Key, t};
         let settings = self.settings.get();
-        let (key, kind) = match settings.try_save_general() {
-            Ok(_) => (Key::SettingsSaved, StatusKind::Success),
+        let (key, kind, saved) = match settings.try_save_general() {
+            Ok(_) => (Key::SettingsSaved, StatusKind::Success, true),
             Err(error) => {
                 log::warn!("cannot save settings: {}", error.kind());
-                (Key::SettingsSaveFailed, StatusKind::Error)
+                (Key::SettingsSaveFailed, StatusKind::Error, false)
             }
         };
         self.notify_at(StatusSurface::Settings, kind, t(settings.language, key));
+        saved
     }
 
     pub fn set_language(&self, language: Language) {

@@ -301,7 +301,6 @@ fn field(
     )
 }
 
-/// The one surface the field shows, in [`surface`]'s order of precedence.
 fn field_surface(
     state: AppState,
     language: Language,
@@ -316,12 +315,7 @@ fn field_surface(
         .h(relative(1.0))
         .flex_col()
         .child(when(
-            move || {
-                condition.status_surface.get() == StatusSurface::Review
-                    && !condition.status.get().is_empty()
-                    && (surface(&condition) == FieldSurface::Review
-                        || condition.revision_busy.get())
-            },
+            move || surface(&condition) == FieldSurface::Review || condition.revision_busy.get(),
             move || notices::status_line_at(notice.clone(), status, StatusSurface::Review),
         ));
     for want in [
@@ -1604,6 +1598,38 @@ mod tests {
             .child(shell(state, Language::English, Layout::Wide))
     }
 
+    #[component]
+    fn ReviewStatusRowProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.review_open.set(true);
+        state.review_view.set(Some(crate::state::ReviewView {
+            sections: vec![crate::state::ReviewSection {
+                title: "Intent".to_owned(),
+                items: vec!["The document's intent".to_owned()],
+            }],
+            ..crate::state::ReviewView::default()
+        }));
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(
+                view()
+                    .flex_row()
+                    .child(control("review-status-message", &state, |state| {
+                        state.notify_at(
+                            crate::state::StatusSurface::Review,
+                            crate::state::StatusKind::Info,
+                            "Review status",
+                        );
+                    }))
+                    .child(control("review-status-clear", &state, |state| {
+                        state.status.set(Default::default());
+                    })),
+            )
+            .child(shell(state, Language::English, Layout::Wide))
+    }
+
     fn routed_status_app() -> Headless {
         let mut config = EngineConfig::new(Root::of::<RoutedStatusProbe>());
         config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
@@ -1665,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn status_byte_counts_use_tabular_figures() {
+    fn status_byte_counts_use_the_mono_family() {
         let mut app = routed_status_app();
         app.press("id:status-review")
             .expect("open the review field");
@@ -1673,12 +1699,42 @@ mod tests {
             .expect("show sent bytes");
         let selector = "text:Sent 120 B";
         app.wait_for(selector).expect(selector);
-        assert!(
+        assert_eq!(
             app.screen()
                 .span_style(selector)
                 .expect(selector)
-                .font_variant
-                .has(nsh_core::FontVariant::TABULAR_NUMS)
+                .font_family
+                .expect("the status count font")
+                .name()
+                .as_ref(),
+            tokens::FONT_SOURCE
+        );
+    }
+
+    #[test]
+    fn review_status_reserves_its_row_without_a_message() {
+        let mut config =
+            EngineConfig::new(Root::of::<ReviewStatusRowProbe>().tokens(tokens::theme()));
+        config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
+        let mut app = Headless::start(config).expect("Review status row");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("wide viewport");
+        app.wait_for("id:review-intent")
+            .expect("Review body without a message");
+        let empty_y = node(&app, "review-intent").bounds.origin.y.0;
+
+        press(&mut app, "review-status-message");
+        app.wait_for("text:Review status")
+            .expect("Review status message");
+        let message_y = node(&app, "review-intent").bounds.origin.y.0;
+
+        press(&mut app, "review-status-clear");
+        app.wait_for_gone("text:Review status", std::time::Duration::from_secs(2))
+            .expect("cleared Review status message");
+        let cleared_y = node(&app, "review-intent").bounds.origin.y.0;
+        assert!(
+            (empty_y - message_y).abs() <= 0.5 && (empty_y - cleared_y).abs() <= 0.5,
+            "Review keeps its status row reserved: empty={empty_y}, message={message_y}, cleared={cleared_y}"
         );
     }
 

@@ -1431,6 +1431,7 @@ mod tests {
     /// also runs consent's and context's app probes in parallel threads, so this
     /// probe only ever touches a process it owns.
     const PROBE_CHILD: &str = "MARKTURBO_SETTINGS_PROBE_CHILD";
+    const SAVE_FAILURE_PROBE_CHILD: &str = "MARKTURBO_SETTINGS_SAVE_FAILURE_PROBE_CHILD";
 
     /// Runs the probe in a process of its own, with the temp paths in that
     /// process's environment. Nothing here calls `set_var`, so the shared test
@@ -1458,6 +1459,61 @@ mod tests {
             "the settings probe failed:\n{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn closing_settings_keeps_the_page_open_when_saving_fails() {
+        if std::env::var_os(SAVE_FAILURE_PROBE_CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("the test binary"),
+            )
+            .args([
+                "--exact",
+                "ui::settings::tests::closing_settings_keeps_the_page_open_when_saving_fails",
+            ])
+            .env_remove("MARKTURBO_OPEN")
+            .env(SAVE_FAILURE_PROBE_CHILD, "1")
+            .output()
+            .expect("run the settings save-failure probe");
+            assert!(
+                output.status.success(),
+                "the save-failure probe failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let mut config = nsh_engine::EngineConfig::new(
+            nsh_engine::Root::of::<SettingsProbe>().tokens(tokens::theme()),
+        );
+        config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
+        let mut app = nsh_testing::Headless::start(config).expect("start Settings");
+        app.set_viewport(nsh_core::Size::new(px(1440.0), px(900.0)))
+            .expect("the Settings window");
+        app.press("id:title-settings").expect("open the title menu");
+        app.wait_for("id:title-menu-settings")
+            .expect("the Settings menu item");
+        app.press("id:title-menu-settings").expect("open Settings");
+        app.wait_for("id:settings-page").expect("the Settings page");
+        let settings_path = mt_core::settings::settings_path().expect("the hermetic settings path");
+        std::fs::create_dir(&settings_path).expect("block the settings file with a directory");
+        app.press("id:settings-close").expect("close Settings");
+        app.wait_for("id:settings-page >> text:Could not save settings.")
+            .expect("the failed save is shown in Settings");
+        assert!(
+            app.screen()
+                .matches("id:settings-page")
+                .expect("Settings page"),
+            "Settings stays open after a failed save"
+        );
+        assert_eq!(
+            app.screen()
+                .span_style("text:Could not save settings.")
+                .expect("the Settings save error")
+                .color,
+            tokens::LIGHT.danger
         );
     }
 

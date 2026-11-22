@@ -129,7 +129,6 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
         return quiet_label(move || SharedString::from(i18n::t(language, Key::ModeWeb)))
             .into_element();
     };
-    let page = WebDocument::new(tab.clone());
     let trusted = tab.web_trusted;
     let text = tab.text;
     let banner_state = state.clone();
@@ -173,7 +172,9 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
                 move || text.get().trim().is_empty(),
                 move || empty_preview(language),
             )
-            .otherwise(move || web_document(page, trusted, language)),
+            .otherwise(move || {
+                web_document(WebDocument::new(tab.clone(), language), trusted, language)
+            }),
         )
         .into_element()
 }
@@ -396,7 +397,7 @@ impl WebDocument {
     /// [`Self::html`] is what marks it dirty, and the web view applies it after
     /// the commit that sees the change, so a WebView is never navigated from
     /// render.
-    fn new(tab: Tab) -> WebDocument {
+    fn new(tab: Tab, language: Language) -> WebDocument {
         let html = signal(String::new());
         let status = signal(WebLoadState::Loading);
         let written = signal(None::<Page>);
@@ -417,7 +418,8 @@ impl WebDocument {
             } else {
                 web::Trust::Restricted
             };
-            let built = web::build_html(&document, renderer(), trust, page.dark);
+            let built =
+                web::build_html_localized(&document, renderer(), trust, page.dark, language);
             written.set(Some(page));
             html.set(built);
         });
@@ -449,9 +451,8 @@ fn preprocess_markdown(source: &str, path: &std::path::Path, language: Language)
                 kind
             ),
             RenderOutcome::Failed(_) => format!(
-                "\n> **{} {}.**\n\n{}",
-                kind,
-                i18n::t(language, Key::DiagramCouldNotRender),
+                "\n> **{}**\n\n{}",
+                i18n::diagram_failure_label(language, &kind.to_string()),
                 &source[block.range.clone()]
             ),
         };
@@ -482,10 +483,7 @@ fn render_diagram(kind: &str, label: &str, source: &str, language: Language) -> 
             .test_id("diagram-failure")
             .flex_col()
             .gap(px(tokens::SPACE_2))
-            .child(prims::faint(SharedString::from(format!(
-                "{label} {}.",
-                i18n::t(language, Key::DiagramCouldNotRender)
-            ))))
+            .child(prims::faint(i18n::diagram_failure_label(language, label)))
             .child(prims::source_ink(source.to_owned(), move || {
                 tokens::palette().ink_rest
             }))
@@ -497,11 +495,14 @@ fn render_diagram(kind: &str, label: &str, source: &str, language: Language) -> 
 mod tests {
     use std::sync::OnceLock;
 
+    use nsh_core::{EventKind, EventPayload, MountItem, NativeProps, WebSource};
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
 
     use super::*;
     use crate::state::AppState;
+
+    const INVALID_DIAGRAM: &str = "```mermaid\nnot a diagram\n```\n";
 
     /// The fixture the probes open: headings, inline code, strong text, two
     /// tasks and body lines.
@@ -541,8 +542,7 @@ mod tests {
             .get_or_init(|| {
                 let dir = tempfile::tempdir().expect("temp dir");
                 let path = dir.path().join("failure.md");
-                std::fs::write(&path, "```mermaid\nnot a diagram\n```\n")
-                    .expect("write the invalid diagram");
+                std::fs::write(&path, INVALID_DIAGRAM).expect("write the invalid diagram");
                 (dir, path)
             })
             .1
@@ -619,32 +619,26 @@ mod tests {
 
     #[component]
     fn PendingWebProbe() -> impl IntoElement {
-        let page = WebDocument {
-            html: signal("<!doctype html><html></html>".to_owned()),
-            status: signal(WebLoadState::Loading),
-        };
-        let status = page.status;
+        let state = AppState::new();
+        state.new_document();
+        let text = state.active_tab().expect("document").text;
+        text.set("First document".into());
         view()
             .test_id("probe-pending-web")
             .w(px(352.0))
             .h(px(700.0))
             .flex_col()
             .child(prims::quiet_action(
-                "probe-web-ready",
-                "Mark preview loaded",
-                move || web_load_finished(status),
+                "probe-web-clear",
+                "Clear document",
+                move || text.set("".into()),
             ))
             .child(prims::quiet_action(
-                "probe-web-edit",
-                "Simulate edit load",
-                move || web_load_started(status),
+                "probe-web-type",
+                "Type document",
+                move || text.set("Second document".into()),
             ))
-            .child(prims::quiet_action(
-                "probe-web-failed",
-                "Mark preview failed",
-                move || web_load_failed(status),
-            ))
-            .child(web_document(page, signal(false), Language::English))
+            .child(web(state, Language::English))
     }
 
     #[component]
@@ -653,7 +647,26 @@ mod tests {
             .test_id("probe-diagram-failure")
             .w(px(680.0))
             .h(px(700.0))
+            .flex_col()
             .child(rendered(failure_state(), Language::English))
+            .child(rendered(failure_state(), Language::Chinese))
+    }
+
+    #[component]
+    fn WebDiagramFailureProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let source = state.active_tab().expect("diagram document").text;
+        view()
+            .flex_col()
+            .child(prims::quiet_action(
+                "type-diagram",
+                "Type diagram",
+                move || {
+                    source.set(INVALID_DIAGRAM.into());
+                },
+            ))
+            .child(web(state, Language::Chinese))
     }
 
     /// Two documents in SplitWeb: the first trusted, the second (active)
@@ -711,6 +724,19 @@ mod tests {
 
     fn matches(app: &Headless, selector: &str) -> bool {
         app.screen().matches(selector).expect("selector")
+    }
+
+    fn dispatch_web_event(app: &mut Headless, event: EventKind, payload: EventPayload) {
+        let node = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("web-view"))
+            .expect("mounted WebView");
+        app.engine()
+            .control()
+            .dispatch_event(node.id, event, payload);
+        app.settle();
     }
 
     /// A diagram block leaves the preview as an inline SVG image the text view
@@ -779,17 +805,13 @@ mod tests {
             "{}",
             dump(&app)
         );
-        app.press("id:probe-web-ready")
-            .expect("simulate the page load completing");
-        app.settle();
+        dispatch_web_event(&mut app, EventKind::Load, EventPayload::None);
         assert!(
             matches(&app, "id:web-view") && !matches(&app, "id:preview-loading"),
             "{}",
             dump(&app)
         );
-        app.press("id:probe-web-edit")
-            .expect("simulate editing the loaded page");
-        app.settle();
+        dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
         assert!(
             matches(&app, "id:web-view")
                 && !matches(&app, "id:preview-loading")
@@ -797,9 +819,19 @@ mod tests {
             "later edits do not repeat the initial loading state: {}",
             dump(&app)
         );
-        app.press("id:probe-web-failed")
-            .expect("simulate the page load failing");
-        app.settle();
+        app.press("id:probe-web-clear").expect("clear the document");
+        app.wait_for("id:preview-empty").expect("empty preview");
+        assert!(!matches(&app, "id:web-view"), "{}", dump(&app));
+        app.press("id:probe-web-type").expect("retype the document");
+        app.wait_for("id:web-view").expect("remounted WebView");
+        assert!(matches(&app, "id:preview-loading"), "{}", dump(&app));
+        dispatch_web_event(
+            &mut app,
+            EventKind::Error,
+            EventPayload::Error {
+                message: "load failed".into(),
+            },
+        );
         assert!(
             matches(&app, "id:web-view")
                 && matches(&app, "id:web-preview-failed")
@@ -807,6 +839,10 @@ mod tests {
             "{}",
             dump(&app)
         );
+        dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
+        assert!(matches(&app, "id:preview-loading"), "{}", dump(&app));
+        dispatch_web_event(&mut app, EventKind::Load, EventPayload::None);
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
     }
 
     #[test]
@@ -819,10 +855,41 @@ mod tests {
         app.settle();
         let shown = texts(&app);
         assert!(
-            shown.contains("Mermaid could not render") && shown.contains("not a diagram"),
+            shown.contains("Mermaid could not render")
+                && shown.contains("Mermaid 无法渲染")
+                && shown.contains("not a diagram"),
             "{}",
             dump(&app)
         );
+    }
+
+    #[test]
+    fn a_failed_web_diagram_is_labelled_and_keeps_its_source() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<WebDiagramFailureProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:preview-empty").expect("empty web preview");
+        let (sent, received) = std::sync::mpsc::channel();
+        app.observe(move |_, batch| {
+            for item in &batch.items {
+                if let MountItem::NativeProps {
+                    props: NativeProps::WebView(props),
+                    ..
+                } = item
+                    && let WebSource::Html { html, .. } = &props.source
+                    && !html.is_empty()
+                {
+                    sent.send(html.clone()).expect("capture WebView HTML");
+                }
+            }
+        });
+        app.press("id:type-diagram").expect("type the diagram");
+        app.settle();
+        let html = received.try_iter().last().expect("WebView receives HTML");
+        assert!(
+            html.contains(r#"class="mt-error-title">Mermaid 无法渲染.</div>"#),
+            "{html}"
+        );
+        assert!(html.contains("<pre>not a diagram"), "{html}");
     }
 
     /// The preview renders the document's own content — a heading, its inline

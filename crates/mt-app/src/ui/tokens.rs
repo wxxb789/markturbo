@@ -15,8 +15,8 @@
 
 use nsh_core::{Color, element::FontWeight, prelude::*};
 
-pub fn tabular_nums<T: Styled>(element: T) -> T {
-    element.tabular_nums()
+pub fn mono_count<T: Styled>(element: T) -> T {
+    element.font_family(FONT_SOURCE)
 }
 
 /// `0xRRGGBB`, opaque.

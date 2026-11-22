@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
+use mt_core::settings::Language;
 use mt_core::{Block, BlockKind, Document};
 
 /// How much the WebView is allowed to execute.
@@ -47,10 +48,20 @@ impl Trust {
 /// Diagrams and math are pre-rendered by the shared registry, not reparsed by
 /// an independent browser-side Markdown pipeline.
 pub fn build_html(doc: &Document, registry: &RendererRegistry, trust: Trust, dark: bool) -> String {
+    build_html_localized(doc, registry, trust, dark, Language::default())
+}
+
+pub(crate) fn build_html_localized(
+    doc: &Document,
+    registry: &RendererRegistry,
+    trust: Trust,
+    dark: bool,
+    language: Language,
+) -> String {
     let body = match doc.doc_type() {
         mt_core::DocType::Html => return build_html_raw(doc, trust),
-        mt_core::DocType::Mdx => render_mdx_body(doc, registry, trust),
-        _ => render_markdown_body(doc, registry),
+        mt_core::DocType::Mdx => render_mdx_body(doc, registry, trust, language),
+        _ => render_markdown_body(doc, registry, language),
     };
 
     format!(
@@ -199,7 +210,7 @@ fn head_end(source: &str) -> usize {
 }
 
 /// Render an ordinary Markdown document to HTML.
-fn render_markdown_body(doc: &Document, registry: &RendererRegistry) -> String {
+fn render_markdown_body(doc: &Document, registry: &RendererRegistry, language: Language) -> String {
     let mut out = String::new();
     let mut markdown_run = String::new();
 
@@ -209,7 +220,7 @@ fn render_markdown_body(doc: &Document, registry: &RendererRegistry) -> String {
                 // Flush accumulated prose before the out-of-band block, so
                 // ordering is preserved.
                 flush_markdown(&mut out, &mut markdown_run, doc);
-                out.push_str(&render_out_of_band(block, id, registry));
+                out.push_str(&render_out_of_band(block, id, registry, language));
             }
             None => {
                 markdown_run.push_str(&doc.source()[block.range.clone()]);
@@ -242,18 +253,35 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
         },
     ) {
         Ok(html) => out.push_str(&html),
-        Err(message) => out.push_str(&diagnostic_html("markdown", &message.reason, run)),
+        Err(message) => out.push_str(&diagnostic_html(
+            "markdown rendering failed",
+            &message.reason,
+            run,
+        )),
     }
     run.clear();
 }
 
 /// Render a diagram/math block, or a diagnostic with the source preserved.
-fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> String {
+fn render_out_of_band(
+    block: &Block,
+    id: &str,
+    registry: &RendererRegistry,
+    language: Language,
+) -> String {
     match registry.render(id, &block.content) {
         RenderOutcome::Svg(markup) => {
             format!("<figure class=\"mt-render mt-{id}\">{markup}</figure>")
         }
-        RenderOutcome::Failed(diag) => diagnostic_html(&diag.source, &diag.message, &block.content),
+        RenderOutcome::Failed(diag) => {
+            let title = match &block.kind {
+                BlockKind::Diagram(kind) => {
+                    crate::i18n::diagram_failure_label(language, &kind.to_string())
+                }
+                _ => format!("{} rendering failed", diag.source),
+            };
+            diagnostic_html(&title, &diag.message, &block.content)
+        }
     }
 }
 
@@ -263,14 +291,19 @@ fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> S
 /// placeholders in both trust levels; what `Trusted` changes today is the CSP,
 /// which is the boundary that has to be right before any runtime ships. The
 /// Markdown parts of the document render fully either way.
-fn render_mdx_body(doc: &Document, registry: &RendererRegistry, trust: Trust) -> String {
+fn render_mdx_body(
+    doc: &Document,
+    registry: &RendererRegistry,
+    trust: Trust,
+    language: Language,
+) -> String {
     let mut out = String::new();
     let mut markdown_run = String::new();
 
     for block in doc.blocks() {
         if let Some(id) = block.renderer_id() {
             flush_markdown(&mut out, &mut markdown_run, doc);
-            out.push_str(&render_out_of_band(block, id, registry));
+            out.push_str(&render_out_of_band(block, id, registry, language));
             continue;
         }
         match block.kind {
@@ -287,7 +320,11 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry, trust: Trust) ->
     flush_markdown(&mut out, &mut markdown_run, doc);
 
     for diag in doc.diagnostics().iter().filter(|d| d.source == "mdx") {
-        out.push_str(&diagnostic_html(&diag.source, &diag.message, ""));
+        out.push_str(&diagnostic_html(
+            &format!("{} rendering failed", diag.source),
+            &diag.message,
+            "",
+        ));
     }
     out
 }
@@ -308,15 +345,15 @@ fn mdx_placeholder(kind: mt_core::document::block::MdxKind, source: &str, _trust
 }
 
 /// An inline diagnostic that always keeps the original source visible.
-fn diagnostic_html(source: &str, message: &str, original: &str) -> String {
+fn diagnostic_html(title: &str, message: &str, original: &str) -> String {
     let original = if original.trim().is_empty() {
         String::new()
     } else {
         format!("<pre>{}</pre>", escape(original))
     };
     format!(
-        "<div class=\"mt-error\"><div class=\"mt-error-title\">{} rendering failed</div><div class=\"mt-error-msg\">{}</div>{original}</div>",
-        escape(source),
+        "<div class=\"mt-error\"><div class=\"mt-error-title\">{}</div><div class=\"mt-error-msg\">{}</div>{original}</div>",
+        escape(title),
         escape(message)
     )
 }

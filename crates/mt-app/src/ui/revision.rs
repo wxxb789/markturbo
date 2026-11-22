@@ -503,7 +503,7 @@ fn outcome(state: AppState, language: Language) -> impl IntoElement {
         .child(when(
             move || discarded.get() > 0,
             move || {
-                tokens::tabular_nums(prims::faint(move || {
+                tokens::mono_count(prims::faint(move || {
                     S::NotApplied(discarded.get()).text(language)
                 }))
             },
@@ -893,7 +893,7 @@ fn decisions(
                             },
                         )),
                 )
-                .child(tokens::tabular_nums(prims::rest(move || {
+                .child(tokens::mono_count(prims::rest(move || {
                     let (decided, all) = counts(&hunks, &now);
                     S::Decided(decided, all).text(language)
                 })))

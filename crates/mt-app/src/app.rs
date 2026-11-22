@@ -28,7 +28,7 @@ pub fn App() -> impl IntoElement {
     // blocking thread, after the first frame is on its way.
     state.companion_font.restore();
     if ui::cjk_optics::capture_requested() {
-        return ui::cjk_optics::capture();
+        return ui::cjk_optics::capture(state.companion_font.clone());
     }
     if let Some(path) = startup_path() {
         log::debug!("startup: opening {}", path.display());

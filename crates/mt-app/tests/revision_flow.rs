@@ -22,7 +22,16 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
+    let question = "Which audience should this revision prioritize?";
+    let answer = "Readers new to the topic.";
     let (review, _) = two_change_outputs(source);
+    let mut review: serde_json::Value = serde_json::from_str(&review).expect("Review output");
+    review["clarification_questions"] = serde_json::json!([{
+        "question": question,
+        "priority": "medium",
+        "impact": null
+    }]);
+    let review = review.to_string();
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
     let (started, request_received) = std::sync::mpsc::sync_channel(1);
@@ -46,11 +55,42 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
         .expect("wide viewport");
     app.wait_for("label:Markdown source")
         .expect("source editor");
+    app.type_text("label:Markdown source", "\nUnsaved edit.")
+        .expect("edit the buffer without saving");
+    app.wait_for("id:title-dirty").expect("the dirty buffer");
+    let buffer = app
+        .screen()
+        .input_text("label:Markdown source")
+        .expect("read the unsaved buffer")
+        .map(str::to_owned)
+        .expect("the editor contains text");
+    assert!(buffer.contains("Unsaved edit.") && buffer.contains(source));
+    assert_eq!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the buffer"),
+        Some(buffer.as_str())
+    );
     app.press("id:title-review").expect("prepare Review");
     app.wait_for("id:consent-card").expect("Review disclosure");
     app.long_press("id:consent-send").expect("send Review");
     app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("Review ready");
+    app.wait_for(&format!("text:{question}"))
+        .expect("the clarification question");
+    app.type_text("id:review-answer-input", answer)
+        .expect("answer the clarification question");
+    assert_eq!(
+        app.screen()
+            .input_text("id:review-answer-input")
+            .expect("read the answer before submission")
+            .as_deref(),
+        Some(answer)
+    );
+    app.press("id:review-answer-submit")
+        .expect("submit the answer");
+    app.wait_for("text:Answered")
+        .expect("the question is answered");
     app.press("id:review-prepare").expect("prepare Revision");
     app.wait_for("text:Ask for a revision?")
         .expect("Revision disclosure");
@@ -61,6 +101,22 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
     app.press("id:revision-cancel").expect("cancel Revision");
     app.wait_for("id:review-prepare")
         .expect("original Review restored");
+    let restored_buffer = app
+        .screen()
+        .input_text("label:Markdown source")
+        .expect("read the restored buffer")
+        .map(str::to_owned);
+    app.press(&format!("label:{question}"))
+        .expect("reopen the answered question");
+    let restored_answer = app
+        .screen()
+        .input_text("id:review-answer-input")
+        .expect("read the restored clarification answer")
+        .map(str::to_owned);
+    assert_eq!(
+        (restored_buffer.as_deref(), restored_answer.as_deref(),),
+        (Some(buffer.as_str()), Some(answer))
+    );
     let disconnect = server.join().expect("loopback server");
     assert!(
         matches!(disconnect, Ok(0))
@@ -206,12 +262,15 @@ fn partial_accept_records_the_final_split_once() {
         .expect("the docked hunk waits for a decision");
     app.wait_for("text:0 of 2 decided")
         .expect("both hunks start undecided");
-    assert!(
+    assert_eq!(
         app.screen()
             .span_style("text:0 of 2 decided")
             .expect("the revision decision count")
-            .font_variant
-            .has(nsh_core::FontVariant::TABULAR_NUMS)
+            .font_family
+            .expect("the decision count font")
+            .name()
+            .as_ref(),
+        mt_app::ui::tokens::FONT_SOURCE
     );
     app.wait_for("text:2 not applied")
         .expect("both hunks start rejected");

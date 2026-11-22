@@ -407,7 +407,7 @@ fn source_block(
         .child(
             view()
                 .pl(px(ORDINAL_W + SPACE_2))
-                .child(tokens::tabular_nums(prims::faint(move || {
+                .child(tokens::mono_count(prims::faint(move || {
                     detail_row.get().detail.clone()
                 }))),
         )
@@ -495,7 +495,6 @@ fn ordinal(row: ReadSignal<SourceRow>, light: Outbound) -> impl IntoElement {
             .font_family(FONT_SOURCE)
             .text_size(px(TYPE_SOURCE))
             .line_height(px(TYPE_SOURCE_LINE))
-            .tabular_nums()
             .bind_color(&ink),
     )
 }
@@ -1439,12 +1438,15 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("Applies under docs/"), "{shown}");
-        assert!(
+        assert_eq!(
             app.screen()
                 .span_style("text:Applies under docs/ · 12 B")
                 .expect("the nested source's byte count")
-                .font_variant
-                .has(nsh_core::FontVariant::TABULAR_NUMS)
+                .font_family
+                .expect("byte count font")
+                .name()
+                .as_ref(),
+            tokens::FONT_SOURCE
         );
         assert!(shown.contains("Include in review"), "{shown}");
         assert!(shown.contains("Not applied by Codex"), "{shown}");

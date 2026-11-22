@@ -444,6 +444,10 @@ pub fn t(language: Language, key: Key) -> &'static str {
     }
 }
 
+pub(crate) fn diagram_failure_label(language: Language, kind: &str) -> String {
+    format!("{kind} {}.", t(language, Key::DiagramCouldNotRender))
+}
+
 pub fn usage_summary(language: Language, counts: &mt_core::usage::UsageAggregate) -> String {
     use mt_core::usage::UsageEventKind;
     let total = |kind| {

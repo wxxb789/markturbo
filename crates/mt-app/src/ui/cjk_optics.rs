@@ -1,6 +1,7 @@
 use nsh_core::prelude::*;
 
 use crate::ui::{
+    fonts::{Companion, CompanionStatus},
     prims,
     tokens::{self, CJK_OPTICS_CAPTURE_VARIANTS, FONT_MODEL, FONT_UI, WEIGHT_MODEL},
 };
@@ -13,9 +14,10 @@ pub(crate) fn capture_requested() -> bool {
     std::env::var_os(CAPTURE_ENV).is_some_and(|value| value == "1")
 }
 
-pub(crate) fn capture() -> View {
+pub(crate) fn capture(companion: Companion) -> View {
     set_color_scheme(nsh_core::platform::Appearance::Light);
     let paragraph = SharedString::from(PARAGRAPH.trim());
+    let status = companion.status;
     view()
         .test_id(CAPTURE_VIEW_ID)
         .label("CJK optical sizing comparison")
@@ -30,6 +32,18 @@ pub(crate) fn capture() -> View {
         .bg(move || tokens::palette().room)
         .text_color(move || tokens::palette().ink)
         .child(prims::ink("CJK optical sizing"))
+        .child(
+            view()
+                .test_id("cjk-optics-font-status")
+                .label("CJK companion font status")
+                .child(prims::faint(move || {
+                    SharedString::from(match status.get() {
+                        CompanionStatus::Installed => "CJK companion font loaded",
+                        CompanionStatus::Applying => "Loading CJK companion font",
+                        _ => "CJK companion font unavailable",
+                    })
+                })),
+        )
         .child(
             view()
                 .w_full()
@@ -74,6 +88,12 @@ mod tests {
 
     use super::*;
 
+    fn installed_companion() -> Companion {
+        let companion = Companion::new();
+        companion.status.set(CompanionStatus::Installed);
+        companion
+    }
+
     #[component]
     fn OpticalRunProbe() -> impl IntoElement {
         prims::script_text(
@@ -90,7 +110,7 @@ mod tests {
 
     #[component]
     fn CaptureViewProbe() -> impl IntoElement {
-        capture()
+        capture(installed_companion())
     }
 
     #[test]
@@ -164,5 +184,44 @@ mod tests {
             3
         );
         assert_eq!(texts.iter().filter(|text| text.contains("中文")).count(), 3);
+
+        let cjk_styles = CJK_OPTICS_CAPTURE_VARIANTS.map(|variant| {
+            app.screen()
+                .span_style(&format!("id:{} >> text:中文", variant.id))
+                .expect("the CJK run in each capture column")
+        });
+        let styles = cjk_styles.map(|style| {
+            (
+                style.font_size.0,
+                style.font_weight,
+                style.font_family.unwrap().name().to_string(),
+            )
+        });
+        assert_eq!(
+            styles,
+            [
+                (tokens::TYPE_MODEL, WEIGHT_MODEL.0, FONT_MODEL.to_owned()),
+                (
+                    tokens::TYPE_MODEL + 1.0,
+                    WEIGHT_MODEL.0,
+                    FONT_MODEL.to_owned()
+                ),
+                (
+                    tokens::TYPE_MODEL + 1.0,
+                    WEIGHT_MODEL.0 + 100,
+                    FONT_UI.to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_view_reports_the_registered_companion_status() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<CaptureViewProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the capture view");
+        app.wait_for("text:CJK companion font loaded")
+            .expect("the registered companion status");
     }
 }

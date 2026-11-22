@@ -290,8 +290,7 @@ fn disclosure_body(
                         .gap(px(tokens::SPACE_2))
                         .child(view().flex_1().child(prims::rest(S::Total.text(language))))
                         .child(
-                            tokens::tabular_nums(text(SharedString::from(bytes_label(rows.total))))
-                                .font_family(tokens::FONT_UI)
+                            tokens::mono_count(text(SharedString::from(bytes_label(rows.total))))
                                 .text_size(px(tokens::TYPE_UI))
                                 .line_height(px(tokens::TYPE_UI_LINE))
                                 .text_color(move || tokens::palette().ink),
@@ -549,14 +548,13 @@ fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
             )
             .child(view().flex_1())
             .child(
-                tokens::tabular_nums(text(move || {
+                tokens::mono_count(text(move || {
                     if has_bytes {
                         SharedString::from(bytes_label(bytes))
                     } else {
                         SharedString::from("")
                     }
                 }))
-                .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
                 .text_color(move || gloss().0),
@@ -2307,24 +2305,25 @@ mod tests {
         assert!(!app.shows("Sent"), "nothing was sent");
     }
 
-    fn assert_tabular_consent_bytes(selector: &str) {
+    fn assert_mono_consent_bytes(selector: &str) {
         let mut app = start_harness();
         app.wait_for("id:consent-total").expect("consent total");
         let style = app.screen().span_style(selector).expect(selector);
-        assert!(
-            style.font_variant.has(nsh_core::FontVariant::TABULAR_NUMS),
+        assert_eq!(
+            style.font_family.expect(selector).name().as_ref(),
+            tokens::FONT_SOURCE,
             "{selector}"
         );
     }
 
     #[test]
-    fn consent_total_bytes_use_tabular_figures() {
-        assert_tabular_consent_bytes("id:consent-total >> text:800 B");
+    fn consent_total_bytes_use_mono_figures() {
+        assert_mono_consent_bytes("id:consent-total >> text:800 B");
     }
 
     #[test]
-    fn consent_item_bytes_use_tabular_figures() {
-        assert_tabular_consent_bytes("id:consent-row-source >> text:200 B");
+    fn consent_item_bytes_use_mono_figures() {
+        assert_mono_consent_bytes("id:consent-row-source >> text:200 B");
     }
 
     #[test]

@@ -98,6 +98,9 @@ SCHEMA = "markturbo.goal-09-visual-matrix"
 RECEIPT_SCHEMA = "markturbo.goal-09-visual-cell"
 CJK_OPTICS_STATE = "cjk-optics"
 CJK_OPTICS_ENV = "MARKTURBO_GOAL17_CJK_OPTICS"
+CJK_COMPANION_FONT_NAME = "SourceHanSansCN-VF.otf"
+CJK_COMPANION_FONT_LOADED = "CJK companion font loaded"
+CJK_COMPANION_FONT_UNAVAILABLE = "CJK companion font unavailable"
 CJK_OPTICS_VARIANTS = (
     ("cjk-optics-plus-0", "+0"),
     ("cjk-optics-plus-1px", "+1px"),
@@ -1272,6 +1275,94 @@ def remove_profile(profile: Path, timeout: float = PROFILE_REMOVAL_SECONDS) -> N
                 stop_profile_browsers(profile)
 
 
+def companion_font_data_dir() -> Path:
+    override = os.environ.get("MARKTURBO_DATA_DIR")
+    if override is not None and override.strip():
+        root = Path(override.strip())
+        if root.is_absolute():
+            return root
+        raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE")
+    if sys.platform != "win32":
+        raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE")
+
+    class Guid(ctypes.Structure):
+        _fields_ = [
+            ("data1", ctypes.c_uint32),
+            ("data2", ctypes.c_uint16),
+            ("data3", ctypes.c_uint16),
+            ("data4", ctypes.c_ubyte * 8),
+        ]
+
+    # FOLDERID_LocalAppData, matching dirs::data_local_dir() on Windows.
+    folder_id = Guid(
+        0xF1B32785,
+        0x6FBA,
+        0x4FCF,
+        (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
+    )
+    path = ctypes.c_void_p()
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.SHGetKnownFolderPath.argtypes = (
+            ctypes.POINTER(Guid),
+            wt.DWORD,
+            wt.HANDLE,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        result = shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(path)
+        )
+        if result != 0 or not path.value:
+            raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE")
+        return Path(ctypes.wstring_at(path.value)) / "markturbo"
+    except HarnessBlocked:
+        raise
+    except (AttributeError, OSError):
+        raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE") from None
+    finally:
+        if path.value:
+            ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+            ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+            ole32.CoTaskMemFree(path)
+
+
+def seed_companion_font(capture_data: Path) -> None:
+    source_data = companion_font_data_dir()
+    source = source_data / "fonts" / CJK_COMPANION_FONT_NAME
+    if not source.is_file():
+        raise HarnessBlocked("CJK_COMPANION_FONT_MISSING")
+    try:
+        destination = capture_data / "fonts" / CJK_COMPANION_FONT_NAME
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    except OSError:
+        raise HarnessBlocked("CJK_COMPANION_FONT_SEED_FAILED") from None
+
+
+def require_companion_font_loaded(harness: VisualHarness, app: RunningApp) -> None:
+    def status() -> str | None:
+        if harness.shows_text(app, CJK_COMPANION_FONT_LOADED):
+            return "loaded"
+        if harness.shows_text(app, CJK_COMPANION_FONT_UNAVAILABLE):
+            return "unavailable"
+        return None
+
+    try:
+        result = wait_until(
+            status,
+            UI_TIMEOUT,
+            "CJK_COMPANION_FONT_STATE_MISSING",
+            interval=0.1,
+        )
+    except HarnessFailure as error:
+        if error.code == "CJK_COMPANION_FONT_STATE_MISSING":
+            raise HarnessBlocked(error.code) from None
+        raise
+    if result != "loaded":
+        raise HarnessBlocked("CJK_COMPANION_FONT_NOT_LOADED")
+
+
 def capture_cell(
     win32: Win32,
     exe: Path,
@@ -1334,6 +1425,8 @@ def capture_cell(
         "executable": executable,
     }
     try:
+        if cjk_optics:
+            seed_companion_font(data)
         with child_environment(overrides):
             app = harness.launch_app(
                 None if cell.state in EMPTY_STATES or cjk_optics else plan,
@@ -1367,6 +1460,7 @@ def capture_cell(
                 "CJK_OPTICS_VIEW_MISSING",
                 interval=0.1,
             )
+            require_companion_font_loaded(harness, app)
             expected_names = (
                 "中文",
                 "Latin",
@@ -1380,6 +1474,7 @@ def capture_cell(
                 "comparison_view": "goal17-cjk-optics",
                 "variant_ids": [variant_id for variant_id, _ in CJK_OPTICS_VARIANTS],
                 "paragraph_visible": True,
+                "companion_font_loaded": True,
             }
         else:
             markers = harness.prepare(app, cell, plan, server)
@@ -1461,6 +1556,11 @@ def capture_cell(
             }
         )
     except (VisualFailure, HarnessFailure, HarnessBlocked) as error:
+        receipt["status"] = (
+            "BLOCKED"
+            if cjk_optics and isinstance(error, HarnessBlocked)
+            else "FAILED"
+        )
         receipt["reason_code"] = error.code
         if error.detail:
             receipt["failure_type"] = error.detail
@@ -1599,19 +1699,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         win32.allow_display_sleep()
     captured = sum(item["status"] == "CAPTURED" for item in summary["cells"])
-    summary["status"] = "PASS" if captured == len(cells) else "FAIL"
+    blocked = sum(item["status"] == "BLOCKED" for item in summary["cells"])
+    failed = sum(item["status"] == "FAILED" for item in summary["cells"])
+    summary["status"] = (
+        "PASS"
+        if captured == len(cells)
+        else "BLOCKED"
+        if blocked and not failed and arguments.goal17_cjk_optics
+        else "FAIL"
+    )
     summary["completed_at"] = utc_now()
-    summary["summary"] = {
+    summary_counts = {
         "cell_count": len(cells),
         "captured_count": captured,
-        "failed_count": len(cells) - captured,
+        "failed_count": failed if arguments.goal17_cjk_optics else len(cells) - captured,
     }
+    if arguments.goal17_cjk_optics:
+        summary_counts["blocked_count"] = blocked
+    summary["summary"] = summary_counts
     (out / "matrix.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
     print(f"{summary['status']}: {captured}/{len(cells)} captured", flush=True)
-    return 0 if summary["status"] == "PASS" else 1
+    return {"PASS": 0, "FAIL": 1, "BLOCKED": 2}[summary["status"]]
 
 
 if __name__ == "__main__":

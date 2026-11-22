@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shlex
 import tempfile
 import threading
 import unittest
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from scripts.markturbo_tools import cli
 from scripts.markturbo_tools.native import runtime, visual
 
 
@@ -46,6 +48,130 @@ class MatrixTests(unittest.TestCase):
             ["--exe", "markturbo.exe", "--out", "captures", "--goal17-cjk-optics"]
         )
         self.assertTrue(arguments.goal17_cjk_optics)
+
+    def test_goal17_capture_seeds_only_the_font_before_app_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            user_data = root / "user-data"
+            source = user_data / "fonts" / visual.CJK_COMPANION_FONT_NAME
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"companion font")
+            (user_data / "settings.toml").write_text("theme = 'dark'", encoding="utf-8")
+            harness = mock.Mock()
+            observed: dict[str, Any] = {}
+
+            def stop_before_launch(
+                _target: Path | None,
+                data: Path,
+                _config: Path,
+                _workspace: Path,
+                _stderr: Path,
+            ) -> None:
+                observed["data_entries"] = sorted(path.name for path in data.iterdir())
+                font_dir = data / "fonts"
+                observed["font_entries"] = sorted(path.name for path in font_dir.iterdir())
+                observed["font_bytes"] = (font_dir / visual.CJK_COMPANION_FONT_NAME).read_bytes()
+                raise runtime.HarnessFailure("CJK_TEST_STOP")
+
+            harness.launch_app.side_effect = stop_before_launch
+            with (
+                mock.patch.object(visual, "VisualHarness", return_value=harness),
+                mock.patch.dict(
+                    os.environ, {"MARKTURBO_DATA_DIR": str(user_data)}, clear=False
+                ),
+            ):
+                receipt = visual.capture_cell(
+                    mock.Mock(),
+                    Path("markturbo.exe"),
+                    root / "out",
+                    visual.cjk_optics_cell(),
+                    visual.SourceBinding("head", "tree", False, None),
+                    {},
+                    (),
+                    mock.Mock(),
+                )
+
+            self.assertEqual(observed["data_entries"], ["fonts"])
+            self.assertEqual(observed["font_entries"], [visual.CJK_COMPANION_FONT_NAME])
+            self.assertEqual(observed["font_bytes"], b"companion font")
+            self.assertEqual(receipt["reason_code"], "CJK_TEST_STOP")
+            harness.cleanup.assert_called_once()
+
+    def test_missing_goal17_companion_font_blocks_capture_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            user_data = root / "user-data"
+            harness = mock.Mock()
+            with (
+                mock.patch.object(visual, "VisualHarness", return_value=harness),
+                mock.patch.dict(
+                    os.environ, {"MARKTURBO_DATA_DIR": str(user_data)}, clear=False
+                ),
+            ):
+                receipt = visual.capture_cell(
+                    mock.Mock(),
+                    Path("markturbo.exe"),
+                    root / "out",
+                    visual.cjk_optics_cell(),
+                    visual.SourceBinding("head", "tree", False, None),
+                    {},
+                    (),
+                    mock.Mock(),
+                )
+
+            harness.launch_app.assert_not_called()
+            stored = json.loads(
+                (
+                    root
+                    / "out"
+                    / "cells"
+                    / visual.cjk_optics_cell().cell_id
+                    / "receipt.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(receipt["status"], "BLOCKED")
+            self.assertEqual(stored["status"], "BLOCKED")
+            self.assertEqual(stored["reason_code"], "CJK_COMPANION_FONT_MISSING")
+            self.assertNotIn(str(user_data), json.dumps(stored))
+
+    def test_goal17_capture_requires_the_companion_font_to_be_loaded(self) -> None:
+        harness = mock.Mock()
+        harness.shows_text.side_effect = lambda _app, text: (
+            text == visual.CJK_COMPANION_FONT_LOADED
+        )
+        visual.require_companion_font_loaded(harness, mock.Mock())
+
+        harness.shows_text.side_effect = lambda _app, text: (
+            text == visual.CJK_COMPANION_FONT_UNAVAILABLE
+        )
+        with self.assertRaises(runtime.HarnessBlocked) as raised:
+            visual.require_companion_font_loaded(harness, mock.Mock())
+        self.assertEqual(raised.exception.code, "CJK_COMPANION_FONT_NOT_LOADED")
+
+        with mock.patch.object(
+            visual,
+            "wait_until",
+            side_effect=runtime.HarnessFailure("CJK_COMPANION_FONT_STATE_MISSING"),
+        ):
+            with self.assertRaises(runtime.HarnessBlocked) as missing:
+                visual.require_companion_font_loaded(harness, mock.Mock())
+        self.assertEqual(missing.exception.code, "CJK_COMPANION_FONT_STATE_MISSING")
+
+    def test_documented_goal17_visual_command_parses_through_mt_cli(self) -> None:
+        acceptance = Path(__file__).resolve().parents[2] / "docs" / "goal-17-acceptance.md"
+        command = next(
+            line.strip()
+            for line in acceptance.read_text(encoding="utf-8").splitlines()
+            if line.strip().startswith("uv run --locked --project scripts scripts/mt.py visual")
+        )
+        tokens = shlex.split(command)
+        entrypoint = next(index for index, token in enumerate(tokens) if token.endswith("mt.py"))
+        arguments = cli.parser().parse_args(tokens[entrypoint + 1 :])
+        self.assertEqual(arguments.command, "visual")
+        visual_arguments = visual.parser().parse_args(cli.forwarded(arguments.args))
+        self.assertTrue(visual_arguments.goal17_cjk_optics)
+        self.assertEqual(visual_arguments.exe, Path("<release-exe>"))
+        self.assertEqual(visual_arguments.out, Path(".scratch/goal-17-cjk"))
 
     def test_physical_viewports_convert_dip_to_the_window_dpi(self) -> None:
         self.assertEqual(visual.physical_viewport("minimum", 120), (900, 600))
