@@ -1692,5 +1692,6 @@ mod tests {
         store.delete(&lower).unwrap();
         assert!(store.read(&lower).unwrap().is_none());
         drop(cleanup);
+        println!("\nMT_WINCRED_ROUND_TRIP_COMPLETED");
     }
 }
