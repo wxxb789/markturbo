@@ -315,8 +315,8 @@ fn file_name(state: AppState) -> impl IntoElement {
     .gap(px(SPACE_2))
     .flex_shrink(1.0)
     .min_w(px(0.0))
-    .hover(|s| s.text_color(tokens::palette().ink).underline())
-    .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+    .hover(|s| s.text_color(|| tokens::palette().ink).underline())
+    .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
     .child(
         text(move || match folder_state.active_tab() {
             Some(tab) if !tab.untitled => tab
@@ -725,8 +725,8 @@ fn menu_row(
             .truncate()
             .transition_colors()
             .duration(move || duration.get())
-            .group_hover(|s| s.text_color(tokens::palette().ink).underline())
-            .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
+            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
     )
     .children(hint.map(|hint| {
         text(hint)
@@ -771,14 +771,14 @@ fn row_action(
         .transition_colors()
         .duration(move || duration.get())
         .group_hover(|s| {
-            s.text_color(tokens::palette().ink)
+            s.text_color(|| tokens::palette().ink)
                 .underline()
-                .text_decoration_color(tokens::palette().ink)
+                .text_decoration_color(|| tokens::palette().ink)
         })
         .group_focus_visible(|s| {
-            s.text_color(tokens::palette().ink)
+            s.text_color(|| tokens::palette().ink)
                 .underline()
-                .text_decoration_color(tokens::palette().ink)
+                .text_decoration_color(|| tokens::palette().ink)
         });
     if strong {
         label_text = label_text
@@ -1014,6 +1014,69 @@ mod tests {
             None,
             "a disabled Review cannot be pressed"
         );
+    }
+
+    #[test]
+    fn hovered_titlebar_text_tracks_the_current_theme() {
+        use nsh_core::{platform::ColorScheme, tailwind::state::HOVERED};
+
+        let mut config = EngineConfig::new(Root::of::<ReviewProbe>().tokens(tokens::theme()));
+        config.environment.color_scheme = ColorScheme::Light;
+        config.environment.reduce_motion = true;
+        let mut app = Headless::start(config).expect("start the titlebar");
+        app.set_viewport(nsh_core::Size::new(Points(600.0), Points(400.0)))
+            .expect("set the viewport");
+        app.wait_for("id:title-settings")
+            .expect("the title Settings action");
+        let settings = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("title-settings"))
+            .expect("the title Settings action")
+            .id;
+        app.engine().control().set_states(settings, HOVERED);
+        app.settle();
+        press_without_settling(&app, "id:title-settings");
+        app.wait_for("id:title-menu-open-folder")
+            .expect("the first title menu row");
+        let open_folder = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("title-menu-open-folder"))
+            .expect("the first title menu row")
+            .id;
+        app.engine().control().set_states(open_folder, HOVERED);
+        app.settle();
+        let light_colors = (
+            app.screen()
+                .span_style("id:title-settings >> text:Settings")
+                .expect("the hovered title Settings text")
+                .color,
+            app.screen()
+                .span_style("id:title-menu-open-folder >> text:Open folder")
+                .expect("the hovered menu row text")
+                .color,
+        );
+        assert_eq!(light_colors, (tokens::LIGHT.ink, tokens::LIGHT.ink));
+
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("report OS appearance");
+        app.settle();
+        let dark_colors = (
+            app.screen()
+                .span_style("id:title-settings >> text:Settings")
+                .expect("the hovered title Settings text")
+                .color,
+            app.screen()
+                .span_style("id:title-menu-open-folder >> text:Open folder")
+                .expect("the hovered menu row text")
+                .color,
+        );
+        assert_eq!(dark_colors, (tokens::DARK.ink, tokens::DARK.ink));
     }
 
     #[test]

@@ -162,8 +162,8 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
                         .cursor_pointer()
                         .pl(px(SPACE_3))
                         .py(px(SPACE_1))
-                        .hover(|s| s.text_color(tokens::palette().ink))
-                        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                        .hover(|s| s.text_color(|| tokens::palette().ink))
+                        .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
                         .on_press(move || state.open_file(path.clone())),
                 )
                 .child(
@@ -228,8 +228,8 @@ fn open_folder_action(
             .py(px(SPACE_2))
             .border(px(HAIRLINE))
             .border_color(move || tokens::palette().ink_caption)
-            .hover(|s| s.border_color(tokens::palette().ink))
-            .focus_visible(|s| s.border_color(tokens::palette().ink))
+            .hover(|s| s.border_color(|| tokens::palette().ink))
+            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
             .on_press(move || choose_folder(state.clone())),
     )
     .child(
@@ -303,8 +303,10 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                         .py(px(SPACE_1))
                         .when(!missing, |row| {
                             row.cursor_pointer()
-                                .hover(|s| s.text_color(tokens::palette().ink))
-                                .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+                                .hover(|s| s.text_color(|| tokens::palette().ink))
+                                .focus_visible(|s| {
+                                    s.text_color(|| tokens::palette().ink).underline()
+                                })
                         })
                         .on_press(move || {
                             // Checked again at the press: the target may have gone

@@ -930,8 +930,8 @@ fn copy_action(state: AppState, language: Language) -> impl IntoElement {
             .bg(Color::TRANSPARENT)
             .px(px(2.0))
             .py(px(4.0))
-            .hover(|s| s.text_color(tokens::palette().ink).underline())
-            .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+            .hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
             .on_press(move || copy_approved(&state)),
     )
     .child(

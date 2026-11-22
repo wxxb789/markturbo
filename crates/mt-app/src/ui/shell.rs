@@ -180,14 +180,19 @@ fn column(
 ) -> impl IntoElement {
     let active = state.active;
     let content_state = state.clone();
+    let recovery_state = state.clone();
+    let recovery_banner_state = state.clone();
     let snap_offset = signal(0.0);
-    let reflow_deadline = Rc::new(Cell::new(None));
+    let recovery_deadline = Rc::new(Cell::new(None));
+    let tab_deadline = Rc::new(Cell::new(None));
     effect({
-        let reflow_deadline = reflow_deadline.clone();
+        let recovery_deadline = recovery_deadline.clone();
+        let tab_deadline = tab_deadline.clone();
         move || {
             if motion::reduced_motion()
-                && reflow_deadline
+                && recovery_deadline
                     .take()
+                    .max(tab_deadline.take())
                     .is_some_and(|deadline| nsh_core::time::now() < deadline)
             {
                 // Win32 ignores frames equal to an active tween's destination.
@@ -207,45 +212,46 @@ fn column(
         .when(layout.field_overlays(), |column| {
             column.opacity(Layout::DIMMED)
         })
+        .child(banner_slot(
+            "recovery-banner-slot",
+            move || notices::has_recovery(&recovery_state),
+            move || notices::recovery_banner(recovery_banner_state.clone(), language),
+            track_reflow(recovery_deadline),
+        ))
         // Key on tab identity only: replacing this subtree discards the editor's undo history.
         .child(each(
             move || vec![active.get()],
             |key| *key,
             move |_, _| {
-                reflow_deadline.set(None);
-                let reflow_deadline = reflow_deadline.clone();
-                column_content(content_state.clone(), language, snap_offset, move |ms| {
-                    let deadline = nsh_core::time::now() + Duration::from_secs_f32(ms / 1000.0);
-                    reflow_deadline.set(Some(
-                        reflow_deadline
-                            .get()
-                            .map_or(deadline, |old| old.max(deadline)),
-                    ));
-                })
+                tab_deadline.set(None);
+                column_content(
+                    content_state.clone(),
+                    language,
+                    snap_offset,
+                    track_reflow(tab_deadline.clone()),
+                )
             },
         ))
         .child(notices::status_line(state, language, status))
+}
+
+fn track_reflow(deadline: Rc<Cell<Option<nsh_core::time::Instant>>>) -> impl Fn(f32) {
+    move |ms| {
+        let end = nsh_core::time::now() + Duration::from_secs_f32(ms / 1000.0);
+        deadline.set(deadline.get().max(Some(end)));
+    }
 }
 
 fn column_content(
     state: AppState,
     language: Language,
     snap_offset: Signal<f32>,
-    on_reflow: impl Fn(f32) + Clone + 'static,
-) -> [AnyElement; 3] {
+    on_reflow: impl Fn(f32) + 'static,
+) -> [AnyElement; 2] {
     let document_state = state.clone();
-    let recovery_state = state.clone();
     let conflict_state = state.clone();
-    let state_for_recovery = state.clone();
     let conflict_banner_state = state.clone();
     [
-        banner_slot(
-            "recovery-banner-slot",
-            move || notices::has_recovery(&recovery_state),
-            move || notices::recovery_banner(state_for_recovery.clone(), language),
-            on_reflow.clone(),
-        )
-        .into_element(),
         banner_slot(
             "conflict-banner-slot",
             move || notices::has_conflict(&conflict_state),
@@ -1206,10 +1212,10 @@ mod tests {
     }
 
     fn recovery_probe() -> Headless {
-        let mut app = Headless::start(EngineConfig::new(
-            Root::of::<RecoveryBannerProbe>().tokens(tokens::theme()),
-        ))
-        .expect("start the probe");
+        let mut config =
+            EngineConfig::new(Root::of::<RecoveryBannerProbe>().tokens(tokens::theme()));
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("the probe's window");
         app
@@ -1415,6 +1421,58 @@ mod tests {
                     .iter()
                     .any(|frames| frames.contains(&before.id) && frames.contains(&document.id)),
             "the existing banner slot must expand from zero and move the document in the same transition: {transitioned:?}"
+        );
+    }
+
+    #[test]
+    fn restoring_the_last_draft_keeps_the_banner_mounted_during_its_exit() {
+        use nsh_core::{
+            MountItem,
+            animation::{AnimationOp, Driver},
+        };
+
+        let mut app = recovery_probe();
+        let batches = capture_batches(&mut app);
+        press_without_settling(&mut app, "probe-show-recovery");
+        app.run_for(Duration::from_millis(motion::ENTER_MS as u64))
+            .expect("finish the banner entry");
+        let slot = node(&app, "recovery-banner-slot").id;
+        let banner = node(&app, "recovery-banner").id;
+        let opacity = binding_nodes(
+            &batches.try_iter().flatten().collect::<Vec<_>>(),
+            node(&app, "banner-fade").id,
+        )[0];
+        press_without_settling(&mut app, "recovery-restore-0");
+        assert!(app.screen().shows("Recovered text"));
+
+        app.wait(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("reach the middle of the banner exit");
+        assert_eq!(node(&app, "recovery-banner").id, banner);
+        let exit: Vec<_> = batches.try_iter().collect();
+        assert!(exit.iter().any(|batch| {
+            transitioned_frames(batch, motion::EXIT_MS).contains(&slot)
+                && batch.iter().any(|item| {
+                    matches!(
+                        item,
+                        MountItem::Frame { id, frame } if *id == slot && frame.size.height.0 == 0.0
+                    )
+                })
+        }));
+        assert!(exit.iter().flatten().any(|item| matches!(
+            item,
+            MountItem::Animation(AnimationOp::Start {
+                node,
+                driver: Driver::Timing { to: 0.0, duration_ms, .. },
+                ..
+            }) if *node == opacity && *duration_ms == motion::EXIT_MS
+        )));
+        app.run_for(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("finish the banner exit");
+        assert!(
+            !app.screen()
+                .layout_nodes()
+                .iter()
+                .any(|node| node.test_id.as_deref() == Some("recovery-banner"))
         );
     }
 

@@ -775,7 +775,7 @@ fn questions(
                         .optional_label(Some(SharedString::from(text.clone())))
                         .w_full()
                         .cursor_pointer()
-                        .focus_visible(|style| style.text_color(tokens::palette().ink))
+                        .focus_visible(|style| style.text_color(|| tokens::palette().ink))
                         .on_press(reopen),
                 )
                 .child(row)
@@ -1041,7 +1041,7 @@ fn step_control(
             .role(AccessibilityRole::Button)
             .optional_label(Some(SharedString::from(s(label, language))))
             .cursor_pointer()
-            .focus_visible(|style| style.text_color(tokens::palette().ink))
+            .focus_visible(|style| style.text_color(|| tokens::palette().ink))
             .on_press(step),
     )
     .child(prims::kbd(key))
