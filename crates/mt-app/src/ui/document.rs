@@ -9,12 +9,6 @@
 //! decorations are applied to the editor here ([`glow::document_decorations`]),
 //! so a finding's light moves with the text.
 //!
-//! The document lane owns: Martian Mono 14/24 with Markdown punctuation at 34%
-//! ink, `reveal_position(.., center)` for the review's camera, the preview and
-//! its results, the web pane with its trust level and its `web_dirty`
-//! deferral, and the Split routing that puts the preview (or the web pane) in
-//! the field.
-//!
 //! The camera: a docked surface (the review's racked finding, a revision's
 //! current hunk) asks for a line with
 //! [`crate::state::AppState::focus_document_line`], and the source editor
