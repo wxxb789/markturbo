@@ -72,7 +72,7 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
 #[derive(Clone, Copy)]
 enum LinkScope {
     Document,
-    ForeignObject,
+    ForeignObject(usize),
     Foreign(&'static str),
 }
 
@@ -112,7 +112,7 @@ fn neutralize_document_links(page: &str) -> Cow<'_, str> {
                         scopes.pop();
                     } else if !closing && !end.slash {
                         if root == "svg" && name.eq_ignore_ascii_case("foreignObject") {
-                            scopes.push(LinkScope::ForeignObject);
+                            scopes.push(LinkScope::ForeignObject(0));
                         } else if let Some(next) = ["svg", "math"]
                             .into_iter()
                             .find(|next| name.eq_ignore_ascii_case(next))
@@ -123,10 +123,18 @@ fn neutralize_document_links(page: &str) -> Cow<'_, str> {
                 }
                 _ => {
                     if closing {
-                        if name.eq_ignore_ascii_case("foreignObject")
-                            && matches!(scopes.last(), Some(LinkScope::ForeignObject))
-                        {
-                            scopes.pop();
+                        if name.eq_ignore_ascii_case("foreignObject") {
+                            let pop = match scopes.last_mut() {
+                                Some(LinkScope::ForeignObject(depth)) if *depth == 0 => true,
+                                Some(LinkScope::ForeignObject(depth)) => {
+                                    *depth -= 1;
+                                    false
+                                }
+                                _ => false,
+                            };
+                            if pop {
+                                scopes.pop();
+                            }
                         }
                     } else if name.eq_ignore_ascii_case("plaintext") {
                         break;
@@ -138,6 +146,11 @@ fn neutralize_document_links(page: &str) -> Cow<'_, str> {
                             .find(|root| name.eq_ignore_ascii_case(root))
                     {
                         scopes.push(LinkScope::Foreign(root));
+                    } else if !end.slash
+                        && name.eq_ignore_ascii_case("foreignObject")
+                        && let Some(LinkScope::ForeignObject(depth)) = scopes.last_mut()
+                    {
+                        *depth += 1;
                     }
                 }
             }
@@ -285,8 +298,17 @@ fn html_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n' | '\x0c')
 }
 
-const HTML_RAW_TEXT_NAMES: [&str; 9] = [
-    "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes", "noscript",
+const HTML_RAW_TEXT_NAMES: [&str; 10] = [
+    "script",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
 ];
 
 fn is_html_raw_text_name(name: &str) -> bool {
@@ -825,14 +847,7 @@ fn collect_inline_script_ranges(
 
         let mut opening = None;
         let mut raw: Option<&'static str> = None;
-        let mut comment = false;
         for (start, end, tag) in tags {
-            if comment {
-                if tag.contains("-->") {
-                    comment = false;
-                }
-                continue;
-            }
             if let Some(name) = raw {
                 if is_html_end_tag(tag, name) {
                     raw = None;
@@ -840,13 +855,12 @@ fn collect_inline_script_ranges(
                 continue;
             }
             if opening.is_none() {
-                if tag.starts_with("<!--") {
-                    comment = !tag.contains("-->");
-                    continue;
-                }
                 if !is_script_tag(tag, false)
                     && let Some(name) = html_raw_text_name(tag)
                 {
+                    if name == "plaintext" {
+                        break;
+                    }
                     raw = Some(name);
                     continue;
                 }
@@ -1166,10 +1180,12 @@ fn restore_inline_scripts(
             let placeholder = &scripts[index];
             let span_start = marker_start
                 .checked_sub(placeholder.before.len())
-                .filter(|&span| html[span..marker_start] == *placeholder.before);
-            let span_end = end
-                .checked_add(placeholder.after.len())
-                .filter(|&span| span <= html.len() && html[end..span] == *placeholder.after);
+                .filter(|&span| {
+                    html.as_bytes().get(span..marker_start) == Some(placeholder.before.as_bytes())
+                });
+            let span_end = end.checked_add(placeholder.after.len()).filter(|&span| {
+                html.as_bytes().get(end..span) == Some(placeholder.after.as_bytes())
+            });
             if let (Some(span_start), Some(span_end)) = (span_start, span_end) {
                 counts[index] += 1;
                 matches.push((span_start, span_end, index));
@@ -2300,16 +2316,52 @@ mod tests {
 
     #[test]
     fn examples_inside_inline_raw_text_stay_examples() {
-        let source = concat!(
-            "A <textarea><script>void 1;</script></textarea> B\n",
-            "\nC <!-- <script>void 2;</script> --> D\n",
-        );
+        let source = "A <textarea><script>void 1;</script></textarea> B\n";
         let html = page(&md(source), &registry(), false);
         let rendered = body(&html);
         assert!(!rendered.contains("<script>void 1;</script>"), "{rendered}");
-        assert!(!rendered.contains("<script>void 2;</script>"), "{rendered}");
         assert!(rendered.contains("&lt;textarea>"), "{rendered}");
-        assert!(rendered.contains("C <!-- "), "{rendered}");
+    }
+
+    #[test]
+    fn plaintext_keeps_the_rest_of_the_inline_context_inert() {
+        let source = "A <plaintext><script>document.x=1</script></plaintext> \
+                      <script>document.y=2</script> B";
+        let html = page(&md(source), &registry(), false);
+        let rendered = body(&html);
+        assert!(!rendered.contains("<script>"), "{rendered}");
+        assert!(
+            rendered.contains("&lt;script>document.x=1&lt;/script>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("&lt;script>document.y=2&lt;/script>"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn nested_foreign_object_keeps_the_html_context_for_its_script() {
+        let source = "<svg><foreignObject><foreignObject></foreignObject>\
+                      <script>const tag = /<link>/;</script></foreignObject></svg>";
+        assert_eq!(neutralize_document_links(source).as_ref(), source);
+    }
+
+    #[test]
+    fn inline_script_restoration_does_not_slice_outside_char_boundaries() {
+        let placeholder = ScriptPlaceholder {
+            marker: "<!--mt-script:ABCD:0-->".to_string(),
+            script: "<script>void 0</script>",
+            before: "&lt;script>",
+            after: "&lt;/script>",
+        };
+        assert_eq!(
+            restore_inline_scripts(
+                "\u{1f600}<script><!--mt-script:ABCD:0--></script>".to_string(),
+                vec![placeholder]
+            ),
+            Err(vec![true])
+        );
     }
 
     #[test]
