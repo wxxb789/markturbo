@@ -93,6 +93,12 @@ CELL_GRID_TOP = 48
 CELL_SIZE = 16
 CELL_GAP = 3
 CELL_BORDER_WIDTH = 2
+CELL_SAMPLE_COUNT = 3
+CELL_SAMPLE_OFFSETS = tuple(
+    CELL_BORDER_WIDTH
+    + (CELL_SIZE - 2 * CELL_BORDER_WIDTH) * sample // (CELL_SAMPLE_COUNT + 1)
+    for sample in range(1, CELL_SAMPLE_COUNT + 1)
+)
 CELL_TOLERANCE = 16
 CELL_PAGE_COLOR = (255, 255, 255)
 CELL_BORDER_COLOR = (20, 20, 20)
@@ -405,16 +411,26 @@ def _pixel_matches(actual: tuple[int, ...], expected: tuple[int, int, int]) -> b
     ) <= CELL_TOLERANCE
 
 
+def _cell_matches_color(image: Any, left: int, top: int, expected: tuple[int, int, int]) -> bool:
+    return all(
+        _pixel_matches(image.getpixel((left + x, top + y)), expected)
+        for y in CELL_SAMPLE_OFFSETS
+        for x in CELL_SAMPLE_OFFSETS
+    )
+
+
 def detect_fixture_cells(image: Any) -> list[bool]:
     image = image.convert("RGB")
     width, height = image.size
-    center_y = CELL_GRID_TOP + CELL_SIZE // 2
-    if height <= center_y:
+    last_sample_offset = max(CELL_SAMPLE_OFFSETS)
+    if height <= CELL_GRID_TOP + last_sample_offset:
         return []
 
     step = CELL_SIZE + CELL_GAP
-    first_center_x = CELL_GRID_LEFT + CELL_SIZE // 2
-    slot_count = max(0, (width - first_center_x - 1) // step + 1)
+    slot_count = max(
+        0,
+        (width - CELL_GRID_LEFT - last_sample_offset - 1) // step + 1,
+    )
     last_cell = -1
     known_colors = (
         CELL_PENDING_COLOR,
@@ -425,10 +441,9 @@ def detect_fixture_cells(image: Any) -> list[bool]:
     )
     for index in range(slot_count):
         left = CELL_GRID_LEFT + index * step
-        center = image.getpixel((first_center_x + index * step, center_y))
-        border = image.getpixel((left, center_y))
-        if _pixel_matches(border, CELL_BORDER_COLOR) or any(
-            _pixel_matches(center, color) for color in known_colors
+        if any(
+            _cell_matches_color(image, left, CELL_GRID_TOP, color)
+            for color in known_colors
         ):
             last_cell = index
 
@@ -437,7 +452,7 @@ def detect_fixture_cells(image: Any) -> list[bool]:
 
     cells = []
     for index in range(last_cell + 1):
-        center = image.getpixel((first_center_x + index * step, center_y))
+        left = CELL_GRID_LEFT + index * step
         if index == 0:
             expected = CELL_SCRIPT_COLOR
         elif index == len(FIXTURE_ATTEMPT_SOURCE) + 1:
@@ -446,7 +461,7 @@ def detect_fixture_cells(image: Any) -> list[bool]:
             expected = CELL_ASSIGNED_COLOR
         else:
             expected = CELL_ATTEMPT_COLOR
-        cells.append(_pixel_matches(center, expected))
+        cells.append(_cell_matches_color(image, left, CELL_GRID_TOP, expected))
     return cells
 
 

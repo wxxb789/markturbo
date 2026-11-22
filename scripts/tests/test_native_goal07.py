@@ -676,6 +676,56 @@ class PixelCellObservationTests(unittest.TestCase):
         )
         self.assertEqual(HARNESS.detect_fixture_cells(noisy), [True] * len(expected))
 
+    def test_detector_ignores_dark_background(self) -> None:
+        from PIL import Image
+
+        dark = Image.new(
+            "RGB",
+            (
+                HARNESS.CELL_GRID_LEFT + HARNESS.CELL_SIZE,
+                HARNESS.CELL_GRID_TOP + HARNESS.CELL_SIZE,
+            ),
+            (32, 33, 36),
+        )
+        self.assertEqual(HARNESS.detect_fixture_cells(dark), [])
+
+    def test_detector_ignores_a_single_stray_border_pixel(self) -> None:
+        from PIL import Image, ImageDraw
+
+        size = HARNESS.CELL_SIZE
+        center_y = HARNESS.CELL_GRID_TOP + size // 2
+        stray = Image.new(
+            "RGB",
+            (
+                HARNESS.CELL_GRID_LEFT + HARNESS.CELL_SIZE,
+                HARNESS.CELL_GRID_TOP + HARNESS.CELL_SIZE,
+            ),
+            HARNESS.CELL_PAGE_COLOR,
+        )
+        ImageDraw.Draw(stray).point(
+            (HARNESS.CELL_GRID_LEFT, center_y), fill=HARNESS.CELL_BORDER_COLOR
+        )
+        self.assertEqual(HARNESS.detect_fixture_cells(stray), [])
+
+    def test_detector_ignores_a_single_stray_cell_color_pixel(self) -> None:
+        from PIL import Image, ImageDraw
+
+        size = HARNESS.CELL_SIZE
+        center_y = HARNESS.CELL_GRID_TOP + size // 2
+        first_center_x = HARNESS.CELL_GRID_LEFT + size // 2
+        stray = Image.new(
+            "RGB",
+            (
+                HARNESS.CELL_GRID_LEFT + HARNESS.CELL_SIZE,
+                HARNESS.CELL_GRID_TOP + HARNESS.CELL_SIZE,
+            ),
+            HARNESS.CELL_PAGE_COLOR,
+        )
+        ImageDraw.Draw(stray).point(
+            (first_center_x, center_y), fill=HARNESS.CELL_SCRIPT_COLOR
+        )
+        self.assertEqual(HARNESS.detect_fixture_cells(stray), [])
+
     def test_detector_rejects_a_missing_or_wrong_color_cell(self) -> None:
         expected = [
             HARNESS.CELL_SCRIPT_COLOR,

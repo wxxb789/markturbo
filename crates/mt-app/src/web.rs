@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use html5ever::buffer_queue::BufferQueue;
 use html5ever::tendril::StrTendril;
@@ -587,7 +588,6 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
     let mut options = markdown::Options {
         parse: mt_core::document::doc::parse_options(doc.doc_type()),
         compile: markdown::CompileOptions {
-            // Author HTML is allowed; the sandboxed frame policy governs scripts and loads.
             allow_dangerous_html: true,
             allow_dangerous_protocol: false,
             ..markdown::CompileOptions::default()
@@ -629,7 +629,15 @@ fn preserve_inline_scripts<'a>(
     };
     let mut ranges = Vec::new();
     let mut jsx_names = Vec::new();
-    collect_inline_script_ranges(&ast, source, parse_options, &mut ranges, &mut jsx_names)?;
+    let context = ScriptContext::default();
+    collect_inline_script_ranges(
+        &ast,
+        source,
+        parse_options,
+        &mut ranges,
+        &mut jsx_names,
+        &context,
+    )?;
     ranges.sort_unstable_by_key(|(start, _, _)| *start);
     if ranges.is_empty() {
         return Ok((Cow::Borrowed(source), Vec::new()));
@@ -700,21 +708,51 @@ fn random_script_marker_prefix() -> Result<String, String> {
     Ok(prefix)
 }
 
+#[derive(Default)]
+struct ScriptContext<'a> {
+    paragraph_start: Option<usize>,
+    list_item: Option<(&'a markdown::mdast::ListItem, &'a ScriptContext<'a>)>,
+}
+
 fn collect_inline_script_ranges(
     node: &markdown::mdast::Node,
     source: &str,
     parse_options: &mut markdown::ParseOptions,
     ranges: &mut Vec<InlineScriptRange>,
     jsx_names: &mut Vec<usize>,
+    context: &ScriptContext<'_>,
 ) -> Result<(), String> {
     use markdown::mdast::Node;
+    let next_context;
+    let context = match node {
+        Node::ListItem(item) => {
+            next_context = ScriptContext {
+                paragraph_start: None,
+                list_item: Some((item, context)),
+            };
+            &next_context
+        }
+        Node::Paragraph(paragraph) => {
+            next_context = ScriptContext {
+                paragraph_start: paragraph
+                    .position
+                    .as_ref()
+                    .map(|position| position.start.offset),
+                list_item: context.list_item,
+            };
+            &next_context
+        }
+        _ => context,
+    };
     if let Node::MdxJsxTextElement(jsx) = node
         && let Some(position) = &jsx.position
         && let Some(raw) = source.get(position.start.offset..position.end.offset)
     {
         let start = position.start.offset;
         if jsx.name.as_deref() == Some("script") && !raw.ends_with("/>") {
-            ranges.push((start, position.end.offset, raw.to_string()));
+            let end = position.end.offset;
+            let script = script_value(source, context, start, end, parse_options)?;
+            ranges.push((start, end, script));
             return Ok(());
         }
         jsx_names.push(start + 1);
@@ -729,13 +767,6 @@ fn collect_inline_script_ranges(
         node,
         Node::Paragraph(_) | Node::Heading(_) | Node::TableCell(_)
     ) {
-        let paragraph_start = match node {
-            Node::Paragraph(paragraph) => paragraph
-                .position
-                .as_ref()
-                .map(|position| position.start.offset),
-            _ => None,
-        };
         let mut tags = Vec::new();
         collect_html_tags(node, &mut tags);
         tags.sort_unstable_by_key(|(start, _, _)| *start);
@@ -747,12 +778,7 @@ fn collect_inline_script_ranges(
             } else if is_script_tag(tag, true)
                 && let Some(start) = opening.take()
             {
-                let raw = &source[start..end];
-                let script = if raw.contains('\n') {
-                    parsed_script_value(source, paragraph_start, start, end, parse_options)?
-                } else {
-                    raw.to_string()
-                };
+                let script = script_value(source, context, start, end, parse_options)?;
                 ranges.push((start, end, script));
             }
         }
@@ -760,34 +786,74 @@ fn collect_inline_script_ranges(
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_inline_script_ranges(child, source, parse_options, ranges, jsx_names)?;
+            collect_inline_script_ranges(child, source, parse_options, ranges, jsx_names, context)?;
         }
     }
     Ok(())
 }
 
-fn parsed_script_value(
+fn line_start(source: &str, offset: usize) -> usize {
+    source[..offset]
+        .rfind(['\r', '\n'])
+        .map_or(0, |end| end + 1)
+}
+
+fn project_list_openers(
+    projection: &mut String,
     source: &str,
-    paragraph_start: Option<usize>,
+    context: &ScriptContext<'_>,
+    before_line: usize,
+) {
+    let Some((item, parent)) = context.list_item else {
+        return;
+    };
+    let Some(position) = &item.position else {
+        return;
+    };
+    let start = line_start(source, position.start.offset);
+    project_list_openers(projection, source, parent, start.min(before_line));
+    if start < before_line {
+        let line_end = source[start..]
+            .find(['\r', '\n'])
+            .map_or(source.len(), |end| start + end);
+        let content = item
+            .children
+            .first()
+            .and_then(|node| node.position())
+            .map_or(line_end, |child| child.start.offset);
+        projection.push_str(&source[start..content.min(line_end)]);
+        if content < line_end {
+            projection.push_str("<!-- -->");
+        }
+        projection.push('\n');
+    }
+}
+
+fn script_value(
+    source: &str,
+    context: &ScriptContext<'_>,
     start: usize,
     end: usize,
     parse_options: &mut markdown::ParseOptions,
 ) -> Result<String, String> {
-    let prefix = paragraph_start.map_or("", |offset| {
-        let line_start = source[..offset]
-            .rfind('\n')
-            .map_or(0, |newline| newline + 1);
-        &source[line_start..offset]
-    });
-    let mut projection = String::with_capacity(prefix.len() + end - start);
-    projection.push_str(prefix);
-    projection.push_str(&source[start..end]);
-    let html_flow = parse_options.constructs.html_flow;
-    parse_options.constructs.html_flow = true;
+    let raw = &source[start..end];
+    if !raw.contains('\n') && !raw.contains('\r') {
+        return Ok(raw.to_string());
+    }
+    let paragraph_start = context.paragraph_start.unwrap_or(start);
+    let paragraph_line = line_start(source, paragraph_start);
+    let mut projection = String::new();
+    project_list_openers(&mut projection, source, context, paragraph_line);
+    projection.push_str(&source[paragraph_line..paragraph_start]);
+    let script_start = projection.len();
+    projection.push_str(raw);
+    let html_flow = std::mem::replace(&mut parse_options.constructs.html_flow, true);
+    let jsx_flow = std::mem::replace(&mut parse_options.constructs.mdx_jsx_flow, false);
     let ast = markdown::to_mdast(&projection, parse_options);
     parse_options.constructs.html_flow = html_flow;
+    parse_options.constructs.mdx_jsx_flow = jsx_flow;
     let ast = ast.map_err(|message| message.reason)?;
-    let Some(html) = first_html_node(&ast) else {
+    let Some(html) = html_node_at(&ast, script_start) else {
         return Err("an inline script was not recovered from parsed HTML".into());
     };
     let Some(position) = &html.position else {
@@ -799,11 +865,18 @@ fn parsed_script_value(
     Ok(html.value.clone())
 }
 
-fn first_html_node(node: &markdown::mdast::Node) -> Option<&markdown::mdast::Html> {
-    if let markdown::mdast::Node::Html(html) = node {
+fn html_node_at(node: &markdown::mdast::Node, offset: usize) -> Option<&markdown::mdast::Html> {
+    if let markdown::mdast::Node::Html(html) = node
+        && html
+            .position
+            .as_ref()
+            .is_some_and(|position| position.start.offset == offset)
+    {
         return Some(html);
     }
-    node.children()?.iter().find_map(first_html_node)
+    node.children()?
+        .iter()
+        .find_map(|child| html_node_at(child, offset))
 }
 
 fn collect_html_tags<'a>(node: &'a markdown::mdast::Node, tags: &mut Vec<(usize, usize, &'a str)>) {
@@ -835,28 +908,49 @@ fn is_script_tag(tag: &str, closing: bool) -> bool {
         }
 }
 
-fn restore_inline_scripts(mut html: String, scripts: ScriptPlaceholders) -> Result<String, String> {
-    for (marker, script) in &scripts {
-        let mut matches = html.match_indices(marker);
-        let Some((start, _)) = matches.next() else {
-            return Err("an inline script placeholder was lost during Markdown rendering".into());
-        };
-        if matches.next().is_some() {
+fn restore_inline_scripts(html: String, scripts: ScriptPlaceholders) -> Result<String, String> {
+    let Some((first_marker, _)) = scripts.first() else {
+        return Ok(html);
+    };
+    let (prefix, _) = first_marker
+        .rsplit_once(':')
+        .expect("script marker includes an id");
+    let prefix = prefix.trim_start_matches('.');
+    let mut remaining: HashMap<&str, &str> = scripts
+        .iter()
+        .map(|(marker, script)| (marker.as_str(), script.as_str()))
+        .collect();
+    let mut restored = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while let Some(offset) = html[cursor..].find(prefix) {
+        let start = cursor + offset;
+        let end = html[start..]
+            .find("-->")
+            .map_or(html.len(), |end| start + end + 3);
+        let (start, script) = if let Some(script) = remaining.remove(&html[start..end]) {
+            (start, script)
+        } else if start > cursor
+            && html.as_bytes()[start - 1] == b'.'
+            && let Some(script) = remaining.remove(&html[start - 1..end])
+        {
+            (start - 1, script)
+        } else {
             return Err(
-                "an inline script placeholder appeared more than once during Markdown rendering"
-                    .into(),
+                "an unexpected or duplicate inline script placeholder appeared during Markdown rendering".into()
             );
-        }
-        html.replace_range(start..start + marker.len(), script);
+        };
+        restored.push_str(&html[cursor..start]);
+        restored.push_str(script);
+        cursor = end;
     }
-    if let Some((prefix, _)) = scripts
-        .first()
-        .and_then(|(marker, _)| marker.rsplit_once(':'))
-        && html.contains(prefix.trim_start_matches('.'))
-    {
+    if !remaining.is_empty() {
+        return Err("an inline script placeholder was lost during Markdown rendering".into());
+    }
+    restored.push_str(&html[cursor..]);
+    if restored.contains(prefix) {
         return Err("an inline script placeholder remained after Markdown rendering".into());
     }
-    Ok(html)
+    Ok(restored)
 }
 
 fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> String {
@@ -1216,6 +1310,21 @@ mod tests {
     }
 
     #[test]
+    fn markdown_inline_script_in_a_later_nested_list_paragraph_keeps_its_text() {
+        let source = "- outer\n  - inner\n\n    Note <script>\n    void 0;\n    </script>";
+        let html = page(&md(source), &registry(), false);
+        assert!(body(&html).contains("<p>Note <script>\nvoid 0;\n</script></p>"));
+    }
+
+    #[test]
+    fn mdx_inline_script_in_a_blockquote_keeps_its_text() {
+        let source = "> Note <script>\n> void 0;</script>";
+        let doc = Document::with_type(DocType::Mdx, source.into());
+        let html = page(&doc, &registry(), false);
+        assert!(body(&html).contains("<p>Note <script>\nvoid 0;</script></p>"));
+    }
+
+    #[test]
     fn markdown_heading_and_table_scripts_keep_their_raw_text() {
         let script = r#"<script>document.body.dataset.x="A & B"</script>"#;
         let registry = registry();
@@ -1435,7 +1544,7 @@ mod tests {
 
     #[test]
     fn inline_script_restoration_rejects_missing_or_duplicate_markers() {
-        let marker = "MTMARKDOWNRAWSCRIPT0123456789abcdef0123456789abcdef0END".to_string();
+        let marker = "<!--mt-script:0123456789abcdef0123456789abcdef:0-->".to_string();
         let script = "<script>author()</script>".to_string();
 
         assert!(
@@ -1456,6 +1565,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn inline_script_restoration_near_the_host_limit_is_bounded() {
+        let prefix = "<!--mt-script:0123456789abcdef0123456789abcdef";
+        let mut html = String::new();
+        let mut scripts = Vec::new();
+        let script = "<script>void 0</script>";
+        for id in 0.. {
+            let marker = format!("{prefix}:{id}-->");
+            if html.len() + marker.len() >= MAX_HOST_UTF16_UNITS {
+                break;
+            }
+            html.push_str(&marker);
+            scripts.push((marker, script.to_string()));
+        }
+        let expected = script.repeat(scripts.len());
+        let started = std::time::Instant::now();
+        let restored = restore_inline_scripts(html, scripts).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "restoration took {elapsed:?}"
+        );
+        assert!(restored == expected, "restoration changed the scripts");
     }
 
     #[test]

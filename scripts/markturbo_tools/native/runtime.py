@@ -721,7 +721,6 @@ class OwnedProcess:
             raise
 
     def active_process_ids(self) -> tuple[int, ...]:
-        """List this launch's live processes from the job, not a PID tree scan."""
         if self._closed or not self._job:
             raise HarnessFailure("PROCESS_JOB_UNAVAILABLE")
         capacity = 16
