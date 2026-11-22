@@ -59,9 +59,6 @@ pub enum Key {
     OverwriteFailed,
     SettingsSaved,
     SettingsSaveFailed,
-    TrustScripts,
-    ScriptsTrusted,
-    ScriptsRestricted,
     MoreLayouts,
     FewerLayouts,
     ReviewWithContext,
@@ -272,9 +269,6 @@ pub enum Key {
     ModeSplitWeb,
     WebPreviewFailed,
     WebPreviewRetry,
-    TrustThisDocument,
-    Trusted,
-    HtmlNeedsTrust,
     FileChangedOnDisk,
     ReloadFromDisk,
     Overwrite,
@@ -985,9 +979,6 @@ fn english(key: Key) -> &'static str {
         Key::OverwriteFailed => "Overwrite failed",
         Key::SettingsSaved => "Settings saved.",
         Key::SettingsSaveFailed => "Could not save settings.",
-        Key::TrustScripts => "Trust scripts",
-        Key::ScriptsTrusted => "Trusted: scripts may run",
-        Key::ScriptsRestricted => "Restricted: scripts disabled",
         Key::MoreLayouts => "More layouts",
         Key::FewerLayouts => "Fewer layouts",
         Key::ReviewWithContext => "Review with selected context",
@@ -1222,12 +1213,6 @@ fn english(key: Key) -> &'static str {
         Key::ModeSplitWeb => "Split · Compatibility",
         Key::WebPreviewFailed => "The Web preview could not be opened.",
         Key::WebPreviewRetry => "Retry Web preview",
-        Key::TrustThisDocument => "Trust this document",
-        Key::Trusted => "Trusted ✓",
-        Key::HtmlNeedsTrust => {
-            "This HTML file is shown in a sandbox, so images and stylesheets it loads from disk \
-             are blocked. Trust this document to load them."
-        }
         Key::FileChangedOnDisk => "This file changed on disk since it was opened.",
         Key::ReloadFromDisk => "Reload from disk",
         Key::Overwrite => "Overwrite",
@@ -1484,9 +1469,6 @@ fn chinese(key: Key) -> &'static str {
         Key::OverwriteFailed => "覆盖失败",
         Key::SettingsSaved => "设置已保存。",
         Key::SettingsSaveFailed => "无法保存设置。",
-        Key::TrustScripts => "信任脚本",
-        Key::ScriptsTrusted => "已信任：允许运行脚本",
-        Key::ScriptsRestricted => "受限：脚本已禁用",
         Key::MoreLayouts => "更多布局",
         Key::FewerLayouts => "更少布局",
         Key::ReviewWithContext => "使用所选上下文审查",
@@ -1695,11 +1677,6 @@ fn chinese(key: Key) -> &'static str {
         Key::ModeSplitWeb => "分栏 · 兼容预览",
         Key::WebPreviewFailed => "无法打开 Web 预览。",
         Key::WebPreviewRetry => "重试 Web 预览",
-        Key::TrustThisDocument => "信任此文档",
-        Key::Trusted => "已信任 ✓",
-        Key::HtmlNeedsTrust => {
-            "此 HTML 文件在沙箱中显示，它从磁盘加载的图片和样式表被阻止。信任此文档以加载它们。"
-        }
         Key::FileChangedOnDisk => "此文件自打开后已在磁盘上被修改。",
         Key::ReloadFromDisk => "从磁盘重新加载",
         Key::Overwrite => "覆盖",
@@ -2073,9 +2050,6 @@ mod tests {
         Key::ModeSplitWeb,
         Key::WebPreviewFailed,
         Key::WebPreviewRetry,
-        Key::TrustThisDocument,
-        Key::Trusted,
-        Key::HtmlNeedsTrust,
         Key::FileChangedOnDisk,
         Key::ReloadFromDisk,
         Key::Overwrite,
@@ -2248,14 +2222,6 @@ mod tests {
         // A shared technical label remains readable, not an enum variant name.
         assert_eq!(t(Language::Chinese, Key::ModeWeb), "兼容预览");
         assert!(!t(Language::Chinese, Key::ModeWeb).contains("Key::"));
-    }
-
-    #[test]
-    fn the_html_sandbox_banner_names_the_way_out() {
-        // A banner that says only "blocked" leaves the user with a broken page
-        // and no next step; both languages must point at Trust.
-        assert!(t(Language::English, Key::HtmlNeedsTrust).contains("Trust"));
-        assert!(t(Language::Chinese, Key::HtmlNeedsTrust).contains("信任"));
     }
 
     #[test]

@@ -74,16 +74,18 @@ fn compatibility_layouts_are_progressively_disclosed() {
         .expect("the compatibility layout is hidden again");
     assert!(!app.shows("Web preview"), "the disclosed layout stayed");
 
-    // Reopened, the disclosed layout works: Web shows the document as a page
-    // with its scripts restricted until the user trusts them.
     app.press("id:title-settings")
         .expect("open the glyph's menu");
     app.press("id:title-menu-web")
         .expect("switch to the web pane");
     app.wait_for("id:web-pane")
         .expect("the web compatibility pane");
-    app.wait_for("text:Restricted: scripts disabled")
-        .expect("the trust level on the pane");
+    app.wait_for("id:web-view").expect("the document WebView");
+    assert_eq!(
+        app.screen().count("id:web-banner").expect("selector"),
+        0,
+        "no trust banner in the Web pane"
+    );
     app.wait_for_gone("label:Markdown source", Duration::from_secs(5))
         .expect("the web pane replaces the editor");
 

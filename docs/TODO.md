@@ -32,8 +32,8 @@
 - [ ] **Pele Mermaid renderer** — Evaluate [Pele](https://github.com/obsidianmd/pele)
   as a replacement for `mermaid-svg` only after a pure-Rust or embeddable
   (WASM) build matching current Pele syntax exists. Pele is a TypeScript/npm
-  package; the native path deliberately has no JS runtime and untrusted
-  documents keep scripts blocked, so the WebView is not a substitute. The
+  package; the native path deliberately has no JS runtime, and the WebView's
+  isolated inline-script policy is not a substitute for a native renderer. The
   available port, `bezel-mermaid` 0.2.25 (Pele 1.6.0), measured slower than
   `mermaid-svg` 0.7 on this repo's diagrams (flowchart 130 µs vs 104 µs,
   40-node flow 638 µs vs 436 µs) with larger SVG output. Revisit with a

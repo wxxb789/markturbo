@@ -186,13 +186,12 @@ How nsh 0.6.1 exposes views to UIA, and so how the harnesses select them:
   only in the state whose action they mean.
 - nsh system alerts (`alert_dialog()`) are not in the UIA tree: they are drawn
   inside the window as hosted items, which have no accessibility hook. This
-  covers the Overwrite confirmation after Keep mine (goal 02) and the Run
-  scripts confirmation after Trust scripts (goal 07). While an alert shows it
+  covers the Overwrite confirmation after Keep mine (goal 02). While an alert shows it
   takes every key. Enter presses its first button, or the last regular
   `.action` when it has one. The harnesses therefore check that the press alone changed
   nothing, then send Enter from the main window's keyboard focus, and prove the
-  decision by its effect: the file holds the edited bytes, or the Trusted
-  banner appears, so an Enter that cancels fails the case. Test-id'd,
+  decision by its effect: the file holds the edited bytes, so an Enter that
+  cancels fails the case. Test-id'd,
   in-window confirmation cards would let a harness select the button directly.
 
 The harnesses do not scan Rust source; a renamed selector fails the live run
@@ -235,17 +234,22 @@ the app only where the behaviour itself needs a restart.
   UIA folds into the `title-file` Button), `tests/recovery_restore.rs` (a
   discarded record is not offered on the next launch),
   `tests/save_as_overwrite.rs` and `ui/revision.rs` `SaveConflictProbe`.
-- Goal 07, one case `revision_session`, one launch on `trusted.html` from
+- Goal 07, one case `revision_session`, one launch on `security-fixture.html` from
   argv, one Review→Revision chain (two loopback provider requests) over a
-  two-hunk HTML fixture. `TRUST`: scripts are trusted first through the Run
-  scripts alert, then the Edit mode hands the keyboard back. `DECISIONS`:
+  two-hunk HTML fixture. `WEB_SECURITY`: the inline script changes a visible
+  marker without a prompt and attempts popup, top-level and frame navigation
+  and form submission. The first screenshot shows the attempt cells and the
+  pre-navigation cell; the second detects no fixture cells, consistent with a
+  browser block page. Exactly one app window remains, and the counted
+  loopback listeners record no contacts, including on the final HTTPS port.
+  Browser argument-string tests verify configuration only.
+  Edit mode then hands the keyboard back. `DECISIONS`:
   Accept(h1), the executable script value after the CJK/emoji line, writes at
   once across the multibyte offsets; Reject(h2) reads `2 of 2 decided`;
   `Undo` (`revision-undo`) takes it back to `1 of 2 decided`; `Copy`
   (`revision-copy`) puts exactly the approved text on the OS clipboard; an
   edit over the whole document shows `Can't apply — this part changed` with
-  no Accept; `Done` leaves the file on disk unchanged; the Web pane is
-  Restricted, because the accepted write revoked the trust. `QUIT`: one
+  no Accept; `Done` leaves the file on disk unchanged. `QUIT`: one
   guard, Discard, the process exits. A consent hold whose request never reaches the loopback
   fails at once (`REVIEW_REQUEST_NOT_SENT` / `REVISION_REQUEST_NOT_SENT`).
   Headless: Reject and Undo restoring exact bytes after a write, reject-all

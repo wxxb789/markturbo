@@ -164,7 +164,6 @@ TITLE_REVIEW_AUTOMATION_ID = "title-review"
 MENU_SPLIT_AUTOMATION_ID = "title-menu-split"
 MENU_CONTEXT_AUTOMATION_ID = "title-menu-context"
 MENU_SETTINGS_AUTOMATION_ID = "title-menu-settings"
-WEB_TRUST_AUTOMATION_ID = "web-trust"
 WEB_VIEW_AUTOMATION_ID = "web-view"
 CONTEXT_CLOSE_AUTOMATION_ID = "context-close"
 CONFLICT_KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
@@ -1058,8 +1057,8 @@ class VisualHarness(NativeHarness):
     def web_preview(self, app: RunningApp, *_: Any) -> list[str]:
         self.open_document(app)
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-        self.require(app, WEB_TRUST_AUTOMATION_ID, "WEB_RESTRICTED_MISSING")
-        return [TITLE_FILE_AUTOMATION_ID, MENU_WEB_AUTOMATION_ID, WEB_TRUST_AUTOMATION_ID]
+        self.require(app, WEB_VIEW_AUTOMATION_ID, "WEB_VIEW_MISSING")
+        return [TITLE_FILE_AUTOMATION_ID, MENU_WEB_AUTOMATION_ID, WEB_VIEW_AUTOMATION_ID]
 
     def context(self, app: RunningApp, cell: Cell, *_: Any) -> list[str]:
         self.open_document(app)

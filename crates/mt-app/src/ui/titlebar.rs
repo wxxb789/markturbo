@@ -876,6 +876,29 @@ mod tests {
         title_row(state, Language::English)
     }
 
+    #[component]
+    fn MenuUnderlayProbe() -> impl IntoElement {
+        let pressed = signal(false);
+        view()
+            .relative()
+            .w_full()
+            .h_full()
+            .child(
+                view()
+                    .absolute()
+                    .top(px(TITLE_ROW_H * 2.0))
+                    .right(px(MENU_W / 4.0))
+                    .child(prims::quiet_action("underlay", "Press", move || {
+                        pressed.set(true)
+                    })),
+            )
+            .child(when(
+                move || pressed.get(),
+                || prims::ink("Underlay pressed"),
+            ))
+            .child(pane_menu_probe())
+    }
+
     #[derive(Clone, PartialEq, Props)]
     struct MenuMotionProbeProps {
         content: Option<Renderer<bool>>,
@@ -1137,6 +1160,42 @@ mod tests {
         );
         assert!(pane_dot_is_in_row(&app, "title-menu-edit"));
         assert!(!pane_dot_is_in_row(&app, "title-menu-preview"));
+    }
+
+    #[test]
+    fn a_fading_menu_leaves_the_underlay_pressable() {
+        let mut app = manual_app(Root::of::<MenuUnderlayProbe>());
+        let settings = "id:title-settings";
+        let row = "id:title-menu-split";
+        app.wait_for(settings).expect("the settings action");
+        app.press(settings).expect("open the menu");
+        let row_id = app
+            .screen()
+            .press_target(row)
+            .unwrap()
+            .expect("the open row");
+
+        press_without_settling(&app, settings);
+        for _ in 0..2 {
+            app.next_frame(Duration::from_millis(16))
+                .expect("advance into the menu exit");
+        }
+        let nodes = app.screen().layout_nodes();
+        let bounds = |id| {
+            nodes
+                .iter()
+                .find(|node| node.test_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("{id} is mounted"))
+                .bounds
+        };
+        assert!(bounds("title-menu").contains(&bounds("underlay").center()));
+        assert!(nodes.iter().any(|node| node.id == row_id));
+        assert!(!app.screen().matches("id:title-menu-scrim").unwrap());
+        app.press(row)
+            .expect_err("the fading row cannot take a press");
+        app.press("id:underlay")
+            .expect("press behind the fading menu");
+        assert!(app.screen().matches("text:Underlay pressed").unwrap());
     }
 
     #[test]

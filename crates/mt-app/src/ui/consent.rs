@@ -1413,14 +1413,11 @@ impl Hold {
         } else {
             HoldLabel::Sent
         });
-        self.state.notify_at(
+        self.state.notify_count_at(
             crate::state::StatusSurface::Review,
             crate::state::StatusKind::Success,
-            format!(
-                "{} · {}",
-                S::Sent.text(self.language),
-                sent_bytes(self.language, self.total.get())
-            ),
+            format!("{} · ", S::Sent.text(self.language)),
+            sent_bytes(self.language, self.total.get()),
         );
         if self.is_revision {
             self.state.send_revision();

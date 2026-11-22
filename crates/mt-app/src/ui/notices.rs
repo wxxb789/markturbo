@@ -42,7 +42,8 @@ use nsh_core::{
 use crate::{
     i18n::{self, Key},
     state::{
-        AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest, Tab,
+        AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest,
+        StatusMessage, Tab,
     },
     ui::{
         motion::{self, reduced_motion},
@@ -1217,7 +1218,7 @@ fn card_action(
 
 fn clear_status_if_current(state: &AppState, generation: u64) {
     if state.status_generation.get_untracked() == generation {
-        state.status.set(SharedString::default());
+        state.status.set(StatusMessage::default());
     }
 }
 
@@ -1262,13 +1263,14 @@ pub(crate) fn status_line_at(
             .bind_opacity(&presence.opacity)
             .bind_translate_y(&presence.rise)
             .child(
-                tokens::mono_count(text(move || {
+                text(move || {
                     if owner.get() == surface {
-                        message.get()
+                        message.get().text
                     } else {
                         SharedString::default()
                     }
-                }))
+                })
+                .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
                 .number_of_lines(1)
@@ -1278,7 +1280,14 @@ pub(crate) fn status_line_at(
                     } else {
                         tokens::palette().ink_rest
                     }
-                }),
+                })
+                .child(tokens::mono_count(text(move || {
+                    if owner.get() == surface {
+                        message.get().count.clone().unwrap_or_default()
+                    } else {
+                        SharedString::default()
+                    }
+                }))),
             ),
     )
 }
@@ -1534,7 +1543,7 @@ mod tests {
                 clear_status_if_current(&clear_state, second);
             })
             .child(prims::ink("Trigger status clear"))
-            .child(text(move || state.status.get()))
+            .child(text(move || state.status.get().text))
     }
 
     fn status_probe_content(samples: mpsc::Sender<f32>) -> impl IntoElement {

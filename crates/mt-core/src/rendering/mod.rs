@@ -740,6 +740,14 @@ impl PlantUmlRenderer {
     }
 }
 
+fn plantuml_command(program: &PathBuf) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(["-tsvg", "-pipe"])
+        .env("PLANTUML_SECURITY_PROFILE", "SANDBOX");
+    command
+}
+
 impl BlockRenderer for PlantUmlRenderer {
     fn id(&self) -> &'static str {
         "plantuml"
@@ -763,7 +771,7 @@ impl BlockRenderer for PlantUmlRenderer {
             ));
         };
 
-        match run_piped(&program, &["-tsvg", "-pipe"], &wrap_plantuml(source)) {
+        match run_piped(&mut plantuml_command(&program), &wrap_plantuml(source)) {
             Ok(svg) => interpret_plantuml(&svg),
             Err(err) => RenderOutcome::Failed(diagnose("plantuml", "PlantUML", &err)),
         }
@@ -876,11 +884,10 @@ fn extract_line(text: &str) -> Option<usize> {
         .filter(|&n: &usize| n > 0)
 }
 
-fn run_piped(program: &PathBuf, args: &[&str], source: &str) -> Result<String, String> {
+fn run_piped(command: &mut Command, source: &str) -> Result<String, String> {
     use std::io::Write;
 
-    let mut child = Command::new(program)
-        .args(args)
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1301,6 +1308,17 @@ mod tests {
         // Other diagram families use their own @start directive.
         let mindmap = "@startmindmap\n* root\n@endmindmap";
         assert_eq!(wrap_plantuml(mindmap), mindmap);
+    }
+
+    #[test]
+    fn plantuml_command_uses_the_sandbox_security_profile() {
+        let command = plantuml_command(&PathBuf::from("plantuml"));
+        let profile = command
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("PLANTUML_SECURITY_PROFILE"))
+            .map(|(_, value)| value);
+
+        assert_eq!(profile, Some(Some(std::ffi::OsStr::new("SANDBOX"))));
     }
 
     #[test]

@@ -33,8 +33,10 @@ Headless could no longer scroll the viewport (exit 1).
 With routing intact, neutralizing error color and removing the status text's
 tabular figures failed the two corresponding style assertions (exit 1).
 
-The code gate is CI on the PR head plus
+The code gate is the GitHub CI run on the PR's final merged head plus
 `uv run --locked --project scripts scripts/mt.py check ci`.
+
+Verified head: (filled at merge)
 
 ## Desktop acceptance
 

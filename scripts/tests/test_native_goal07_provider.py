@@ -308,8 +308,7 @@ class LoopbackProviderTests(unittest.TestCase):
         edited = HARNESS.apply_edits(
             HARNESS.SOURCE_BYTES, PROVIDER.fixture_edits(HARNESS.SOURCE_TEXT)
         )
-        self.assertIn("<p>trusted 文档 🚀</p>\r\n".encode("utf-8"), edited)
-        self.assertIn(
-            b'<script>window.goal07 = "new";</script>\r\n<p>owner: team</p>\r\n', edited
-        )
+        self.assertIn("<p>fixture 文档 🚀</p>\r\n".encode("utf-8"), edited)
+        self.assertIn(b'window.goal07 = "new";\r\n', edited)
+        self.assertIn(b"<p>owner: team</p>\r\n", edited)
         self.assertEqual(edited.count(b"\r\n"), HARNESS.SOURCE_BYTES.count(b"\r\n"))

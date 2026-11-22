@@ -1839,7 +1839,12 @@ mod tests {
                         );
                     }))
                     .child(control("status-review-bytes", &state, |state| {
-                        state.notify_at(StatusSurface::Review, StatusKind::Success, "Sent 120 B");
+                        state.notify_count_at(
+                            StatusSurface::Review,
+                            StatusKind::Success,
+                            "Sent ",
+                            "120 B",
+                        );
                     })),
             )
             .child(shell(state, Language::English, Layout::Wide))
@@ -1875,10 +1880,11 @@ mod tests {
                     }))
                     .child(control("revision-start", &state, |state| {
                         state.revision_busy.set(true);
-                        state.notify_at(
+                        state.notify_count_at(
                             crate::state::StatusSurface::Review,
                             crate::state::StatusKind::Success,
-                            "Sent 120 B",
+                            "Sent ",
+                            "120 B",
                         );
                     }))
                     .child(control("revision-ready", &state, |state| {
@@ -1930,6 +1936,17 @@ mod tests {
             app.press(&format!("id:{control}")).expect(control);
             app.wait_for(selector).expect(selector);
             assert_eq!(app.screen().count(message).expect(message), 1);
+            assert_eq!(
+                app.screen()
+                    .span_style(selector)
+                    .expect(selector)
+                    .font_family
+                    .expect(selector)
+                    .name()
+                    .as_ref(),
+                tokens::FONT_UI,
+                "{selector}"
+            );
         }
     }
 
@@ -1965,12 +1982,23 @@ mod tests {
             .expect("open the review field");
         app.press("id:status-review-bytes")
             .expect("show sent bytes");
-        let selector = "text:Sent 120 B";
-        app.wait_for(selector).expect(selector);
+        let line = "text:Sent 120 B";
+        app.wait_for(line).expect(line);
         assert_eq!(
             app.screen()
-                .span_style(selector)
-                .expect(selector)
+                .span_style(line)
+                .expect(line)
+                .font_family
+                .expect("the status message font")
+                .name()
+                .as_ref(),
+            tokens::FONT_UI
+        );
+        let count = "text:120 B";
+        assert_eq!(
+            app.screen()
+                .span_style(count)
+                .expect(count)
                 .font_family
                 .expect("the status count font")
                 .name()

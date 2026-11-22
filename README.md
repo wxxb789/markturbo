@@ -406,26 +406,32 @@ Settings outranks its matching environment variable.
 
 ## Security
 
-The web layouts (**Web preview**, **Split · Web**) hand the page to the
-platform WebView as an HTML string with no base URL.
+The web layouts (**Web preview**, **Split · Web**) use one policy for Markdown,
+MDX and HTML. Script execution follows each source grammar for fidelity: Markdown
+runs only scripts CommonMark keeps as raw HTML (a type-1 HTML block, which may
+span blank lines, or an inline `<script>` in a paragraph without a blank line),
+while MDX runs scripts only when the source parses as MDX; otherwise the grammar
+renders or diagnoses it normally.
+The app loads a fixed, base-free host page; document content runs only in its
+sandboxed frame.
 
-Every tab starts **Restricted**. The web pane shows **Restricted: scripts
-disabled** and a **Trust scripts** button; trusting asks **Run scripts in this
-document?** and, after **Run scripts**, shows **Trusted: scripts may run**.
-Trust applies to that open tab. Accepting or undoing a Revision change
-revokes it before the text changes.
+The WebView stays enabled in all web layouts. On non-elevated Windows,
+WebView2's process-level network switch backs up the in-page policy. Elevated
+Windows, macOS (WKWebView), and Linux (WebKitGTK) use only the in-page layers:
+the sandbox and CSP, a prelude that removes WebRTC entry points, and a
+DNS-prefetch opt-out. The preview makes document `<link>` elements inert before
+loading the frame. On macOS, Linux, and elevated Windows, a script-inserted
+resource hint can still trigger a connection attempt. The owner accepts this
+residual risk; the in-page layers are not a process-level network block.
 
-| | Restricted (default) | Trusted |
-|---|---|---|
-| Markdown / MDX | CSP: no network, no scripts | CSP: no network, inline scripts run |
-| HTML | Injected CSP: no network, no scripts | Original source, no CSP; scripts run and may reach the network |
-
-The CSP is `default-src 'none'; style-src 'unsafe-inline'; img-src data:;
-font-src data:;` plus `script-src 'none'` (Restricted) or `'unsafe-inline'`
-(Trusted). Because there is no base URL, relative images and stylesheets in a
-trusted HTML file do not resolve. The CSP governs what a page loads, not
-top-level navigation such as following a link, and the app does not intercept
-navigation.
+The preview's policy allows inline scripts and styles and `data:` images and
+fonts. Documents are not allowed to access the network or file system, open
+popups, submit forms, or navigate out of the preview. Remote scripts and
+relative assets in HTML are not supported. The app does not open document
+links in another app. PlantUML runs outside the browser policy with
+`PLANTUML_SECURITY_PROFILE=SANDBOX`; a PlantUML launcher that sets its own
+security profile overrides ours. Release-build verification of the isolation
+policy is [pending](docs/goal-15-acceptance.md#pending-release-checks).
 
 ## Keyboard
 
