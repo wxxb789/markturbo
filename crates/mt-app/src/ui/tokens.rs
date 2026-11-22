@@ -472,7 +472,7 @@ pub const FONT_SOURCE: &str = concat!(
 /// The downloadable companion CJK face's family, first in the CJK position of
 /// every list above but not in the Windows [`FONT_INPUT`].
 pub const FONT_CJK_COMPANION: &str = cjk_companion!();
-/// Text inputs. nsh 0.5.1's Windows input takes only the *first* family of
+/// Text inputs. nsh 0.6.1's Windows input takes only the first nonempty family of
 /// a list and only from the system's fonts — never a registered one, with no
 /// fallback through the rest — so a list led by Martian left its placeholder
 /// in DirectWrite's last-resort serif. There it leads with Bahnschrift, the
@@ -626,7 +626,7 @@ mod tests {
         }
     }
 
-    /// nsh 0.5.1's Windows text input resolves only the first family of a
+    /// nsh 0.6.1's Windows text input resolves only the first nonempty family of a
     /// list, from the system's fonts alone: it must name a face Windows
     /// ships, never a registered Martian one (which left its placeholder in
     /// a serif). Elsewhere inputs resolve the whole list and keep Martian.

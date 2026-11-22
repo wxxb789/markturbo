@@ -74,38 +74,35 @@ INTEGRITY_NAMES = {
     "protected",
 }
 
-# How the nsh 0.5.1 UI appears in Windows UI Automation. Verified against the
-# nsh-platform-windows 0.5.1 crate source:
+# How the nsh 0.6.1 UI appears in Windows UI Automation. Verified against the
+# nsh-platform-windows 0.6.1 crate source:
 #
-# * AutomationId is the view's `.test_id(..)` (src/access/uia.rs:821), but only
-#   on a view that is itself a UIA element. A plain view with no role, label or
-#   press handler is flat and is looked through (src/access.rs:284-297,
-#   373-384). `prims::quiet_action`/`primary_action` and the guard card's
+# * AutomationId is the view's `.test_id(..)` (access/uia.rs), but only on a
+#   view that is itself a UIA element. Plain wrappers are looked through
+#   (access.rs `control_for` and `children`). `prims::quiet_action`/
+#   `primary_action` and the guard card's
 #   actions are the pressable Button view itself, so each carries its own
 #   AutomationId (for example `guard-save`, `welcome-new-file`) and is found by
 #   it; anonymous name lookups do not see them.
 # * Name is the accessibility label, else a text view's visible text, else the
-#   folded content of a grouping control such as a Button (src/access.rs:453).
+#   folded content of a grouping control such as a Button (access.rs `name_of`).
 # * ControlType follows the role, else Text for text views, Edit for inputs,
-#   Button for pressable views and Group for labelled ones (src/access.rs:284;
-#   src/access/uia.rs:1256).
-# * Invoke is offered by pressable views and `activate` actions, never by
-#   toggles (src/access/uia.rs:771); it delivers one whole press, so it cannot
+#   Image for labelled images, Button for pressable views, Group for labelled
+#   or explicitly accessible views, and Pane for scrolls (access.rs).
+# * Invoke is offered by views with a Press handler or an `activate` action,
+#   never by toggles (access/uia.rs); it delivers one whole press, so it cannot
 #   charge the consent card's hold (`ui/consent.rs` `send_button`). Value is
-#   offered by inputs only (src/access/uia.rs:789); the source editor's input
-#   is its IME sink, not the document (nsh-base 0.5.1 src/editor/view.rs:1526,
-#   src/editor/controller.rs:749-813), so the document is read through the
+#   offered by inputs only; the source editor's input is its IME sink, not
+#   the document (nsh-base's editor view and controller), so it is read through the
 #   editor's own Select All + Copy, which writes the exact text
-#   (nsh-platform-windows src/system.rs:2046). SetFocus is supported
-#   (src/access/uia.rs:974).
+#   (system.rs `set_clipboard_text`). SetFocus supports inputs and focusable
+#   views (access/uia.rs and access.rs).
 # * System alerts (`nsh::alert_dialog()`: the Overwrite and Run scripts
 #   confirmations in `state.rs`) are not in the UIA tree. They are drawn inside
-#   the surface as items the root hosts (src/system.rs:5-13, 1906), the
-#   `Hosted` trait has no accessibility hook, and the UIA tree walks views only
-#   (src/access.rs:373-384). While one shows, every key goes to it
-#   (src/system.rs:2022-2040); Enter presses its focused button, which starts on
-#   the last Default-styled button, else the first (src/system.rs:1461-1476,
-#   1674). `confirm_system_alert` answers with Enter; each caller proves the
+#   the surface as hosted items (system.rs), and the UIA tree walks views only.
+#   While one shows, it owns keyboard input. Enter presses its selected button,
+#   initially the last Default-styled button, else the first.
+#   `confirm_system_alert` answers with Enter; each caller proves the
 #   confirmed effect, so a cancelling Enter fails its wait.
 SYSTEM_ALERT_SETTLE_SECONDS = 0.5
 # How long one Enter's effect is awaited before the alert is answered again.
@@ -2528,7 +2525,7 @@ class NativeHarness:
             return actual
         self.win32.send_key(app.hwnd, VK_BACK)
         # An empty document copies line-wise as its one empty line, "\n"
-        # (nsh-base 0.5.1 `editor/commands.rs` `copy`). Backspace over Select
+        # (nsh-base 0.6.1 `editor/commands.rs` `copy`). Backspace over Select
         # All leaves no line break behind, so here "\n" can only mean empty.
         self.wait_editor_fingerprint(app, fingerprint_text("\n"), self.ui_timeout)
         return fingerprint_text("")

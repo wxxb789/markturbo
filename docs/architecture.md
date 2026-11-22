@@ -1,7 +1,7 @@
 # Architecture
 
-> **Migration status (2026-11-16):** `crates/mt-app` is now a Native Shell
-> (nsh 0.5.1) Rust app on the native Win32/Direct2D, AppKit and GTK 4 backends.
+> **Migration status (2026-11-21):** `crates/mt-app` is now a Native Shell
+> (nsh 0.6.1) Rust app on the native Win32/Direct2D, AppKit and GTK 4 backends.
 > `mt-core` remains UI-framework-free. The GPUI-specific mechanisms below
 > describe the v0.1 shell and are retained as history; current UI boundaries are
 > the nsh modules under `crates/mt-app/src`.

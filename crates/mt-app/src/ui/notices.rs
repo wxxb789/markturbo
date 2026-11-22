@@ -17,11 +17,10 @@
 //!
 //! The guard card asks through the state's [`crate::state::GuardRequest`]
 //! instead of the platform's dialog, so a close or a quit is decided inside
-//! the room: Save, Don't save or Cancel, with Cancel selected first. Windows
-//! gives keyboard focus to text fields only (nsh 0.5.1), so the card carries
-//! its own ring: Left/Right (or Tab/Shift+Tab) move it, Enter takes the
-//! selected control's decision, and Escape always cancels. Every control
-//! carries an accessibility label.
+//! the room: Save, Don't save or Cancel, with Cancel selected first. The card
+//! keeps its own selection ring: Left/Right (or Tab/Shift+Tab) move it,
+//! Enter takes the selected control's decision, and Escape always cancels.
+//! Every control carries an accessibility label.
 
 use std::{
     cell::RefCell,
@@ -906,8 +905,7 @@ pub fn guard_is_open(state: &AppState) -> bool {
 /// The guard card, in the overlay layer: 'Close without saving?' with Save,
 /// Don't save and Cancel. Cancel starts selected — the designed ring shows
 /// which control the keyboard is on — and Left/Right (or Tab/Shift+Tab) move
-/// the ring, so every decision is keyboard-reachable on Windows, where views
-/// take no keyboard focus.
+/// the ring, so every decision is keyboard-reachable without moving focus.
 pub fn guard(state: AppState, language: Language) -> impl IntoElement {
     match state.guard.get() {
         Some(request) => guard_card(state, request, language).into_element(),
@@ -996,10 +994,6 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .into_element()
 }
 
-/// The guard's keys, bound while the card is up (they die with it): Escape
-/// cancels whatever is selected, Enter takes the selected decision, and
-/// Left/Right or Tab/Shift+Tab move the selection. Windows gives the keyboard
-/// focus to text fields only (nsh 0.5.1), so the card carries its own ring.
 fn bind_guard_keys(state: &AppState) {
     let escape = state.clone();
     on_key_with(
@@ -1010,15 +1004,28 @@ fn bind_guard_keys(state: &AppState) {
         },
         move |_| escape.guard_cancel(),
     );
-    let enter = state.clone();
-    on_key_with(
-        "enter",
-        KeyOptions {
-            when: When::Always,
-            ..KeyOptions::default()
-        },
-        move |_| enter.guard_activate(),
-    );
+    for (key, activate) in [
+        ("enter", true),
+        ("shift+enter", false),
+        ("space", false),
+        ("shift+space", false),
+    ] {
+        let state = state.clone();
+        on_key_with(
+            key,
+            KeyOptions {
+                when: When::Always,
+                // A pointer-opened guard can leave focus on a background button.
+                for_focus: true,
+                ..KeyOptions::default()
+            },
+            move |_| {
+                if activate {
+                    state.guard_activate();
+                }
+            },
+        );
+    }
     for (key, delta) in [
         ("left", -1isize),
         ("shift+tab", -1),

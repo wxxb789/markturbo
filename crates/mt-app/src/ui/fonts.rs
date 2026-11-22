@@ -117,7 +117,7 @@ pub enum CompanionStatus {
     Installed,
     /// Deleting the stored file.
     Removing,
-    /// Removed this session. nsh 0.5.1 cannot unregister a face, so the
+    /// Removed this session. nsh 0.6.1 cannot unregister a face, so the
     /// registered one stays until the app restarts.
     Removed,
     /// The last operation failed.

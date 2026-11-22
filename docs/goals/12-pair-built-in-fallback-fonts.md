@@ -24,8 +24,8 @@ to a serif. Martian stays embedded; no font is added to the executable.
 
    The Native Preview body uses `FONT_UI`, not a list of its own.
 2. The four text inputs use `FONT_INPUT`. On Windows its first family is a
-   face Windows ships (Bahnschrift), because nsh 0.5.1's Windows input
-   resolves only the first family, from system fonts only. Elsewhere it equals
+   face Windows ships (Bahnschrift), because nsh 0.6.1's Windows input
+   resolves only the first nonempty family, from system fonts only. Elsewhere it equals
    `FONT_UI`.
 3. `cargo test --profile ci -p mt-app` passes on Windows, and so does the
    per-PR CI. This includes a test of each platform's exact ordered fallback
