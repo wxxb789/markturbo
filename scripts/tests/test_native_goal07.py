@@ -937,7 +937,7 @@ class PhaseTests(unittest.TestCase):
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
             mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
             self.assertRaisesRegex(
-                runtime.HarnessFailure, "SELF_NAVIGATION_FRAME_NOT_REPLACED"
+                runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED"
             ),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
@@ -948,24 +948,12 @@ class PhaseTests(unittest.TestCase):
 
     def test_web_phase_reports_stable_empty_frame_without_observing_assignment(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
-        order.read_fixture_cell_results.side_effect = [
-            list(PIXEL_REQUIRED_CELL_RESULTS),
-            *([[]] * 30),
-        ]
-
-        def replay_empty_frames(check: Callable[[], Any], timeout: float, code: str, **kwargs: Any) -> Any:
-            if timeout == harness.ui_timeout:
-                return wait_once(check, timeout, code, **kwargs)
-            for _ in range(30):
-                value = check()
-                if value:
-                    return value
-            raise runtime.HarnessFailure(code)
+        order.read_fixture_cell_results.side_effect = [list(PIXEL_REQUIRED_CELL_RESULTS)] + [[]] * 4
 
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            mock.patch.object(HARNESS, "wait_until", side_effect=replay_empty_frames),
-            mock.patch.object(HARNESS.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]),
+            mock.patch.object(runtime.time, "perf_counter", side_effect=[0, 0, 0, 0, 1, 2, 2.9, 3]),
+            mock.patch.object(runtime.time, "sleep"),
             self.assertRaisesRegex(
                 runtime.HarnessFailure, "SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED"
             ),
@@ -977,23 +965,26 @@ class PhaseTests(unittest.TestCase):
         harness.win32.visible_top_level_windows.assert_not_called()
 
     def test_web_phase_observes_assignment_with_slow_samples(self) -> None:
-        sample_duration = 0.45
+        sample_duration = 0.92
         for assigned in (True, False):
             with self.subTest(assigned=assigned):
                 harness, order, app = self.web_security_harness(focus_returns=True)
                 now = 0.0
-                sample_count = 0
                 assigned_at: float | None = None
+                first_sample = True
+
+                def advance(seconds: float) -> None:
+                    nonlocal now
+                    now += seconds
 
                 def read_sample(_app: Any) -> list[bool]:
-                    nonlocal now, sample_count, assigned_at
-                    now += sample_duration
-                    if sample_count == 0:
+                    nonlocal first_sample, assigned_at
+                    advance(sample_duration)
+                    if first_sample:
+                        first_sample = False
                         if assigned:
                             assigned_at = now
-                        sample_count += 1
                         return list(PIXEL_REQUIRED_CELL_RESULTS)
-                    sample_count += 1
                     if (
                         assigned_at is not None
                         and now - assigned_at
@@ -1002,18 +993,12 @@ class PhaseTests(unittest.TestCase):
                         return list(PIXEL_CELL_RESULTS)
                     return []
 
-                def replay(check: Callable[[], Any], _timeout: float, code: str, **_kwargs: Any) -> Any:
-                    for _ in range(20):
-                        value = check()
-                        if value:
-                            return value
-                    raise runtime.HarnessFailure(code)
-
                 order.read_fixture_cell_results.side_effect = read_sample
                 with (
                     mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-                    mock.patch.object(HARNESS, "wait_until", side_effect=replay),
-                    mock.patch.object(HARNESS.time, "monotonic", side_effect=lambda: now),
+                    mock.patch.object(runtime.time, "perf_counter", lambda: now),
+                    mock.patch.object(HARNESS.time, "monotonic", lambda: now),
+                    mock.patch.object(runtime.time, "sleep", advance),
                 ):
                     if assigned:
                         observed = harness.phase_web_security(

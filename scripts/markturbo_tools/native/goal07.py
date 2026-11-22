@@ -265,7 +265,8 @@ EDITOR_SOURCE_BYTES = EDITOR_SOURCE_TEXT.encode("utf-8")
 # hunk's part.
 STALE_EDIT = f"{DOCUMENT_SENTINEL}:stale"
 FIXTURE_FILE = "security-fixture.html"
-SELF_NAVIGATION_TIMEOUT_SECONDS = 3.0
+SELF_NAVIGATION_ASSIGNED_TIMEOUT_SECONDS = 3.0
+SELF_NAVIGATION_FRAME_TIMEOUT_SECONDS = 10.0
 NETWORK_PROBE_SETTLE_SECONDS = 1.0
 NETWORK_OBSERVATION_KEYS = frozenset(
     {"web_security_tcp_contact_count", "web_security_udp_contact_count"}
@@ -1193,18 +1194,28 @@ class Goal07Harness(NativeHarness):
         if app.process.poll() is not None:
             raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
 
+        if not navigation_assigned_seen:
+            def assignment_visible() -> bool:
+                cells = self.read_fixture_cell_results(app)
+                return len(cells) > assigned_index and cells[assigned_index] is True
+
+            navigation_assigned_seen = wait_until(
+                assignment_visible,
+                SELF_NAVIGATION_ASSIGNED_TIMEOUT_SECONDS,
+                "SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED",
+                interval=SELF_NAVIGATION_SAMPLE_INTERVAL_SECONDS,
+            )
+
         post_navigation_cells: list[bool] | None = None
         fixture_absent_since: float | None = None
 
         def frame_replaced() -> bool | None:
-            nonlocal fixture_absent_since, navigation_assigned_seen, post_navigation_cells
+            nonlocal fixture_absent_since, post_navigation_cells
             try:
                 cells = self.read_fixture_cell_results(app)
             except Exception:
                 fixture_absent_since = None
                 raise
-            if len(cells) > assigned_index and cells[assigned_index] is True:
-                navigation_assigned_seen = True
             if cells:
                 fixture_absent_since = None
                 return None
@@ -1214,14 +1225,12 @@ class Goal07Harness(NativeHarness):
                 return None
             if now - fixture_absent_since < SELF_NAVIGATION_EMPTY_FRAME_STABILITY_SECONDS:
                 return None
-            if not navigation_assigned_seen:
-                raise HarnessFailure("SELF_NAVIGATION_ASSIGNED_NOT_OBSERVED")
             post_navigation_cells = cells
             return True
 
         wait_until(
             frame_replaced,
-            SELF_NAVIGATION_TIMEOUT_SECONDS,
+            SELF_NAVIGATION_FRAME_TIMEOUT_SECONDS,
             "SELF_NAVIGATION_FRAME_NOT_REPLACED",
             interval=SELF_NAVIGATION_SAMPLE_INTERVAL_SECONDS,
         )

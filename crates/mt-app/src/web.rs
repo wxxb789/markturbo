@@ -70,28 +70,105 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
 }
 
 fn neutralize_document_links(page: &str) -> Cow<'_, str> {
-    let mut candidates = page
-        .match_indices('<')
-        .filter_map(|(start, _)| {
-            let tag = page.as_bytes().get(start + 1..start + 6)?;
-            (tag[..4].eq_ignore_ascii_case(b"link")
-                && (html_whitespace(char::from(tag[4])) || matches!(tag[4], b'/' | b'>')))
-            .then_some(start)
-        })
-        .peekable();
-    if candidates.peek().is_none() {
-        return Cow::Borrowed(page);
-    }
-
+    let mut remaining = page;
+    let mut output = None;
     let mut copied = 0;
-    let mut neutralized = String::with_capacity(page.len());
-    for start in candidates {
+    while let Some((_, after_start)) = remaining.split_once('<') {
+        remaining = after_start;
+        let Some(attributes) = tag_attributes(after_start, "link") else {
+            continue;
+        };
+        let start = page.len() - after_start.len() - 1;
+        let neutralized = output.get_or_insert_with(|| String::with_capacity(page.len()));
         neutralized.push_str(&page[copied..start]);
-        neutralized.push_str("<mt-link");
-        copied = start + "<link".len();
+        neutralized.push_str("<template data-mt-link");
+        let mut copied_attributes = 0;
+        let end = scan_tag_end(attributes, |offset| {
+            if tag_attributes(&attributes[offset + 1..], "link").is_some() {
+                neutralized.push_str(&attributes[copied_attributes..offset]);
+                neutralized.push_str("&lt;");
+                copied_attributes = offset + 1;
+            }
+        });
+        neutralized.push_str(&attributes[copied_attributes..end.offset - usize::from(end.slash)]);
+        if let Some(quote) = end.quote {
+            neutralized.push(quote.into());
+        }
+        neutralized.push_str("></template>");
+        remaining = attributes.get(end.offset + 1..).unwrap_or_default();
+        copied = page.len() - remaining.len();
     }
-    neutralized.push_str(&page[copied..]);
-    Cow::Owned(neutralized)
+    match output {
+        Some(mut neutralized) => {
+            neutralized.push_str(&page[copied..]);
+            Cow::Owned(neutralized)
+        }
+        None => Cow::Borrowed(page),
+    }
+}
+
+fn tag_attributes<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let (tag, rest) = source.split_at_checked(name.len())?;
+    (tag.eq_ignore_ascii_case(name)
+        && (rest.is_empty() || rest.starts_with(|c| html_whitespace(c) || matches!(c, '/' | '>'))))
+    .then_some(rest)
+}
+
+struct TagEnd {
+    offset: usize,
+    slash: bool,
+    quote: Option<u8>,
+}
+
+fn scan_tag_end(attributes: &str, mut visit_less_than: impl FnMut(usize)) -> TagEnd {
+    #[derive(Clone, Copy)]
+    enum State {
+        BeforeName,
+        Name,
+        AfterName,
+        BeforeValue,
+        Unquoted,
+        Quoted(u8),
+        Slash,
+    }
+    use State::*;
+
+    let mut state = BeforeName;
+    for (offset, byte) in attributes.bytes().enumerate() {
+        if byte == b'<' {
+            visit_less_than(offset);
+        }
+        let space = html_whitespace(byte.into());
+        state = match (state, byte) {
+            (Quoted(quote), byte) if quote == byte => BeforeName,
+            (Quoted(_), _) => state,
+            (_, b'>') => {
+                return TagEnd {
+                    offset,
+                    slash: matches!(state, Slash),
+                    quote: None,
+                };
+            }
+            (Unquoted, _) if space => BeforeName,
+            (Unquoted, _) => Unquoted,
+            (BeforeValue, b'\'' | b'"') => Quoted(byte),
+            (BeforeValue, _) if space => BeforeValue,
+            (BeforeValue, _) => Unquoted,
+            (Name | AfterName, b'=') => BeforeValue,
+            (Name | AfterName, _) if space => AfterName,
+            (_, _) if space => BeforeName,
+            (_, b'/') => Slash,
+            _ => Name,
+        };
+    }
+    TagEnd {
+        offset: attributes.len(),
+        slash: matches!(state, Slash),
+        quote: match state {
+            Quoted(quote) => Some(quote),
+            _ => None,
+        },
+    }
 }
 
 fn escape_srcdoc(page: &str) -> String {
@@ -635,7 +712,6 @@ fn collect_markdown_flow_scripts(
     source: &str,
     ranges: &mut Vec<ScriptRange>,
 ) {
-    const CLOSE: &[u8] = b"</script>";
     let Some(position) = &html.position else {
         return;
     };
@@ -665,13 +741,8 @@ fn collect_markdown_flow_scripts(
         }
         None
     };
-    while let Some(close) = content
-        .as_bytes()
-        .windows(CLOSE.len())
-        .position(|tag| tag.eq_ignore_ascii_case(CLOSE))
-    {
+    while let Some(tail) = script_end_tail(content) {
         let start = value.len() - remaining.len();
-        let tail = &content[close + CLOSE.len()..];
         let end = value.len() - tail.len();
         let (Some(source_start), Some(source_end)) = (source_offset(start), source_offset(end))
         else {
@@ -692,6 +763,13 @@ fn collect_markdown_flow_scripts(
         remaining = next;
         content = next_content;
     }
+}
+
+fn script_end_tail(content: &str) -> Option<&str> {
+    let attributes = content
+        .match_indices("</")
+        .find_map(|(start, _)| tag_attributes(&content[start + 2..], "script"))?;
+    attributes.get(scan_tag_end(attributes, |_| {}).offset + 1..)
 }
 
 fn line_start(source: &str, offset: usize) -> usize {
@@ -1417,6 +1495,42 @@ mod tests {
     }
 
     #[test]
+    fn markdown_flow_scripts_accept_html_end_tag_syntax() {
+        let space = "<script>void 0;</script >";
+        let tab = "<script>void 1;</SCRIPT\t>";
+        let attributes = "<script>void 2;</script ignored=\">\">";
+        for scripts in [vec![space], vec![tab], vec![space, tab, attributes]] {
+            let source = scripts.concat();
+            let (ranges, _) = collect_script_ranges(&source, &markdown::ParseOptions::default());
+            let extracted: Vec<_> = ranges.iter().map(|range| range.script.as_str()).collect();
+            assert_eq!(extracted, scripts);
+        }
+    }
+
+    #[test]
+    fn document_link_templates_keep_head_and_body_siblings() {
+        let source = concat!(
+            "<!doctype html><html><head><link rel=stylesheet data-label='a>b'>",
+            "<title>Preview</title></head><body><main>Body</main>",
+            "<link rel=stylesheet data-label=\"c>d\" /></body></html>",
+        );
+        let html = page(
+            &Document::with_type(DocType::Html, source.into()),
+            &registry(),
+            false,
+        );
+        assert!(html.ends_with(concat!(
+            "<template data-mt-link rel=stylesheet data-label='a>b'></template>",
+            "<title>Preview</title></head><body><main>Body</main>",
+            "<template data-mt-link rel=stylesheet data-label=\"c>d\" ></template></body></html>",
+        )), "{html}");
+        assert_eq!(
+            neutralize_document_links("<link rel=stylesheet data-label='a>b"),
+            "<template data-mt-link rel=stylesheet data-label='a>b'></template>"
+        );
+    }
+
+    #[test]
     fn document_links_are_made_inert_in_every_context() {
         let source = concat!(
             "<link rel=preconnect><LINK rel=dns-prefetch><link/rel=preload>",
@@ -1424,8 +1538,10 @@ mod tests {
             "<linker><link-data><link\u{e9}>",
         );
         let expected = concat!(
-            "<mt-link rel=preconnect><mt-link rel=dns-prefetch><mt-link/rel=preload>",
-            "<svg><title><mt-link rel=preload></title></svg>",
+            "<template data-mt-link rel=preconnect></template>",
+            "<template data-mt-link rel=dns-prefetch></template>",
+            "<template data-mt-link/rel=preload></template>",
+            "<svg><title><template data-mt-link rel=preload></template></title></svg>",
             "<linker><link-data><link\u{e9}>",
         );
         let html = page(
@@ -1452,7 +1568,9 @@ mod tests {
             false,
         );
         let elapsed = started.elapsed();
-        assert!(html.ends_with(&format!("<mt-link rel=preload{attributes}>")));
+        assert!(html.ends_with(&format!(
+            "<template data-mt-link rel=preload{attributes}></template>"
+        )));
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "50,000 attributes took {elapsed:?}"
@@ -1464,36 +1582,42 @@ mod tests {
         let cases = [
             (
                 "<LiNk ReL=PrEcOnNeCt href='about:blank'>",
-                "<mt-link ReL=PrEcOnNeCt href='about:blank'>",
+                "<template data-mt-link ReL=PrEcOnNeCt href='about:blank'></template>",
             ),
             (
                 "<link href='about:blank' rel='alternate\tDNS-prefetch'>",
-                "<mt-link href='about:blank' rel='alternate\tDNS-prefetch'>",
+                "<template data-mt-link href='about:blank' rel='alternate\tDNS-prefetch'></template>",
             ),
             (
                 "<link disabled rel=prefetch href='about:blank'>",
-                "<mt-link disabled rel=prefetch href='about:blank'>",
+                "<template data-mt-link disabled rel=prefetch href='about:blank'></template>",
             ),
             (
                 "<link rel='preload' href='about:blank' />",
-                "<mt-link rel='preload' href='about:blank' />",
+                "<template data-mt-link rel='preload' href='about:blank' ></template>",
             ),
             (
                 "<link href='about:blank' rel=modulepreload>",
-                "<mt-link href='about:blank' rel=modulepreload>",
+                "<template data-mt-link href='about:blank' rel=modulepreload></template>",
             ),
-            ("<link rel=prerender>", "<mt-link rel=prerender>"),
+            (
+                "<link rel=prerender>",
+                "<template data-mt-link rel=prerender></template>",
+            ),
             (
                 "<link rel=preload data-label='<link rel=preload>'><link rel=prefetch>",
-                "<mt-link rel=preload data-label='<mt-link rel=preload>'><mt-link rel=prefetch>",
+                concat!(
+                    "<template data-mt-link rel=preload data-label='&lt;link rel=preload>'></template>",
+                    "<template data-mt-link rel=prefetch></template>",
+                ),
             ),
             (
                 "<link rel=stylesheet href='theme.css'>",
-                "<mt-link rel=stylesheet href='theme.css'>",
+                "<template data-mt-link rel=stylesheet href='theme.css'></template>",
             ),
             (
                 "<!-- <link rel=preload> -->",
-                "<!-- <mt-link rel=preload> -->",
+                "<!-- <template data-mt-link rel=preload></template> -->",
             ),
         ];
         let registry = registry();
@@ -1520,7 +1644,10 @@ mod tests {
         );
         assert_eq!(
             neutralize_document_links(source),
-            source.replace("<link", "<mt-link")
+            source.replace(
+                "<link rel=preload>",
+                "<template data-mt-link rel=preload></template>"
+            )
         );
     }
 
@@ -1533,7 +1660,10 @@ mod tests {
         let filtered = neutralize_document_links(&source);
         let elapsed = started.elapsed();
 
-        assert_eq!(filtered, format!("{opening}<mt-link rel=preload>{closing}"));
+        assert_eq!(
+            filtered,
+            format!("{opening}<template data-mt-link rel=preload></template>{closing}")
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "filter took {elapsed:?} for {} UTF-16 units",
@@ -1560,7 +1690,7 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(
-            filtered.strip_suffix("<mt-link rel=preload>"),
+            filtered.strip_suffix("<template data-mt-link rel=preload></template>"),
             source.strip_suffix("<link rel=preload>")
         );
         assert!(
@@ -1719,7 +1849,8 @@ mod tests {
             )
         };
         let hint = r#"<link rel="preload" href="fixture.css" as="style">"#;
-        let inert = hint.replacen("<link", "<mt-link", 1);
+        let inert =
+            r#"<template data-mt-link rel="preload" href="fixture.css" as="style"></template>"#;
         let overhead = build(format!("<p>{inert}</p>")).encode_utf16().count();
         let text = "a".repeat(MAX_HOST_UTF16_UNITS - overhead);
         let exact = build(format!("<p>{hint}{text}</p>"));
@@ -1774,7 +1905,7 @@ mod tests {
     fn html_inserts_csp_at_the_start_of_the_real_or_implied_head() {
         let registry = registry();
         let author = r#"<link rel="stylesheet" href="relative.css"><script>run()</script>"#;
-        let inert = author.replacen("<link", "<mt-link", 1);
+        let inert = r#"<template data-mt-link rel="stylesheet" href="relative.css"></template><script>run()</script>"#;
         let policy = format!("{DOCUMENT_POLICY}{FRAME_PRELUDE}");
         for (prefix, expected_prefix) in [
             ("<!doctype html><html><head>", "<!doctype html><html><head>"),
