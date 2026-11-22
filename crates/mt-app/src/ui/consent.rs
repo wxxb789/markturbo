@@ -785,23 +785,21 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
             titlebar::bind_mod_enter(&ctrl_enter_state);
         }
     });
-    let escape_state = state.clone();
-    let enter_state = state.clone();
-    let space_state = state.clone();
     effect(move || {
-        if !is_open(&escape_state) {
+        if !is_open(&state) {
             return;
         }
         on_key_with("escape", KeyOptions::default(), {
-            let state = escape_state.clone();
+            let state = state.clone();
             move |_| cancel(&state, is_revision)
         });
-        for key in ["enter", "space"] {
-            let state = if key == "enter" {
-                enter_state.clone()
-            } else {
-                space_state.clone()
-            };
+        for (key, unmodified) in [
+            ("enter", true),
+            ("shift+enter", false),
+            ("space", true),
+            ("shift+space", false),
+        ] {
+            let state = state.clone();
             let hold = hold.clone();
             on_key_with(
                 key,
@@ -814,7 +812,7 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
                     ..KeyOptions::default()
                 },
                 move |_| {
-                    if !is_open(&state) {
+                    if !unmodified || !is_open(&state) {
                         return;
                     }
                     if hold.focused.get() {
@@ -2339,6 +2337,101 @@ mod tests {
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("the first press cancelled the card");
         assert!(!app.shows("Sent"), "nothing was sent");
+    }
+
+    #[component]
+    fn BackgroundFocusHarness() -> impl IntoElement {
+        let state = AppState::new();
+        let open_state = state.clone();
+        let card_state = state.clone();
+        let presses = signal(0);
+        let background_focused = signal(false);
+        let background = element_ref();
+        effect(move || on_key_with("f6", KeyOptions::default(), move |_| background.focus()));
+        view()
+            .child(
+                view()
+                    .test_id("open-consent")
+                    .element_ref(&background)
+                    .on_focus(move || background_focused.set(true))
+                    .on_blur(move || background_focused.set(false))
+                    .on_press(move |_: &PressEvent| {
+                        presses.update(|count| *count += 1);
+                        open_state
+                            .review_consent
+                            .set(Some(SharedString::from("disclosure text")));
+                        open_state.review_manifest.set(Some(sample_consent()));
+                    })
+                    .child(prims::rest("Open consent")),
+            )
+            .child(text(move || {
+                format!("Background presses: {}", presses.get())
+            }))
+            .child(when(
+                move || background_focused.get(),
+                || text("Background focused"),
+            ))
+            .child(when(
+                move || is_open(&state),
+                move || card(card_state.clone(), Language::English),
+            ))
+    }
+
+    fn shifted_key_keeps_consent_open_without_pressing_the_background(key: &str) {
+        let mut config = EngineConfig::new(Root::of::<BackgroundFocusHarness>());
+        config.environment.os = nsh_core::platform::Os::Windows;
+        config.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = Headless::start(config).expect("start the harness");
+        app.wait_for("id:open-consent").expect("background control");
+        app.press("id:open-consent").expect("open consent");
+        app.wait_for("id:consent-card").expect("the card");
+        app.press_key("f6").expect("focus the background control");
+        assert!(app.shows("Background focused"), "background has focus");
+        assert!(app.shows("Background presses: 1"));
+
+        app.press_key(key).expect("press the shifted key");
+        assert!(
+            app.shows("Background presses: 1"),
+            "{key} pressed the background"
+        );
+        assert_eq!(
+            app.screen().matches("id:consent-card"),
+            Ok(true),
+            "{key} closed the card"
+        );
+        assert!(!app.shows("Sent"), "nothing was sent");
+    }
+
+    #[test]
+    fn shift_enter_is_consumed_with_background_focus() {
+        shifted_key_keeps_consent_open_without_pressing_the_background("shift+enter");
+    }
+
+    #[test]
+    fn shift_space_is_consumed_with_background_focus() {
+        shifted_key_keeps_consent_open_without_pressing_the_background("shift+space");
+    }
+
+    #[test]
+    fn shifted_keys_do_not_charge_the_focused_hold_control() {
+        let mut app = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab to the hold control");
+        }
+
+        for key in ["shift+enter", "shift+space"] {
+            app.press_key(key).expect("press the shifted key");
+            assert!(app.shows("Hold to send"), "{key} changed the hold");
+            assert!(!app.shows("Nothing was sent."), "{key} started charging");
+        }
+
+        app.press_key("space").expect("charge with bare Space");
+        app.wait_for("text:Nothing was sent.")
+            .expect("the focused control charged and cooled");
     }
 
     #[test]
