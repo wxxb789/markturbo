@@ -179,9 +179,22 @@ fn column(
     status: notices::StatusPresence,
 ) -> impl IntoElement {
     let active = state.active;
+    let laid_out_tab = signal(active.get_untracked());
     let content_state = state.clone();
     let recovery_state = state.clone();
     let recovery_banner_state = state.clone();
+    let recovery_open = computed({
+        let was_open = Cell::new(false);
+        move || {
+            // Win32 cannot tween a new editor's first frame. Lay it out before collapsing.
+            let open = notices::has_recovery(&recovery_state)
+                || (was_open.get()
+                    && active.get() != laid_out_tab.get()
+                    && !motion::reduced_motion());
+            was_open.set(open);
+            open
+        }
+    });
     let snap_offset = signal(0.0);
     let recovery_deadline = Rc::new(Cell::new(None));
     let tab_deadline = Rc::new(Cell::new(None));
@@ -214,7 +227,7 @@ fn column(
         })
         .child(banner_slot(
             "recovery-banner-slot",
-            move || notices::has_recovery(&recovery_state),
+            move || recovery_open.get(),
             move || notices::recovery_banner(recovery_banner_state.clone(), language),
             track_reflow(recovery_deadline),
         ))
@@ -223,19 +236,27 @@ fn column(
                 .test_id("document-slot")
                 .flex_1()
                 .min_h(px(0.0))
-                .w_full()
+                .ml(px(-tokens::COLUMN_GAP))
+                .pl(px(tokens::COLUMN_GAP))
                 .flex_col()
+                .overflow_hidden()
                 .pt(move || Length::from(px(snap_offset.get())))
                 // Key on tab identity only: replacing this subtree discards the editor's undo history.
                 .child(each(
                     move || vec![active.get()],
                     |key| *key,
-                    move |_, _| {
+                    move |tab, _| {
+                        let tab = tab.get_untracked();
                         tab_deadline.set(None);
                         column_content(
                             content_state.clone(),
                             language,
-                            snap_offset,
+                            move || {
+                                laid_out_tab.set(tab);
+                                if snap_offset.get_untracked() != 0.0 {
+                                    snap_offset.set(0.0);
+                                }
+                            },
                             track_reflow(tab_deadline.clone()),
                         )
                     },
@@ -254,7 +275,7 @@ fn track_reflow(deadline: Rc<Cell<Option<nsh_core::time::Instant>>>) -> impl Fn(
 fn column_content(
     state: AppState,
     language: Language,
-    snap_offset: Signal<f32>,
+    on_layout: impl Fn() + 'static,
     on_reflow: impl Fn(f32) + 'static,
 ) -> [AnyElement; 2] {
     let document_state = state.clone();
@@ -273,11 +294,7 @@ fn column_content(
             .flex_1()
             .min_h(px(0.0))
             .w_full()
-            .on_layout(move |_: &Bounds<Points>| {
-                if snap_offset.get_untracked() != 0.0 {
-                    snap_offset.set(0.0);
-                }
-            })
+            .on_layout(move |_: &Bounds<Points>| on_layout())
             .child(
                 when(move || document::has_document(&document_state), {
                     let state = state.clone();
@@ -689,6 +706,9 @@ mod tests {
                 };
                 state.set_active(next);
             }))
+            .child(control("probe-close-other-tab", &state, move |state| {
+                state.request_close_tab(other);
+            }))
             .child(shell(state, Language::English, Layout::Wide))
     }
 
@@ -907,6 +927,29 @@ mod tests {
                 "Compare content was removed or changed during the fade: {expected:?}"
             );
         }
+        app.wait(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("reach the middle of the conflict exit");
+        let comparison = node(&app, "conflict-previous").id;
+        let tab_count = |app: &Headless| {
+            app.screen()
+                .layout_nodes()
+                .iter()
+                .filter(|node| node.test_id.as_deref() == Some("rail-file-row"))
+                .count()
+        };
+        assert_eq!(tab_count(&app), 2);
+        press_without_settling(&mut app, "probe-close-other-tab");
+        assert_eq!(tab_count(&app), 1);
+        assert_eq!(node(&app, "conflict-previous").id, comparison);
+        app.run_for(Duration::from_millis(motion::EXIT_MS as u64 / 2))
+            .expect("finish the conflict exit on its original schedule");
+        assert!(
+            !app.screen()
+                .layout_nodes()
+                .iter()
+                .any(|node| node.id == comparison),
+            "closing an inactive tab stranded the fading comparison"
+        );
     }
 
     #[component]
@@ -1483,7 +1526,8 @@ mod tests {
             frame
         };
         let mid_slot = sample(&open_slot, &node(&app, "recovery-banner-slot"));
-        let mid_document = sample(&open_document, &node(&app, "document-slot"));
+        let document = node(&app, "document-slot");
+        let mid_document = sample(&open_document, &document);
         assert!(
             mid_slot.size.height.0 > 0.0 && mid_slot.size.height.0 < open_slot.bounds.size.height.0
         );
@@ -1493,6 +1537,27 @@ mod tests {
             "the document top {} must follow the collapsing banner bottom {mid_bottom}",
             mid_document.origin.y.0
         );
+        let editor = node(&app, "source-editor");
+        let mut first_editor = editor.clone();
+        first_editor.bounds.size.height = exit
+            .iter()
+            .flatten()
+            .find_map(|item| match item {
+                MountItem::Frame { id, frame } if *id == editor.id => Some(frame.size.height),
+                _ => None,
+            })
+            .expect("the new editor's first native frame");
+        let mid_editor = sample(&first_editor, &editor);
+        let editor_bottom = mid_document.origin.y.0
+            + (mid_editor.origin.y.0 - document.bounds.origin.y.0)
+            + mid_editor.size.height.0;
+        let document_bottom = mid_document.origin.y.0 + mid_document.size.height.0;
+        assert!(
+            (editor_bottom - document_bottom).abs() < 0.01,
+            "the editor bottom {editor_bottom} must fill the current slot ending at {document_bottom}"
+        );
+        assert!(document.clips, "the document slot must clip its children");
+        assert!(editor.bounds.origin.x.0 >= document.bounds.origin.x.0);
         assert!(exit.iter().any(|batch| {
             transitioned_frames(batch, motion::EXIT_MS).contains(&slot)
                 && batch.iter().any(|item| {

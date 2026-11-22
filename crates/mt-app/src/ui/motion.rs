@@ -11,8 +11,8 @@ use nsh_core::{
     Color, LayoutCurve, LayoutTransition,
     element::{
         AdaptiveColor, AnimatedNode, AnimatedValue, Easing, Element, Keyframe, KeyframeTiming,
-        Signal, Spawned, Styled, animated_value, effect, reduce_motion, sample_easing, signal,
-        spawn,
+        Signal, Spawned, Styled, animated_value, computed, effect, reduce_motion, sample_easing,
+        signal, spawn,
     },
 };
 
@@ -91,12 +91,13 @@ impl Presence {
     }
 
     pub fn with_initial(open: impl Fn() -> bool + 'static, snap_on_mount: bool) -> Self {
+        let open = computed(open);
         let visible = signal(false);
         let opacity = animated_value(0.0);
         let previous = Cell::new(None);
         let hide = Cell::new(None::<Spawned<()>>);
         effect(move || {
-            let open = open();
+            let open = open.get();
             let reduced = reduced_motion();
             let before = previous.replace(Some((open, reduced)));
             if before == Some((open, reduced)) {
