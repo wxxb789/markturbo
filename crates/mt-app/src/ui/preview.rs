@@ -8,12 +8,6 @@
 //! places whichever the pane asks for; [`is_open`] tells the shell whether the
 //! field is showing a preview at all. [`web`] is the compatibility pane.
 //!
-//! The document lane owns: Martian Grotesk 16/27 for the preview body, the
-//! preview's diagram and math rendering (ported here from the old `app.rs`,
-//! which is why the helpers below already work), the web pane's trust level,
-//! its `web_dirty` deferral (never mutate a WebView from render) and its
-//! restricted-scripts banner.
-//!
 //! The preview body uses [`tokens::FONT_UI`], which leads with the Regular
 //! instance's legacy family so DirectWrite finds the registered face.
 //! The Windows editor probe (`document::tests::the_editor_draws_the_registered_source_font`)
@@ -21,12 +15,6 @@
 //! 884 for both `FONT_UI` and the registered Regular face, 755 for a missing
 //! family, and 727 for DengXian.
 //!
-//! The web pane never navigates from render: its [`WebDocument`] watches the
-//! document text, the trust level and the appearance, marks the page dirty and
-//! builds it from an effect, whose write the web view applies at the next
-//! commit. A pane that is not on screen is not there to watch, so a hidden tab
-//! is never navigated behind the user's back.
-
 use std::sync::LazyLock;
 
 use mt_core::{
@@ -99,9 +87,7 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
                             .is_some_and(|tab| matches!(tab.pane.get(), Pane::SplitWeb))
                     }
                 },
-                // Keyed by the active tab, as the column and the native
-                // preview are: switching between two SplitWeb tabs remounts
-                // the pane on the new document, its page and its trust.
+                // Re-key on tab switch so the WebView binds to the new document.
                 move || {
                     let tabs_state = web_state.clone();
                     let pane_state = web_state.clone();
@@ -118,60 +104,22 @@ pub fn field(state: AppState, language: Language) -> AnyElement {
         .into_element()
 }
 
-/// The web compatibility pane: the document as a page, with its trust level,
-/// in the column (Web) or in the field (SplitWeb).
-///
-/// The pane renders nothing it does not have: while Restricted the page's
-/// scripts do not run and the banner says so; `Trust scripts` hands the file
-/// to the state, which asks the user before anything changes.
 pub fn web(state: AppState, language: Language) -> AnyElement {
     let Some(tab) = state.active_tab() else {
         return quiet_label(move || SharedString::from(i18n::t(language, Key::ModeWeb)))
             .into_element();
     };
     let page = WebDocument::new(tab.clone());
-    let trusted = tab.web_trusted;
-    let banner_state = state.clone();
-    let banner_tab = tab.clone();
     view()
         .test_id("web-pane")
         .flex_1()
         .min_h(px(0.0))
         .h(relative(1.0))
-        .flex_col()
-        .child(
-            view()
-                .test_id("web-banner")
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .w_full()
-                .pb(px(tokens::SPACE_2))
-                .child(prims::rest(move || {
-                    if trusted.get() {
-                        SharedString::from(i18n::t(language, Key::ScriptsTrusted))
-                    } else {
-                        SharedString::from(i18n::t(language, Key::ScriptsRestricted))
-                    }
-                }))
-                .child(when(move || !trusted.get(), {
-                    let id = banner_tab.id;
-                    move || {
-                        let state = banner_state.clone();
-                        prims::quiet_action(
-                            "web-trust",
-                            i18n::t(language, Key::TrustScripts),
-                            move || state.request_web_trust(id),
-                        )
-                        .into_element()
-                    }
-                })),
-        )
         .child(
             web_view_html(move || page.html.get(), None)
                 .test_id("web-view")
                 .label(SharedString::from(i18n::t(language, Key::ModeWeb)))
-                .java_script_enabled(move || trusted.get())
+                .java_script_enabled(true)
                 .flex_1(),
         )
         .into_element()
@@ -297,21 +245,14 @@ struct WebDocument {
     html: Signal<String>,
 }
 
-/// What a built page depends on: the document text, the trust level and the
-/// appearance.
 #[derive(Clone, PartialEq)]
 struct Page {
     text: String,
-    trusted: bool,
     dark: bool,
 }
 
 impl WebDocument {
-    /// Watches the tab's text, trust level and the appearance, and rebuilds the
-    /// page from an effect when any of them changes: the write to
-    /// [`Self::html`] is what marks it dirty, and the web view applies it after
-    /// the commit that sees the change, so a WebView is never navigated from
-    /// render.
+    /// Writing from the effect defers WebView navigation until after render.
     fn new(tab: Tab) -> WebDocument {
         let html = signal(String::new());
         let written = signal(None::<Page>);
@@ -320,19 +261,13 @@ impl WebDocument {
         effect(move || {
             let page = Page {
                 text: watch.text.get().to_string(),
-                trusted: watch.web_trusted.get(),
                 dark: dark(),
             };
             if written.get_untracked().as_ref() == Some(&page) {
                 return;
             }
             let document = Document::new(Some(build.path.clone()), page.text.clone());
-            let trust = if page.trusted {
-                web::Trust::Trusted
-            } else {
-                web::Trust::Restricted
-            };
-            let built = web::build_html(&document, renderer(), trust, page.dark);
+            let built = web::build_html(&document, renderer(), page.dark);
             written.set(Some(page));
             html.set(built);
         });
@@ -399,8 +334,12 @@ fn render_diagram(kind: &str, source: &str) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, OnceLock},
+    };
 
+    use nsh_core::{MountItem, NativeProps, WebSource};
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
 
@@ -473,18 +412,17 @@ mod tests {
             .child(rendered(state, Language::English))
     }
 
-    /// Two documents in SplitWeb: the first trusted, the second (active)
-    /// restricted, and a button that switches to the first.
     #[component]
     fn SplitWebProbe() -> impl IntoElement {
         let state = AppState::new();
         state.new_document();
         state.new_document();
         let tabs = state.tabs.get();
-        for tab in &tabs {
+        for (index, tab) in tabs.iter().enumerate() {
             tab.pane.set(Pane::SplitWeb);
+            tab.text
+                .set(SharedString::from(format!("Document {}", index + 1)));
         }
-        tabs[0].web_trusted.set(true);
         let first = tabs[0].id;
         let switch = state.clone();
         view()
@@ -687,34 +625,102 @@ mod tests {
         assert!(texts(&app).contains("Release plan"), "{}", dump(&app));
     }
 
-    /// Switching straight between two SplitWeb tabs rebinds the field's web
-    /// pane to the new document: its trust banner follows the active tab.
     #[test]
     fn the_field_web_pane_follows_the_active_tab() {
-        let restricted = i18n::t(Language::English, Key::ScriptsRestricted);
-        let trusted = i18n::t(Language::English, Key::ScriptsTrusted);
         let mut app = Headless::start(EngineConfig::new(Root::of::<SplitWebProbe>()))
             .expect("start the probe");
+        let sources = Arc::new(Mutex::new(HashMap::new()));
+        let observed_sources = Arc::clone(&sources);
+        app.observe(move |_, batch| {
+            let mut sources = observed_sources.lock().unwrap();
+            for item in &batch.items {
+                if let MountItem::NativeProps {
+                    id,
+                    props: NativeProps::WebView(web),
+                } = item
+                {
+                    sources.insert(*id, web.source.clone());
+                }
+            }
+        });
+        let assert_document = |app: &Headless, active: &str, inactive: &str| {
+            let sources = sources.lock().unwrap();
+            let Some(WebSource::Html { html, .. }) = sources.get(&web_view_node_id(app)) else {
+                panic!("the mounted web view did not receive HTML");
+            };
+            assert!(
+                html.contains(active) && !html.contains(inactive),
+                "expected only {active} in the mounted web view"
+            );
+        };
         app.wait_for("id:web-pane").expect("the web pane renders");
         app.settle();
-        let shown = texts(&app);
-        assert!(shown.contains(restricted), "{}", dump(&app));
-        assert!(!shown.contains(trusted), "{}", dump(&app));
+        assert_eq!(web_view_count(&app), 1, "{}", dump(&app));
+        assert_document(&app, "Document 2", "Document 1");
 
         app.press("label:Probe switch")
             .expect("switch to the first tab");
         app.settle();
-        let shown = texts(&app);
-        assert!(shown.contains(trusted), "{}", dump(&app));
-        assert!(!shown.contains(restricted), "{}", dump(&app));
+        assert_eq!(web_view_count(&app), 1, "{}", dump(&app));
+        assert_document(&app, "Document 1", "Document 2");
+    }
+
+    #[component]
+    fn WebPaneProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        web(state, Language::English)
+    }
+
+    #[test]
+    fn web_pane_mounts_with_scripts_enabled() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<WebPaneProbe>()))
+            .expect("start the web pane probe");
+        let javascript_enabled = Arc::new(Mutex::new(Vec::new()));
+        let observed_javascript_enabled = Arc::clone(&javascript_enabled);
+        app.observe(move |_, batch| {
+            for item in &batch.items {
+                if let MountItem::NativeProps {
+                    props: NativeProps::WebView(web),
+                    ..
+                } = item
+                {
+                    observed_javascript_enabled
+                        .lock()
+                        .unwrap()
+                        .push(web.javascript_enabled);
+                }
+            }
+        });
+        app.settle();
+
         assert!(
-            app.screen()
-                .layout_nodes()
-                .iter()
-                .all(|node| node.test_id.as_deref() != Some("web-trust")),
-            "a trusted document offers no Trust scripts action: {}",
+            web_view_count(&app) == 1,
+            "the WebView must remain mounted: {}",
             dump(&app)
         );
+        assert!(
+            javascript_enabled.lock().unwrap().contains(&true),
+            "the mounted WebView must run scripts: {}",
+            dump(&app)
+        );
+    }
+
+    fn web_view_count(app: &Headless) -> usize {
+        app.screen()
+            .layout_nodes()
+            .iter()
+            .filter(|node| node.test_id.as_deref() == Some("web-view"))
+            .count()
+    }
+
+    fn web_view_node_id(app: &Headless) -> u32 {
+        app.screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("web-view"))
+            .expect("the web view is mounted")
+            .id
     }
 
     /// The shell with the fixture open in Split — chosen here, not left to
