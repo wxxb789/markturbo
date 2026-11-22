@@ -120,6 +120,7 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
                 .test_id("web-view")
                 .label(SharedString::from(i18n::t(language, Key::ModeWeb)))
                 .java_script_enabled(true)
+                .on_message(crate::links::preview_message)
                 .flex_1(),
         )
         .into_element()
@@ -670,6 +671,79 @@ mod tests {
         let state = AppState::new();
         state.new_document();
         web(state, Language::English)
+    }
+
+    #[component]
+    fn LinkProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        if let Some(tab) = state.active_tab() {
+            tab.text.set(SharedString::from(
+                "[link](https://example.com/from-link)\n",
+            ));
+        }
+        web(state, Language::English)
+    }
+
+    #[test]
+    fn a_link_message_opens_once_and_the_preview_page_stays() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<LinkProbe>())).expect("start the probe");
+        let pages = Arc::new(Mutex::new(Vec::new()));
+        let observed_pages = Arc::clone(&pages);
+        app.observe(move |_, batch| {
+            for item in &batch.items {
+                if let MountItem::NativeProps {
+                    props: NativeProps::WebView(web),
+                    ..
+                } = item
+                    && let WebSource::Html { html, .. } = &web.source
+                {
+                    observed_pages.lock().unwrap().push(html.clone());
+                }
+            }
+        });
+        app.wait_for("id:web-pane").expect("the web pane renders");
+        app.settle();
+        let id = web_view_node_id(&app);
+        let page = pages
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("the mounted page");
+        assert!(page.contains("https://example.com/from-link"), "{page}");
+
+        let deliver = |app: &Headless, data: &str| {
+            app.engine().control().dispatch_event(
+                id,
+                nsh_core::EventKind::Message,
+                nsh_core::EventPayload::Map(vec![(
+                    "data",
+                    nsh_core::PayloadValue::Str(data.to_owned()),
+                )]),
+            );
+        };
+        deliver(&app, "file:///etc/passwd");
+        deliver(&app, r#"{"url":"https://example.com/from-link"}"#);
+        app.settle();
+        assert!(
+            app.screen().opened_urls().is_empty(),
+            "{:?}",
+            app.screen().opened_urls()
+        );
+
+        deliver(&app, "https://example.com/from-link");
+        app.settle();
+        assert_eq!(
+            app.screen().opened_urls().to_vec(),
+            vec!["https://example.com/from-link".to_owned()]
+        );
+        assert_eq!(
+            pages.lock().unwrap().last().unwrap(),
+            &page,
+            "the preview page was rebuilt or navigated"
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@
 |`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore.|
 |`state/revision_ledger.rs`|`RevisionLedger`: where each hunk of a live Approved Revision sits in its tab's text.|
 |`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
-|`web.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, localized strings and disclosures, log setup.|
+|`web.rs`, `links.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, preview link openings, localized strings and disclosures, log setup.|
 
 ### Optional local usage counters
 
@@ -396,7 +396,9 @@ not bundle an MDX compiler or runtime.
 Markdown, MDX and HTML use the same path. The app supplies a base-free HTML
 string for a static host. It contains one full-viewport iframe with only
 `sandbox="allow-scripts"`, and the author document occupies its escaped
-`srcdoc` attribute. The app listens to no document bridge messages.
+`srcdoc` attribute. One inline host script relays only strings sent by that
+frame's window to the app's bridge (`window.nsh.postMessage`); the app reads
+those messages as link activations and nothing else.
 
 The document head starts with
 `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:`.
@@ -425,7 +427,15 @@ script-inserted resource hint can still trigger a connection attempt. The owner
 accepts this residual risk. Runtime verification remains pending.
 
 The capture-phase click and submit guard covers document links and forms,
-including links exposed in the event path from open shadow roots. The
+including links exposed in the event path from open shadow roots. An
+activation of an `http:`, `https:` or `mailto:` link cancels the navigation
+and sends only the URL through the host relay; the app parses it with the
+`url` crate, opens it through nsh's `open_url` (the OS default handler, no
+shell), and limits the opens to one per 500 ms. Every other scheme and
+relative URL sends nothing. The message is one-way: the app never loads the
+message URL in the WebView, and a message that is not one of the three
+schemes does nothing. The owner accepts the residual risk that a document
+script can forge an activation and make the browser open a URL. The
 Navigation API is not used in the opaque-origin frame. A link inside a closed
 shadow root is treated like other script-driven navigation: the browser may
 replace the frame with its block page, which the next document update replaces.
