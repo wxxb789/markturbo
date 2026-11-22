@@ -407,7 +407,11 @@ Settings outranks its matching environment variable.
 ## Security
 
 The web layouts (**Web preview**, **Split · Web**) use one policy for Markdown,
-MDX and HTML. Inline scripts can run from the first render, without a prompt.
+MDX and HTML. Script execution follows each source grammar for fidelity: Markdown
+runs only scripts CommonMark keeps as raw HTML (a type-1 HTML block, which may
+span blank lines, or an inline `<script>` in a paragraph without a blank line),
+while MDX runs scripts only when the source parses as MDX; otherwise the grammar
+renders or diagnoses it normally.
 The app loads a fixed, base-free host page; document content runs only in its
 sandboxed frame.
 

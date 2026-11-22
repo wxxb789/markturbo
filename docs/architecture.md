@@ -401,8 +401,12 @@ string for a static host. It contains one full-viewport iframe with only
 The document head starts with
 `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:`.
 An HTML document retains its shell and styles; its own CSP may only add
-restrictions. Inline scripts run from the first render, but remote scripts,
-file resources and relative assets do not load. The sandbox blocks popups,
+restrictions. Script execution follows each source grammar for fidelity:
+Markdown runs only scripts CommonMark keeps as raw HTML (a type-1 HTML block,
+which may span blank lines, or an inline `<script>` in a paragraph without a
+blank line), while MDX runs scripts only when the source parses as MDX; otherwise
+the grammar renders or diagnoses it normally. Remote scripts, file resources
+and relative assets do not load. The sandbox blocks popups,
 forms and top-level navigation, and the host's additional `frame-src 'self'`
 directive restricts the frame from navigating to external resources. Source
 checks verify the generated policy, not WebView runtime enforcement.

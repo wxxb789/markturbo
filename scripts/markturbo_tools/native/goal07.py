@@ -6,6 +6,7 @@ import argparse
 import functools
 import json
 import socket
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,11 @@ def _css_rgb(color: tuple[int, int, int]) -> str:
     return f"rgb({color[0]}, {color[1]}, {color[2]})"
 
 
+SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS = 300
+SELF_NAVIGATION_ASSIGNMENT_DELAY_SECONDS = SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS / 1000
+SELF_NAVIGATION_SAMPLE_INTERVAL_SECONDS = 0.1
+
+
 FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => fetchProbe(`${tcpLoopback}/fetch`) },",
     "  { run: () => fetchProbe(`${tcpHostname}/fetch`) },",
@@ -153,7 +159,7 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => { try { submitForm(`${tcpHostname}/form`); } catch (_) {} } },",
     (
         "  { run: async () => {\r\n"
-        "    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 300))));\r\n"
+        f"    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, {SELF_NAVIGATION_ASSIGNMENT_DELAY_MILLISECONDS}))));\r\n"
         "    try {\r\n"
         "      location.href = \"https://127.0.0.1:\" + tcpPort + \"/\";\r\n"
         "      assignedCell.style.backgroundColor = assignedCellColor;\r\n"
@@ -1157,13 +1163,17 @@ class Goal07Harness(NativeHarness):
         self.menu_command(app, MENU_WEB_AUTOMATION_ID)
 
         about_to_navigate_index = len(FIXTURE_ATTEMPT_SOURCE) + 1
+        assigned_index = len(FIXTURE_ATTEMPT_SOURCE) + 2
         about_to_navigate_seen = False
+        navigation_assigned_seen = False
 
         def completed_cells() -> list[bool] | None:
-            nonlocal about_to_navigate_seen
+            nonlocal about_to_navigate_seen, navigation_assigned_seen
             cells = self.read_fixture_cell_results(app)
             if len(cells) > about_to_navigate_index and cells[about_to_navigate_index] is True:
                 about_to_navigate_seen = True
+            if len(cells) > assigned_index and cells[assigned_index] is True:
+                navigation_assigned_seen = True
             return cells if fixture_cells_complete(cells) else None
 
         try:
@@ -1182,11 +1192,25 @@ class Goal07Harness(NativeHarness):
             raise HarnessFailure("APP_EXITED_AFTER_DOCUMENT_SCRIPT")
 
         post_navigation_cells: list[bool] | None = None
+        fixture_absent_since: float | None = None
 
         def frame_replaced() -> bool | None:
-            nonlocal post_navigation_cells
-            cells = self.read_fixture_cell_results(app)
-            if cells:
+            nonlocal fixture_absent_since, navigation_assigned_seen, post_navigation_cells
+            try:
+                cells = self.read_fixture_cell_results(app)
+            except Exception:
+                fixture_absent_since = None
+                raise
+            if len(cells) > assigned_index and cells[assigned_index] is True:
+                navigation_assigned_seen = True
+            if cells or not navigation_assigned_seen:
+                fixture_absent_since = None
+                return None
+            now = time.monotonic()
+            if fixture_absent_since is None:
+                fixture_absent_since = now
+                return None
+            if now - fixture_absent_since < SELF_NAVIGATION_ASSIGNMENT_DELAY_SECONDS:
                 return None
             post_navigation_cells = cells
             return True
@@ -1195,16 +1219,19 @@ class Goal07Harness(NativeHarness):
             frame_replaced,
             SELF_NAVIGATION_TIMEOUT_SECONDS,
             "SELF_NAVIGATION_FRAME_NOT_REPLACED",
-            interval=0.1,
+            interval=SELF_NAVIGATION_SAMPLE_INTERVAL_SECONDS,
         )
         if post_navigation_cells is None:
             raise HarnessFailure("SELF_NAVIGATION_SAMPLE_TWO_NOT_OBSERVED")
+        self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
+        post_navigation_cells = self.read_fixture_cell_results(app)
+        if post_navigation_cells:
+            raise HarnessFailure("SELF_NAVIGATION_FRAME_NOT_REPLACED")
         record(
             observed,
             "web_security_post_navigation_cell_results",
             post_navigation_cells,
         )
-        self.win32.sleep(NETWORK_PROBE_SETTLE_SECONDS)
         record_network_contacts(observed, network_probes)
         windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
         if windows != (app.hwnd,):

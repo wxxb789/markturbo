@@ -122,6 +122,12 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
 4. **Scripts run without a click.** A headless or unit test shows that an MDX component, or a
    browser-side diagram that needs scripts, is in the built page for a freshly opened tab, with no
    preceding action.
+   - **Which scripts run follows the source grammar.** Markdown keeps a script that CommonMark keeps as
+     raw HTML: an HTML block (type 1, which may span blank lines) or an inline `<script>` whose
+     paragraph has no blank line inside it. MDX keeps a script that parses as MDX; JavaScript that is not
+     valid MDX text (for example a bare `<` comparison) yields the normal MDX diagnostic, as in other
+     MDX tools. Anything else renders as the grammar renders it. This is fidelity, not security: no case
+     lets a request leave.
 5. **Docs say one thing.** The README "Security" section, `docs/architecture.md` (the trust table
    around lines 150 and 405–430, and line 984) and CONCEPTS.md (around line 156) describe the single
    policy. That policy is scripts on; no network, file or navigation access; and HTML pages that

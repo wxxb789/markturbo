@@ -65,28 +65,16 @@ pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> St
         host_csp = csp_meta(HOST_FRAME_SRC),
     );
     const HOST_SUFFIX: &str = "\"></iframe></body></html>";
-    if host_exceeds_utf16_limit(&host_prefix, &page, HOST_SUFFIX) {
+    let page = strip_resource_hints(&page);
+    let host = format!("{host_prefix}{}{HOST_SUFFIX}", escape_srcdoc(&page));
+    if host.encode_utf16().count() > MAX_HOST_UTF16_UNITS {
         return format!(
             "<!doctype html><html><head>{}<meta charset=\"utf-8\"></head>\
              <body><p role=\"alert\">This preview is too large to display.</p></body></html>",
             csp_meta("")
         );
     }
-    let page = strip_resource_hints(&page);
-    format!("{host_prefix}{}{HOST_SUFFIX}", escape_srcdoc(&page))
-}
-
-fn host_exceeds_utf16_limit(prefix: &str, page: &str, suffix: &str) -> bool {
-    let escaped_page_units = page
-        .chars()
-        .map(|character| match character {
-            '&' => 5,
-            '"' => 6,
-            other => other.len_utf16(),
-        })
-        .sum::<usize>();
-    prefix.encode_utf16().count() + escaped_page_units + suffix.encode_utf16().count()
-        > MAX_HOST_UTF16_UNITS
+    host
 }
 
 fn strip_resource_hints(page: &str) -> Cow<'_, str> {
@@ -593,15 +581,14 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
             ..markdown::CompileOptions::default()
         },
     };
-    let rendered =
-        preserve_inline_scripts(run, &mut options.parse).and_then(|(source, scripts)| {
-            if !scripts.is_empty() {
-                options.parse.constructs.html_text = true;
-            }
-            let html = markdown::to_html_with_options(source.as_ref(), &options)
-                .map_err(|message| message.reason)?;
-            restore_inline_scripts(html, scripts)
-        });
+    let rendered = preserve_inline_scripts(run, &options.parse).and_then(|(source, scripts)| {
+        if !scripts.is_empty() {
+            options.parse.constructs.html_text = true;
+        }
+        let html = markdown::to_html_with_options(source.as_ref(), &options)
+            .map_err(|message| message.reason)?;
+        restore_inline_scripts(html, scripts)
+    });
     match rendered {
         Ok(html) => out.push_str(&html),
         Err(message) => out.push_str(&diagnostic_html("markdown", &message, run)),
@@ -620,9 +607,9 @@ struct ScriptRange {
 
 fn preserve_inline_scripts<'a>(
     source: &'a str,
-    parse_options: &mut markdown::ParseOptions,
+    parse_options: &markdown::ParseOptions,
 ) -> Result<(Cow<'a, str>, ScriptPlaceholders), String> {
-    let (mut ranges, mut jsx_names) = collect_script_ranges(source, parse_options)?;
+    let (mut ranges, mut jsx_names) = collect_script_ranges(source, parse_options);
     if ranges.is_empty() {
         return Ok((Cow::Borrowed(source), Vec::new()));
     }
@@ -639,31 +626,24 @@ fn preserve_inline_scripts<'a>(
 
 fn collect_script_ranges(
     source: &str,
-    parse_options: &mut markdown::ParseOptions,
-) -> Result<(Vec<ScriptRange>, Vec<usize>), String> {
+    parse_options: &markdown::ParseOptions,
+) -> (Vec<ScriptRange>, Vec<usize>) {
     if !source
         .as_bytes()
         .windows(b"<script".len())
         .any(|tag| tag.eq_ignore_ascii_case(b"<script"))
     {
-        return Ok((Vec::new(), Vec::new()));
+        return (Vec::new(), Vec::new());
     }
 
     let Ok(ast) = markdown::to_mdast(source, parse_options) else {
-        return Ok((Vec::new(), Vec::new()));
+        return (Vec::new(), Vec::new());
     };
     let mut ranges = Vec::new();
     let mut jsx_names = Vec::new();
     let context = ScriptContext::default();
-    collect_inline_script_ranges(
-        &ast,
-        source,
-        parse_options,
-        &mut ranges,
-        &mut jsx_names,
-        &context,
-    )?;
-    Ok((ranges, jsx_names))
+    collect_inline_script_ranges(&ast, source, &mut ranges, &mut jsx_names, &context);
+    (ranges, jsx_names)
 }
 
 fn protect_script_ranges(
@@ -749,17 +729,44 @@ fn random_script_marker_prefix() -> Result<String, String> {
 #[derive(Default)]
 struct ScriptContext<'a> {
     inline_start: Option<usize>,
-    list_item: Option<(&'a markdown::mdast::ListItem, &'a ScriptContext<'a>)>,
+    list_opener: Option<(ListOpener<'a>, &'a ScriptContext<'a>)>,
+}
+
+#[derive(Clone, Copy)]
+struct ListOpener<'a> {
+    line_start: usize,
+    prefix: &'a str,
+    has_content: bool,
+}
+
+impl<'a> ListOpener<'a> {
+    fn new(source: &'a str, item: &markdown::mdast::ListItem) -> Option<Self> {
+        let position = item.position.as_ref()?;
+        let line_start = line_start(source, position.start.offset);
+        let content = item
+            .children
+            .first()
+            .and_then(|child| child.position())
+            .filter(|child| child.start.line == position.start.line);
+        let prefix = match content {
+            Some(child) => &source[line_start..child.start.offset],
+            None => source[line_start..].split(['\r', '\n']).next()?,
+        };
+        Some(Self {
+            line_start,
+            prefix,
+            has_content: content.is_some(),
+        })
+    }
 }
 
 fn collect_inline_script_ranges(
     node: &markdown::mdast::Node,
     source: &str,
-    parse_options: &mut markdown::ParseOptions,
     ranges: &mut Vec<ScriptRange>,
     jsx_names: &mut Vec<usize>,
     context: &ScriptContext<'_>,
-) -> Result<(), String> {
+) {
     use markdown::mdast::Node;
     let phrasing_block = matches!(
         node,
@@ -770,14 +777,14 @@ fn collect_inline_script_ranges(
         Node::ListItem(item) => {
             next_context = ScriptContext {
                 inline_start: None,
-                list_item: Some((item, context)),
+                list_opener: ListOpener::new(source, item).map(|opener| (opener, context)),
             };
             &next_context
         }
         _ if phrasing_block => {
             next_context = ScriptContext {
                 inline_start: node.position().map(|position| position.start.offset),
-                list_item: context.list_item,
+                list_opener: context.list_opener,
             };
             &next_context
         }
@@ -794,14 +801,15 @@ fn collect_inline_script_ranges(
         let start = position.start.offset;
         if name.as_deref() == Some("script") && !raw.ends_with("/>") {
             let end = position.end.offset;
-            let script = script_value(source, context, start, end, parse_options)?;
-            ranges.push(ScriptRange {
-                start,
-                end,
-                script,
-                flow: !inline,
-            });
-            return Ok(());
+            if let Some(script) = script_value(source, context, start, end) {
+                ranges.push(ScriptRange {
+                    start,
+                    end,
+                    script,
+                    flow: !inline,
+                });
+            }
+            return;
         }
         if inline {
             jsx_names.push(start + 1);
@@ -824,8 +832,8 @@ fn collect_inline_script_ranges(
                 opening.get_or_insert(start);
             } else if is_script_tag(tag, true)
                 && let Some(start) = opening.take()
+                && let Some(script) = script_value(source, context, start, end)
             {
-                let script = script_value(source, context, start, end, parse_options)?;
                 ranges.push(ScriptRange {
                     start,
                     end,
@@ -838,10 +846,9 @@ fn collect_inline_script_ranges(
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_inline_script_ranges(child, source, parse_options, ranges, jsx_names, context)?;
+            collect_inline_script_ranges(child, source, ranges, jsx_names, context);
         }
     }
-    Ok(())
 }
 
 fn line_start(source: &str, offset: usize) -> usize {
@@ -850,31 +857,14 @@ fn line_start(source: &str, offset: usize) -> usize {
         .map_or(0, |end| end + 1)
 }
 
-fn project_list_openers(
-    projection: &mut String,
-    source: &str,
-    context: &ScriptContext<'_>,
-    before_line: usize,
-) {
-    let Some((item, parent)) = context.list_item else {
+fn project_list_openers(projection: &mut String, context: &ScriptContext<'_>, before_line: usize) {
+    let Some((opener, parent)) = &context.list_opener else {
         return;
     };
-    let Some(position) = &item.position else {
-        return;
-    };
-    let start = line_start(source, position.start.offset);
-    project_list_openers(projection, source, parent, start.min(before_line));
-    if start < before_line {
-        let line_end = source[start..]
-            .find(['\r', '\n'])
-            .map_or(source.len(), |end| start + end);
-        let content = item
-            .children
-            .first()
-            .and_then(|node| node.position())
-            .map_or(line_end, |child| child.start.offset);
-        projection.push_str(&source[start..content.min(line_end)]);
-        if content < line_end {
+    project_list_openers(projection, parent, opener.line_start.min(before_line));
+    if opener.line_start < before_line {
+        projection.push_str(opener.prefix);
+        if opener.has_content {
             projection.push_str("<!-- -->");
         }
         projection.push('\n');
@@ -886,35 +876,24 @@ fn script_value(
     context: &ScriptContext<'_>,
     start: usize,
     end: usize,
-    parse_options: &mut markdown::ParseOptions,
-) -> Result<String, String> {
+) -> Option<String> {
     let raw = &source[start..end];
     if !raw.contains('\n') && !raw.contains('\r') {
-        return Ok(raw.to_string());
+        return Some(raw.to_string());
     }
     let content_start = context.inline_start.unwrap_or(start);
     let content_line = line_start(source, content_start);
     let mut projection = String::new();
-    project_list_openers(&mut projection, source, context, content_line);
+    project_list_openers(&mut projection, context, content_line);
     projection.push_str(&source[content_line..content_start]);
     let script_start = projection.len();
     projection.push_str(raw);
-    let html_flow = std::mem::replace(&mut parse_options.constructs.html_flow, true);
-    let jsx_flow = std::mem::replace(&mut parse_options.constructs.mdx_jsx_flow, false);
-    let ast = markdown::to_mdast(&projection, parse_options);
-    parse_options.constructs.html_flow = html_flow;
-    parse_options.constructs.mdx_jsx_flow = jsx_flow;
-    let ast = ast.map_err(|message| message.reason)?;
-    let Some(html) = html_node_at(&ast, &projection, script_start) else {
-        return Err("an inline script was not recovered from parsed HTML".into());
-    };
-    let Some(position) = &html.position else {
-        return Err("an inline script had no parsed HTML position".into());
-    };
-    if position.end.offset != projection.len() {
-        return Err("parsed HTML ended before the inline script".into());
-    }
-    Ok(html.value.trim_start_matches([' ', '\t']).to_string())
+    let mut parse = markdown::ParseOptions::default();
+    parse.constructs.code_indented = false;
+    let ast = markdown::to_mdast(&projection, &parse).ok()?;
+    let html = html_node_at(&ast, &projection, script_start)?;
+    (html.position.as_ref()?.end.offset == projection.len())
+        .then(|| html.value.trim_start_matches([' ', '\t']).to_string())
 }
 
 fn html_node_at<'a>(
@@ -1021,6 +1000,10 @@ fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> S
 }
 
 fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
+    if let Some(diag) = doc.diagnostics().iter().find(|diag| diag.source == "mdx") {
+        return diagnostic_html(&diag.source, &diag.message, doc.source());
+    }
+
     let mut out = String::new();
     let mut markdown_run = String::new();
 
@@ -1042,14 +1025,10 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
                 } else {
                     out.push_str(&mdx_placeholder(kind, &block.content));
                     if kind == mt_core::document::block::MdxKind::JsxElement {
-                        let mut parse = mt_core::document::doc::parse_options(DocType::Mdx);
-                        match collect_script_ranges(&block.content, &mut parse) {
-                            Ok((scripts, _)) => {
-                                for range in scripts {
-                                    out.push_str(&range.script);
-                                }
-                            }
-                            Err(message) => out.push_str(&diagnostic_html("mdx", &message, "")),
+                        let parse = mt_core::document::doc::parse_options(DocType::Mdx);
+                        let (scripts, _) = collect_script_ranges(&block.content, &parse);
+                        for range in scripts {
+                            out.push_str(&range.script);
                         }
                     }
                 }
@@ -1062,9 +1041,6 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
     }
     flush_markdown(&mut out, &mut markdown_run, doc);
 
-    for diag in doc.diagnostics().iter().filter(|d| d.source == "mdx") {
-        out.push_str(&diagnostic_html(&diag.source, &diag.message, ""));
-    }
     out
 }
 
@@ -1431,6 +1407,10 @@ mod tests {
                 "<Widget>\n  <script>\n  void 0;\n  </script>\n</Widget>",
                 "<script>\n  void 0;\n  </script>",
             ),
+            (
+                "<Widget>\n    <script>\n    void 0;\n    </script>\n</Widget>",
+                "<script>\n    void 0;\n    </script>",
+            ),
         ]
         .into_iter()
         .filter(|&(source, expected)| {
@@ -1719,6 +1699,36 @@ mod tests {
     }
 
     #[test]
+    fn multiline_scripts_in_a_list_with_a_long_first_line_are_bounded() {
+        let script = "<script>\nvoid 0;\n</script>";
+        let count = 10_000;
+        let source = format!(
+            "- {}\n\n{}",
+            "a".repeat(300_000),
+            "  Note <script>\n  void 0;\n  </script>\n\n".repeat(count)
+        );
+        let ast = markdown::to_mdast(&source, &markdown::ParseOptions::default()).unwrap();
+        let mut ranges = Vec::new();
+        let started = std::time::Instant::now();
+        collect_inline_script_ranges(
+            &ast,
+            &source,
+            &mut ranges,
+            &mut Vec::new(),
+            &ScriptContext::default(),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+        assert!(
+            ranges.len() == count && ranges.iter().all(|range| range.script == script),
+            "list scripts were lost or changed"
+        );
+    }
+
+    #[test]
     fn rejects_host_pages_over_the_windows_string_load_limit() {
         let registry = registry();
         let build = |text| {
@@ -1737,6 +1747,58 @@ mod tests {
         let above = build(format!("{prefix}{}{suffix}", "a".repeat(capacity + 1)));
         assert!(above.contains("This preview is too large to display."));
         assert!(!above.contains("<iframe"));
+    }
+
+    #[test]
+    fn accepts_page_that_fits_after_stripping_resource_hints() {
+        let registry = registry();
+        let build = |source| {
+            build_html(
+                &Document::with_type(DocType::Html, source),
+                &registry,
+                false,
+            )
+        };
+        let overhead = build("<p><!----></p>".into()).encode_utf16().count();
+        let text = "a".repeat(MAX_HOST_UTF16_UNITS - overhead);
+        let hint = r#"<link rel="preload" href="fixture.css" as="style">"#;
+        let expected = build(format!("<p><!---->{text}</p>"));
+        assert!(
+            expected.contains("srcdoc=\"") && build(format!("<p>{hint}{text}</p>")) == expected,
+            "the stripped page should load unchanged"
+        );
+    }
+
+    #[test]
+    fn invalid_mdx_script_shows_one_diagnostic_without_running_authored_scripts() {
+        let source = "Before\n\n<script>String(1<2)</script>\n\nAfter\n\n<script>later()</script>";
+        let doc = Document::with_type(DocType::Mdx, source.into());
+        let html = page(&doc, &registry(), false);
+        let rendered = body(&html);
+        let diagnostic = &doc.diagnostics()[0];
+        assert_eq!(
+            rendered.trim(),
+            diagnostic_html("mdx", &diagnostic.message, source)
+        );
+    }
+
+    #[test]
+    fn markdown_script_spanning_paragraphs_follows_commonmark() {
+        let source =
+            "Before <script>\nvoid 0;\n\nvoid 1;\n</script>\n\nAfter\n\n<script>later()</script>";
+        let expected = markdown::to_html_with_options(
+            source,
+            &markdown::Options {
+                compile: markdown::CompileOptions {
+                    allow_dangerous_html: true,
+                    ..markdown::CompileOptions::default()
+                },
+                ..markdown::Options::default()
+            },
+        )
+        .unwrap();
+        let html = page(&md(source), &registry(), false);
+        assert_eq!(body(&html).trim(), expected.trim());
     }
 
     #[test]

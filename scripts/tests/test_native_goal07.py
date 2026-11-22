@@ -852,7 +852,10 @@ class PhaseTests(unittest.TestCase):
         probes = mock.Mock()
         probes.snapshot.return_value = {"tcp_contacts": 0, "udp_contacts": 0}
         harness = bare_harness(win32=win32, network_probes=probes)
-        order.read_fixture_cell_results.side_effect = [list(PIXEL_CELL_RESULTS), []]
+        order.read_fixture_cell_results.side_effect = [
+            list(PIXEL_CELL_RESULTS),
+            *([[]] * 8),
+        ]
         for name in ("menu_command", "read_fixture_cell_results", "editor_control"):
             setattr(harness, name, getattr(order, name))
         return harness, order, app
@@ -861,7 +864,9 @@ class PhaseTests(unittest.TestCase):
         harness, order, app = self.web_security_harness(focus_returns=True)
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            mock.patch.object(
+                HARNESS.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]
+            ) as monotonic,
         ):
             observed = harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
@@ -869,12 +874,12 @@ class PhaseTests(unittest.TestCase):
             order.mock_calls,
             [
                 mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
-                mock.call.read_fixture_cell_results(app),
-                mock.call.read_fixture_cell_results(app),
+                *([mock.call.read_fixture_cell_results(app)] * 6),
                 mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
                 mock.call.editor_control(app),
             ],
         )
+        self.assertEqual(monotonic.call_count, 4)
         self.assertEqual(
             observed,
             {
@@ -914,6 +919,22 @@ class PhaseTests(unittest.TestCase):
                 harness.network_probes.snapshot.assert_not_called()
                 harness.win32.visible_top_level_windows.assert_not_called()
 
+    def test_web_phase_does_not_accept_an_empty_frame_before_assignment(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [list(PIXEL_REQUIRED_CELL_RESULTS), []]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_FRAME_NOT_REPLACED"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        self.assertEqual(order.read_fixture_cell_results.call_count, 2)
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
     def test_web_phase_does_not_treat_a_failed_sample_two_capture_as_empty(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
         order.read_fixture_cell_results.side_effect = [
@@ -933,16 +954,82 @@ class PhaseTests(unittest.TestCase):
 
     def test_web_phase_allows_missing_assigned_cell_in_sample_one(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
-        order.read_fixture_cell_results.side_effect = [list(PIXEL_CELL_RESULTS[:-1]), []]
+        order.read_fixture_cell_results.side_effect = [
+            list(PIXEL_REQUIRED_CELL_RESULTS),
+            list(PIXEL_CELL_RESULTS),
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            mock.patch.object(
+                HARNESS.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]
+            ),
         ):
             observed = harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
         self.assertEqual(observed["web_security_cell_results"], PIXEL_REQUIRED_CELL_RESULTS)
+        self.assertEqual(order.read_fixture_cell_results.call_count, 7)
         harness.network_probes.snapshot.assert_called_once_with()
         harness.win32.visible_top_level_windows.assert_called_once_with((73, 74))
+
+    def test_web_phase_resamples_after_network_settle(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [
+            list(PIXEL_CELL_RESULTS),
+            [],
+            [],
+            [],
+            [],
+            list(PIXEL_CELL_RESULTS),
+        ]
+
+        def verify_stable_samples(_seconds: float) -> None:
+            self.assertEqual(order.read_fixture_cell_results.call_count, 5)
+
+        harness.win32.sleep.side_effect = verify_stable_samples
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(
+                HARNESS.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]
+            ),
+            self.assertRaisesRegex(
+                runtime.HarnessFailure, "SELF_NAVIGATION_FRAME_NOT_REPLACED"
+            ),
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        self.assertEqual(order.read_fixture_cell_results.call_count, 6)
+        harness.win32.sleep.assert_called_once_with(HARNESS.NETWORK_PROBE_SETTLE_SECONDS)
+        harness.network_probes.snapshot.assert_not_called()
+        harness.win32.visible_top_level_windows.assert_not_called()
+
+    def test_web_phase_resets_absence_interval_after_a_failed_sample(self) -> None:
+        harness, order, app = self.web_security_harness(focus_returns=True)
+        order.read_fixture_cell_results.side_effect = [
+            list(PIXEL_CELL_RESULTS),
+            [],
+            RuntimeError("sample failed"),
+            [],
+            [],
+            [],
+            [],
+            [],
+        ]
+        with (
+            mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
+            mock.patch.object(
+                HARNESS.time, "monotonic", side_effect=[0.0, 0.2, 0.3, 0.4, 0.5]
+            ) as monotonic,
+        ):
+            harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        self.assertEqual(monotonic.call_count, 5)
+        self.assertEqual(order.read_fixture_cell_results.call_count, 8)
+        harness.network_probes.snapshot.assert_called_once_with()
 
     def test_web_phase_fails_when_sample_one_is_blank(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
@@ -1416,9 +1503,12 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
 
     def test_web_phase_fails_while_the_web_view_keeps_the_keyboard(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=False)
+        harness.ui_timeout = 0.01
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            mock.patch.object(HARNESS, "wait_until", side_effect=wait_once),
+            mock.patch.object(
+                HARNESS.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 0.3]
+            ),
             self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
