@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import socket
 import subprocess
@@ -49,6 +50,34 @@ def passing_observations(case_id: str = CASE) -> dict[str, Any]:
         web_security_cell_results=list(PIXEL_CELL_RESULTS),
         provider_request_count=HARNESS.EXPECTED_REQUEST_COUNT,
     )
+
+
+def render_script_cell_layout(layout: dict[str, Any]) -> Any:
+    from PIL import Image, ImageDraw
+
+    def pixels(value: str) -> int:
+        return int(value.removesuffix("px"))
+
+    def rgb(value: str) -> tuple[int, ...]:
+        return tuple(int(channel.strip()) for channel in value[4:-1].split(","))
+
+    image = Image.new("RGB", (800, 80), HARNESS.CELL_PAGE_COLOR)
+    draw = ImageDraw.Draw(image)
+    left = pixels(layout["grid"]["left"])
+    top = pixels(layout["grid"]["top"])
+    gap = pixels(layout["grid"]["gap"])
+    for index, cell in enumerate(layout["cells"]):
+        width = pixels(cell["width"])
+        height = pixels(cell["height"])
+        border_width, _, border_color = cell["border"].split(" ", 2)
+        x = left + index * (width + gap)
+        draw.rectangle(
+            (x, top, x + width - 1, top + height - 1),
+            fill=rgb(cell["backgroundColor"]),
+            outline=rgb(border_color),
+            width=pixels(border_width),
+        )
+    return image
 
 
 def valid_evidence() -> dict:
@@ -635,7 +664,7 @@ class PixelCellObservationTests(unittest.TestCase):
         top = HARNESS.CELL_GRID_TOP
         image = Image.new(
             "RGB",
-            (left + len(colors) * (size + gap), top + size + gap),
+            (800, 80),
             HARNESS.CELL_PAGE_COLOR,
         )
         draw = ImageDraw.Draw(image)
@@ -675,6 +704,29 @@ class PixelCellObservationTests(unittest.TestCase):
             [tuple(channel + 5 for channel in color) for color in expected]
         )
         self.assertEqual(HARNESS.detect_fixture_cells(noisy), [True] * len(expected))
+
+    def test_detector_ignores_uniform_fields_across_fixture_color_tolerances(self) -> None:
+        from PIL import Image
+
+        known_colors = (
+            HARNESS.CELL_PENDING_COLOR,
+            HARNESS.CELL_SCRIPT_COLOR,
+            HARNESS.CELL_ATTEMPT_COLOR,
+            HARNESS.CELL_COMPLETE_COLOR,
+            HARNESS.CELL_ASSIGNED_COLOR,
+        )
+        failures = []
+        for color in known_colors:
+            variants = {color}
+            for delta in (-HARNESS.CELL_TOLERANCE, HARNESS.CELL_TOLERANCE):
+                if all(0 <= value + delta <= 255 for value in color):
+                    variants.add(tuple(value + delta for value in color))
+            for variant in variants:
+                uniform = Image.new("RGB", (800, 80), variant)
+                cells = HARNESS.detect_fixture_cells(uniform)
+                if cells:
+                    failures.append((variant, len(cells)))
+        self.assertEqual(failures, [])
 
     def test_detector_ignores_dark_background(self) -> None:
         from PIL import Image
@@ -1231,6 +1283,17 @@ async function main() {
   const assignedWrites = cellWrites.filter(([color]) => color === assignedColor);
   if (assignedWrites.length !== 1 || assignedWrites[0][1] !== calls.length) throw new Error("assigned cell was not painted after HTTPS self-navigation returned");
   if (calls.length !== expectedAttempts - 1) throw new Error("not every automatic attempt ran");
+  if (mode === "cancelled-navigation") {
+    console.log(JSON.stringify({
+      grid: { left: cellGrid.style.left, top: cellGrid.style.top, gap: cellGrid.style.gap },
+      cells: cells.map(cell => ({
+        width: cell.style.width,
+        height: cell.style.height,
+        border: cell.style.border,
+        backgroundColor: cell.style.backgroundColor,
+      })),
+    }));
+  }
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });
 """
@@ -1272,6 +1335,13 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr.strip())
+                if mode == "cancelled-navigation":
+                    layout = json.loads(result.stdout.splitlines()[-1])
+                    image = render_script_cell_layout(layout)
+                    self.assertEqual(
+                        HARNESS.detect_fixture_cells(image),
+                        [True] * (len(HARNESS.FIXTURE_ATTEMPT_SOURCE) + 3),
+                    )
                 if mode == "never-run":
                     self.assertIn("pixel-cell verdict rejected unstarted attempts", result.stdout)
                 elif mode == "rtc-available":
@@ -1355,7 +1425,8 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
 
     def decisions_harness(self, accept_offered: bool = False) -> tuple[HARNESS.Goal07Harness, mock.Mock]:
         order = mock.Mock()
-        harness = bare_harness(network_probes=mock.Mock())
+        probes = mock.Mock(tcp_port=43123, udp_port=54234)
+        harness = bare_harness(network_probes=probes)
         for name in (
             "review_and_revise", "_named_texts", "editor_fingerprint", "decide_hunks",
             "undo_decision", "copy_approved", "replace_editor", "wait_name", "control_absent",
@@ -1365,9 +1436,12 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
         order.review_and_revise.return_value = len(EDITS)
         order._named_texts.return_value = PROPOSAL_AFTER
         order.editor_fingerprint.side_effect = [REVIEWED, ONE_ACCEPTED]
-        order.copy_approved.return_value = HARNESS.apply_edits(
+        accepted_template = HARNESS.apply_edits(
             HARNESS.EDITOR_SOURCE_BYTES, EDITS[:1]
         ).decode("utf-8")
+        order.copy_approved.return_value = accepted_template.replace(
+            HARNESS.TCP_PORT_TOKEN, str(probes.tcp_port)
+        ).replace(HARNESS.UDP_PORT_TOKEN, str(probes.udp_port))
         order.replace_editor.return_value = STALE
         order.control_absent.return_value = not accept_offered
         return harness, order
@@ -1841,6 +1915,86 @@ class ConsentTests(unittest.TestCase):
 
 
 class ProfileAndFixtureTests(unittest.TestCase):
+    def test_runtime_fixture_fingerprints_require_substituted_port_bytes(self) -> None:
+        probes = mock.Mock(tcp_port=43123, udp_port=43124)
+        runtime_source = HARNESS.fixture_source(probes)
+        accepted_template = HARNESS.apply_edits(
+            HARNESS.EDITOR_SOURCE_BYTES, EDITS[:1]
+        ).decode("utf-8")
+        accepted_runtime = accepted_template.replace(
+            HARNESS.TCP_PORT_TOKEN, str(probes.tcp_port)
+        ).replace(HARNESS.UDP_PORT_TOKEN, str(probes.udp_port))
+        observed: dict[str, Any] = {}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / HARNESS.FIXTURE_FILE
+            invalid_disk_sources = (
+                ("template", HARNESS.SOURCE_BYTES),
+                (
+                    "wrong-port",
+                    runtime_source.replace(
+                        f'const tcpPort = "{probes.tcp_port}";',
+                        f'const tcpPort = "{probes.tcp_port + 1}";',
+                    ).encode("utf-8"),
+                ),
+            )
+            for label, invalid in invalid_disk_sources:
+                path.write_bytes(invalid)
+                with self.subTest(disk_source=label):
+                    with self.assertRaisesRegex(
+                        runtime.HarnessFailure,
+                        "^WEB_SECURITY_FIXTURE_DISK_BYTES_UNEXPECTED$",
+                    ):
+                        with HARNESS.phase("WEB_SECURITY"):
+                            HARNESS.record(
+                                observed,
+                                "web_security_disk_before",
+                                HARNESS.fixture_fingerprint(path, probes),
+                            )
+
+            path.write_bytes(runtime_source.encode("utf-8"))
+            with HARNESS.phase("WEB_SECURITY"):
+                HARNESS.record(
+                    observed,
+                    "web_security_disk_before",
+                    HARNESS.fixture_fingerprint(path, probes),
+                )
+            self.assertEqual(observed["web_security_disk_before"], DISK.evidence())
+
+        observed = {}
+        with HARNESS.phase("DECISIONS"):
+            HARNESS.record(
+                observed,
+                "decisions_clipboard_copied",
+                HARNESS.clipboard_fingerprint(accepted_runtime, probes),
+            )
+        self.assertEqual(observed["decisions_clipboard_copied"], ONE_ACCEPTED.evidence())
+
+        invalid_clipboard_sources = (
+            (
+                "template",
+                accepted_template,
+                "^DECISIONS_CLIPBOARD_BYTES_UNEXPECTED$",
+            ),
+            (
+                "wrong-port",
+                accepted_runtime.replace(
+                    f'const tcpPort = "{probes.tcp_port}";',
+                    f'const tcpPort = "{probes.tcp_port + 1}";',
+                ),
+                "^DECISIONS_CLIPBOARD_BYTES_UNEXPECTED$",
+            ),
+        )
+        for label, invalid, code in invalid_clipboard_sources:
+            with self.subTest(clipboard_source=label):
+                with self.assertRaisesRegex(runtime.HarnessFailure, code):
+                    with HARNESS.phase("DECISIONS"):
+                        HARNESS.record(
+                            {},
+                            "decisions_clipboard_copied",
+                            HARNESS.clipboard_fingerprint(invalid, probes),
+                        )
+
     def test_loopback_profile_is_keyless_and_uses_only_a_process_synthetic_key(self) -> None:
         settings = HARNESS.review_settings_document("http://127.0.0.1:4141/v1/").decode("utf-8")
         self.assertIn('model-provider = "openai-responses"', settings)

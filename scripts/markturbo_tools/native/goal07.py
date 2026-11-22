@@ -412,7 +412,33 @@ def _pixel_matches(actual: tuple[int, ...], expected: tuple[int, int, int]) -> b
 
 
 def _cell_matches_color(image: Any, left: int, top: int, expected: tuple[int, int, int]) -> bool:
+    width, height = image.size
+    middle_x = left + CELL_SIZE // 2
+    middle_y = top + CELL_SIZE // 2
+    border_points = (
+        (middle_x, top),
+        (middle_x, top + CELL_SIZE - 1),
+        (left, middle_y),
+        (left + CELL_SIZE - 1, middle_y),
+    )
+    gap_points = (
+        (middle_x, top - 1),
+        (middle_x, top + CELL_SIZE),
+        (left - 1, middle_y),
+        (left + CELL_SIZE, middle_y),
+    )
+    if any(
+        x < 0 or y < 0 or x >= width or y >= height
+        for x, y in (*border_points, *gap_points)
+    ):
+        return False
     return all(
+        _pixel_matches(image.getpixel(point), CELL_BORDER_COLOR)
+        for point in border_points
+    ) and all(
+        _pixel_matches(image.getpixel(point), CELL_PAGE_COLOR)
+        for point in gap_points
+    ) and all(
         _pixel_matches(image.getpixel((left + x, top + y)), expected)
         for y in CELL_SAMPLE_OFFSETS
         for x in CELL_SAMPLE_OFFSETS
@@ -496,6 +522,8 @@ def canonicalize_fixture_source(
     if network_probes is None:
         return value
     if isinstance(value, bytes):
+        if b"__GOAL07_" in value:
+            raise HarnessFailure("FIXTURE_PLACEHOLDER_UNEXPECTED")
         return (
             value.replace(
                 f'const tcpPort = "{network_probes.tcp_port}";'.encode("ascii"),
@@ -505,6 +533,8 @@ def canonicalize_fixture_source(
                 f'const udpPort = "{UDP_PORT_TOKEN}";'.encode("ascii"),
             )
         )
+    if "__GOAL07_" in value:
+        raise HarnessFailure("FIXTURE_PLACEHOLDER_UNEXPECTED")
     return (
         value.replace(
             f'const tcpPort = "{network_probes.tcp_port}";',
@@ -525,11 +555,29 @@ def fixture_text_fingerprint(
     return fingerprint_text(canonical)
 
 
+def _accepted_fixture_source_template(edits: list[dict[str, Any]]) -> str:
+    return apply_edits(EDITOR_SOURCE_BYTES, edits[:1]).decode("utf-8")
+
+
+def clipboard_fingerprint(
+    value: str, network_probes: NetworkProbeListeners
+) -> Fingerprint:
+    template = _accepted_fixture_source_template(
+        provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT)
+    )
+    expected = template.replace(TCP_PORT_TOKEN, str(network_probes.tcp_port)).replace(
+        UDP_PORT_TOKEN, str(network_probes.udp_port)
+    )
+    if value.encode("utf-8") != expected.encode("utf-8"):
+        raise HarnessFailure("CLIPBOARD_BYTES_UNEXPECTED")
+    return fixture_text_fingerprint(value, network_probes)
+
+
 def fixture_fingerprint(path: Path, network_probes: NetworkProbeListeners) -> Fingerprint:
     raw = path.read_bytes()
     expected = fixture_source(network_probes).encode("utf-8")
     if raw != expected:
-        return fingerprint_bytes(raw)
+        raise HarnessFailure("FIXTURE_DISK_BYTES_UNEXPECTED")
     value = canonicalize_fixture_source(raw, network_probes)
     if not isinstance(value, bytes):
         raise TypeError("fixture fingerprint must be bytes")
@@ -624,12 +672,11 @@ def apply_edits(source: bytes, edits: list[dict[str, Any]]) -> bytes:
 
 
 def expected_fingerprints() -> dict[str, dict[str, Any]]:
-    """The exact bytes every fingerprint observation must have."""
     edits = provider_fixtures.fixture_edits(EDITOR_SOURCE_TEXT)
     disk = fingerprint_bytes(SOURCE_BYTES)
     # Accept(h1) alone: Reject(h2) writes nothing and its Undo leaves h2 open,
     # so this is also the approved result Copy exports.
-    one_accepted_source = apply_edits(EDITOR_SOURCE_BYTES, edits[:1]).decode("utf-8")
+    one_accepted_source = _accepted_fixture_source_template(edits)
     one_accepted = fixture_text_fingerprint(one_accepted_source)
     expected = {
         "web_security_disk_before": disk,
@@ -1204,7 +1251,7 @@ class Goal07Harness(NativeHarness):
         record(
             observed,
             "decisions_clipboard_copied",
-            fixture_text_fingerprint(self.copy_approved(app), self.network_probes),
+            clipboard_fingerprint(self.copy_approved(app), self.network_probes),
         )
         # An edit over the whole document touches the open h2's part: the
         # field says so and offers no Accept.

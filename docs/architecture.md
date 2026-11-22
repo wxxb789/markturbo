@@ -973,10 +973,10 @@ Ordered by how cheap they are:
 ## Known limits
 
 - PlantUML needs a local install. Everything else is self-contained.
-- The WebView is Windows/macOS only, upstream. Linux gets an explanation in the
-  Web pane rather than a broken one; native rendering is unaffected.
+- The WebView preview runs on Windows, macOS, and Linux (WebKitGTK).
 - MDX components render as placeholders; there is no MDX runtime.
-- Live web preview pauses above 512KB; the editor and native preview stay live.
+- A web preview page whose escaped UTF-16 length exceeds the WebView2
+  `NavigateToString` limit shows a diagnostic; the editor and native preview stay live.
 - Translation is the one feature that leaves the machine *on its own*, and only
   when the user invokes it with a key configured. What crosses the wire is prose
   the user asked to have translated. The Web preview's sandbox and resource
