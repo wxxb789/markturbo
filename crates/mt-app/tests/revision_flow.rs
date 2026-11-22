@@ -681,7 +681,6 @@ fn copy_exports_only_the_approved_result_and_saves_nothing() {
     );
 }
 
-/// What `Replace the document` types over the whole buffer.
 const REPLACEMENT: &str = "Typed over everything\n";
 
 #[test]

@@ -400,6 +400,7 @@ fn menu_anchor(state: AppState, language: Language, menu: MenuMotion) -> impl In
             }),
         )
         .child(when(
+            // Keep the panel's rows and focus handles alive through a reversal.
             move || menu.is_visible(),
             move || menu_panel(panel_state.clone(), language, menu).into_element(),
         ))

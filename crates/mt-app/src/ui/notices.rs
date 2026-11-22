@@ -1255,9 +1255,7 @@ pub(crate) fn status_line(
             .w_full()
             .h(px(tokens::TYPE_UI_LINE))
             .bind_opacity(&presence.opacity)
-            .when(!reduced_motion(), |line| {
-                line.bind_translate_y(&presence.rise)
-            })
+            .bind_translate_y(&presence.rise)
             .child(
                 text(move || state.status.get())
                     .font_family(tokens::FONT_UI)
@@ -1269,30 +1267,55 @@ pub(crate) fn status_line(
     )
 }
 
-#[cfg(test)]
-fn status_line_with_opacity(
-    state: AppState,
-    language: Language,
-    opacity: AnimatedValue,
-) -> impl IntoElement {
-    let presence = StatusPresence {
-        opacity,
-        rise: animated_value(motion::CARD_RISE_PX),
-    };
-    observe_status(state.clone(), presence);
-    status_line(state, language, presence)
-}
-
 fn observe_status(watched: AppState, presence: StatusPresence) {
+    // Effect reruns dispose their tasks; notice deadlines belong to the app owner.
+    let owner = Owner::current();
     let active_fade = Cell::new(None::<Spawned<()>>);
+    let exit_deadline = Rc::new(Cell::new(None::<nsh_core::time::Instant>));
+    let previous = Cell::new(None::<(u64, bool, bool)>);
     let opacity = presence.opacity;
     let rise = presence.rise;
     effect(move || {
         let message = watched.status.get();
         let generation = watched.status_generation.get();
         let held = watched.status_held.get_untracked();
-        // A new generation cancels the old exit before retargeting its presence.
+        let reduced = reduced_motion();
+        let before = previous.replace(Some((generation, message.is_empty(), reduced)));
+        let same_status = before.is_some_and(|(old_generation, was_empty, _)| {
+            old_generation == generation && was_empty == message.is_empty()
+        });
+        if same_status {
+            if before.is_some_and(|(_, _, was_reduced)| !was_reduced && reduced)
+                && !message.is_empty()
+            {
+                rise.set(0.0);
+                if let Some(deadline) = exit_deadline.get() {
+                    let now = nsh_core::time::now();
+                    let duration = Duration::from_secs_f32(motion::REDUCED_CROSSFADE_MS / 1000.0);
+                    let reduced_deadline = now + duration;
+                    if deadline > reduced_deadline {
+                        exit_deadline.set(Some(reduced_deadline));
+                        active_fade.set(None);
+                        let clearing = watched.clone();
+                        let exit_deadline = Rc::clone(&exit_deadline);
+                        active_fade.set(Some(owner.run(|| {
+                            spawn(async move {
+                                if opacity
+                                    .timing(0.0, motion::REDUCED_CROSSFADE_MS, motion::EASE_OUT)
+                                    .await
+                                {
+                                    exit_deadline.set(None);
+                                    clear_status_if_current(&clearing, generation);
+                                }
+                            })
+                        })));
+                    }
+                }
+            }
+            return;
+        }
         active_fade.set(None);
+        exit_deadline.set(None);
         opacity.stop();
         rise.stop();
         if message.is_empty() {
@@ -1300,7 +1323,6 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
             rise.set(motion::CARD_RISE_PX);
             return;
         }
-        let reduced = untracked(reduced_motion);
         let enter_ms = if reduced {
             motion::REDUCED_CROSSFADE_MS
         } else {
@@ -1317,20 +1339,26 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
             return;
         }
         let clearing = watched.clone();
-        active_fade.set(Some(spawn(async move {
-            timer(Duration::from_millis(
-                motion::STATUS_HOLD_MS + enter_ms as u64,
-            ))
-            .await;
-            let reduced = untracked(reduced_motion);
-            let exit_ms = if reduced {
-                motion::REDUCED_CROSSFADE_MS
-            } else {
-                motion::EXIT_MS
-            };
-            if opacity.timing(0.0, exit_ms, motion::EASE_OUT).await {
-                clear_status_if_current(&clearing, generation);
-            }
+        let exit_deadline = Rc::clone(&exit_deadline);
+        let hold_deadline =
+            nsh_core::time::now() + Duration::from_millis(motion::STATUS_HOLD_MS + enter_ms as u64);
+        active_fade.set(Some(owner.run(|| {
+            spawn(async move {
+                nsh_core::element::timer_until(hold_deadline).await;
+                let reduced = untracked(reduced_motion);
+                let exit_ms = if reduced {
+                    motion::REDUCED_CROSSFADE_MS
+                } else {
+                    motion::EXIT_MS
+                };
+                exit_deadline.set(Some(
+                    nsh_core::time::now() + Duration::from_secs_f32(exit_ms / 1000.0),
+                ));
+                if opacity.timing(0.0, exit_ms, motion::EASE_OUT).await {
+                    exit_deadline.set(None);
+                    clear_status_if_current(&clearing, generation);
+                }
+            })
         })));
     });
 }
@@ -1342,8 +1370,7 @@ pub fn banner_rule() -> impl IntoElement {
 
 // ─── the comparison's keys ────────────────────────────────────────────────
 
-/// Bind only while the conflict is active and no text input is being edited,
-/// so closing the comparison stops capture before its exit.
+/// Closing releases shortcuts while the resolved comparison remains visible in its exit.
 fn bind_compare_keys(state: &AppState) {
     for (key, delta) in [("j", 1isize), ("k", -1isize)] {
         let state = state.clone();
@@ -1450,7 +1477,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use nsh_engine::{EngineConfig, Points, Root};
+    use nsh_engine::{EngineConfig, Environment, Points, Root};
     use nsh_testing::Headless;
 
     #[derive(Clone, PartialEq, Props)]
@@ -1487,7 +1514,8 @@ mod tests {
         let state = AppState::new();
         let start = state.clone();
         let takeover = state.clone();
-        let opacity = animated_value(0.0);
+        let presence = StatusPresence::new(state.clone());
+        let opacity = presence.opacity;
         let read_task = Cell::new(None::<Spawned<()>>);
         view()
             .w(px(400.0))
@@ -1511,7 +1539,6 @@ mod tests {
                     })
                     .child(prims::ink("Take over")),
             )
-            .child(status_line_with_opacity(state, Language::English, opacity))
             .child(
                 view()
                     .test_id("status-opacity-read")
@@ -1524,6 +1551,7 @@ mod tests {
                     })
                     .child(prims::ink("Read opacity")),
             )
+            .child(status_line(state, Language::English, presence))
     }
 
     fn press_without_settling(app: &mut Headless, selector: &str) {
@@ -1536,6 +1564,24 @@ mod tests {
                 nsh_core::EventKind::Press,
                 nsh_core::EventPayload::Press(Default::default()),
             );
+            engine.flush(move |_| {
+                let _ = sent.send(());
+            });
+        }
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        app.catch_up();
+    }
+
+    fn set_reduced_motion_without_settling(app: &mut Headless, reduced: bool) {
+        let environment = Environment {
+            window: nsh_core::Size::new(Points(400.0), Points(120.0)),
+            reduce_motion: reduced,
+            ..Default::default()
+        };
+        let (sent, received) = mpsc::channel();
+        {
+            let engine = app.engine().control();
+            engine.set_environment(environment);
             engine.flush(move |_| {
                 let _ = sent.send(());
             });
@@ -1569,7 +1615,7 @@ mod tests {
         loop {
             app.catch_up();
             match samples.recv_timeout(Duration::from_millis(10)) {
-                Ok(value) => return value,
+                Ok(values) => return values,
                 Err(mpsc::RecvTimeoutError::Timeout) if std::time::Instant::now() < deadline => {}
                 Err(error) => panic!("read status opacity: {error}"),
             }
@@ -1644,12 +1690,129 @@ mod tests {
         let opacity_did_not_rise = after <= before;
 
         app.wait(Duration::from_millis(motion::EXIT_MS as u64 / 2))
-            .expect("advance past the original status clear deadline");
+            .expect("advance to the original status clear deadline");
         let cleared_on_time = !app.screen().shows("First status");
         assert!(
             opacity_did_not_rise && cleared_on_time,
             "changing motion settings must not restart a fading status: opacity {before} -> {after} (non-rising: {opacity_did_not_rise}); cleared by the original deadline: {cleared_on_time}"
         );
+    }
+
+    #[test]
+    fn reduced_motion_mid_exit_caps_a_long_remaining_fade() {
+        let (sent, samples) = mpsc::channel();
+        let mut app = status_app(sent);
+        press_without_settling(&mut app, "id:status-start");
+        app.next_frame(Duration::from_millis(16))
+            .expect("start the status timers");
+        app.wait(Duration::from_millis(
+            motion::STATUS_HOLD_MS + motion::ENTER_MS as u64 - 16,
+        ))
+        .expect("advance to the status exit timer");
+        app.wait(Duration::from_millis(16))
+            .expect("cross the status exit timer");
+        app.wait(Duration::from_millis(16))
+            .expect("advance into the status exit");
+        let before = status_opacity(&mut app, &samples);
+        assert!(
+            before > 0.0 && before < 1.0,
+            "the status exit must be in progress, got {before}"
+        );
+
+        set_reduced_motion_without_settling(&mut app, true);
+        app.wait(Duration::from_millis(110))
+            .expect("finish the reduced-motion exit");
+        let after = status_opacity(&mut app, &samples);
+        let hidden_within_cap = !app.screen().shows("First status");
+        assert!(
+            after.abs() < 0.001 && hidden_within_cap,
+            "reduced motion must finish the in-progress exit within 100ms: opacity {after}; cleared: {hidden_within_cap}"
+        );
+    }
+
+    #[test]
+    fn reduced_motion_mid_entry_snaps_the_rise_without_replaying_or_restarting_the_hold() {
+        use nsh_core::{
+            MountItem,
+            animation::{AnimationOp, Driver},
+        };
+
+        let (sent, _) = mpsc::channel();
+        let mut app = status_app(sent);
+        let (sent, batches) = mpsc::channel();
+        app.observe(move |_, batch| {
+            let _ = sent.send(batch.items.clone());
+        });
+        press_without_settling(&mut app, "id:status-start");
+        app.wait(Duration::from_millis(64))
+            .expect("advance partway through the status entry");
+        let entry: Vec<_> = batches.try_iter().flatten().collect();
+        let entry_node = |target| {
+            entry.iter().find_map(|item| match item {
+                MountItem::Animation(AnimationOp::Start {
+                    node,
+                    driver:
+                        Driver::Timing {
+                            to, duration_ms, ..
+                        },
+                    ..
+                }) if *to == target && *duration_ms == motion::ENTER_MS => Some(*node),
+                _ => None,
+            })
+        };
+        let opacity = entry_node(1.0).expect("the notice starts fading in");
+        let rise = entry_node(0.0).expect("the notice starts rising");
+
+        set_reduced_motion_without_settling(&mut app, true);
+        let interrupted: Vec<_> = batches.try_iter().flatten().collect();
+        let snapped = interrupted.iter().any(|item| {
+            matches!(
+                item,
+                MountItem::Animation(AnimationOp::Set { node, value: 0.0 }) if *node == rise
+            )
+        });
+        let reset_opacity = interrupted.iter().any(|item| matches!(
+            item,
+            MountItem::Animation(AnimationOp::Start { node, .. }
+                | AnimationOp::Set { node, .. } | AnimationOp::Stop { node }) if *node == opacity
+        ));
+        assert!(
+            snapped && !reset_opacity,
+            "reduced motion must snap the rise without restarting opacity"
+        );
+
+        let exit_started = || {
+            batches.try_iter().flatten().any(|item| {
+                matches!(
+                    item,
+                    MountItem::Animation(AnimationOp::Start {
+                        node,
+                        driver: Driver::Timing { to: 0.0, .. },
+                        ..
+                    }) if node == opacity
+                )
+            })
+        };
+        app.wait(Duration::from_millis(
+            motion::STATUS_HOLD_MS + motion::ENTER_MS as u64 - 65,
+        ))
+        .expect("advance to just before the original status exit");
+        assert!(
+            !exit_started(),
+            "reduced motion must not start exit before the original deadline"
+        );
+        app.wait(Duration::from_millis(49))
+            .expect("cross the original status exit deadline");
+        app.catch_up();
+        assert!(
+            exit_started(),
+            "the reduced-motion change must not postpone the original exit"
+        );
+        app.wait(Duration::from_millis(
+            motion::REDUCED_CROSSFADE_MS as u64 + 16,
+        ))
+        .expect("finish the reduced-motion status exit");
+        assert!(!app.screen().shows("First status"));
     }
 
     #[test]

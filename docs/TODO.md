@@ -2,6 +2,9 @@
 
 ## Deferred
 
+- [ ] **Keyboard press feedback on Win32**: nsh 0.6.1 dispatches only `Press`
+  for keyboard activation, so pressables show no press-down visual for keyboard
+  use. Revisit when nsh exposes keyboard press-down and release events.
 - [ ] **First-time-user and screen-reader evidence for the shipped UI** — Goal
   09 was accepted on 2026-11-13 without the five first-time-target-user sessions
   and the Windows 11 x64 keyboard/screen-reader smoke its completion evidence

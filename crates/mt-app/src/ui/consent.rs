@@ -610,7 +610,6 @@ fn buttons(
         )
 }
 
-/// Cancel: default focus, a quiet action, and it authorizes nothing.
 fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl IntoElement {
     let reference = element_ref();
     // Initial focus lands on Cancel, which authorizes nothing.
@@ -704,7 +703,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
                 #[cfg(test)]
                 tests::record_focus(tests::FocusStop::Hold);
             })
-            // The window losing the keyboard ends any press in it.
+            // A hold must not authorize once focus leaves Send.
             .on_blur(move || {
                 blur.focused.set(false);
                 blur.release();

@@ -36,8 +36,8 @@ pub const FILAMENT_COOL_MS: f32 = 3.0 * FILAMENT_RELEASE_TAU_MS;
 /// A pip lighting, a leaving row's flash.
 pub const FLASH_MS: f32 = 120.0;
 pub const EXTINGUISH_MS: f32 = 120.0;
-/// Mounted editor decorations keep resolved styles when appearance changes.
 pub const HEAT_TICK_MS: u64 = 33;
+// Poll after the heat settles because mounted decorations keep resolved colors.
 pub const HEAT_WATCH_MS: u64 = 250;
 pub const OUTBOUND_DECAY_MS: f32 = 250.0;
 /// A local action's hover ink step (never warmth).

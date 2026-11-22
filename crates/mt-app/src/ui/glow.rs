@@ -825,11 +825,9 @@ mod tests {
         e.focus = Some(1);
         e.focus_ms = 1000.0;
         assert_eq!(heat_at(&e, 1, 1000.0 + IGNITE_MS + COOL_MS, false), 1.0);
-        // The one that lost the focus cools from the moment it did.
         e.cooling_since[0] = Some(1000.0);
         let losing = heat_at(&e, 0, 1000.0 + IGNITE_MS + COOL_TAU_MS, false);
         assert!(losing < 0.5 && losing > EMBER, "cooling from hot: {losing}");
-        // Stale drains everything to the afterimage.
         e.stale_ms = Some(2000.0);
         assert_eq!(heat_at(&e, 1, 2000.0 + AFTERIMAGE_MS + 1.0, false), 0.0);
         e.stale_ms = None;
@@ -962,9 +960,6 @@ mod tests {
                 stated: true,
             };
 
-            // A HOT stated finding: the glyphs in the hot colour, and the
-            // under-bloom as the span's background (over the emitter plate,
-            // one flat colour).
             let hot = stated_decoration(&anchor, 1.0, palette);
             let style = hot.style.as_ref().expect("a span style");
             let decls = style.decls();

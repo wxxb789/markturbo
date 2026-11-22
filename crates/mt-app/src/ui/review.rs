@@ -918,8 +918,6 @@ fn reopen_question(session: Signal<Session>, order: &[usize], index: usize) {
         question_heat(&emitters, order, previous).cool();
     }
     ignite_hold(question_heat(&emitters, order, index));
-    // The question is the HOT item again, and the column's light goes back to
-    // the question's own finding.
     glow::focus_finding(None);
     focus_request().set(Some(Focus::Answer(index)));
 }

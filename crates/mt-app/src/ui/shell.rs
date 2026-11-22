@@ -180,7 +180,7 @@ fn column(
 ) -> impl IntoElement {
     let active = state.active;
     let content_state = state.clone();
-    let frame_generation = signal(0_u64);
+    let snap_offset = signal(0.0);
     let reflow_deadline = Rc::new(Cell::new(None));
     effect({
         let reflow_deadline = reflow_deadline.clone();
@@ -190,7 +190,9 @@ fn column(
                     .take()
                     .is_some_and(|deadline| nsh_core::time::now() < deadline)
             {
-                frame_generation.update(|generation| *generation += 1);
+                // Win32 ignores frames equal to an active tween's destination.
+                // A layout round trip stops the tween without replacing the editor.
+                snap_offset.set(1.0);
             }
         }
     });
@@ -200,19 +202,19 @@ fn column(
         .h(relative(1.0))
         .flex_col()
         .px(px(tokens::COLUMN_GAP))
+        .pt(move || Length::from(px(snap_offset.get())))
         .bg(move || tokens::palette().column_ground)
         .when(layout.field_overlays(), |column| {
             column.opacity(Layout::DIMMED)
         })
-        // Win32 ignores frames equal to a running tween's target.
-        // Replacing their nodes drops the tween.
+        // Key on tab identity only: replacing this subtree discards the editor's undo history.
         .child(each(
-            move || vec![(active.get(), frame_generation.get())],
+            move || vec![active.get()],
             |key| *key,
             move |_, _| {
                 reflow_deadline.set(None);
                 let reflow_deadline = reflow_deadline.clone();
-                column_content(content_state.clone(), language, move |ms| {
+                column_content(content_state.clone(), language, snap_offset, move |ms| {
                     let deadline = nsh_core::time::now() + Duration::from_secs_f32(ms / 1000.0);
                     reflow_deadline.set(Some(
                         reflow_deadline
@@ -228,6 +230,7 @@ fn column(
 fn column_content(
     state: AppState,
     language: Language,
+    snap_offset: Signal<f32>,
     on_reflow: impl Fn(f32) + Clone + 'static,
 ) -> [AnyElement; 3] {
     let document_state = state.clone();
@@ -255,6 +258,11 @@ fn column_content(
             .flex_1()
             .min_h(px(0.0))
             .w_full()
+            .on_layout(move |_: &Bounds<Points>| {
+                if snap_offset.get_untracked() != 0.0 {
+                    snap_offset.set(0.0);
+                }
+            })
             .child(
                 when(move || document::has_document(&document_state), {
                     let state = state.clone();
@@ -369,6 +377,7 @@ pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoEle
                 move || {
                     let state = consent_state.clone();
                     dynamic(move || {
+                        // Only a new authorization session can replace the hold control.
                         session.get();
                         consent::card(state.clone(), language)
                     })
@@ -425,6 +434,7 @@ fn banner_slot<E: IntoElement + 'static>(
         .overflow_hidden()
         .pointer_events(move || surface_pointer(open()))
         .child(when(
+            // Keep comparison state mounted through the fade, including reversals.
             move || presence.visible.get(),
             move || {
                 view()
@@ -668,7 +678,7 @@ mod tests {
             .child(shell(state, Language::English, Layout::Wide))
     }
 
-    fn conflict_probe() -> Headless {
+    fn file_probe() -> Headless {
         let mut config =
             EngineConfig::new(Root::of::<ConflictBannerProbe>().tokens(tokens::theme()));
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
@@ -676,6 +686,11 @@ mod tests {
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("the probe's window");
         app.wait_for("text:Original buffer").expect("file loaded");
+        app
+    }
+
+    fn conflict_probe() -> Headless {
+        let mut app = file_probe();
         press_without_settling(&mut app, "probe-conflict");
         app.wait_for("id:conflict-banner").expect("conflict banner");
         app
@@ -753,6 +768,32 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_during_banner_reflow_preserves_editor_undo() {
+        let mut app = file_probe();
+        app.type_text("label:Markdown source", "x")
+            .expect("edit the file");
+        let editor = node(&app, "source-editor").id;
+        press_without_settling(&mut app, "probe-conflict");
+        app.wait(Duration::from_millis(32)).expect("mid-reflow");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduce motion");
+        let same_editor = node(&app, "source-editor").id == editor;
+        app.wait_for("id:source-editor >> text:/x/")
+            .expect("the typed edit is still present");
+        app.type_text("label:Markdown source", "")
+            .expect("focus the editor");
+        app.press_key("mod+z").expect("undo the edit");
+        let undone = app
+            .screen()
+            .matches("id:source-editor >> text:/^Original buffer$/")
+            .expect("read the source text");
+        assert!(
+            same_editor && undone,
+            "editor retained: {same_editor}; undo worked: {undone}"
+        );
+    }
+
+    #[test]
     fn enabling_reduced_motion_snaps_a_running_banner_reflow() {
         use nsh_core::MountItem;
 
@@ -775,15 +816,13 @@ mod tests {
             .expect("advance partway through reflow");
         app.set_environment("reduced motion", |env| env.reduce_motion = true)
             .expect("reduce motion");
+        app.settle();
         let snapped = ids.map(|id| node(&app, id));
         assert!(
-            snapped.each_ref().map(|node| node.bounds) == final_bounds
+            snapped.each_ref().map(|node| node.id) == moving
+                && snapped.each_ref().map(|node| node.bounds) == final_bounds
                 && batches.try_iter().any(|batch| {
-                    moving.iter().all(|old| {
-                        batch.iter().any(|item| matches!(
-                            item, MountItem::Delete { id } if id == old
-                        ))
-                    }) && snapped.iter().all(|node| {
+                    snapped.iter().all(|node| {
                         batch.iter().any(|item| matches!(
                             item, MountItem::Frame { id, .. } if *id == node.id
                         ))
@@ -791,7 +830,7 @@ mod tests {
                         item, MountItem::LayoutAnimation(animation) if animation.update.is_some()
                     ))
                 }),
-            "reduced motion must replace the in-flight frames with their final frames"
+            "reduced motion must resend the final frames without replacing their nodes"
         );
     }
 
