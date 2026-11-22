@@ -569,39 +569,41 @@ impl Drop for SettingsWriteGuard {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
-    lock_settings_writes_named("Global\\markturbo-settings-write-v1")
-}
+pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::WindowsAndMessaging::CharUpperBuffW;
 
-#[cfg(all(test, target_os = "windows"))]
-pub(crate) fn lock_settings_writes_for_test(root: &Path) -> std::io::Result<SettingsWriteGuard> {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
+    // Resolve the existing prefix for first saves, then fold the initialized
+    // UTF-16 buffer in place to match Windows path lookup.
+    let path = canonical_settings_path(path)?;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if unsafe { CharUpperBuffW(&mut wide) } as usize != wide.len() {
+        return Err(std::io::Error::other("cannot case-normalize settings path"));
+    }
+    let bytes: Vec<u8> = wide.into_iter().flat_map(u16::to_le_bytes).collect();
+    let digest = format!("{:x}", Sha256::digest(bytes));
     lock_settings_writes_named(&format!(
-        "Local\\markturbo-settings-test-{:016x}",
-        hasher.finish()
+        "Global\\markturbo-settings-write-v2-{}",
+        &digest[..32]
     ))
 }
 
-#[cfg(all(test, not(target_os = "windows")))]
-pub(crate) fn lock_settings_writes_for_test(_root: &Path) -> std::io::Result<SettingsWriteGuard> {
-    lock_settings_writes()
-}
-
-#[cfg(test)]
-pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
-    let root = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(path);
-    lock_settings_writes_for_test(root)
-}
-
-#[cfg(not(test))]
-fn lock_settings_writes_for_path(_path: &Path) -> std::io::Result<SettingsWriteGuard> {
-    lock_settings_writes()
+fn canonical_settings_path(path: &Path) -> std::io::Result<PathBuf> {
+    let absolute = std::path::absolute(path)?;
+    let mut ancestor = absolute.as_path();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut canonical) => {
+                canonical.extend(absolute.strip_prefix(ancestor).unwrap().components());
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -635,17 +637,38 @@ fn lock_settings_writes_named(name: &str) -> std::io::Result<SettingsWriteGuard>
 
 #[cfg(not(target_os = "windows"))]
 pub(crate) struct SettingsWriteGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
+    path: PathBuf,
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
-    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    Ok(SettingsWriteGuard {
-        _guard: WRITES
+static ACTIVE_SETTINGS_WRITES: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+#[cfg(not(target_os = "windows"))]
+static SETTINGS_WRITE_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for SettingsWriteGuard {
+    fn drop(&mut self) {
+        ACTIVE_SETTINGS_WRITES
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    })
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+        SETTINGS_WRITE_RELEASED.notify_all();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
+    let path = canonical_settings_path(path)?;
+    let writes = ACTIVE_SETTINGS_WRITES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SETTINGS_WRITE_RELEASED
+        .wait_while(writes, |writes| writes.contains(&path))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.clone());
+    Ok(SettingsWriteGuard { path })
 }
 
 /// Where settings live.
@@ -717,21 +740,20 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn settings_and_usage_with_same_relative_consent_path_share_a_test_lock() {
+    fn settings_and_usage_with_same_relative_consent_path_contend() {
         use std::io::ErrorKind;
 
         let directory = tempfile::tempdir_in(".").unwrap();
-        let consent_path = Path::new(directory.path().file_name().unwrap());
-        // Check both writers against the expected lock from a different thread.
-        let settings_guard = lock_settings_writes_for_test(consent_path).unwrap();
-        let usage = crate::usage::UsageStore::open_in(directory.path(), consent_path, false);
+        let consent_path = Path::new(directory.path().file_name().unwrap()).join("settings.toml");
+        let settings_guard = lock_settings_writes_for_path(&consent_path).unwrap();
+        let usage = crate::usage::UsageStore::open_in(directory.path(), &consent_path, false);
 
         let (settings_write, usage_write) = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     (
                         SettingsData::default()
-                            .try_save_to_with_intent(consent_path, SettingsWriteIntent::General),
+                            .try_save_to_with_intent(&consent_path, SettingsWriteIntent::General),
                         usage.clear(),
                     )
                 })
@@ -748,7 +770,10 @@ mod tests {
         );
 
         drop(settings_guard);
-        assert_eq!(usage.clear(), Ok(()));
+        assert_eq!(
+            std::thread::spawn(move || usage.clear()).join().unwrap(),
+            Ok(())
+        );
     }
 
     #[test]
@@ -886,6 +911,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn settings_write_lock_does_not_block_a_different_path() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let _guard = lock_settings_writes_for_path(&first.path().join("settings.toml")).unwrap();
+        let path = second.path().join("settings.toml");
+
+        std::thread::spawn(move || SettingsData::default().try_save_general_to(&path))
+            .join()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn settings_write_lock_matches_a_case_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config/settings.toml");
+        let alias = directory.path().join("CONFIG/SETTINGS.TOML");
+        assert_settings_write_is_blocked(&path, alias);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn settings_write_lock_matches_a_relative_alias() {
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let relative = Path::new(directory.path().file_name().unwrap()).join("settings.toml");
+        let absolute = std::path::absolute(&relative).unwrap();
+        assert_settings_write_is_blocked(&absolute, relative);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn assert_settings_write_is_blocked(locked_path: &Path, write_path: PathBuf) {
+        let _guard = lock_settings_writes_for_path(locked_path).unwrap();
+        let result =
+            std::thread::spawn(move || SettingsData::default().try_save_general_to(&write_path))
+                .join()
+                .unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
     }
 
     /// TOML cannot represent a scalar after an array table.

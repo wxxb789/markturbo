@@ -362,12 +362,12 @@ impl UsageStore {
         Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)
     }
 
-    fn lock_settings_writes(&self) -> io::Result<crate::settings::SettingsWriteGuard> {
-        #[cfg(test)]
-        if let Some(path) = self.consent_path.as_deref() {
-            return crate::settings::lock_settings_writes_for_path(path);
-        }
-        crate::settings::lock_settings_writes()
+    fn lock_settings_writes(&self) -> io::Result<Option<crate::settings::SettingsWriteGuard>> {
+        self.consent_path
+            .as_deref()
+            .or(self.path.as_deref())
+            .map(crate::settings::lock_settings_writes_for_path)
+            .transpose()
     }
 
     fn persisted_consent(&self) -> bool {
