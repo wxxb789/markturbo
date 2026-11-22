@@ -23,11 +23,21 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let question = "Which audience should this revision prioritize?";
+    let unanswered_question = "What should readers do after reading it?";
     let answer = "Readers new to the topic.";
     let (review, _) = two_change_outputs(source);
     let mut review: serde_json::Value = serde_json::from_str(&review).expect("Review output");
+    review["findings"] = serde_json::json!([{
+        "kind": "inference",
+        "text": "The title needs a clearer promise.",
+        "anchor": {"kind": "document_wide"}
+    }]);
     review["clarification_questions"] = serde_json::json!([{
         "question": question,
+        "priority": "high",
+        "impact": null
+    }, {
+        "question": unanswered_question,
         "priority": "medium",
         "impact": null
     }]);
@@ -91,9 +101,21 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
         .expect("submit the answer");
     app.wait_for("text:Answered")
         .expect("the question is answered");
+    app.wait_for(&format!("text:{unanswered_question}"))
+        .expect("the remaining clarification is unanswered");
+    app.press("id:review-findings-step")
+        .expect("expand the finding");
+    app.wait_for("text:The title needs a clearer promise.")
+        .expect("the finding is expanded");
     app.press("id:review-prepare").expect("prepare Revision");
     app.wait_for("text:Ask for a revision?")
         .expect("Revision disclosure");
+    assert!(
+        !app.screen()
+            .matches("id:review-finding")
+            .expect("the finding selector"),
+        "preparing Revision hides the expanded finding"
+    );
     app.long_press("id:consent-send").expect("send Revision");
     request_received
         .recv_timeout(Duration::from_secs(5))
@@ -101,6 +123,8 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
     app.press("id:revision-cancel").expect("cancel Revision");
     app.wait_for("id:review-prepare")
         .expect("original Review restored");
+    app.wait_for("text:The title needs a clearer promise.")
+        .expect("the expanded finding is restored");
     let restored_buffer = app
         .screen()
         .input_text("label:Markdown source")

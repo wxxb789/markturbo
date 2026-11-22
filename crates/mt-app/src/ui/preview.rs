@@ -27,7 +27,7 @@
 //! commit. A pane that is not on screen is not there to watch, so a hidden tab
 //! is never navigated behind the user's back.
 
-use std::sync::LazyLock;
+use std::{sync::LazyLock, time::Duration};
 
 use mt_core::{
     BlockKind, Document,
@@ -44,7 +44,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Pane, Tab},
     ui::{
-        prims,
+        motion, prims,
         tokens::{self, WEIGHT_MEDIUM},
     },
     web,
@@ -207,13 +207,18 @@ fn web_load_message(test_id: &str, message: impl IntoElement) -> AnyElement {
 }
 
 fn web_document(page: WebDocument, trusted: Signal<bool>, language: Language) -> AnyElement {
-    let WebDocument { html, status } = page;
+    let WebDocument {
+        html,
+        status,
+        load_delay,
+    } = page;
     view()
         .test_id("web-content")
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
         .child(dynamic(move || match status.get() {
+            WebLoadState::Pending | WebLoadState::Ready => view().into_element(),
             WebLoadState::Loading => web_load_message(
                 "preview-loading",
                 prims::faint(i18n::t(language, Key::PreviewLoading)),
@@ -223,32 +228,40 @@ fn web_document(page: WebDocument, trusted: Signal<bool>, language: Language) ->
                 prims::rest(i18n::t(language, Key::WebPreviewFailed))
                     .text_color(move || tokens::palette().danger),
             ),
-            WebLoadState::Ready => view().into_element(),
         }))
         .child(
             web_view_html(move || html.get(), None)
                 .test_id("web-view")
                 .label(SharedString::from(i18n::t(language, Key::ModeWeb)))
                 .java_script_enabled(move || trusted.get())
-                .on_load_start(move |_: &WebNavigation| web_load_started(status))
-                .on_load(move |_: &WebNavigation| web_load_finished(status))
-                .on_error(move |_: &str| web_load_failed(status))
+                .on_load_start(move |_: &WebNavigation| web_load_started(status, load_delay))
+                .on_load(move |_: &WebNavigation| web_load_finished(status, load_delay))
+                .on_error(move |_: &str| web_load_failed(status, load_delay))
                 .flex_1(),
         )
         .into_element()
 }
 
-fn web_load_started(status: Signal<WebLoadState>) {
-    if status.get() != WebLoadState::Ready {
-        status.set(WebLoadState::Loading);
-    }
+fn web_load_started(status: Signal<WebLoadState>, load_delay: Stored<Option<Spawned<()>>>) {
+    load_delay.replace(None);
+    status.set(WebLoadState::Pending);
+    load_delay.replace(Some(set_timeout(
+        Duration::from_millis(motion::HOVER_MS as u64),
+        move || {
+            if status.get_untracked() == WebLoadState::Pending {
+                status.set(WebLoadState::Loading);
+            }
+        },
+    )));
 }
 
-fn web_load_finished(status: Signal<WebLoadState>) {
+fn web_load_finished(status: Signal<WebLoadState>, load_delay: Stored<Option<Spawned<()>>>) {
+    load_delay.replace(None);
     status.set(WebLoadState::Ready);
 }
 
-fn web_load_failed(status: Signal<WebLoadState>) {
+fn web_load_failed(status: Signal<WebLoadState>, load_delay: Stored<Option<Spawned<()>>>) {
+    load_delay.replace(None);
     status.set(WebLoadState::Failed);
 }
 
@@ -373,10 +386,12 @@ struct WebDocument {
     /// What the web view binds; a new value reaches it at the next commit.
     html: Signal<String>,
     status: Signal<WebLoadState>,
+    load_delay: Stored<Option<Spawned<()>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WebLoadState {
+    Pending,
     Loading,
     Ready,
     Failed,
@@ -399,7 +414,8 @@ impl WebDocument {
     /// render.
     fn new(tab: Tab, language: Language) -> WebDocument {
         let html = signal(String::new());
-        let status = signal(WebLoadState::Loading);
+        let status = signal(WebLoadState::Ready);
+        let load_delay = stored(None::<Spawned<()>>);
         let written = signal(None::<Page>);
         let watch = tab.clone();
         let build = tab.clone();
@@ -423,7 +439,11 @@ impl WebDocument {
             written.set(Some(page));
             html.set(built);
         });
-        WebDocument { html, status }
+        WebDocument {
+            html,
+            status,
+            load_delay,
+        }
     }
 }
 
@@ -493,7 +513,7 @@ fn render_diagram(kind: &str, label: &str, source: &str, language: Language) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
+    use std::{sync::OnceLock, time::Duration};
 
     use nsh_core::{EventKind, EventPayload, MountItem, NativeProps, WebSource};
     use nsh_engine::{EngineConfig, Root};
@@ -794,36 +814,46 @@ mod tests {
     }
 
     #[test]
-    fn a_web_preview_tracks_loading_success_and_failure() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<PendingWebProbe>()))
-            .expect("start the probe");
+    fn a_web_preview_delays_loading_for_every_navigation() {
+        let mut config = EngineConfig::new(Root::of::<PendingWebProbe>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
         app.settle();
+        assert!(matches(&app, "id:web-view"));
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
+        dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
+        app.wait(Duration::from_millis(motion::HOVER_MS as u64 + 16))
+            .expect("advance past the loading threshold");
         assert!(
             matches(&app, "id:preview-loading")
-                && texts(&app).contains(i18n::t(Language::English, Key::PreviewLoading))
-                && matches(&app, "id:web-view"),
+                && texts(&app).contains(i18n::t(Language::English, Key::PreviewLoading)),
             "{}",
             dump(&app)
         );
         dispatch_web_event(&mut app, EventKind::Load, EventPayload::None);
-        assert!(
-            matches(&app, "id:web-view") && !matches(&app, "id:preview-loading"),
-            "{}",
-            dump(&app)
-        );
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
         dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
-        assert!(
-            matches(&app, "id:web-view")
-                && !matches(&app, "id:preview-loading")
-                && !matches(&app, "id:web-preview-failed"),
-            "later edits do not repeat the initial loading state: {}",
-            dump(&app)
-        );
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
+        dispatch_web_event(&mut app, EventKind::Load, EventPayload::None);
+        app.wait(Duration::from_millis(motion::HOVER_MS as u64 + 16))
+            .expect("finish the short navigation delay");
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
+        dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
+        app.wait(Duration::from_millis(motion::HOVER_MS as u64 + 16))
+            .expect("advance a slow re-navigation from ready");
+        assert!(matches(&app, "id:preview-loading"), "{}", dump(&app));
+        dispatch_web_event(&mut app, EventKind::Load, EventPayload::None);
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
         app.press("id:probe-web-clear").expect("clear the document");
         app.wait_for("id:preview-empty").expect("empty preview");
         assert!(!matches(&app, "id:web-view"), "{}", dump(&app));
         app.press("id:probe-web-type").expect("retype the document");
         app.wait_for("id:web-view").expect("remounted WebView");
+        dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
+        app.wait(Duration::from_millis(motion::HOVER_MS as u64 + 16))
+            .expect("advance the pending navigation");
         assert!(matches(&app, "id:preview-loading"), "{}", dump(&app));
         dispatch_web_event(
             &mut app,
@@ -840,6 +870,9 @@ mod tests {
             dump(&app)
         );
         dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
+        assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
+        app.wait(Duration::from_millis(motion::HOVER_MS as u64 + 16))
+            .expect("advance the re-navigation delay");
         assert!(matches(&app, "id:preview-loading"), "{}", dump(&app));
         dispatch_web_event(&mut app, EventKind::Load, EventPayload::None);
         assert!(!matches(&app, "id:preview-loading"), "{}", dump(&app));
@@ -1038,10 +1071,14 @@ mod tests {
     fn the_field_web_pane_follows_the_active_tab() {
         let restricted = i18n::t(Language::English, Key::ScriptsRestricted);
         let trusted = i18n::t(Language::English, Key::ScriptsTrusted);
-        let mut app = Headless::start(EngineConfig::new(Root::of::<SplitWebProbe>()))
-            .expect("start the probe");
+        let mut config = EngineConfig::new(Root::of::<SplitWebProbe>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
         app.wait_for("id:web-pane").expect("the web pane renders");
         app.settle();
+        dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
+        app.wait(Duration::from_millis(motion::HOVER_MS as u64 + 16))
+            .expect("advance the first page load");
         assert!(
             matches(&app, "id:web-view") && matches(&app, "id:preview-loading"),
             "the first page stays mounted while it loads: {}",
@@ -1054,6 +1091,9 @@ mod tests {
         app.press("label:Probe switch")
             .expect("switch to the first tab");
         app.settle();
+        dispatch_web_event(&mut app, EventKind::LoadStart, EventPayload::None);
+        app.wait(Duration::from_millis(motion::HOVER_MS as u64 + 16))
+            .expect("advance the next page load");
         assert!(
             matches(&app, "id:web-view") && matches(&app, "id:preview-loading"),
             "the next tab's page stays mounted while it loads: {}",

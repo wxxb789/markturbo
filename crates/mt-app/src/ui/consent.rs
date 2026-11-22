@@ -71,7 +71,7 @@ use nsh_core::{Color, TransformKind, element::AnimatedValue, prelude::*};
 use crate::{
     i18n::{self, Key},
     state::{AppState, OutboundConsent, OutboundItem, OutboundOrigin, ReviewScopeChoice},
-    ui::{motion, prims, titlebar, tokens},
+    ui::{motion, prims, review, titlebar, tokens},
 };
 
 const FILAMENT_H: f32 = 2.0;
@@ -885,7 +885,7 @@ fn last_key() -> Rc<Cell<Option<Instant>>> {
 /// Cancel the waiting consent, whatever it is.
 fn cancel(state: &AppState, is_revision: bool) {
     if is_revision {
-        state.cancel_revision();
+        review::cancel_revision(state);
     } else {
         state.cancel_review();
     }

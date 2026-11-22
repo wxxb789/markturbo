@@ -3427,16 +3427,16 @@ impl AppState {
     }
 
     pub fn close_settings(&self) {
-        if self.persist_settings() {
+        if self.persist_settings(StatusSurface::Editor) {
             self.settings_open.set(false);
         }
     }
 
     pub fn save_settings(&self) {
-        self.persist_settings();
+        self.persist_settings(StatusSurface::Settings);
     }
 
-    fn persist_settings(&self) -> bool {
+    fn persist_settings(&self, success_surface: StatusSurface) -> bool {
         use crate::i18n::{Key, t};
         let settings = self.settings.get();
         let (key, kind, saved) = match settings.try_save_general() {
@@ -3446,7 +3446,12 @@ impl AppState {
                 (Key::SettingsSaveFailed, StatusKind::Error, false)
             }
         };
-        self.notify_at(StatusSurface::Settings, kind, t(settings.language, key));
+        let surface = if saved {
+            success_surface
+        } else {
+            StatusSurface::Settings
+        };
+        self.notify_at(surface, kind, t(settings.language, key));
         saved
     }
 

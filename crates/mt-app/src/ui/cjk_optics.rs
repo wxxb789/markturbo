@@ -109,6 +109,19 @@ mod tests {
     }
 
     #[component]
+    fn ScriptBoundaryProbe() -> impl IntoElement {
+        prims::script_text(
+            "A·B | e\u{0305} | 中\u{05B0} | 中文·中文 | 中文, Latin | Latin, 中文",
+            tokens::TYPE_MODEL,
+            WEIGHT_MODEL,
+            CJK_OPTICS_CAPTURE_VARIANTS[2].optics,
+        )
+        .font_family(FONT_MODEL)
+        .font_weight(WEIGHT_MODEL)
+        .text_size(px(tokens::TYPE_MODEL))
+    }
+
+    #[component]
     fn CaptureViewProbe() -> impl IntoElement {
         capture(installed_companion())
     }
@@ -143,6 +156,38 @@ mod tests {
         assert_eq!(cjk.font_weight, WEIGHT_MODEL.0 + 100);
         assert_eq!(latin.font_family.unwrap().name().as_ref(), FONT_MODEL);
         assert_eq!(cjk.font_family.unwrap().name().as_ref(), FONT_UI);
+    }
+
+    #[test]
+    fn primary_scripts_and_graphemes_control_optical_styles() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<ScriptBoundaryProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the script-boundary probe");
+        app.wait_for("text:A·B | e\u{0305} | 中\u{05B0} | 中文·中文 | 中文, Latin | Latin, 中文")
+            .expect("the mixed-script text");
+
+        let style = |selector: &str| {
+            let style = app.screen().span_style(selector).expect(selector);
+            (
+                style.font_size.0,
+                style.font_weight,
+                style.font_family.unwrap().name().to_string(),
+            )
+        };
+        let latin = (tokens::TYPE_MODEL, WEIGHT_MODEL.0, FONT_MODEL.to_owned());
+        let cjk = (
+            tokens::TYPE_MODEL + 1.0,
+            WEIGHT_MODEL.0 + 100,
+            FONT_UI.to_owned(),
+        );
+
+        for selector in ["text:A·B", "text:e\u{0305}", "text:, >> nth=1"] {
+            assert_eq!(style(selector), latin, "{selector}");
+        }
+        for selector in ["text:中\u{05B0}", "text:中文·中文", "text:, >> nth=0"] {
+            assert_eq!(style(selector), cjk, "{selector}");
+        }
     }
 
     #[test]

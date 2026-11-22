@@ -9,17 +9,15 @@ invent new ones.
 ## Done when
 
 1. **Tabular figures.**
-   - Add a `tokens` font-feature token for tabular numerals (`tnum`). Use the nsh 0.6.1 text API;
-     verify it exists in the locked source.
-   - Apply it to every changing count:
+   - The bundled Martian Grotesk has no `tnum` feature. nsh 0.6.1 provides `tabular_nums()`,
+     but it cannot add a feature missing from the font.
+   - Use bundled Martian Mono, whose digits share one advance, for every changing count:
      - consent byte counts;
      - "n of m decided";
      - the findings count;
      - context bytes;
      - status-line byte counts.
-   - If nsh cannot set OpenType features, report that and use the `Martian Mono` family for those
-     figures instead.
-   - A test asserts the style on each listed text.
+   - Tests assert the family on each listed text and verify equal digit advance.
 2. **Settings.**
    - Anchor Save and Close to the field column's right edge.
    - Make the page scroll, so the last section is never clipped at the 900px-tall window.

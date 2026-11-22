@@ -157,6 +157,54 @@ class MatrixTests(unittest.TestCase):
                 visual.require_companion_font_loaded(harness, mock.Mock())
         self.assertEqual(missing.exception.code, "CJK_COMPANION_FONT_STATE_MISSING")
 
+    def test_goal17_capture_cell_blocks_when_the_companion_font_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            user_data = root / "user-data"
+            font = user_data / "fonts" / visual.CJK_COMPANION_FONT_NAME
+            font.parent.mkdir(parents=True)
+            font.write_bytes(b"companion font")
+            app = mock.Mock(window=mock.Mock(handle=1))
+            harness = mock.Mock()
+            harness.shows_text.side_effect = lambda _app, text: (
+                text != visual.CJK_COMPANION_FONT_LOADED
+            )
+            window = mock.Mock(hwnd=1)
+            window.foreground.return_value = True
+            window.accessibility.return_value = {"unnamed": []}
+            window.obstruction.return_value = {"visible": False}
+            win32 = mock.Mock()
+            win32.user32.GetDpiForWindow.return_value = 96
+
+            harness.launch_app.return_value = app
+            with (
+                mock.patch.object(visual, "VisualHarness", return_value=harness),
+                mock.patch.object(visual, "AppWindow", return_value=window),
+                mock.patch.object(
+                    visual, "dpi_awareness", return_value=(0, 0, (0, 0, 500, 500))
+                ),
+                mock.patch.object(visual, "capture_window", side_effect=RuntimeError),
+                mock.patch.object(visual, "SETTLE_SECONDS", 0),
+                mock.patch.dict(
+                    os.environ, {"MARKTURBO_DATA_DIR": str(user_data)}, clear=False
+                ),
+            ):
+                receipt = visual.capture_cell(
+                    win32,
+                    root / "markturbo.exe",
+                    root / "out",
+                    visual.cjk_optics_cell(),
+                    visual.SourceBinding("head", "tree", False, None),
+                    {"name": "markturbo.exe", "byte_count": 1, "sha256": "a" * 64},
+                    (None,) * 5,
+                    None,
+                )
+
+        self.assertEqual(
+            (receipt["status"], receipt["reason_code"]),
+            ("BLOCKED", "CJK_COMPANION_FONT_NOT_LOADED"),
+        )
+
     def test_documented_goal17_visual_command_parses_through_mt_cli(self) -> None:
         acceptance = Path(__file__).resolve().parents[2] / "docs" / "goal-17-acceptance.md"
         command = next(

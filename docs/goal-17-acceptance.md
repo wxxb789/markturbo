@@ -9,8 +9,10 @@ The light ember is `#8D6240`: OKLCH lightness 0.534 and chroma 0.074, with
 
 Headless checks inspect the resolved text styles, not screenshots or widget
 source.
-The bundled Martian Grotesk Regular has no `tnum` feature in GSUB/GPOS, so
-Goal 17 changing counts use bundled Martian Mono at the surrounding size.
+The bundled Martian Grotesk has no `tnum` feature in GSUB/GPOS. The nsh 0.6.1
+`tabular_nums()` API cannot supply that missing font feature, so changing counts
+use bundled Martian Mono at the surrounding size. Tests assert the family and
+verify equal digit advance.
 
 The Revision loopback test withholds the response headers, presses Cancel,
 and checks that the client disconnects and the prior Review returns. This
@@ -22,9 +24,7 @@ high; the usage section fits inside the viewport after scrolling. Checked
 row origins include y=108, 124, 156, 316, 392, 424, 540, 564, 632, 680,
 760, and 912.
 
-Temporary regressions failed 21 targeted app unit tests, five Settings
-integration tests, and two Revision integration tests (each command exited
-101). The tests detected the removed states, incorrect layout, CJK scope,
+Targeted regression checks detected removed states, incorrect layout, CJK scope,
 low chroma, missing tabular figures, incorrect routing, and missing request
 cancellation. Adding the CJK comparison to the default visual matrix failed
 its isolated Python test (exit 1); restoring the opt-in behavior passed it.
@@ -33,14 +33,8 @@ Headless could no longer scroll the viewport (exit 1).
 With routing intact, neutralizing error color and removing the status text's
 tabular figures failed the two corresponding style assertions (exit 1).
 
-| Check | Exit | Result |
-| --- | ---: | --- |
-| `cargo fmt --all -- --check` | 0 | No formatting differences. |
-| `cargo clippy --profile ci -p mt-core -p mt-app --all-targets` | 0 | 3 pre-existing warnings. |
-| `cargo test --profile ci -p mt-app` | 0 | 294 passed, 0 failed, 0 ignored. |
-| `cargo test --profile ci -p mt-core --features model-transport` | 0 | 835 passed, 7 ignored, 0 failed. |
-| `uv run --locked --project scripts scripts/mt.py check fast` | 0 | 235 passed in 8 shards. |
-| `uv run --locked --project scripts scripts/mt.py check ci` | 0 | 235 tooling tests passed; 1129 workspace tests passed, 7 ignored, 0 failed. |
+The code gate is CI on the PR head plus
+`uv run --locked --project scripts scripts/mt.py check ci`.
 
 ## Desktop acceptance
 

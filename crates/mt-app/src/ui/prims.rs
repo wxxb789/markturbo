@@ -26,6 +26,7 @@ use nsh_core::{
     prelude::*,
 };
 use unicode_script::{Script, UnicodeScript};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ui::{
     motion::{self, HOVER_MS, Heat, PRESS_RELEASE_MS},
@@ -148,76 +149,31 @@ struct ScriptRun {
 }
 
 fn script_runs(content: &str) -> Vec<ScriptRun> {
-    let mut classified: Vec<_> = content
-        .chars()
-        .map(|character| (character, cjk_script(character)))
-        .collect();
-    let mut previous = None;
-    for (_, is_cjk) in &mut classified {
-        if let Some(script) = *is_cjk {
-            previous = Some(script);
-        } else {
-            *is_cjk = previous;
-        }
-    }
-    let mut next = None;
-    for (_, is_cjk) in classified.iter_mut().rev() {
-        if let Some(script) = *is_cjk {
-            next = Some(script);
-        } else {
-            *is_cjk = next;
-        }
-    }
-
+    let graphemes = content.graphemes(true);
+    let mut previous = graphemes.clone().find_map(cjk_script).unwrap_or(false);
     let mut runs: Vec<ScriptRun> = Vec::new();
-    for (character, is_cjk) in classified {
-        let is_cjk = is_cjk.unwrap_or(false);
+    for grapheme in graphemes {
+        let is_cjk = cjk_script(grapheme).unwrap_or(previous);
+        previous = is_cjk;
         match runs.last_mut() {
-            Some(run) if run.is_cjk == is_cjk => run.text.push(character),
+            Some(run) if run.is_cjk == is_cjk => run.text.push_str(grapheme),
             _ => runs.push(ScriptRun {
                 index: runs.len(),
                 is_cjk,
-                text: character.to_string(),
+                text: grapheme.to_owned(),
             }),
         }
     }
     runs
 }
 
-fn cjk_script(character: char) -> Option<bool> {
-    let script = character.script();
-    let extension = character.script_extension();
-    let cjk_extension = !extension.is_common()
-        && !extension.is_inherited()
-        && [
-            Script::Bopomofo,
-            Script::Han,
-            Script::Hangul,
-            Script::Hiragana,
-            Script::Katakana,
-            Script::Nushu,
-            Script::Tangut,
-            Script::Yi,
-        ]
-        .into_iter()
-        .any(|cjk_script| extension.contains_script(cjk_script));
-    let cjk = matches!(
-        script,
-        Script::Bopomofo
-            | Script::Han
-            | Script::Hangul
-            | Script::Hiragana
-            | Script::Katakana
-            | Script::Nushu
-            | Script::Tangut
-            | Script::Yi
-    ) || cjk_extension;
-    if cjk {
-        Some(true)
-    } else if script == Script::Inherited || extension.is_inherited() {
-        None
-    } else {
-        Some(false)
+fn cjk_script(grapheme: &str) -> Option<bool> {
+    match grapheme.chars().next().map(|character| character.script()) {
+        Some(
+            Script::Bopomofo | Script::Han | Script::Hangul | Script::Hiragana | Script::Katakana,
+        ) => Some(true),
+        Some(Script::Common | Script::Inherited) | None => None,
+        Some(_) => Some(false),
     }
 }
 
@@ -491,6 +447,28 @@ mod tests {
     use super::*;
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
+
+    #[test]
+    fn script_runs_follow_primary_scripts_and_keep_graphemes_whole() {
+        for (input, expected) in [
+            ("A·B", vec![(false, "A·B")]),
+            ("e\u{0305}", vec![(false, "e\u{0305}")]),
+            ("中\u{05B0}", vec![(true, "中\u{05B0}")]),
+            ("中文·中文", vec![(true, "中文·中文")]),
+            ("中文, Latin", vec![(true, "中文, "), (false, "Latin")]),
+            ("Latin, 中文", vec![(false, "Latin, "), (true, "中文")]),
+            ("·中文", vec![(true, "·中文")]),
+        ] {
+            let runs = script_runs(input);
+            assert_eq!(
+                runs.iter()
+                    .map(|run| (run.is_cjk, run.text.as_str()))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{input}"
+            );
+        }
+    }
 
     /// One of each action, and a line that counts the presses they hear.
     #[component]

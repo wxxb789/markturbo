@@ -66,7 +66,7 @@ use crate::{
     ui::{
         glow,
         motion::{self, EASE_IN_OUT, Heat, LINEAR},
-        prims, titlebar,
+        prims, review, titlebar,
         tokens::{self, SPACE_1, SPACE_2, SPACE_3},
     },
 };
@@ -390,6 +390,8 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
         .test_id("revision-field")
         .w_full()
         .h(move || px(field_height()))
+        .flex_shrink(1.0)
+        .min_h(px(0.0))
         .flex_col()
         .gap(px(SPACE_3))
         // The proposal belongs to a tab not on screen: nothing here can be
@@ -431,7 +433,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                     .child(prims::quiet_action(
                         "revision-cancel",
                         i18n::t(language, Key::Cancel),
-                        move || state.cancel_revision(),
+                        move || review::cancel_revision(&state),
                     ))
             },
         ))
@@ -1856,9 +1858,8 @@ mod tests {
         let decisions = bounds("revision-decisions");
         let keys = bounds("revision-keys");
 
-        // The field is the window under the 32px title row, in the field's
-        // own box (the 440px docked reading position).
-        let expected = 900.0 - tokens::TITLE_ROW_H;
+        let status_height = tokens::SPACE_3 + tokens::TYPE_UI_LINE;
+        let expected = 900.0 - tokens::TITLE_ROW_H - status_height;
         assert!(
             (field.size.height.0 - expected).abs() < 2.0,
             "field height {} instead of {expected}",

@@ -315,7 +315,12 @@ fn field_surface(
         .h(relative(1.0))
         .flex_col()
         .child(when(
-            move || surface(&condition) == FieldSurface::Review || condition.revision_busy.get(),
+            move || {
+                matches!(
+                    surface(&condition),
+                    FieldSurface::Review | FieldSurface::Revision
+                )
+            },
             move || notices::status_line_at(notice.clone(), status, StatusSurface::Review),
         ));
     for want in [
@@ -1625,6 +1630,27 @@ mod tests {
                     }))
                     .child(control("review-status-clear", &state, |state| {
                         state.status.set(Default::default());
+                    }))
+                    .child(control("revision-start", &state, |state| {
+                        state.revision_busy.set(true);
+                        state.notify_at(
+                            crate::state::StatusSurface::Review,
+                            crate::state::StatusKind::Success,
+                            "Sent 120 B",
+                        );
+                    }))
+                    .child(control("revision-ready", &state, |state| {
+                        state
+                            .revision_hunks
+                            .set(vec![crate::state::RevisionHunkView {
+                                ordinal: 0,
+                                change_id: 0,
+                                rationale: "Clarify the sentence".to_owned(),
+                                before: "Draft".to_owned(),
+                                after: "Revised draft".to_owned(),
+                                accepted: signal(false),
+                            }]);
+                        state.revision_busy.set(false);
                     })),
             )
             .child(shell(state, Language::English, Layout::Wide))
@@ -1735,6 +1761,34 @@ mod tests {
         assert!(
             (empty_y - message_y).abs() <= 0.5 && (empty_y - cleared_y).abs() <= 0.5,
             "Review keeps its status row reserved: empty={empty_y}, message={message_y}, cleared={cleared_y}"
+        );
+    }
+
+    #[test]
+    fn revision_receipt_and_body_position_survive_the_proposal_arrival() {
+        let config = EngineConfig::new(Root::of::<ReviewStatusRowProbe>().tokens(tokens::theme()));
+        let mut app = Headless::start(config).expect("Review status row");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("wide viewport");
+        let receipt = "id:field >> id:status >> text:Sent 120 B";
+        app.press("id:revision-start").expect("start the request");
+        app.wait_for(receipt).expect("receipt during the request");
+        let busy_y = node(&app, "revision-field").bounds.origin.y.0;
+
+        app.press("id:revision-ready")
+            .expect("deliver the proposal");
+        app.wait_for_gone("id:revision-cancel", Duration::from_secs(2))
+            .expect("the request has finished");
+        let ready = node(&app, "revision-field").bounds;
+        let field = node(&app, "field").bounds;
+        let ready_y = ready.origin.y.0;
+        let ready_bottom = ready_y + ready.size.height.0;
+        let field_bottom = field.origin.y.0 + field.size.height.0;
+        assert!(
+            app.screen().matches(receipt).expect("receipt selector")
+                && (busy_y - ready_y).abs() <= 0.5
+                && ready_bottom <= field_bottom + 0.5,
+            "the proposal keeps the receipt and fits without moving: busy={busy_y}, ready={ready:?}, field={field:?}"
         );
     }
 

@@ -216,3 +216,12 @@ fn settings_save_failure_uses_danger_status_on_the_settings_surface() {
         "status remains beside Settings: page={page:?}, status={status:?}"
     );
 }
+
+#[test]
+fn closing_settings_shows_the_save_receipt_in_the_editor() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start_settings();
+    app.press("id:settings-close").expect("save and close");
+    app.wait_for("id:column >> id:status >> text:Settings saved.")
+        .expect("Close shows the receipt in the returning editor column");
+}

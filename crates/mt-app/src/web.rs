@@ -14,6 +14,7 @@ use std::path::Path;
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
 use mt_core::settings::Language;
 use mt_core::{Block, BlockKind, Document};
+use nsh_core::Color;
 
 /// How much the WebView is allowed to execute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,15 +66,19 @@ pub(crate) fn build_html_localized(
     };
 
     format!(
-        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>{vars}\n{style}</style>\n</head><body>{banner}{body}</body></html>",
+        "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n{csp}\n<style>{vars}\n:root {{\n  --danger-color: {danger};\n}}\n{style}</style>\n</head><body>{banner}{body}</body></html>",
         csp = csp_meta(trust),
         vars = css_variables(dark),
+        danger = css_hex_color(if dark {
+            crate::ui::tokens::DARK.danger
+        } else {
+            crate::ui::tokens::LIGHT.danger
+        }),
         style = STYLE,
         banner = trust_banner(doc, trust),
     )
 }
 
-/// The original Light and Dark reading palettes, independent of UI toolkit.
 fn css_variables(dark: bool) -> &'static str {
     if dark {
         r#":root {
@@ -114,6 +119,16 @@ fn css_variables(dark: bool) -> &'static str {
   --body-line-height: 1.6;
 }"#
     }
+}
+
+fn css_hex_color(color: Color) -> String {
+    let (red, green, blue, _) = color.to_f64();
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        (red * 255.0).round() as u8,
+        (green * 255.0).round() as u8,
+        (blue * 255.0).round() as u8
+    )
 }
 
 /// The Content-Security-Policy for this trust level.
@@ -485,7 +500,7 @@ img, svg { max-width: 100%; }
 .mt-render { margin: 1.4em 0; text-align: center; }
 .mt-error { border: 1px solid #d9534f; border-left-width: 4px; border-radius: 8px;
             padding: 10px 14px; margin: 1.2em 0; }
-.mt-error-title { font-weight: 600; color: #d9534f; }
+.mt-error-title { font-weight: 600; color: var(--danger-color); }
 .mt-error-msg   { white-space: pre-wrap; margin: .4em 0; font-size: .92em; }
 .mt-mdx { border: 1px dashed var(--border-color, rgba(127,127,127,.6)); border-radius: 8px;
           padding: 8px 12px; margin: 1.2em 0; }
@@ -499,17 +514,65 @@ img, svg { max-width: 100%; }
 mod tests {
     use super::*;
     use mt_core::DocType;
+    use nsh_core::{Color, prelude::*};
 
     fn registry() -> RendererRegistry {
         RendererRegistry::with_defaults()
     }
 
-    /// The `<body>` content only. The stylesheet names every CSS class, so a
-    /// whole-document `contains` check would match markup that never rendered.
     fn body(html: &str) -> &str {
         let start = html.find("<body>").expect("body") + "<body>".len();
         let end = html.rfind("</body>").expect("/body");
         &html[start..end]
+    }
+
+    fn css_color(html: &str, name: &str) -> Color {
+        let prefix = format!("{name}: ");
+        let value = html
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .expect("CSS color variable");
+        css_hex(value)
+    }
+
+    fn css_rule_color(html: &str, selector: &str, property: &str) -> Color {
+        let selector = format!("{selector} {{");
+        let rule = html
+            .split_once(&selector)
+            .expect("CSS rule")
+            .1
+            .split_once('}')
+            .expect("CSS rule end")
+            .0;
+        let property = format!("{property}: ");
+        let value = rule
+            .split(';')
+            .find_map(|declaration| declaration.trim().strip_prefix(&property))
+            .expect("CSS rule color");
+        value
+            .strip_prefix("var(")
+            .and_then(|variable| variable.strip_suffix(')'))
+            .map(|variable| css_color(html, variable))
+            .unwrap_or_else(|| css_hex(value))
+    }
+
+    fn css_hex(value: &str) -> Color {
+        let value = value
+            .trim()
+            .trim_end_matches(';')
+            .strip_prefix('#')
+            .expect("hex color");
+        let [red, green, blue] = std::array::from_fn(|index| {
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).expect("hex channel")
+        });
+        Color::rgba(red, green, blue, 0xff)
+    }
+
+    fn contrast_ratio(foreground: Color, background: Color) -> f32 {
+        let background = Hsla::from(background);
+        background
+            .blend(Hsla::from(foreground))
+            .contrast_ratio(background)
     }
 
     fn md(src: &str) -> Document {
@@ -692,6 +755,25 @@ mod tests {
             assert!(html.contains("var(--text-color"));
             assert!(html.contains("default-src 'none'"));
             assert!(html.contains("script-src 'none'"));
+        }
+    }
+
+    #[test]
+    fn failed_diagram_titles_use_theme_danger_with_aa_contrast() {
+        let doc = md("```mermaid\nnot a diagram\n```\n");
+        for dark in [false, true] {
+            let html = build_html(&doc, &registry(), Trust::Restricted, dark);
+            assert!(body(&html).contains("class=\"mt-error-title\""));
+            let danger = css_rule_color(&html, ".mt-error-title", "color");
+            let background = css_color(&html, "--bg-color");
+            let contrast = contrast_ratio(danger, background);
+            assert!(contrast >= 4.5, "theme danger contrast was {contrast:.2}:1");
+            let token = if dark {
+                crate::ui::tokens::DARK.danger
+            } else {
+                crate::ui::tokens::LIGHT.danger
+            };
+            assert_eq!(danger, token);
         }
     }
 

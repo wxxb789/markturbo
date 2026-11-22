@@ -96,6 +96,7 @@ struct Session {
     /// Whether the docked position is showing that finding rather than the
     /// question to answer.
     showing_finding: bool,
+    showing_finding_before_revision: Option<bool>,
     /// Whether the user expanded `All fields`.
     all_fields: bool,
     /// Whether the user cancelled this run's wait.
@@ -135,6 +136,23 @@ fn focus_soon(reference: ElementRef) {
 
 fn session() -> Signal<Session> {
     global::<Session>()
+}
+
+fn prepare_revision(state: &AppState, session: Signal<Session>) {
+    session.update(|session| {
+        session.showing_finding_before_revision = Some(session.showing_finding);
+        session.showing_finding = false;
+    });
+    state.start_revision();
+}
+
+pub(crate) fn cancel_revision(state: &AppState) {
+    session().update(|session| {
+        if let Some(showing_finding) = session.showing_finding_before_revision.take() {
+            session.showing_finding = showing_finding;
+        }
+    });
+    state.cancel_revision();
 }
 
 /// Every model item's heat: the goal, the questions (in the state's order)
@@ -693,7 +711,11 @@ fn docked(
                 view()
                     .flex_row()
                     .items_center()
-                    .child(prims::rest(finding_kind(&finding, language)))
+                    .child(
+                        view()
+                            .test_id("review-finding-kind")
+                            .child(prims::rest(finding_kind(&finding, language))),
+                    )
                     .child(
                         view()
                             .child(prims::faint(match lines {
@@ -1137,7 +1159,6 @@ fn footer(
                 .w_full()
                 .flex_row()
                 .items_center()
-                .justify_end()
                 .gap(px(SPACE_2))
                 .child(if stale {
                     view().into_element()
@@ -1155,7 +1176,12 @@ fn footer(
                     prims::primary_action(
                         "review-prepare",
                         s(S::PrepareRevision, language),
-                        move || prepare_state.start_revision(),
+                        move || {
+                            prepare_session.update(|session| {
+                                session.showing_finding_before_revision = None;
+                            });
+                            prepare_state.start_revision();
+                        },
                     )
                     .element_ref(&reference)
                     .into_element()
@@ -1163,10 +1189,7 @@ fn footer(
                     prims::quiet_action(
                         "review-prepare",
                         s(S::PrepareRevision, language),
-                        move || {
-                            prepare_session.update(|session| session.showing_finding = false);
-                            prepare_state.start_revision();
-                        },
+                        move || prepare_revision(&prepare_state, prepare_session),
                     )
                     .into_element()
                 })
@@ -1184,6 +1207,7 @@ fn footer(
 /// The 2px edge and haze an inferred finding shows in the column.
 fn haze_swatch() -> impl IntoElement {
     view()
+        .test_id("review-legend-inferred-swatch")
         .w(px(26.0))
         .h(px(16.0))
         .border_l(px(2.0))
@@ -1541,12 +1565,18 @@ fn voice(
     language: Language,
     drained: Option<Color>,
 ) -> impl IntoElement {
+    #[cfg(test)]
+    let optics = global::<Option<tokens::CjkOptics>>()
+        .get_untracked()
+        .unwrap_or(tokens::CJK_OPTICS);
+    #[cfg(not(test))]
+    let optics = tokens::CJK_OPTICS;
     let palette = tokens::palette();
     let (ink, ember, hot) = match drained {
         Some(afterimage) => (afterimage, afterimage, afterimage),
         None => (palette.ink, palette.ember, palette.hot),
     };
-    prims::script_text(content, TYPE_MODEL, WEIGHT_MODEL, tokens::CJK_OPTICS)
+    prims::script_text(content, TYPE_MODEL, WEIGHT_MODEL, optics)
         .font_family(tokens::FONT_MODEL)
         .font_weight(WEIGHT_MODEL)
         .text_size(px(TYPE_MODEL))
@@ -1855,17 +1885,46 @@ mod tests {
     }
 
     #[test]
-    fn review_voice_uses_the_cjk_script_text_entry() {
-        let source = include_str!("review.rs");
-        let voice = source
-            .split("fn voice(")
-            .nth(1)
-            .expect("the production Review voice")
-            .split("fn heat_line(")
-            .next()
-            .expect("the Review voice body");
-        assert!(voice.contains("prims::script_text"), "{voice}");
-        assert!(voice.contains("tokens::CJK_OPTICS"), "{voice}");
+    fn review_voice_emits_model_styles_for_latin_and_cjk() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<ReviewVoiceProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the Review voice probe");
+        app.wait_for("text:Review voice: Latin, 中文.")
+            .expect("the mixed-script model voice");
+
+        for (selector, expected) in [
+            (
+                "text:Latin",
+                (
+                    TYPE_MODEL,
+                    TYPE_MODEL_LINE,
+                    WEIGHT_MODEL.0,
+                    tokens::FONT_MODEL,
+                ),
+            ),
+            (
+                "text:中文",
+                (
+                    TYPE_MODEL + 1.0,
+                    TYPE_MODEL_LINE,
+                    WEIGHT_MODEL.0 + 100,
+                    tokens::FONT_UI,
+                ),
+            ),
+        ] {
+            let style = app.screen().span_style(selector).expect(selector);
+            assert_eq!(
+                (
+                    style.font_size.0,
+                    style.line_height.0,
+                    style.font_weight,
+                    style.font_family.unwrap().name().to_string(),
+                ),
+                (expected.0, expected.1, expected.2, expected.3.to_owned(),),
+                "{selector}"
+            );
+        }
     }
 
     #[test]
@@ -1885,23 +1944,24 @@ mod tests {
         app.wait_for("id:review-findings-step")
             .expect("the findings stepper");
 
+        let intent_label = s(S::Understood, Language::English);
+        let legend_label = s(S::WordsSwatch, Language::English);
+        let question_priority = priority_label(ClarificationPriority::Critical, Language::English);
+        let action = VisibleContent::Control("review-prepare");
         let initial_sections_fit =
-            sections_fit(&app, &["review-intent", "review-legend", "review-actions"]);
+            section_gaps_fit(&app, &["review-intent", "review-legend", "review-actions"]);
         let initial_nodes = app.screen().layout_nodes();
-        let position = |id: &str| {
-            initial_nodes
-                .iter()
-                .find(|node| node.test_id.as_deref() == Some(id))
-                .map(|node| (node.bounds.origin.x.0, node.bounds.origin.y.0))
-        };
         let legend_wraps_left = match (
-            position("review-legend"),
-            position("review-legend-stated"),
-            position("review-legend-inferred"),
+            text_position(&app, intent_label),
+            text_position(&app, legend_label),
+            content_position(
+                &app,
+                VisibleContent::Control("review-legend-inferred-swatch"),
+            ),
         ) {
-            (Some((legend_x, _)), Some((stated_x, stated_y)), Some((inferred_x, inferred_y))) => {
-                (stated_x - legend_x).abs() <= 0.5
-                    && (inferred_x - legend_x).abs() <= 0.5
+            (Some((intent_x, _)), Some((stated_x, stated_y)), Some((inferred_x, inferred_y))) => {
+                (stated_x - intent_x).abs() <= 0.5
+                    && (inferred_x - intent_x).abs() <= 0.5
                     && inferred_y - stated_y > 0.5
             }
             _ => false,
@@ -1912,32 +1972,88 @@ mod tests {
                 Some("review-docked" | "review-questions")
             )
         });
-        app.press("id:review-findings-step")
-            .expect("show the selected finding");
-        app.settle();
-        let nodes = app.screen().layout_nodes();
-        let stepped_sections_fit = sections_fit(
+        let initial_content_lefts = content_lefts(
+            &app,
+            &[
+                VisibleContent::Text(intent_label),
+                VisibleContent::Text(legend_label),
+                action,
+            ],
+        );
+
+        app.press("id:layout-show-questions")
+            .expect("show a question section");
+        app.wait_for("id:review-questions")
+            .expect("the questions section");
+        let question_content_lefts = content_lefts(
+            &app,
+            &[
+                VisibleContent::Text(intent_label),
+                VisibleContent::Text(question_priority),
+                VisibleContent::Text(legend_label),
+                action,
+            ],
+        );
+        let question_sections_fit = section_gaps_fit(
             &app,
             &[
                 "review-intent",
-                "review-docked",
+                "review-questions",
                 "review-legend",
                 "review-actions",
             ],
         );
+
+        app.press("id:review-findings-step")
+            .expect("show the selected finding");
+        app.settle();
+        let stepped_sections_fit = section_gaps_fit(
+            &app,
+            &[
+                "review-intent",
+                "review-docked",
+                "review-questions",
+                "review-legend",
+                "review-actions",
+            ],
+        );
+        let stepped_content_lefts = content_lefts(
+            &app,
+            &[
+                VisibleContent::Text(intent_label),
+                VisibleContent::Control("review-finding-kind"),
+                VisibleContent::Text(question_priority),
+                VisibleContent::Text(legend_label),
+                action,
+            ],
+        );
+        let nodes = app.screen().layout_nodes();
         let stepped_sections_present = nodes
             .iter()
             .any(|node| node.test_id.as_deref() == Some("review-docked"))
-            && !nodes
+            && nodes
                 .iter()
                 .any(|node| node.test_id.as_deref() == Some("review-questions"));
+        assert!(
+            content_lefts_align(&initial_content_lefts),
+            "intent, legend words, and Prepare left edges: {initial_content_lefts:?}"
+        );
+        assert!(
+            content_lefts_align(&question_content_lefts),
+            "intent, question, legend words, and Prepare left edges: {question_content_lefts:?}"
+        );
+        assert!(
+            content_lefts_align(&stepped_content_lefts),
+            "intent, finding kind, question, legend words, and Prepare left edges: {stepped_content_lefts:?}"
+        );
         assert!(
             initial_sections_fit
                 && legend_wraps_left
                 && empty_sections_omitted
+                && question_sections_fit
                 && stepped_sections_fit
                 && stepped_sections_present,
-            "visible sections align within {SPACE_XL}px; narrow legend wraps at the left edge"
+            "section gaps are at most {SPACE_XL}px; the legend wraps at its visible left edge"
         );
     }
 
@@ -1957,6 +2073,25 @@ mod tests {
             vertical_gap(
                 section_extent(&app, "review-intent"),
                 text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-questions")
+            .expect("show a question section");
+        app.wait_for("id:review-questions")
+            .expect("question section");
+        gaps.push((
+            "intent to question",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                section_extent(&app, "review-questions"),
+            ),
+        ));
+        gaps.push((
+            "question to legend",
+            vertical_gap(
+                section_extent(&app, "review-questions"),
+                section_extent(&app, "review-legend"),
             ),
         ));
 
@@ -2170,6 +2305,14 @@ mod tests {
         review
     }
 
+    fn with_question(mut review: ReviewView) -> ReviewView {
+        review.questions_detail.push(question(
+            ClarificationPriority::Critical,
+            "Clarify the expected outcome",
+        ));
+        review
+    }
+
     fn review_spacing_control(
         id: &'static str,
         state: &AppState,
@@ -2185,15 +2328,52 @@ mod tests {
         })
     }
 
+    fn review_state_control(
+        id: &'static str,
+        state: &AppState,
+        review: ReviewView,
+    ) -> impl IntoElement {
+        let state = state.clone();
+        view()
+            .test_id(id)
+            .w(px(8.0))
+            .h(px(8.0))
+            .on_press(move || state.review_view.set(Some(review.clone())))
+    }
+
+    #[component]
+    fn ReviewVoiceProbe() -> impl IntoElement {
+        global::<Option<tokens::CjkOptics>>()
+            .set(Some(tokens::CJK_OPTICS_CAPTURE_VARIANTS[2].optics));
+        let state = AppState::new();
+        state.review_view.set(Some(ReviewView {
+            sections: vec![crate::state::ReviewSection {
+                title: "Intent".to_owned(),
+                items: vec!["Review voice: Latin, 中文.".to_owned()],
+            }],
+            ..ReviewView::default()
+        }));
+        view()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(field(state, Language::English))
+    }
+
     #[component]
     fn ReviewLayoutProbe() -> impl IntoElement {
         let state = AppState::new();
         state.review_view.set(Some(layout_review()));
+        let question_state = with_question(layout_review());
         view()
             .test_id("review-layout-probe")
             .flex_col()
             .w(px(220.0))
             .h(px(720.0))
+            .child(review_state_control(
+                "layout-show-questions",
+                &state,
+                question_state,
+            ))
             .child(field(state, Language::English))
     }
 
@@ -2237,6 +2417,11 @@ mod tests {
                         false,
                         false,
                         true,
+                    ))
+                    .child(review_state_control(
+                        "spacing-questions",
+                        &state,
+                        with_question(spacing_review(false, false, false)),
                     )),
             )
             .child(field(state, Language::English))
@@ -2293,7 +2478,13 @@ mod tests {
             .child(failure_block(state, Language::English, &cancelled))
     }
 
-    fn sections_fit(app: &Headless, ids: &[&str]) -> bool {
+    #[derive(Clone, Copy)]
+    enum VisibleContent<'a> {
+        Text(&'a str),
+        Control(&'a str),
+    }
+
+    fn section_gaps_fit(app: &Headless, ids: &[&str]) -> bool {
         let nodes = app.screen().layout_nodes();
         let mut sections = Vec::new();
         for id in ids {
@@ -2304,13 +2495,47 @@ mod tests {
             else {
                 return false;
             };
-            sections.push((bounds.origin.x.0, bounds.origin.y.0, bounds.size.height.0));
+            sections.push((bounds.origin.y.0, bounds.size.height.0));
         }
-        let left = sections[0].0;
-        sections.iter().all(|(x, _, _)| (x - left).abs() <= 0.5)
-            && sections
-                .windows(2)
-                .all(|pair| pair[1].1 - pair[0].1 - pair[0].2 <= SPACE_XL)
+        sections
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 - pair[0].1 <= SPACE_XL)
+    }
+
+    fn content_lefts(app: &Headless, contents: &[VisibleContent<'_>]) -> Vec<Option<f32>> {
+        contents
+            .iter()
+            .map(|content| content_position(app, *content).map(|position| position.0))
+            .collect()
+    }
+
+    fn content_lefts_align(positions: &[Option<f32>]) -> bool {
+        let Some(Some(left)) = positions.first() else {
+            return false;
+        };
+        positions.len() >= 2
+            && positions
+                .iter()
+                .all(|x| x.as_ref().is_some_and(|x| (*x - *left).abs() <= 0.5))
+    }
+
+    fn content_position(app: &Headless, content: VisibleContent<'_>) -> Option<(f32, f32)> {
+        let nodes = app.screen().layout_nodes();
+        let node = match content {
+            VisibleContent::Text(content) => nodes.iter().find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == content)
+            }),
+            VisibleContent::Control(id) => nodes
+                .iter()
+                .find(|node| node.test_id.as_deref() == Some(id)),
+        }?;
+        Some((node.bounds.origin.x.0, node.bounds.origin.y.0))
+    }
+
+    fn text_position(app: &Headless, content: &str) -> Option<(f32, f32)> {
+        content_position(app, VisibleContent::Text(content))
     }
 
     fn section_extent(app: &Headless, id: &str) -> (f32, f32) {
