@@ -22,6 +22,7 @@
 //! the emitters in [`prims`]); everything else is ambient ink. Local actions
 //! never glow.
 
+pub mod cjk_optics;
 pub mod consent;
 pub mod context;
 pub mod document;

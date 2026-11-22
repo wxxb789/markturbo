@@ -299,6 +299,7 @@ struct SourceRow {
     path: PathBuf,
     path_label: SharedString,
     detail: SharedString,
+    count: Option<SharedString>,
     includable: bool,
     /// The effective text that would leave with this source, cut to the
     /// preview the old panel showed (400 characters and an ellipsis); `None`
@@ -318,17 +319,25 @@ impl SourceRow {
             .and_then(|content| resolved.contents.get(content))
             .filter(|content| !content.text.trim().is_empty());
         let includable = content.is_some();
+        let scope = scope_line(resolved, source, language);
+        let detail = SharedString::from(if includable {
+            format!("{scope} \u{b7} ")
+        } else {
+            format!(
+                "{scope} \u{b7} {}",
+                bytes_line(resolved, source, false, language)
+            )
+        });
+        let count =
+            includable.then(|| SharedString::from(bytes_line(resolved, source, true, language)));
         Self {
             key: SharedString::from(format!("{index}:{}", source.path.display())),
             index,
             number: index + 1,
             path: source.path.clone(),
             path_label: SharedString::from(display_path(resolved, source)),
-            detail: SharedString::from(format!(
-                "{} \u{b7} {}",
-                scope_line(resolved, source, language),
-                bytes_line(resolved, source, includable, language),
-            )),
+            detail,
+            count,
             includable,
             preview: content.map(|content| SharedString::from(preview_text(&content.text))),
         }
@@ -405,9 +414,16 @@ fn source_block(
                 .child(include_toggle(toggle_state, language, row)),
         )
         .child(
-            view()
-                .pl(px(ORDINAL_W + SPACE_2))
-                .child(prims::faint(move || detail_row.get().detail.clone())),
+            view().pl(px(ORDINAL_W + SPACE_2)).child(
+                text(move || detail_row.get().detail)
+                    .font_family(tokens::FONT_UI)
+                    .text_size(px(tokens::TYPE_UI))
+                    .line_height(px(tokens::TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink_caption)
+                    .child(tokens::mono_count(text(move || {
+                        detail_row.get().count.clone().unwrap_or_default()
+                    }))),
+            ),
         )
         .child(when(
             move || expanded.get().as_deref() == Some(row.get_untracked().path.as_path()),
@@ -493,7 +509,6 @@ fn ordinal(row: ReadSignal<SourceRow>, light: Outbound) -> impl IntoElement {
             .font_family(FONT_SOURCE)
             .text_size(px(TYPE_SOURCE))
             .line_height(px(TYPE_SOURCE_LINE))
-            .tabular_nums()
             .bind_color(&ink),
     )
 }
@@ -1437,6 +1452,26 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("Applies under docs/"), "{shown}");
+        assert_eq!(
+            app.screen()
+                .span_style("text:12 B")
+                .expect("the nested source's byte count")
+                .font_family
+                .expect("byte count font")
+                .name()
+                .as_ref(),
+            tokens::FONT_SOURCE
+        );
+        assert_eq!(
+            app.screen()
+                .span_style("text:Applies under docs/ · 12 B")
+                .expect("the nested source's detail line")
+                .font_family
+                .expect("detail line font")
+                .name()
+                .as_ref(),
+            tokens::FONT_UI
+        );
         assert!(shown.contains("Include in review"), "{shown}");
         assert!(shown.contains("Not applied by Codex"), "{shown}");
         assert!(shown.contains("CLAUDE.md"), "{shown}");

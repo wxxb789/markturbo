@@ -42,7 +42,8 @@ use nsh_core::{
 use crate::{
     i18n::{self, Key},
     state::{
-        AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest, Tab,
+        AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest,
+        StatusMessage, Tab,
     },
     ui::{
         motion::{self, reduced_motion},
@@ -478,10 +479,9 @@ fn compare_panel(
                                 difference_text(index + 1, total, language)
                             })
                     })
-                    .font_family(tokens::FONT_UI)
+                    .font_family(tokens::FONT_SOURCE)
                     .text_size(px(tokens::TYPE_UI))
                     .line_height(px(tokens::TYPE_UI_LINE))
-                    .tabular_nums()
                     .text_color(move || tokens::palette().ink_rest),
                 )
                 .child(view().flex_1())
@@ -1218,7 +1218,7 @@ fn card_action(
 
 fn clear_status_if_current(state: &AppState, generation: u64) {
     if state.status_generation.get_untracked() == generation {
-        state.status.set(SharedString::default());
+        state.status.set(StatusMessage::default());
     }
 }
 
@@ -1242,10 +1242,20 @@ impl StatusPresence {
 
 pub(crate) fn status_line(
     state: AppState,
-    language: Language,
+    _language: Language,
     presence: StatusPresence,
 ) -> impl IntoElement {
-    let _ = language;
+    status_line_at(state, presence, crate::state::StatusSurface::Editor)
+}
+
+pub(crate) fn status_line_at(
+    state: AppState,
+    presence: StatusPresence,
+    surface: crate::state::StatusSurface,
+) -> impl IntoElement {
+    let error = state.status_error;
+    let message = state.status;
+    let owner = state.status_surface;
     view().test_id("status").w_full().pt(px(SPACE_3)).child(
         view()
             .w_full()
@@ -1253,12 +1263,31 @@ pub(crate) fn status_line(
             .bind_opacity(&presence.opacity)
             .bind_translate_y(&presence.rise)
             .child(
-                text(move || state.status.get())
-                    .font_family(tokens::FONT_UI)
-                    .text_size(px(tokens::TYPE_UI))
-                    .line_height(px(tokens::TYPE_UI_LINE))
-                    .number_of_lines(1)
-                    .text_color(move || tokens::palette().ink_rest),
+                text(move || {
+                    if owner.get() == surface {
+                        message.get().text
+                    } else {
+                        SharedString::default()
+                    }
+                })
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .number_of_lines(1)
+                .text_color(move || {
+                    if error.get() {
+                        tokens::palette().danger
+                    } else {
+                        tokens::palette().ink_rest
+                    }
+                })
+                .child(tokens::mono_count(text(move || {
+                    if owner.get() == surface {
+                        message.get().count.clone().unwrap_or_default()
+                    } else {
+                        SharedString::default()
+                    }
+                }))),
             ),
     )
 }
@@ -1514,7 +1543,7 @@ mod tests {
                 clear_status_if_current(&clear_state, second);
             })
             .child(prims::ink("Trigger status clear"))
-            .child(text(move || state.status.get()))
+            .child(text(move || state.status.get().text))
     }
 
     fn status_probe_content(samples: mpsc::Sender<f32>) -> impl IntoElement {

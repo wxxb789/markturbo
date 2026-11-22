@@ -43,7 +43,7 @@ use crate::{
         prims,
         tokens::{
             self, FOCUS_RING, FOCUS_RING_OFFSET, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
-            SPACE_6, TYPE_MODEL, TYPE_MODEL_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MODEL, with_alpha,
+            SPACE_XL, TYPE_MODEL, TYPE_MODEL_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MODEL, with_alpha,
         },
     },
 };
@@ -64,9 +64,9 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
     view()
         .test_id("review-field")
         .w_full()
-        .h(move || px(field_height()))
+        .flex_1()
+        .min_h(px(0.0))
         .flex_col()
-        .flex_shrink_0()
         .pt(px(SPACE_5))
         .child(
             view()
@@ -101,6 +101,7 @@ struct Session {
     /// Whether the docked position is showing that finding rather than the
     /// question to answer.
     showing_finding: bool,
+    showing_finding_before_revision: Option<bool>,
     /// Whether the user expanded `All fields`.
     all_fields: bool,
     /// Whether the user cancelled this run's wait.
@@ -140,6 +141,23 @@ fn focus_soon(reference: ElementRef) {
 
 fn session() -> Signal<Session> {
     global::<Session>()
+}
+
+fn prepare_revision(state: &AppState, session: Signal<Session>) {
+    session.update(|session| {
+        session.showing_finding_before_revision = Some(session.showing_finding);
+        session.showing_finding = false;
+    });
+    state.start_revision();
+}
+
+pub(crate) fn cancel_revision(state: &AppState) {
+    session().update(|session| {
+        if let Some(showing_finding) = session.showing_finding_before_revision.take() {
+            session.showing_finding = showing_finding;
+        }
+    });
+    state.cancel_revision();
 }
 
 /// Every model item's heat: the goal, the questions (in the state's order)
@@ -382,7 +400,7 @@ fn body(state: AppState, language: Language, session: Signal<Session>) -> impl I
             }
             if state.review_consent.get().is_some() {
                 return view()
-                    .pt(px(SPACE_6))
+                    .pt(px(SPACE_XL))
                     .child(prims::rest(i18n::t(language, Key::ReviewWaiting)))
                     .into_element();
             }
@@ -392,7 +410,7 @@ fn body(state: AppState, language: Language, session: Signal<Session>) -> impl I
             if session.get().cancelled {
                 return cancelled(state.clone(), language).into_element();
             }
-            view().into_element()
+            empty(language).into_element()
         }))
 }
 
@@ -404,45 +422,46 @@ fn result(
     session: Signal<Session>,
     review: ReviewView,
 ) -> AnyElement {
-    let empty = review.sections.is_empty()
+    let content_empty = review.sections.is_empty()
         && review.findings_anchored.is_empty()
         && review.questions_detail.is_empty();
-    if empty && (review.failure.is_some() || !review.status.is_empty()) {
-        // A result that carries no review at all: say why, calmly, and offer
-        // the one way forward. Nothing here is a simulated result.
-        return failure_block(state, language, &review).into_element();
+    if content_empty {
+        if review.failure.is_some() || !review.status.is_empty() {
+            return failure_block(state, language, &review).into_element();
+        }
+        return empty(language).into_element();
     }
     let emitters = emitters().get();
     let order = priority_order(&review.questions_detail);
     let stale = review.stale;
-    let mut column = view().flex_col().flex_1().min_h(px(0.0)).w_full();
+    let mut column = view()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
+        .gap(px(SPACE_XL));
     if stale {
         column = column.child(stale_banner(state.clone(), language));
     }
     if review.partial {
         column = column.child(partial_banner(language));
     }
+    column = column.child(intent(language, session, &review, &emitters, stale));
+    if let Some(docked) = docked(state.clone(), language, session, &review, &emitters, stale) {
+        column = column.child(docked);
+    }
+    if let Some(questions) = questions(
+        state.clone(),
+        language,
+        session,
+        &review,
+        &order,
+        &emitters,
+        stale,
+    ) {
+        column = column.child(questions);
+    }
     column
-        .child(intent(language, session, &review, &emitters, stale))
-        .child(spacer())
-        .child(docked(
-            state.clone(),
-            language,
-            session,
-            &review,
-            &emitters,
-            stale,
-        ))
-        .child(questions(
-            state.clone(),
-            language,
-            session,
-            &review,
-            &order,
-            &emitters,
-            stale,
-        ))
-        .child(spacer())
         .child(footer(state, language, session, &review))
         .into_element()
 }
@@ -469,13 +488,24 @@ fn failure_block(state: AppState, language: Language, review: &ReviewView) -> im
             s(S::TryAgain, language),
         ),
     };
+    let headline = match review.failure {
+        Some(ReviewFailure::Timeout | ReviewFailure::Malformed | ReviewFailure::Other) => {
+            text(headline)
+                .font_family(tokens::FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(move || tokens::palette().danger)
+                .into_element()
+        }
+        _ => prims::ink(headline).into_element(),
+    };
     let mut block = view()
         .test_id("review-failure")
-        .pt(px(SPACE_6))
+        .pt(px(SPACE_XL))
         .w_full()
         .flex_col()
         .gap(px(SPACE_3))
-        .child(prims::ink(headline));
+        .child(headline);
     if let Some(detail) = detail {
         block = block.child(prims::faint(detail));
     }
@@ -484,12 +514,6 @@ fn failure_block(state: AppState, language: Language, review: &ReviewView) -> im
     }))
 }
 
-/// A flex spacer that collapses when the content needs the room.
-fn spacer() -> impl IntoElement {
-    view().flex_1().min_h(px(SPACE_2))
-}
-
-/// 'Text changed since this review' with `Review again`.
 fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
     let again = state.clone();
     // 'Review again' takes the focus when the result goes stale: it is the
@@ -507,7 +531,6 @@ fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
         .w_full()
         .flex_col()
         .gap(px(SPACE_2))
-        .pt(px(SPACE_3))
         .child(
             view()
                 .flex_row()
@@ -523,15 +546,12 @@ fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
         )
 }
 
-/// 'Partial review': the reviewed package omitted a normally in-scope
-/// supporting file, so the result never presents itself as covering it all.
 fn partial_banner(language: Language) -> impl IntoElement {
     view()
         .test_id("review-partial")
         .w_full()
         .flex_col()
         .gap(px(SPACE_1))
-        .pt(px(SPACE_3))
         .child(prims::ink(i18n::t(language, Key::ReviewPartial)))
         .child(prims::faint(s(S::PartialHint, language)))
 }
@@ -569,8 +589,6 @@ fn reviewed_tab(state: &AppState, review: &ReviewView) -> Option<Tab> {
         .cloned()
 }
 
-/// The understood intent: the goal in the model's voice, then what the model
-/// understood beyond it behind `All fields`.
 fn intent(
     language: Language,
     session: Signal<Session>,
@@ -592,10 +610,15 @@ fn intent(
         .collect();
     let toggle = session;
     let mut block = view()
+        .test_id("review-intent")
         .w_full()
         .flex_col()
         .gap(px(SPACE_2))
-        .pt(px(SPACE_4))
+        .pt(px(if stale || review.partial {
+            0.0
+        } else {
+            SPACE_4
+        }))
         .child(prims::rest(s(S::Understood, language)))
         .child(voice(goal, emitters.goal, language, drained(stale)));
     if !sections.is_empty() {
@@ -660,18 +683,16 @@ fn docked(
     review: &ReviewView,
     emitters: &Emitters,
     stale: bool,
-) -> AnyElement {
+) -> Option<AnyElement> {
     let selected = session.get();
-    let Some((index, finding)) = selected.focus.and_then(|index| {
+    let (index, finding) = selected.focus.and_then(|index| {
         review
             .findings_anchored
             .get(index)
             .map(|finding| (index, finding.clone()))
-    }) else {
-        return view().into_element();
-    };
+    })?;
     if !selected.showing_finding {
-        return view().into_element();
+        return None;
     }
     let heat = emitters
         .findings
@@ -695,7 +716,11 @@ fn docked(
                 view()
                     .flex_row()
                     .items_center()
-                    .child(prims::rest(finding_kind(&finding, language)))
+                    .child(
+                        view()
+                            .test_id("review-finding-kind")
+                            .child(prims::rest(finding_kind(&finding, language))),
+                    )
                     .child(
                         view()
                             .child(prims::faint(match lines {
@@ -710,7 +735,7 @@ fn docked(
     if !stale {
         block = block.child(prims::bloom(heat, 6.0));
     }
-    block.into_element()
+    Some(block.into_element())
 }
 
 /// The questions: the one to answer HOT with its `Why it matters:` and its
@@ -723,10 +748,17 @@ fn questions(
     order: &[usize],
     emitters: &Emitters,
     stale: bool,
-) -> impl IntoElement {
+) -> Option<AnyElement> {
+    if review.questions_detail.is_empty() {
+        return None;
+    }
     let session_now = session.get();
     let current = current_question(&session_now, order);
-    let mut block = view().w_full().flex_col().gap(px(SPACE_3));
+    let mut block = view()
+        .test_id("review-questions")
+        .w_full()
+        .flex_col()
+        .gap(px(SPACE_3));
     if let Some(index) = current
         && let Some(question) = review.questions_detail.get(index).cloned()
     {
@@ -740,54 +772,48 @@ fn questions(
         .copied()
         .filter(|index| Some(*index) != current)
         .collect();
-    block = block.child(
-        view()
-            .flex_col()
-            .gap(px(SPACE_2))
-            .children(others.into_iter().map(|index| {
-                let question = review.questions_detail.get(index);
-                let heat = question_heat(emitters, order, index);
-                let answered = session_now.answered.contains(&index);
-                let skipped = session_now.skipped.contains(&index);
-                let text = question
-                    .map(|question| question.question.clone())
-                    .unwrap_or_default();
-                let priority = question
-                    .map(|question| priority_label(question.priority, language))
-                    .unwrap_or_default();
-                let row = cooled_row(&text, priority, heat, language, stale, answered, skipped);
-                // A cooled question is not dead: pressing it (or reaching it
-                // with Tab) makes it the current one again, with its answer
-                // as it was left, so a typo is fixable without re-running
-                // the whole review. While the result is stale there is
-                // nothing to edit, and the line stays plain text.
-                if stale {
-                    return view()
+    if !others.is_empty() {
+        block = block.child(
+            view()
+                .flex_col()
+                .gap(px(SPACE_2))
+                .children(others.into_iter().map(|index| {
+                    let question = review.questions_detail.get(index);
+                    let heat = question_heat(emitters, order, index);
+                    let answered = session_now.answered.contains(&index);
+                    let skipped = session_now.skipped.contains(&index);
+                    let text = question
+                        .map(|question| question.question.clone())
+                        .unwrap_or_default();
+                    let priority = question
+                        .map(|question| priority_label(question.priority, language))
+                        .unwrap_or_default();
+                    let row = view()
                         .test_id("review-question-line")
                         .w_full()
-                        .child(row)
-                        .into_element();
-                }
-                let reopen = {
-                    let order = order.to_vec();
-                    move || reopen_question(session, &order, index)
-                };
-                // A pressable wrapper would add an unnamed UIA button.
-                prims::press_feedback(
-                    view()
-                        .test_id("review-question-line")
-                        .role(AccessibilityRole::Button)
-                        .optional_label(Some(SharedString::from(text.clone())))
-                        .w_full()
-                        .cursor_pointer()
-                        .focus_visible(|style| style.text_color(|| tokens::palette().ink))
-                        .on_press(reopen),
-                )
-                .child(row)
-                .into_element()
-            })),
-    );
-    block
+                        .child(cooled_row(
+                            &text, priority, heat, language, stale, answered, skipped,
+                        ));
+                    if stale {
+                        return row.into_element();
+                    }
+                    let reopen = {
+                        let order = order.to_vec();
+                        move || reopen_question(session, &order, index)
+                    };
+                    // A pressable wrapper would add an unnamed UIA button.
+                    prims::press_feedback(
+                        row.role(AccessibilityRole::Button)
+                            .optional_label(Some(SharedString::from(text)))
+                            .cursor_pointer()
+                            .focus_visible(|style| style.text_color(|| tokens::palette().ink))
+                            .on_press(reopen),
+                    )
+                    .into_element()
+                })),
+        );
+    }
+    Some(block.into_element())
 }
 
 /// The question to answer: its priority, its words, `Why it matters:` and
@@ -988,42 +1014,48 @@ fn advance_question(session: Signal<Session>, order: &[usize], index: usize) {
 
 // ─── the footer ──────────────────────────────────────────────────────────
 
-/// The pointer's way through the findings: `J`/`K` fire only while no text
-/// input edits, and the answer field holds the focus by design, so each key is
-/// its own control — a press (or Tab and Enter) steps that way. `J` walks
-/// forward, `K` back, both clamped at the ends ([`step_finding`]).
 fn findings_stepper(
     state: &AppState,
     session: Signal<Session>,
     language: Language,
     findings: usize,
 ) -> AnyElement {
-    view()
+    let mut row = view()
+        .test_id("review-findings-stepper")
         .flex_row()
         .items_center()
         .gap(px(SPACE_2))
-        .child(prims::rest(step_hint(findings, language)))
-        .child(step_control(
-            "review-findings-step",
-            S::StepFindings,
-            "J",
-            1,
-            state,
-            session,
-            language,
-        ))
-        .child(prims::rest("/"))
-        .child(step_control(
-            "review-findings-back",
-            S::StepFindingsBack,
-            "K",
-            -1,
-            state,
-            session,
-            language,
-        ))
-        .child(prims::rest(s(S::StepThrough, language)))
-        .into_element()
+        .child(
+            view()
+                .test_id("review-findings-count")
+                .child(tokens::mono_count(prims::rest(step_hint(
+                    findings, language,
+                )))),
+        );
+    if findings > 0 {
+        row = row
+            .child(step_control(
+                "review-findings-step",
+                S::StepFindings,
+                "J",
+                1,
+                state,
+                session,
+                language,
+            ))
+            .child(prims::rest("/"))
+            .child(step_control(
+                "review-findings-back",
+                S::StepFindingsBack,
+                "K",
+                -1,
+                state,
+                session,
+                language,
+            ))
+            .child(prims::rest(s(S::StepThrough, language)));
+    }
+    row.into_element()
 }
 
 /// One key of [`findings_stepper`]: the `kbd` plate is the target, so the hint
@@ -1071,22 +1103,26 @@ fn footer(
     let prepare_session = session;
     let close_state = state.clone();
     view()
+        .test_id("review-footer")
         .w_full()
         .flex_col()
         .gap(px(SPACE_3))
-        .pb(px(SPACE_3))
+        .pb(px(SPACE_2))
         .child(
             view()
                 .test_id("review-legend")
+                .w_full()
                 .flex_col()
                 .gap(px(SPACE_2))
                 .child(
                     view()
                         .flex_row()
                         .items_center()
+                        .flex_wrap()
                         .gap(px(SPACE_4))
                         .child(
                             view()
+                                .test_id("review-legend-stated")
                                 .flex_row()
                                 .items_center()
                                 .gap(px(SPACE_2))
@@ -1105,6 +1141,7 @@ fn footer(
                         )
                         .child(
                             view()
+                                .test_id("review-legend-inferred")
                                 .flex_row()
                                 .items_center()
                                 .gap(px(SPACE_2))
@@ -1121,9 +1158,11 @@ fn footer(
         )
         .child(
             view()
+                .test_id("review-actions")
+                .w_full()
                 .flex_row()
                 .items_center()
-                .justify_between()
+                .gap(px(SPACE_2))
                 .child(if stale {
                     view().into_element()
                 } else if done {
@@ -1140,7 +1179,12 @@ fn footer(
                     prims::primary_action(
                         "review-prepare",
                         s(S::PrepareRevision, language),
-                        move || prepare_state.start_revision(),
+                        move || {
+                            prepare_session.update(|session| {
+                                session.showing_finding_before_revision = None;
+                            });
+                            prepare_state.start_revision();
+                        },
                     )
                     .element_ref(&reference)
                     .into_element()
@@ -1148,10 +1192,7 @@ fn footer(
                     prims::quiet_action(
                         "review-prepare",
                         s(S::PrepareRevision, language),
-                        move || {
-                            prepare_session.update(|session| session.showing_finding = false);
-                            prepare_state.start_revision();
-                        },
+                        move || prepare_revision(&prepare_state, prepare_session),
                     )
                     .into_element()
                 })
@@ -1169,6 +1210,7 @@ fn footer(
 /// The 2px edge and haze an inferred finding shows in the column.
 fn haze_swatch() -> impl IntoElement {
     view()
+        .test_id("review-legend-inferred-swatch")
         .w(px(26.0))
         .h(px(16.0))
         .border_l(px(2.0))
@@ -1186,7 +1228,7 @@ fn loading_line(state: AppState, language: Language) -> impl IntoElement {
     let cancel_state = state.clone();
     let host = reviewing_with(&state, language);
     view()
-        .pt(px(SPACE_6))
+        .pt(px(SPACE_XL))
         .w_full()
         .flex_col()
         .gap(px(SPACE_3))
@@ -1216,7 +1258,7 @@ fn cancelled(state: AppState, language: Language) -> impl IntoElement {
     let again = state.clone();
     view()
         .test_id("review-cancelled")
-        .pt(px(SPACE_6))
+        .pt(px(SPACE_XL))
         .w_full()
         .flex_col()
         .gap(px(SPACE_3))
@@ -1226,6 +1268,18 @@ fn cancelled(state: AppState, language: Language) -> impl IntoElement {
             s(S::ReviewAgain, language),
             move || again.start_review(),
         ))
+}
+
+fn empty(language: Language) -> impl IntoElement {
+    view()
+        .test_id("review-empty")
+        .w_full()
+        .pt(px(SPACE_XL))
+        .child(
+            view()
+                .test_id("review-empty-copy")
+                .child(prims::rest(s(S::Empty, language))),
+        )
 }
 
 /// Why Review cannot run, with the one way forward that can help.
@@ -1248,7 +1302,7 @@ fn unavailable(state: AppState, language: Language, reason: ReviewUnavailable) -
     };
     view()
         .test_id("review-unavailable")
-        .pt(px(SPACE_6))
+        .pt(px(SPACE_XL))
         .w_full()
         .flex_col()
         .gap(px(SPACE_3))
@@ -1319,6 +1373,7 @@ enum S {
     StepFindingsBack,
     CouldNotRead,
     PartialHint,
+    Empty,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -1359,6 +1414,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::PartialHint => {
                 "A supporting file of the package was not sent; this result does not cover it."
             }
+            S::Empty => "No review result yet.",
         },
         Language::Chinese => match key {
             S::Lens => "视角",
@@ -1392,6 +1448,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::StepFindingsBack => "上一个发现",
             S::CouldNotRead => "无法读取响应——请重试",
             S::PartialHint => "包中有支持文件未发送；此结果未涵盖该文件。",
+            S::Empty => "暂无审查结果。",
         },
     }
 }
@@ -1409,15 +1466,14 @@ fn reviewing_with(state: &AppState, language: Language) -> SharedString {
     SharedString::from(s(S::ReviewingWith, language).replace("{host}", &host))
 }
 
-/// `3 findings · J / K to step through` opens with this, then the keys.
 fn step_hint(findings: usize, language: Language) -> String {
     match language {
         Language::English => match findings {
-            0 => "No findings ·".to_owned(),
-            1 => "1 finding ·".to_owned(),
-            _ => format!("{findings} findings ·"),
+            0 => "No findings".to_owned(),
+            1 => "1 finding".to_owned(),
+            _ => format!("{findings} findings"),
         },
-        Language::Chinese => format!("{findings} 个发现 ·"),
+        Language::Chinese => format!("{findings} 个发现"),
     }
 }
 
@@ -1512,6 +1568,12 @@ fn voice(
     language: Language,
     drained: Option<AdaptiveColor>,
 ) -> impl IntoElement {
+    #[cfg(test)]
+    let optics = global::<Option<tokens::CjkOptics>>()
+        .get_untracked()
+        .unwrap_or(tokens::CJK_OPTICS);
+    #[cfg(not(test))]
+    let optics = tokens::CJK_OPTICS;
     let (ink, ember, hot) = match drained {
         Some(afterimage) => (afterimage, afterimage, afterimage),
         None => (
@@ -1520,7 +1582,7 @@ fn voice(
             tokens::adaptive_color(|palette| palette.hot),
         ),
     };
-    text(content)
+    prims::script_text(content, TYPE_MODEL, WEIGHT_MODEL, optics)
         .font_family(tokens::FONT_MODEL)
         .font_weight(WEIGHT_MODEL)
         .text_size(px(TYPE_MODEL))
@@ -1708,6 +1770,7 @@ mod tests {
             S::StepFindingsBack,
             S::CouldNotRead,
             S::PartialHint,
+            S::Empty,
         ] {
             assert!(!s(key, Language::English).is_empty());
             assert!(!s(key, Language::Chinese).is_empty());
@@ -1736,9 +1799,447 @@ mod tests {
 
     #[test]
     fn the_step_hint_counts_findings() {
-        assert_eq!(step_hint(0, Language::English), "No findings ·");
-        assert_eq!(step_hint(1, Language::English), "1 finding ·");
-        assert_eq!(step_hint(4, Language::English), "4 findings ·");
+        assert_eq!(step_hint(0, Language::English), "No findings");
+        assert_eq!(step_hint(1, Language::English), "1 finding");
+        assert_eq!(step_hint(4, Language::English), "4 findings");
+    }
+
+    #[test]
+    fn an_idle_review_field_has_an_empty_state() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<EmptyReviewProbe>()))
+            .expect("start the empty review probe");
+        app.wait_for("id:review-empty-copy")
+            .expect("the empty state copy");
+        let nodes = app.screen().layout_nodes();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.test_id.as_deref() == Some("review-empty"))
+                && nodes.iter().any(|node| {
+                    node.text
+                        .as_ref()
+                        .is_some_and(|text| text.text.text == "No review result yet.")
+                }),
+            "the idle review field names its empty state"
+        );
+    }
+
+    #[test]
+    fn an_empty_review_result_uses_the_empty_state() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<EmptyReviewResultProbe>()))
+            .expect("start the empty result probe");
+        app.wait_for("id:review-empty-copy")
+            .expect("the empty state copy");
+        let nodes = app.screen().layout_nodes();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.test_id.as_deref() == Some("review-empty"))
+                && nodes.iter().any(|node| {
+                    node.text
+                        .as_ref()
+                        .is_some_and(|text| text.text.text == "No review result yet.")
+                })
+                && !nodes
+                    .iter()
+                    .any(|node| node.test_id.as_deref() == Some("review-prepare")),
+            "a content-free result shows the empty state without revision actions"
+        );
+    }
+
+    #[test]
+    fn zero_findings_hide_the_step_hint_and_controls() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ZeroFindingsStepperProbe>()))
+            .expect("start the zero-findings probe");
+        app.wait_for("id:review-findings-count")
+            .expect("the zero count");
+        let nodes = app.screen().layout_nodes();
+        assert!(
+            nodes.iter().any(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == "No findings")
+            }) && !nodes.iter().any(|node| {
+                matches!(
+                    node.test_id.as_deref(),
+                    Some("review-findings-step" | "review-findings-back")
+                ) || node
+                    .text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == "to step through")
+            }),
+            "zero findings keep the count and hide J/K stepping"
+        );
+    }
+
+    #[test]
+    fn findings_count_uses_the_mono_family() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewLayoutProbe>()))
+            .expect("start the review layout probe");
+        app.wait_for("id:review-findings-count")
+            .expect("the findings count");
+        assert_eq!(
+            app.screen()
+                .span_style("id:review-findings-count >> text:1 finding")
+                .expect("the count text")
+                .font_family
+                .expect("the count font")
+                .name()
+                .as_ref(),
+            tokens::FONT_SOURCE
+        );
+    }
+
+    #[test]
+    fn review_voice_emits_model_styles_for_latin_and_cjk() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<ReviewVoiceProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the Review voice probe");
+        app.wait_for("text:Review voice: Latin, 中文.")
+            .expect("the mixed-script model voice");
+
+        for (selector, expected) in [
+            (
+                "text:Latin",
+                (
+                    TYPE_MODEL,
+                    TYPE_MODEL_LINE,
+                    WEIGHT_MODEL.0,
+                    tokens::FONT_MODEL,
+                ),
+            ),
+            (
+                "text:中文",
+                (
+                    TYPE_MODEL + 1.0,
+                    TYPE_MODEL_LINE,
+                    WEIGHT_MODEL.0 + 100,
+                    tokens::FONT_UI,
+                ),
+            ),
+        ] {
+            let style = app.screen().span_style(selector).expect(selector);
+            assert_eq!(
+                (
+                    style.font_size.0,
+                    style.line_height.0,
+                    style.font_weight,
+                    style.font_family.unwrap().name().to_string(),
+                ),
+                (expected.0, expected.1, expected.2, expected.3.to_owned(),),
+                "{selector}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_cjk_optics_stays_at_plus_zero_and_same_weight() {
+        let optics = tokens::CJK_OPTICS;
+        for is_cjk in [false, true] {
+            assert_eq!(optics.size(TYPE_MODEL, is_cjk), TYPE_MODEL);
+            assert_eq!(optics.weight(WEIGHT_MODEL, is_cjk), WEIGHT_MODEL);
+        }
+        assert!(!optics.changes_weight());
+    }
+
+    #[test]
+    fn review_sections_share_left_edges_without_large_gaps() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewLayoutProbe>()))
+            .expect("start the review layout probe");
+        app.wait_for("id:review-findings-step")
+            .expect("the findings stepper");
+
+        let intent_label = s(S::Understood, Language::English);
+        let legend_label = s(S::WordsSwatch, Language::English);
+        let question_priority = priority_label(ClarificationPriority::Critical, Language::English);
+        let action = VisibleContent::Control("review-prepare");
+        let initial_sections_fit =
+            section_gaps_fit(&app, &["review-intent", "review-legend", "review-actions"]);
+        let initial_nodes = app.screen().layout_nodes();
+        let legend_wraps_left = match (
+            text_position(&app, intent_label),
+            text_position(&app, legend_label),
+            content_position(
+                &app,
+                VisibleContent::Control("review-legend-inferred-swatch"),
+            ),
+        ) {
+            (Some((intent_x, _)), Some((stated_x, stated_y)), Some((inferred_x, inferred_y))) => {
+                (stated_x - intent_x).abs() <= 0.5
+                    && (inferred_x - intent_x).abs() <= 0.5
+                    && inferred_y - stated_y > 0.5
+            }
+            _ => false,
+        };
+        let empty_sections_omitted = !initial_nodes.iter().any(|node| {
+            matches!(
+                node.test_id.as_deref(),
+                Some("review-docked" | "review-questions")
+            )
+        });
+        let initial_content_lefts = content_lefts(
+            &app,
+            &[
+                VisibleContent::Text(intent_label),
+                VisibleContent::Text(legend_label),
+                action,
+            ],
+        );
+
+        app.press("id:layout-show-questions")
+            .expect("show a question section");
+        app.wait_for("id:review-questions")
+            .expect("the questions section");
+        let question_content_lefts = content_lefts(
+            &app,
+            &[
+                VisibleContent::Text(intent_label),
+                VisibleContent::Text(question_priority),
+                VisibleContent::Text(legend_label),
+                action,
+            ],
+        );
+        let question_sections_fit = section_gaps_fit(
+            &app,
+            &[
+                "review-intent",
+                "review-questions",
+                "review-legend",
+                "review-actions",
+            ],
+        );
+
+        app.press("id:review-findings-step")
+            .expect("show the selected finding");
+        app.settle();
+        let stepped_sections_fit = section_gaps_fit(
+            &app,
+            &[
+                "review-intent",
+                "review-docked",
+                "review-questions",
+                "review-legend",
+                "review-actions",
+            ],
+        );
+        let stepped_content_lefts = content_lefts(
+            &app,
+            &[
+                VisibleContent::Text(intent_label),
+                VisibleContent::Control("review-finding-kind"),
+                VisibleContent::Text(question_priority),
+                VisibleContent::Text(legend_label),
+                action,
+            ],
+        );
+        let nodes = app.screen().layout_nodes();
+        let stepped_sections_present = nodes
+            .iter()
+            .any(|node| node.test_id.as_deref() == Some("review-docked"))
+            && nodes
+                .iter()
+                .any(|node| node.test_id.as_deref() == Some("review-questions"));
+        assert!(
+            content_lefts_align(&initial_content_lefts),
+            "intent, legend words, and Prepare left edges: {initial_content_lefts:?}"
+        );
+        assert!(
+            content_lefts_align(&question_content_lefts),
+            "intent, question, legend words, and Prepare left edges: {question_content_lefts:?}"
+        );
+        assert!(
+            content_lefts_align(&stepped_content_lefts),
+            "intent, finding kind, question, legend words, and Prepare left edges: {stepped_content_lefts:?}"
+        );
+        assert!(
+            initial_sections_fit
+                && legend_wraps_left
+                && empty_sections_omitted
+                && question_sections_fit
+                && stepped_sections_fit
+                && stepped_sections_present,
+            "section gaps are at most {SPACE_XL}px; the legend wraps at its visible left edge"
+        );
+    }
+
+    #[test]
+    fn review_section_gaps_include_notice_padding_in_each_state() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewSpacingProbe>()))
+            .expect("start the review spacing probe");
+        app.wait_for("id:review-intent")
+            .expect("the intent section");
+        let intent_label = s(S::Understood, Language::English);
+        let partial_label = i18n::t(Language::English, Key::ReviewPartial);
+        let partial_hint = s(S::PartialHint, Language::English);
+        let legend_label = s(S::StatedInTheText, Language::English);
+        let mut gaps = Vec::new();
+        gaps.push((
+            "empty result: intent to legend",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-questions")
+            .expect("show a question section");
+        app.wait_for("id:review-questions")
+            .expect("question section");
+        gaps.push((
+            "intent to question",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                section_extent(&app, "review-questions"),
+            ),
+        ));
+        gaps.push((
+            "question to legend",
+            vertical_gap(
+                section_extent(&app, "review-questions"),
+                section_extent(&app, "review-legend"),
+            ),
+        ));
+
+        app.press("id:spacing-partial").expect("show partial state");
+        app.wait_for("id:review-partial")
+            .expect("partial notice detail");
+        gaps.push((
+            "partial notice to intent",
+            vertical_gap(
+                text_extent(&app, partial_hint),
+                text_extent(&app, intent_label),
+            ),
+        ));
+        gaps.push((
+            "partial result sections",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-stale").expect("show stale state");
+        app.wait_for("id:review-stale").expect("stale notice");
+        gaps.push((
+            "stale notice to intent",
+            vertical_gap(
+                section_extent(&app, "review-stale"),
+                text_extent(&app, intent_label),
+            ),
+        ));
+        gaps.push((
+            "stale result sections",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-both")
+            .expect("show both notice states");
+        app.wait_for("id:review-partial")
+            .expect("partial notice beside stale notice");
+        gaps.push((
+            "stale notice to partial notice",
+            vertical_gap(
+                section_extent(&app, "review-stale"),
+                text_extent(&app, partial_label),
+            ),
+        ));
+        gaps.push((
+            "partial notice to intent",
+            vertical_gap(
+                text_extent(&app, partial_hint),
+                text_extent(&app, intent_label),
+            ),
+        ));
+        gaps.push((
+            "combined result sections",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                text_extent(&app, legend_label),
+            ),
+        ));
+
+        app.press("id:spacing-findings")
+            .expect("show a result with findings");
+        app.wait_for("id:review-findings-step")
+            .expect("finding step control");
+        app.press("id:review-findings-step")
+            .expect("show the selected finding");
+        app.wait_for("id:review-docked").expect("docked finding");
+        gaps.push((
+            "intent to finding",
+            vertical_gap(
+                section_extent(&app, "review-intent"),
+                section_extent(&app, "review-docked"),
+            ),
+        ));
+        gaps.push((
+            "finding to legend",
+            vertical_gap(
+                section_extent(&app, "review-docked"),
+                section_extent(&app, "review-legend"),
+            ),
+        ));
+        let over_limit: Vec<_> = gaps
+            .iter()
+            .copied()
+            .filter(|(_, gap)| !(-0.5..=SPACE_XL + 0.5).contains(gap))
+            .collect();
+        assert!(
+            over_limit.is_empty(),
+            "visible section gaps are at most {SPACE_XL}px: {over_limit:?}; measured={gaps:?}"
+        );
+    }
+
+    #[test]
+    fn prepare_revision_and_close_share_the_action_row() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewLayoutProbe>()))
+            .expect("start the review layout probe");
+        app.wait_for("id:review-prepare")
+            .expect("the prepare action");
+        let nodes = app.screen().layout_nodes();
+        let node = |id: &str| {
+            nodes
+                .iter()
+                .find(|node| node.test_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("the `{id}` control is laid out"))
+        };
+        let row = node("review-actions");
+        let prepare = node("review-prepare");
+        let close = node("review-close");
+        let prepare_center = prepare.bounds.origin.y.0 + prepare.bounds.size.height.0 / 2.0;
+        let close_center = close.bounds.origin.y.0 + close.bounds.size.height.0 / 2.0;
+        assert!(
+            prepare.parent == row.id
+                && close.parent == row.id
+                && (prepare_center - close_center).abs() <= 0.5
+                && prepare.bounds.origin.x.0 < close.bounds.origin.x.0,
+            "prepare and close are adjacent actions in one row"
+        );
+    }
+
+    #[test]
+    fn review_failures_use_danger_while_cancellation_stays_neutral() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<FailureColorProbe>()))
+            .expect("start the review failure probe");
+        app.set_environment("light mode", |env| {
+            env.color_scheme = nsh_core::platform::ColorScheme::Light
+        })
+        .expect("light mode");
+        app.wait_for("text:Provider failed")
+            .expect("the provider failure");
+        for (selector, color) in [
+            ("text:/^Provider failed$/", tokens::LIGHT.danger),
+            ("text:/^Cancelled — nothing changed\\.$/", tokens::LIGHT.ink),
+        ] {
+            assert_eq!(
+                app.screen().span_style(selector).expect(selector).color,
+                color
+            );
+        }
     }
 
     /// The document the camera probes review: three known lines.
@@ -1776,6 +2277,299 @@ mod tests {
             tab_id: Some(tab_id),
             ..ReviewView::default()
         }
+    }
+
+    fn layout_review() -> ReviewView {
+        ReviewView {
+            status: "Review ready".to_owned(),
+            sections: vec![
+                crate::state::ReviewSection {
+                    title: "Intent".to_owned(),
+                    items: vec!["The document's intent".to_owned()],
+                },
+                crate::state::ReviewSection {
+                    title: "Scope".to_owned(),
+                    items: vec!["A detail".to_owned()],
+                },
+            ],
+            findings_anchored: vec![ReviewFindingView {
+                stated: false,
+                text: "One finding".to_owned(),
+                location: None,
+            }],
+            ..ReviewView::default()
+        }
+    }
+
+    fn spacing_review(partial: bool, stale: bool, with_findings: bool) -> ReviewView {
+        let mut review = layout_review();
+        review.partial = partial;
+        review.stale = stale;
+        if !with_findings {
+            review.findings_anchored.clear();
+        }
+        review
+    }
+
+    fn with_question(mut review: ReviewView) -> ReviewView {
+        review.questions_detail.push(question(
+            ClarificationPriority::Critical,
+            "Clarify the expected outcome",
+        ));
+        review
+    }
+
+    fn review_spacing_control(
+        id: &'static str,
+        state: &AppState,
+        partial: bool,
+        stale: bool,
+        with_findings: bool,
+    ) -> impl IntoElement {
+        let state = state.clone();
+        view().test_id(id).w(px(8.0)).h(px(8.0)).on_press(move || {
+            state
+                .review_view
+                .set(Some(spacing_review(partial, stale, with_findings)))
+        })
+    }
+
+    fn review_state_control(
+        id: &'static str,
+        state: &AppState,
+        review: ReviewView,
+    ) -> impl IntoElement {
+        let state = state.clone();
+        view()
+            .test_id(id)
+            .w(px(8.0))
+            .h(px(8.0))
+            .on_press(move || state.review_view.set(Some(review.clone())))
+    }
+
+    #[component]
+    fn ReviewVoiceProbe() -> impl IntoElement {
+        global::<Option<tokens::CjkOptics>>()
+            .set(Some(tokens::CJK_OPTICS_CAPTURE_VARIANTS[2].optics));
+        let state = AppState::new();
+        state.review_view.set(Some(ReviewView {
+            sections: vec![crate::state::ReviewSection {
+                title: "Intent".to_owned(),
+                items: vec!["Review voice: Latin, 中文.".to_owned()],
+            }],
+            ..ReviewView::default()
+        }));
+        view()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(field(state, Language::English))
+    }
+
+    #[component]
+    fn ReviewLayoutProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.review_view.set(Some(layout_review()));
+        let question_state = with_question(layout_review());
+        view()
+            .test_id("review-layout-probe")
+            .flex_col()
+            .w(px(220.0))
+            .h(px(720.0))
+            .child(review_state_control(
+                "layout-show-questions",
+                &state,
+                question_state,
+            ))
+            .child(field(state, Language::English))
+    }
+
+    #[component]
+    fn ReviewSpacingProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state
+            .review_view
+            .set(Some(spacing_review(false, false, false)));
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .flex_row()
+                    .child(review_spacing_control(
+                        "spacing-partial",
+                        &state,
+                        true,
+                        false,
+                        false,
+                    ))
+                    .child(review_spacing_control(
+                        "spacing-stale",
+                        &state,
+                        false,
+                        true,
+                        false,
+                    ))
+                    .child(review_spacing_control(
+                        "spacing-both",
+                        &state,
+                        true,
+                        true,
+                        false,
+                    ))
+                    .child(review_spacing_control(
+                        "spacing-findings",
+                        &state,
+                        false,
+                        false,
+                        true,
+                    ))
+                    .child(review_state_control(
+                        "spacing-questions",
+                        &state,
+                        with_question(spacing_review(false, false, false)),
+                    )),
+            )
+            .child(field(state, Language::English))
+    }
+
+    #[component]
+    fn EmptyReviewProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.review_open.set(true);
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(field(state, Language::English))
+    }
+
+    #[component]
+    fn EmptyReviewResultProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.review_view.set(Some(ReviewView::default()));
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(field(state, Language::English))
+    }
+
+    #[component]
+    fn ZeroFindingsStepperProbe() -> impl IntoElement {
+        let state = AppState::new();
+        view()
+            .test_id("zero-findings-stepper-probe")
+            .child(findings_stepper(&state, session(), Language::English, 0))
+    }
+
+    #[component]
+    fn FailureColorProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let failed = ReviewView {
+            status: "Provider failed".to_owned(),
+            diagnostic: Some("The request failed.".to_owned()),
+            failure: Some(ReviewFailure::Other),
+            ..ReviewView::default()
+        };
+        let cancelled = ReviewView {
+            failure: Some(ReviewFailure::Cancelled),
+            ..ReviewView::default()
+        };
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(failure_block(state.clone(), Language::English, &failed))
+            .child(failure_block(state, Language::English, &cancelled))
+    }
+
+    #[derive(Clone, Copy)]
+    enum VisibleContent<'a> {
+        Text(&'a str),
+        Control(&'a str),
+    }
+
+    fn section_gaps_fit(app: &Headless, ids: &[&str]) -> bool {
+        let nodes = app.screen().layout_nodes();
+        let mut sections = Vec::new();
+        for id in ids {
+            let Some(bounds) = nodes
+                .iter()
+                .find(|node| node.test_id.as_deref() == Some(id))
+                .map(|node| node.bounds)
+            else {
+                return false;
+            };
+            sections.push((bounds.origin.y.0, bounds.size.height.0));
+        }
+        sections
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 - pair[0].1 <= SPACE_XL)
+    }
+
+    fn content_lefts(app: &Headless, contents: &[VisibleContent<'_>]) -> Vec<Option<f32>> {
+        contents
+            .iter()
+            .map(|content| content_position(app, *content).map(|position| position.0))
+            .collect()
+    }
+
+    fn content_lefts_align(positions: &[Option<f32>]) -> bool {
+        let Some(Some(left)) = positions.first() else {
+            return false;
+        };
+        positions.len() >= 2
+            && positions
+                .iter()
+                .all(|x| x.as_ref().is_some_and(|x| (*x - *left).abs() <= 0.5))
+    }
+
+    fn content_position(app: &Headless, content: VisibleContent<'_>) -> Option<(f32, f32)> {
+        let nodes = app.screen().layout_nodes();
+        let node = match content {
+            VisibleContent::Text(content) => nodes.iter().find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == content)
+            }),
+            VisibleContent::Control(id) => nodes
+                .iter()
+                .find(|node| node.test_id.as_deref() == Some(id)),
+        }?;
+        Some((node.bounds.origin.x.0, node.bounds.origin.y.0))
+    }
+
+    fn text_position(app: &Headless, content: &str) -> Option<(f32, f32)> {
+        content_position(app, VisibleContent::Text(content))
+    }
+
+    fn section_extent(app: &Headless, id: &str) -> (f32, f32) {
+        let nodes = app.screen().layout_nodes();
+        let bounds = nodes
+            .iter()
+            .find(|node| node.test_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("the `{id}` section is laid out"))
+            .bounds;
+        (bounds.origin.y.0, bounds.origin.y.0 + bounds.size.height.0)
+    }
+
+    fn text_extent(app: &Headless, content: &str) -> (f32, f32) {
+        let nodes = app.screen().layout_nodes();
+        let bounds = nodes
+            .iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == content)
+            })
+            .unwrap_or_else(|| panic!("the text `{content}` is laid out"))
+            .bounds;
+        (bounds.origin.y.0, bounds.origin.y.0 + bounds.size.height.0)
+    }
+
+    fn vertical_gap(after: (f32, f32), before: (f32, f32)) -> f32 {
+        before.0 - after.1
     }
 
     /// The camera request the state holds, drawn as `<tab>:<line>`: a signal

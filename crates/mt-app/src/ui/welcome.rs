@@ -25,7 +25,7 @@ use nsh_core::{Color, file_dialog::OpenDialog, prelude::*};
 use crate::{
     app_paths,
     i18n::{self, Key},
-    state::{AppState, Entry},
+    state::{AppState, Entry, StatusMessage},
     ui::{
         prims,
         tokens::{
@@ -366,7 +366,7 @@ pub(crate) fn choose_folder(state: AppState) {
             Ok(None) => {}
             Err(why) => state
                 .status
-                .set(SharedString::from(format!("Folder picker failed: {why}"))),
+                .set(StatusMessage::plain(format!("Folder picker failed: {why}"))),
         }
     });
 }

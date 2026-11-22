@@ -133,15 +133,15 @@ state: the captured result and source identity, the pending consent, answer
 bindings and the live proposal. Core `review::provider` binds frozen requests
 to disclosure and one-use consent, while its private Revision implementation
 validates provider coverage and proposed edits. Each Revision request carries
-the `revision_generation` current when it was sent; resetting or replacing
-the Review (another Review, Close) advances it, and an answer that returns
-under an older generation is dropped without touching the field or the busy
-flag. A validated proposal is placed over the reviewed tab by a
-`RevisionLedger` (`state/revision_ledger.rs`); nothing is written until the
-user decides. Each Accept writes that change's replacement into the tab's text
-at once, and a Reject after an Accept writes the reviewed bytes back exactly;
-`Ctrl+Z` returns the last-decided change, with its text, to the state it had
-before that decision. The ledger follows user edits between
+the `revision_generation` current when it was sent. Cancel, or resetting the
+Review, cancels the pending transport and advances that generation. A result
+from an older generation cannot change the field or busy flag. Cancel alone
+keeps the original Review and its answers. A validated proposal is placed over
+the reviewed tab by a `RevisionLedger` (`state/revision_ledger.rs`); nothing is
+written until the user decides. Each Accept writes that change's replacement
+into the tab's text at once. A Reject after an Accept writes the reviewed bytes
+back exactly. `Ctrl+Z` returns the last-decided change, with its text, to the
+state it had before that decision. The ledger follows user edits between
 decisions: hunks wholly before or after the edited span move, while a hunk the
 edit touched loses its place and can be neither accepted ("Can't apply — this
 part changed") nor, once accepted, taken back. Every write also checks that the

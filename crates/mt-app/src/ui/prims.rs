@@ -22,10 +22,13 @@ use nsh_core::{
     element::effect,
     element::{
         Accessible, AdaptiveColor, AnimatedNode, ComponentBuilder, Element, Interactive,
-        IntoListener, IntoReactive, ParentElement, SharedString, Signal, StyleRefinement, Styled,
+        IntoListener, IntoReactive, ParentElement, ReadSignal, SharedString, Signal,
+        StyleRefinement, Styled, Text,
     },
     prelude::*,
 };
+use unicode_script::{Script, UnicodeScript};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ui::{
     motion::{self, HOVER_MS, Heat, PRESS_RELEASE_MS},
@@ -65,7 +68,7 @@ pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 }
 
 /// Resting ink: quiet local actions and captions.
-pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
@@ -75,7 +78,7 @@ pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 
 /// Caption ink: the quietest text that must still be read (hints,
 /// disclosures, secondary lines), at 4.5:1 or better on every ground.
-pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
@@ -110,6 +113,70 @@ pub fn model_voice(content: impl IntoReactive<SharedString>, heat: Heat) -> impl
             tokens::adaptive_color(|palette| palette.ember),
             tokens::adaptive_color(|palette| palette.hot),
         ))
+}
+
+pub(crate) fn script_text(
+    content: impl IntoReactive<SharedString>,
+    base_size: f32,
+    base_weight: nsh_core::element::FontWeight,
+    optics: tokens::CjkOptics,
+) -> Text {
+    if optics.is_unchanged() {
+        return text(content);
+    }
+    let runs = content.into_reactive().map(|content| script_runs(&content));
+    text("").child(each(
+        move || runs.get(),
+        |run: &ScriptRun| (run.index, run.is_cjk),
+        move |run: ReadSignal<ScriptRun>, _| {
+            let current = run.get();
+            let span = text(move || run.get().text.clone())
+                .text_size(px(optics.size(base_size, current.is_cjk)))
+                .font_weight(optics.weight(base_weight, current.is_cjk));
+            if current.is_cjk && optics.changes_weight() {
+                // FONT_MODEL's Windows fallback starts with a fixed DengXian Light face.
+                span.font_family(FONT_UI)
+            } else {
+                span
+            }
+        },
+    ))
+}
+
+#[derive(Clone, PartialEq)]
+struct ScriptRun {
+    index: usize,
+    is_cjk: bool,
+    text: String,
+}
+
+fn script_runs(content: &str) -> Vec<ScriptRun> {
+    let graphemes = content.graphemes(true);
+    let mut previous = graphemes.clone().find_map(cjk_script).unwrap_or(false);
+    let mut runs: Vec<ScriptRun> = Vec::new();
+    for grapheme in graphemes {
+        let is_cjk = cjk_script(grapheme).unwrap_or(previous);
+        previous = is_cjk;
+        match runs.last_mut() {
+            Some(run) if run.is_cjk == is_cjk => run.text.push_str(grapheme),
+            _ => runs.push(ScriptRun {
+                index: runs.len(),
+                is_cjk,
+                text: grapheme.to_owned(),
+            }),
+        }
+    }
+    runs
+}
+
+fn cjk_script(grapheme: &str) -> Option<bool> {
+    match grapheme.chars().next().map(|character| character.script()) {
+        Some(
+            Script::Bopomofo | Script::Han | Script::Hangul | Script::Hiragana | Script::Katakana,
+        ) => Some(true),
+        Some(Script::Common | Script::Inherited) | None => None,
+        Some(_) => Some(false),
+    }
 }
 
 /// A quiet local action: resting ink that steps to full ink with an underline
@@ -384,6 +451,28 @@ mod tests {
     use super::*;
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
+
+    #[test]
+    fn script_runs_follow_primary_scripts_and_keep_graphemes_whole() {
+        for (input, expected) in [
+            ("A·B", vec![(false, "A·B")]),
+            ("e\u{0305}", vec![(false, "e\u{0305}")]),
+            ("中\u{05B0}", vec![(true, "中\u{05B0}")]),
+            ("中文·中文", vec![(true, "中文·中文")]),
+            ("中文, Latin", vec![(true, "中文, "), (false, "Latin")]),
+            ("Latin, 中文", vec![(false, "Latin, "), (true, "中文")]),
+            ("·中文", vec![(true, "·中文")]),
+        ] {
+            let runs = script_runs(input);
+            assert_eq!(
+                runs.iter()
+                    .map(|run| (run.is_cjk, run.text.as_str()))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{input}"
+            );
+        }
+    }
 
     /// One of each action, and a line that counts the presses they hear.
     #[component]

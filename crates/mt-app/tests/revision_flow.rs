@@ -17,6 +17,146 @@ mod support;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn cancelling_revision_stops_the_pending_request_and_restores_review() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let question = "Which audience should this revision prioritize?";
+    let unanswered_question = "What should readers do after reading it?";
+    let answer = "Readers new to the topic.";
+    let (review, _) = two_change_outputs(source);
+    let mut review: serde_json::Value = serde_json::from_str(&review).expect("Review output");
+    review["findings"] = serde_json::json!([{
+        "kind": "inference",
+        "text": "The title needs a clearer promise.",
+        "anchor": {"kind": "document_wide"}
+    }]);
+    review["clarification_questions"] = serde_json::json!([{
+        "question": question,
+        "priority": "high",
+        "impact": null
+    }, {
+        "question": unanswered_question,
+        "priority": "medium",
+        "impact": null
+    }]);
+    let review = review.to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (started, request_received) = std::sync::mpsc::sync_channel(1);
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("Review request");
+        read_http_body(&mut stream);
+        write_review_json(&mut stream, &review);
+        drop(stream);
+        let (mut stream, _) = listener.accept().expect("Revision request");
+        read_http_body(&mut stream);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound the disconnect wait");
+        started.send(()).expect("Revision started");
+        stream.read(&mut [0; 1])
+    });
+    let (document, _directory, _config) = revision_fixture(source, &base_url);
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(px(1440.0), px(900.0)))
+        .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+    app.type_text("label:Markdown source", "\nUnsaved edit.")
+        .expect("edit the buffer without saving");
+    app.wait_for("id:title-dirty").expect("the dirty buffer");
+    let buffer = app
+        .screen()
+        .input_text("label:Markdown source")
+        .expect("read the unsaved buffer")
+        .map(str::to_owned)
+        .expect("the editor contains text");
+    assert!(buffer.contains("Unsaved edit.") && buffer.contains(source));
+    assert_eq!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the buffer"),
+        Some(buffer.as_str())
+    );
+    app.press("id:title-review").expect("prepare Review");
+    app.wait_for("id:consent-card").expect("Review disclosure");
+    app.long_press("id:consent-send").expect("send Review");
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("Review ready");
+    app.wait_for(&format!("text:{question}"))
+        .expect("the clarification question");
+    app.type_text("id:review-answer-input", answer)
+        .expect("answer the clarification question");
+    assert_eq!(
+        app.screen()
+            .input_text("id:review-answer-input")
+            .expect("read the answer before submission")
+            .as_deref(),
+        Some(answer)
+    );
+    app.press("id:review-answer-submit")
+        .expect("submit the answer");
+    app.wait_for("text:Answered")
+        .expect("the question is answered");
+    app.wait_for(&format!("text:{unanswered_question}"))
+        .expect("the remaining clarification is unanswered");
+    app.press("id:review-findings-step")
+        .expect("expand the finding");
+    app.wait_for("text:The title needs a clearer promise.")
+        .expect("the finding is expanded");
+    app.press("id:review-prepare").expect("prepare Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("Revision disclosure");
+    assert!(
+        !app.screen()
+            .matches("id:review-finding")
+            .expect("the finding selector"),
+        "preparing Revision hides the expanded finding"
+    );
+    app.long_press("id:consent-send").expect("send Revision");
+    request_received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("request waiting for headers");
+    app.press("id:revision-cancel").expect("cancel Revision");
+    app.wait_for("id:review-prepare")
+        .expect("original Review restored");
+    app.wait_for("text:The title needs a clearer promise.")
+        .expect("the expanded finding is restored");
+    let restored_buffer = app
+        .screen()
+        .input_text("label:Markdown source")
+        .expect("read the restored buffer")
+        .map(str::to_owned);
+    app.press(&format!("label:{question}"))
+        .expect("reopen the answered question");
+    let restored_answer = app
+        .screen()
+        .input_text("id:review-answer-input")
+        .expect("read the restored clarification answer")
+        .map(str::to_owned);
+    assert_eq!(
+        (restored_buffer.as_deref(), restored_answer.as_deref(),),
+        (Some(buffer.as_str()), Some(answer))
+    );
+    let disconnect = server.join().expect("loopback server");
+    assert!(
+        matches!(disconnect, Ok(0))
+            || matches!(&disconnect, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "the pending HTTP request did not disconnect: {disconnect:?}"
+    );
+    assert!(
+        !app.screen()
+            .matches("id:revision-field")
+            .expect("revision selector"),
+        "the cancelled request left a revision surface"
+    );
+    assert_eq!(std::fs::read_to_string(document).expect("document"), source);
+}
+
+#[test]
 fn partial_accept_records_the_final_split_once() {
     let _guard = TEST_LOCK
         .lock()
@@ -146,6 +286,16 @@ fn partial_accept_records_the_final_split_once() {
         .expect("the docked hunk waits for a decision");
     app.wait_for("text:0 of 2 decided")
         .expect("both hunks start undecided");
+    assert_eq!(
+        app.screen()
+            .span_style("text:0 of 2 decided")
+            .expect("the revision decision count")
+            .font_family
+            .expect("the decision count font")
+            .name()
+            .as_ref(),
+        mt_app::ui::tokens::FONT_SOURCE
+    );
     app.wait_for("text:2 not applied")
         .expect("both hunks start rejected");
     assert_eq!(
@@ -377,26 +527,7 @@ fn start_field_over_buffer(
             }
         }
     });
-    let directory = tempfile::tempdir().expect("document dir");
-    let config = tempfile::tempdir().expect("config dir");
-    let document = directory.path().join("plan.md");
-    std::fs::write(&document, source).expect("write document");
-    let endpoint = mt_core::model::EndpointIdentity::parse(
-        mt_core::model::Provider::OpenAiChat,
-        Some(&base_url),
-    )
-    .expect("endpoint");
-    let identity = endpoint.credential_target();
-    std::fs::write(config.path().join("settings.toml"), format!(
-        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
-    )).expect("write settings");
-    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
-    unsafe {
-        std::env::set_var("MARKTURBO_OPEN", &document);
-        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
-        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
-        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
-    }
+    let (document, directory, config) = revision_fixture(source, &base_url);
     let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionFieldOverBuffer>()))
         .expect("start the field over the buffer");
     app.wait_for(&format!("text:Buffer: {buffer}"))
@@ -413,6 +544,33 @@ fn start_field_over_buffer(
     app.wait_for("text:0 of 2 decided")
         .expect("nothing is decided yet");
     (app, document, directory, config)
+}
+
+fn revision_fixture(
+    source: &str,
+    base_url: &str,
+) -> (std::path::PathBuf, tempfile::TempDir, tempfile::TempDir) {
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    std::fs::write(&document, source).expect("write document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    (document, directory, config)
 }
 
 /// Accept writes its hunk into the buffer at once, and only that hunk; a

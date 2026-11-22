@@ -943,6 +943,32 @@ mod tests {
         app
     }
 
+    #[cfg(windows)]
+    #[component]
+    fn CountWidths() -> impl IntoElement {
+        view()
+            .test_id("count-widths")
+            .flex_row()
+            .child(tokens::mono_count(crate::ui::prims::rest("111")))
+            .child(tokens::mono_count(crate::ui::prims::rest("000")))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mono_counts_keep_equal_width_for_ones_and_zeroes() {
+        let app = font_app(Root::of::<CountWidths>(), "id:count-widths");
+        let [(_, ones)] = ruler_widths(&app, "111")[..] else {
+            panic!("expected one text node for 111");
+        };
+        let [(_, zeroes)] = ruler_widths(&app, "000")[..] else {
+            panic!("expected one text node for 000");
+        };
+        assert!(
+            ones > 0.0 && (ones - zeroes).abs() < 0.01,
+            "{ones} vs {zeroes}"
+        );
+    }
+
     /// Every trial's ruler width, in the probe's own order, by trial label.
     #[cfg(windows)]
     fn widths_by_label(

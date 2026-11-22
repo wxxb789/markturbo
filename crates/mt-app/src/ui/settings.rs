@@ -35,16 +35,12 @@ use crate::{
         fonts::{Companion, CompanionAction, CompanionFailure, CompanionStatus},
         notices, prims,
         tokens::{
-            self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_WIDE, RAIL_W, SPACE_2,
-            SPACE_3, SPACE_4, SPACE_5, TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE,
-            WEIGHT_MEDIUM,
+            self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_NARROW, MEASURE_WIDE, RAIL_W,
+            SELECTION_UNDERLINE, SETTINGS_HEADER_H, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+            TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MEDIUM,
         },
     },
 };
-
-/// The form's field width: the measure is for reading prose, and a form reads
-/// better narrower.
-const FIELD_W: f32 = 560.0;
 
 /// Whether the settings page is up.
 pub fn is_open(state: &AppState) -> bool {
@@ -76,13 +72,11 @@ pub(crate) fn page(
             view()
                 .test_id("settings-header")
                 .w_full()
-                .max_w(px(MEASURE_WIDE))
+                .max_w(px(MEASURE_NARROW))
+                .min_h(px(SETTINGS_HEADER_H))
                 .flex_row()
                 .items_center()
                 .child(heading(i18n::t(language, Key::Settings)))
-                // On Windows with nsh 0.5.1, justify_between in this max_w row
-                // left the trailing actions unpainted and offscreen to UIA.
-                // Keep the spacer; that layout has not been re-verified on 0.6.1.
                 .child(view().flex_1())
                 .child(
                     view()
@@ -101,9 +95,16 @@ pub(crate) fn page(
                         )),
                 ),
         )
-        .child(view().pt(px(SPACE_3)).child(prims::hairline()))
+        .child(
+            view()
+                .w_full()
+                .h(px(SPACE_3))
+                .border_b(px(HAIRLINE))
+                .border_b_color(move || tokens::palette().hairline),
+        )
         .child(
             scroll()
+                .test_id("settings-scroll")
                 .flex_1()
                 .min_h(px(0.0))
                 .w_full()
@@ -112,7 +113,11 @@ pub(crate) fn page(
                 .child(content(state.clone(), language)),
         )
         .child(notice_line(state.clone()))
-        .child(notices::status_line(state, language, presence))
+        .child(notices::status_line_at(
+            state,
+            presence,
+            crate::state::StatusSurface::Settings,
+        ))
 }
 
 /// The page's one heading: 16px medium ink — 22px is the model's voice alone.
@@ -130,17 +135,25 @@ fn heading(content: &'static str) -> impl IntoElement {
 /// calm.
 fn notice_line(state: AppState) -> impl IntoElement {
     let condition_state = state.clone();
+    let text_state = state.clone();
+    let color_state = state;
     view().test_id("settings-notice").child(when(
         move || !condition_state.settings_notice.get().is_empty(),
         move || {
             view()
                 .pt(px(SPACE_3))
                 .child(
-                    text(move || state.settings_notice.get())
+                    text(move || text_state.settings_notice.get())
                         .font_family(FONT_UI)
                         .text_size(px(TYPE_UI))
                         .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || tokens::palette().ink_rest),
+                        .text_color(move || {
+                            if color_state.settings_notice_error.get() {
+                                tokens::palette().danger
+                            } else {
+                                tokens::palette().ink_rest
+                            }
+                        }),
                 )
                 .into_element()
         },
@@ -199,8 +212,8 @@ fn field_row(
         .flex_col()
         .gap(px(SPACE_2))
         .child(prims::rest(label))
-        .child(view().max_w(px(FIELD_W)).child(field))
-        .child(view().max_w(px(FIELD_W)).child(note))
+        .child(view().max_w(px(MEASURE_NARROW)).child(field))
+        .child(view().max_w(px(MEASURE_NARROW)).child(note))
 }
 
 /// One labelled field with nothing under it: an empty note would still cost
@@ -210,7 +223,12 @@ fn field_row_bare(label: &'static str, field: impl IntoElement) -> impl IntoElem
         .flex_col()
         .gap(px(SPACE_2))
         .child(prims::rest(label))
-        .child(view().max_w(px(FIELD_W)).child(field))
+        .child(
+            view()
+                .max_w(px(MEASURE_NARROW))
+                .pb(px(SPACE_1 - HAIRLINE))
+                .child(field),
+        )
 }
 
 /// The model endpoint: the wire format, the base URL with its validation line,
@@ -400,7 +418,7 @@ fn translation_section(state: AppState, language: Language) -> impl IntoElement 
         i18n::t(language, Key::Translation),
         view().test_id("settings-translation").child(field_row(
             i18n::t(language, Key::TargetLanguage),
-            prims::text_field(
+            view().pb(px(SPACE_1 - HAIRLINE)).child(prims::text_field(
                 "settings-target-language",
                 i18n::t(language, Key::TargetLanguage),
                 snapshot.translate_to.clone(),
@@ -410,7 +428,7 @@ fn translation_section(state: AppState, language: Language) -> impl IntoElement 
                         .settings
                         .update(|settings| settings.translate_to = value.to_owned());
                 },
-            ),
+            )),
             prims::faint(s(S::TargetLanguageHint, language)),
         )),
     )
@@ -433,8 +451,9 @@ fn credential_section(state: AppState, language: Language) -> impl IntoElement {
             .child(credential_status_line(state.clone(), language))
             .child(
                 view()
-                    .max_w(px(FIELD_W))
+                    .max_w(px(MEASURE_NARROW))
                     .flex_col()
+                    .pb(px(SPACE_1 - HAIRLINE))
                     .child(
                         input()
                             .test_id("api-key")
@@ -572,10 +591,7 @@ fn credential_actions(
 fn store_key(state: &AppState, language: Language, session: bool) {
     let value = state.settings_credential.get();
     if value.trim().is_empty() {
-        state.settings_notice.set(SharedString::from(i18n::t(
-            language,
-            Key::CredentialRequired,
-        )));
+        state.set_settings_notice(i18n::t(language, Key::CredentialRequired), false);
         return;
     }
     let result = if session {
@@ -592,11 +608,9 @@ fn store_key(state: &AppState, language: Language, session: bool) {
             } else {
                 Key::KeyStoredSecurely
             };
-            state
-                .settings_notice
-                .set(SharedString::from(i18n::t(language, key)));
+            state.set_settings_notice(i18n::t(language, key), false);
         }
-        Err(error) => state.settings_notice.set(SharedString::from(error)),
+        Err(error) => state.set_settings_notice(error, true),
     }
 }
 
@@ -605,15 +619,12 @@ fn remove_key(state: &AppState, language: Language, focus_after: ElementRef) {
     match state.remove_credential() {
         Ok(()) => {
             state.settings_credential_revision.update(|n| *n += 1);
-            state.settings_notice.set(SharedString::from(i18n::t(
-                language,
-                Key::CredentialDeleted,
-            )));
+            state.set_settings_notice(i18n::t(language, Key::CredentialDeleted), false);
             // This button goes away with the key it forgot: the keyboard user
             // lands on the store control instead of nowhere.
             focus_after.focus();
         }
-        Err(error) => state.settings_notice.set(SharedString::from(error)),
+        Err(error) => state.set_settings_notice(error, true),
     }
 }
 
@@ -989,6 +1000,13 @@ fn choice_button(
             .accessibility_state(move || AccessibilityState {
                 selected: current(),
                 ..AccessibilityState::default()
+            })
+            .selected_style(|| {
+                nsh_core::element::StyleRefinement::default()
+                    .text_color(tokens::palette().ink)
+                    .underline()
+                    .text_decoration_color(tokens::palette().ink)
+                    .text_decoration_thickness(px(SELECTION_UNDERLINE))
             })
             .window_drag(false)
             .px(px(2.0))
@@ -1413,6 +1431,7 @@ mod tests {
     /// also runs consent's and context's app probes in parallel threads, so this
     /// probe only ever touches a process it owns.
     const PROBE_CHILD: &str = "MARKTURBO_SETTINGS_PROBE_CHILD";
+    const SAVE_FAILURE_PROBE_CHILD: &str = "MARKTURBO_SETTINGS_SAVE_FAILURE_PROBE_CHILD";
 
     /// Runs the probe in a process of its own, with the temp paths in that
     /// process's environment. Nothing here calls `set_var`, so the shared test
@@ -1440,6 +1459,61 @@ mod tests {
             "the settings probe failed:\n{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn closing_settings_keeps_the_page_open_when_saving_fails() {
+        if std::env::var_os(SAVE_FAILURE_PROBE_CHILD).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("the test binary"),
+            )
+            .args([
+                "--exact",
+                "ui::settings::tests::closing_settings_keeps_the_page_open_when_saving_fails",
+            ])
+            .env_remove("MARKTURBO_OPEN")
+            .env(SAVE_FAILURE_PROBE_CHILD, "1")
+            .output()
+            .expect("run the settings save-failure probe");
+            assert!(
+                output.status.success(),
+                "the save-failure probe failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let mut config = nsh_engine::EngineConfig::new(
+            nsh_engine::Root::of::<SettingsProbe>().tokens(tokens::theme()),
+        );
+        config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
+        let mut app = nsh_testing::Headless::start(config).expect("start Settings");
+        app.set_viewport(nsh_core::Size::new(px(1440.0), px(900.0)))
+            .expect("the Settings window");
+        app.press("id:title-settings").expect("open the title menu");
+        app.wait_for("id:title-menu-settings")
+            .expect("the Settings menu item");
+        app.press("id:title-menu-settings").expect("open Settings");
+        app.wait_for("id:settings-page").expect("the Settings page");
+        let settings_path = mt_core::settings::settings_path().expect("the hermetic settings path");
+        std::fs::create_dir(&settings_path).expect("block the settings file with a directory");
+        app.press("id:settings-close").expect("close Settings");
+        app.wait_for("id:settings-page >> text:Could not save settings.")
+            .expect("the failed save is shown in Settings");
+        assert!(
+            app.screen()
+                .matches("id:settings-page")
+                .expect("Settings page"),
+            "Settings stays open after a failed save"
+        );
+        assert_eq!(
+            app.screen()
+                .span_style("text:Could not save settings.")
+                .expect("the Settings save error")
+                .color,
+            tokens::LIGHT.danger
         );
     }
 

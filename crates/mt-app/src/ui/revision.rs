@@ -66,7 +66,7 @@ use crate::{
     ui::{
         glow,
         motion::{self, EASE_IN_OUT, Heat, LINEAR},
-        prims, titlebar,
+        prims, review, titlebar,
         tokens::{self, SPACE_1, SPACE_2, SPACE_3},
     },
 };
@@ -384,11 +384,14 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
     let outcome_state = state.clone();
     let rows_state = state.clone();
     let decisions_state = state.clone();
+    let cancel_state = state.clone();
 
     view()
         .test_id("revision-field")
         .w_full()
         .h(move || px(field_height()))
+        .flex_shrink(1.0)
+        .min_h(px(0.0))
         .flex_col()
         .gap(px(SPACE_3))
         // The proposal belongs to a tab not on screen: nothing here can be
@@ -418,10 +421,21 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
             move || status.get().is_some(),
             move || outcome(outcome_state.clone(), language),
         ))
-        // While the request runs there is nothing to show but that it runs.
         .child(when(
             move || busy.get(),
-            move || prims::rest(i18n::t(language, Key::Revising)),
+            move || {
+                let state = cancel_state.clone();
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(SPACE_3))
+                    .child(prims::rest(i18n::t(language, Key::Revising)))
+                    .child(prims::quiet_action(
+                        "revision-cancel",
+                        i18n::t(language, Key::Cancel),
+                        move || review::cancel_revision(&state),
+                    ))
+            },
         ))
         // The hunks, the current one docked in the reading position: the
         // whole proposal scrolls, so the rows can always reach the decision
@@ -468,6 +482,7 @@ fn outcome(state: AppState, language: Language) -> impl IntoElement {
     let condition_state = state.clone();
     let close_state = state.clone();
     let discarded = state.revision_not_applied;
+    let error = state.revision_status_error;
     view()
         .flex_row()
         .items_center()
@@ -475,13 +490,25 @@ fn outcome(state: AppState, language: Language) -> impl IntoElement {
         // narrow field rather than run past its edge.
         .flex_wrap()
         .gap(px(SPACE_3))
-        .child(prims::rest(move || {
-            status_state.revision_status.get().unwrap_or_default()
-        }))
+        .child(
+            prims::rest(move || status_state.revision_status.get().unwrap_or_default()).text_color(
+                move || {
+                    if error.get() {
+                        tokens::palette().danger
+                    } else {
+                        tokens::palette().ink_rest
+                    }
+                },
+            ),
+        )
         // What `Done` discarded undecided: never written.
         .child(when(
             move || discarded.get() > 0,
-            move || prims::faint(move || S::NotApplied(discarded.get()).text(language)),
+            move || {
+                tokens::mono_count(prims::faint(move || {
+                    S::NotApplied(discarded.get()).text(language)
+                }))
+            },
         ))
         .child(when(
             move || {
@@ -868,10 +895,10 @@ fn decisions(
                             },
                         )),
                 )
-                .child(prims::rest(move || {
+                .child(tokens::mono_count(prims::rest(move || {
                     let (decided, all) = counts(&hunks, &now);
                     S::Decided(decided, all).text(language)
-                }))
+                })))
                 .child(when(
                     move || now.with(|now| !now.decisions.is_empty()),
                     move || {
@@ -1831,9 +1858,8 @@ mod tests {
         let decisions = bounds("revision-decisions");
         let keys = bounds("revision-keys");
 
-        // The field is the window under the 32px title row, in the field's
-        // own box (the 440px docked reading position).
-        let expected = 900.0 - tokens::TITLE_ROW_H;
+        let status_height = tokens::SPACE_3 + tokens::TYPE_UI_LINE;
+        let expected = 900.0 - tokens::TITLE_ROW_H - status_height;
         assert!(
             (field.size.height.0 - expected).abs() < 2.0,
             "field height {} instead of {expected}",

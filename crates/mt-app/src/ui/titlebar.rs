@@ -1151,6 +1151,13 @@ mod tests {
         }
 
         assert!(app.screen().matches("id:title-menu").unwrap());
+        assert_eq!(
+            app.screen()
+                .press_target("id:title-menu-edit")
+                .expect("the Source row selector"),
+            None,
+            "closed menu rows cannot receive presses during the exit"
+        );
         assert!(pane_dot_is_in_row(&app, "title-menu-edit"));
         assert!(!pane_dot_is_in_row(&app, "title-menu-preview"));
     }

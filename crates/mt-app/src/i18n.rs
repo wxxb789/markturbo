@@ -39,6 +39,9 @@ pub enum Key {
     ResolvingInstructions,
     Reviewing,
     Revising,
+    PreviewEmpty,
+    PreviewLoading,
+    DiagramCouldNotRender,
     SendRevision,
     PrepareRevision,
     ApplyApproved,
@@ -55,6 +58,7 @@ pub enum Key {
     SaveAsFailed,
     OverwriteFailed,
     SettingsSaved,
+    SettingsSaveFailed,
     MoreLayouts,
     FewerLayouts,
     ReviewWithContext,
@@ -432,6 +436,10 @@ pub fn t(language: Language, key: Key) -> &'static str {
         Language::English => english(key),
         Language::Chinese => chinese(key),
     }
+}
+
+pub(crate) fn diagram_failure_label(language: Language, kind: &str) -> String {
+    format!("{kind} {}.", t(language, Key::DiagramCouldNotRender))
 }
 
 pub fn usage_summary(language: Language, counts: &mt_core::usage::UsageAggregate) -> String {
@@ -949,6 +957,9 @@ fn english(key: Key) -> &'static str {
         Key::ResolvingInstructions => "Resolving instructions…",
         Key::Reviewing => "Reviewing…",
         Key::Revising => "Revising…",
+        Key::PreviewEmpty => "Nothing to preview yet.",
+        Key::PreviewLoading => "Preparing preview…",
+        Key::DiagramCouldNotRender => "could not render",
         Key::SendRevision => "Send revision",
         Key::PrepareRevision => "Prepare revision",
         Key::ApplyApproved => "Apply approved",
@@ -967,6 +978,7 @@ fn english(key: Key) -> &'static str {
         Key::SaveAsFailed => "Save As failed",
         Key::OverwriteFailed => "Overwrite failed",
         Key::SettingsSaved => "Settings saved.",
+        Key::SettingsSaveFailed => "Could not save settings.",
         Key::MoreLayouts => "More layouts",
         Key::FewerLayouts => "Fewer layouts",
         Key::ReviewWithContext => "Review with selected context",
@@ -1435,6 +1447,9 @@ fn chinese(key: Key) -> &'static str {
         Key::ResolvingInstructions => "正在解析指令…",
         Key::Reviewing => "正在审查…",
         Key::Revising => "正在修订…",
+        Key::PreviewEmpty => "暂无内容可预览。",
+        Key::PreviewLoading => "正在准备预览…",
+        Key::DiagramCouldNotRender => "无法渲染",
         Key::SendRevision => "发送修订",
         Key::PrepareRevision => "准备修订",
         Key::ApplyApproved => "应用已批准修改",
@@ -1453,6 +1468,7 @@ fn chinese(key: Key) -> &'static str {
         Key::SaveAsFailed => "另存为失败",
         Key::OverwriteFailed => "覆盖失败",
         Key::SettingsSaved => "设置已保存。",
+        Key::SettingsSaveFailed => "无法保存设置。",
         Key::MoreLayouts => "更多布局",
         Key::FewerLayouts => "更少布局",
         Key::ReviewWithContext => "使用所选上下文审查",

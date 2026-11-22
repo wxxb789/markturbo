@@ -27,6 +27,9 @@ pub fn App() -> impl IntoElement {
     // A downloaded companion CJK face is read, verified and registered on a
     // blocking thread, after the first frame is on its way.
     state.companion_font.restore();
+    if ui::cjk_optics::capture_requested() {
+        return ui::cjk_optics::capture(state.companion_font.clone());
+    }
     if let Some(path) = startup_path() {
         log::debug!("startup: opening {}", path.display());
         if path.is_dir() {
