@@ -73,9 +73,55 @@ fn neutralize_document_links(page: &str) -> Cow<'_, str> {
     let mut remaining = page;
     let mut output = None;
     let mut copied = 0;
+    let mut foreign_roots = Vec::new();
+    let mut tag_tail_len = None;
     while let Some((_, after_start)) = remaining.split_once('<') {
         remaining = after_start;
         let Some(attributes) = tag_attributes(after_start, "link") else {
+            if tag_tail_len.is_some_and(|len| after_start.len() > len) {
+                continue;
+            }
+            if let Some(comment) = after_start.strip_prefix("!--") {
+                remaining = comment_end_tail(comment).unwrap_or_default();
+                continue;
+            }
+            let (closing, tag) = match after_start.strip_prefix('/') {
+                Some(tag) => (true, tag),
+                None => (false, after_start),
+            };
+            if !tag.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+                continue;
+            }
+            let name_end = tag
+                .find(|c| html_whitespace(c) || matches!(c, '/' | '>'))
+                .unwrap_or(tag.len());
+            let (name, attributes) = tag.split_at(name_end);
+            let end = scan_tag_end(attributes, |_| {});
+            let after_tag = attributes.get(end.offset + 1..).unwrap_or_default();
+            tag_tail_len = Some(after_tag.len());
+            if let Some(root) = ["svg", "math"]
+                .into_iter()
+                .find(|root| name.eq_ignore_ascii_case(root))
+            {
+                if closing && foreign_roots.last() == Some(&root) {
+                    foreign_roots.pop();
+                } else if !closing && !end.slash {
+                    foreign_roots.push(root);
+                }
+            } else if !closing && foreign_roots.is_empty() {
+                if name.eq_ignore_ascii_case("plaintext") {
+                    break;
+                }
+                if [
+                    "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes",
+                    "noscript",
+                ]
+                .into_iter()
+                .any(|raw| name.eq_ignore_ascii_case(raw))
+                {
+                    remaining = raw_text_end_tail(after_tag, name).unwrap_or_default();
+                }
+            }
             continue;
         };
         let start = page.len() - after_start.len() - 1;
@@ -105,6 +151,18 @@ fn neutralize_document_links(page: &str) -> Cow<'_, str> {
         }
         None => Cow::Borrowed(page),
     }
+}
+
+fn comment_end_tail(comment: &str) -> Option<&str> {
+    comment
+        .strip_prefix('>')
+        .or_else(|| comment.strip_prefix("->"))
+        .or_else(|| {
+            comment.match_indices('-').find_map(|(offset, _)| {
+                let tail = &comment[offset + 1..];
+                tail.strip_prefix("->").or_else(|| tail.strip_prefix("-!>"))
+            })
+        })
 }
 
 fn tag_attributes<'a>(source: &'a str, name: &str) -> Option<&'a str> {
@@ -431,13 +489,8 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
             ..markdown::CompileOptions::default()
         },
     };
-    let rendered = preserve_inline_scripts(run, &options.parse).and_then(|(source, scripts)| {
-        if !scripts.is_empty() {
-            options.parse.constructs.html_text = true;
-        }
-        let html = markdown::to_html_with_options(source.as_ref(), &options)
-            .map_err(|message| message.reason)?;
-        restore_inline_scripts(html, scripts)
+    let rendered = render_markdown_scripts(run, &mut options, |source, options| {
+        markdown::to_html_with_options(source, options).map_err(|message| message.reason)
     });
     match rendered {
         Ok(html) => out.push_str(&html),
@@ -446,7 +499,7 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
     run.clear();
 }
 
-type ScriptPlaceholders = Vec<(String, String)>;
+type ScriptPlaceholders<'a> = Vec<(String, &'a str)>;
 
 struct ScriptRange {
     start: usize,
@@ -455,23 +508,42 @@ struct ScriptRange {
     flow: bool,
 }
 
-fn preserve_inline_scripts<'a>(
-    source: &'a str,
-    parse_options: &markdown::ParseOptions,
-) -> Result<(Cow<'a, str>, ScriptPlaceholders), String> {
-    let (mut ranges, mut jsx_names) = collect_script_ranges(source, parse_options);
-    if ranges.is_empty() {
-        return Ok((Cow::Borrowed(source), Vec::new()));
-    }
+fn render_markdown_scripts(
+    source: &str,
+    options: &mut markdown::Options,
+    mut compile: impl FnMut(&str, &markdown::Options) -> Result<String, String>,
+) -> Result<String, String> {
+    let (mut ranges, mut jsx_names) = collect_script_ranges(source, &options.parse);
+    let html_text = options.parse.constructs.html_text;
     ranges.sort_unstable_by_key(|range| range.start);
     jsx_names.sort_unstable();
-    protect_script_ranges(
-        source,
-        ranges,
-        jsx_names,
-        parse_options.constructs.mdx_jsx_text,
-    )
-    .map(|(source, scripts)| (Cow::Owned(source), scripts))
+    let mut end = 0;
+    ranges.retain(|range| {
+        if range.start < end {
+            return false;
+        }
+        end = range.end;
+        true
+    });
+    while !ranges.is_empty() {
+        let (protected, scripts) = protect_script_ranges(
+            source,
+            &ranges,
+            &jsx_names,
+            options.parse.constructs.mdx_jsx_text,
+        )?;
+        options.parse.constructs.html_text = true;
+        let html = compile(&protected, options)?;
+        match restore_inline_scripts(html, scripts) {
+            Ok(html) => return Ok(html),
+            Err(restore_failed) => {
+                let mut failures = restore_failed.into_iter();
+                ranges.retain(|_| !failures.next().expect("one status per script"));
+            }
+        }
+    }
+    options.parse.constructs.html_text = html_text;
+    compile(source, options)
 }
 
 fn collect_script_ranges(
@@ -496,30 +568,27 @@ fn collect_script_ranges(
     (ranges, jsx_names)
 }
 
-fn protect_script_ranges(
+fn protect_script_ranges<'a>(
     source: &str,
-    ranges: Vec<ScriptRange>,
-    jsx_names: Vec<usize>,
+    ranges: &'a [ScriptRange],
+    jsx_names: &[usize],
     mdx: bool,
-) -> Result<(String, ScriptPlaceholders), String> {
+) -> Result<(String, ScriptPlaceholders<'a>), String> {
     let marker_prefix = random_script_marker_prefix()?;
     let mut protected = String::with_capacity(source.len());
     let mut scripts = Vec::with_capacity(ranges.len());
-    let mut jsx_names = jsx_names.into_iter().peekable();
+    let mut jsx_names = jsx_names.iter().copied().peekable();
     let mut cursor = 0;
     for (
         index,
-        ScriptRange {
+        &ScriptRange {
             start,
             end,
-            script,
+            ref script,
             flow,
         },
-    ) in ranges.into_iter().enumerate()
+    ) in ranges.iter().enumerate()
     {
-        if start < cursor {
-            continue;
-        }
         copy_mdx_text(&mut protected, source, cursor, start, &mut jsx_names);
         // A punctuation guard keeps a line-leading comment in MDX's inline grammar.
         let gap = &source[cursor..start];
@@ -530,7 +599,7 @@ fn protect_script_ranges(
         };
         let marker = format!("{guard}{marker_prefix}:{index}-->");
         protected.push_str(&marker);
-        scripts.push((marker, script));
+        scripts.push((marker, script.as_str()));
         cursor = end;
     }
     copy_mdx_text(&mut protected, source, cursor, source.len(), &mut jsx_names);
@@ -720,6 +789,7 @@ fn collect_markdown_flow_scripts(
     let Some(mut content) = opening_tag_end(remaining, "script") else {
         return;
     };
+    let mut indentation = 0;
     let mut line_ends = value
         .split_inclusive(['\r', '\n'])
         .zip(source[position.start.offset..position.end.offset].split_inclusive(['\r', '\n']))
@@ -741,8 +811,8 @@ fn collect_markdown_flow_scripts(
         }
         None
     };
-    while let Some(tail) = script_end_tail(content) {
-        let start = value.len() - remaining.len();
+    while let Some(tail) = raw_text_end_tail(content, "script") {
+        let start = value.len() - remaining.len() - indentation;
         let end = value.len() - tail.len();
         let (Some(source_start), Some(source_end)) = (source_offset(start), source_offset(end))
         else {
@@ -754,21 +824,26 @@ fn collect_markdown_flow_scripts(
             script: value[start..end].to_string(),
             flow: true,
         });
-        let Some((next, next_content)) = tail.match_indices('<').find_map(|(offset, _)| {
+        let Some((offset, next, next_content)) = tail.match_indices('<').find_map(|(offset, _)| {
             let candidate = &tail[offset..];
-            opening_tag_end(candidate, "script").map(|content| (candidate, content))
+            opening_tag_end(candidate, "script").map(|content| (offset, candidate, content))
         }) else {
             break;
         };
+        indentation = tail[..offset]
+            .rsplit_once(['\r', '\n'])
+            .map(|(_, line)| line)
+            .filter(|line| line.bytes().all(|byte| matches!(byte, b' ' | b'\t')))
+            .map_or(0, str::len);
         remaining = next;
         content = next_content;
     }
 }
 
-fn script_end_tail(content: &str) -> Option<&str> {
+fn raw_text_end_tail<'a>(content: &'a str, name: &str) -> Option<&'a str> {
     let attributes = content
         .match_indices("</")
-        .find_map(|(start, _)| tag_attributes(&content[start + 2..], "script"))?;
+        .find_map(|(start, _)| tag_attributes(&content[start + 2..], name))?;
     attributes.get(scan_tag_end(attributes, |_| {}).offset + 1..)
 }
 
@@ -812,9 +887,30 @@ fn script_value(
     let mut parse = markdown::ParseOptions::default();
     parse.constructs.code_indented = false;
     let ast = markdown::to_mdast(&projection, &parse).ok()?;
-    let html = html_node_at(&ast, &projection, script_start)?;
-    (html.position.as_ref()?.end.offset == projection.len())
-        .then(|| html.value.trim_start_matches([' ', '\t']).to_string())
+    if let Some(html) = html_node_at(&ast, &projection, script_start)
+        && html.position.as_ref()?.end.offset == projection.len()
+    {
+        return Some(html.value.trim_start_matches([' ', '\t']).to_string());
+    }
+
+    const RAW_TAG: &str = "<span data-script=\"";
+    projection.truncate(script_start);
+    projection.push_str("x ");
+    projection.push_str(RAW_TAG);
+    projection.push_str(&raw.replace('&', "&amp;").replace('"', "&quot;"));
+    projection.push_str("\">");
+    let ast = markdown::to_mdast(&projection, &parse).ok()?;
+    let html = html_node_at(&ast, &projection, script_start + 2)?;
+    if html.position.as_ref()?.end.offset != projection.len() {
+        return None;
+    }
+    Some(
+        html.value
+            .strip_prefix(RAW_TAG)?
+            .strip_suffix("\">")?
+            .replace("&quot;", "\"")
+            .replace("&amp;", "&"),
+    )
 }
 
 fn html_node_at<'a>(
@@ -866,7 +962,10 @@ fn is_script_tag(tag: &str, closing: bool) -> bool {
         }
 }
 
-fn restore_inline_scripts(html: String, scripts: ScriptPlaceholders) -> Result<String, String> {
+fn restore_inline_scripts(
+    html: String,
+    scripts: ScriptPlaceholders<'_>,
+) -> Result<String, Vec<bool>> {
     let Some((first_marker, _)) = scripts.first() else {
         return Ok(html);
     };
@@ -874,40 +973,45 @@ fn restore_inline_scripts(html: String, scripts: ScriptPlaceholders) -> Result<S
         .rsplit_once(':')
         .expect("script marker includes an id");
     let prefix = prefix.trim_start_matches('.');
-    let mut remaining: HashMap<&str, &str> = scripts
+    let markers: HashMap<&str, usize> = scripts
         .iter()
-        .map(|(marker, script)| (marker.as_str(), script.as_str()))
+        .enumerate()
+        .map(|(index, (marker, _))| (marker.as_str(), index))
         .collect();
-    let mut restored = String::with_capacity(html.len());
+    let mut counts = vec![0; scripts.len()];
+    let mut matches = Vec::with_capacity(scripts.len());
     let mut cursor = 0;
     while let Some(offset) = html[cursor..].find(prefix) {
         let start = cursor + offset;
         let end = html[start..]
             .find("-->")
             .map_or(html.len(), |end| start + end + 3);
-        let (start, script) = if let Some(script) = remaining.remove(&html[start..end]) {
-            (start, script)
-        } else if start > cursor
-            && html.as_bytes()[start - 1] == b'.'
-            && let Some(script) = remaining.remove(&html[start - 1..end])
-        {
-            (start - 1, script)
-        } else {
-            return Err(
-                "an unexpected or duplicate inline script placeholder appeared during Markdown rendering".into()
-            );
-        };
-        restored.push_str(&html[cursor..start]);
-        restored.push_str(script);
+        let matched = markers
+            .get(&html[start..end])
+            .map(|&index| (start, index))
+            .or_else(|| {
+                (start > cursor && html.as_bytes()[start - 1] == b'.')
+                    .then(|| markers.get(&html[start - 1..end]))
+                    .flatten()
+                    .map(|&index| (start - 1, index))
+            });
+        if let Some((start, index)) = matched {
+            counts[index] += 1;
+            matches.push((start, end, index));
+        }
         cursor = end;
     }
-    if !remaining.is_empty() {
-        return Err("an inline script placeholder was lost during Markdown rendering".into());
+    if counts.iter().any(|&count| count != 1) {
+        return Err(counts.into_iter().map(|count| count != 1).collect());
+    }
+    let mut restored = String::with_capacity(html.len());
+    let mut cursor = 0;
+    for (start, end, index) in matches {
+        restored.push_str(&html[cursor..start]);
+        restored.push_str(scripts[index].1);
+        cursor = end;
     }
     restored.push_str(&html[cursor..]);
-    if restored.contains(prefix) {
-        return Err("an inline script placeholder remained after Markdown rendering".into());
-    }
     Ok(restored)
 }
 
@@ -1495,6 +1599,30 @@ mod tests {
     }
 
     #[test]
+    fn markdown_indented_script_in_type_one_block_keeps_later_blocks() {
+        let source = "<script>void 0;</script >\n    <script>void 1;</script>\n\n# After";
+        let html = page(&md(source), &registry(), false);
+        let rendered = body(&html);
+        assert!(rendered.contains("<h1>After</h1>"), "{rendered}");
+        for script in ["<script>void 0;</script >", "<script>void 1;</script>"] {
+            assert!(rendered.contains(script), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn markdown_script_in_lazy_blockquote_continuation_keeps_later_blocks() {
+        let source =
+            "> Note <script>\n> const value = \"&quot;\";\nvoid value;\n> </script>\n\n# After";
+        let html = page(&md(source), &registry(), false);
+        let rendered = body(&html);
+        assert!(rendered.contains("<h1>After</h1>"), "{rendered}");
+        assert!(
+            rendered.contains("<script>\nconst value = \"&quot;\";\nvoid value;\n</script>"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn markdown_flow_scripts_accept_html_end_tag_syntax() {
         let space = "<script>void 0;</script >";
         let tab = "<script>void 1;</SCRIPT\t>";
@@ -1615,10 +1743,7 @@ mod tests {
                 "<link rel=stylesheet href='theme.css'>",
                 "<template data-mt-link rel=stylesheet href='theme.css'></template>",
             ),
-            (
-                "<!-- <link rel=preload> -->",
-                "<!-- <template data-mt-link rel=preload></template> -->",
-            ),
+            ("<!-- <link rel=preload> -->", "<!-- <link rel=preload> -->"),
         ];
         let registry = registry();
         let mut failures = Vec::new();
@@ -1635,18 +1760,22 @@ mod tests {
     }
 
     #[test]
-    fn makes_link_text_inert_in_raw_and_escaped_text_elements() {
+    fn preserves_links_in_raw_text_and_resumes_after_the_end_tag() {
         let source = concat!(
-            "<script>const tag = '<link rel=preload>';</script>",
+            "<script>const tag = /<link>/;</SCRIPT ignored=\">\">",
             "<style>p::before{content:'<link rel=preload>'}</style>",
             "<textarea><link rel=preload></textarea>",
-            "<link rel=preload>",
+            "<title><link></title><xmp><link></xmp><iframe><link></iframe>",
+            "<noembed><link></noembed><noframes><link></noframes>",
+            "<noscript><link></noscript><!-- <link><script> -->",
+            "<script>const tag = /<link>/;</script ><link rel=preload>",
+            "<plaintext><link></plaintext><link>",
         );
         assert_eq!(
             neutralize_document_links(source),
             source.replace(
-                "<link rel=preload>",
-                "<template data-mt-link rel=preload></template>"
+                "</script ><link rel=preload>",
+                "</script ><template data-mt-link rel=preload></template>"
             )
         );
     }
@@ -1716,27 +1845,53 @@ mod tests {
     }
 
     #[test]
-    fn inline_script_restoration_rejects_missing_or_duplicate_markers() {
-        let marker = "<!--mt-script:0123456789abcdef0123456789abcdef:0-->".to_string();
-        let script = "<script>author()</script>".to_string();
-
-        assert!(
-            restore_inline_scripts(String::new(), vec![(marker.clone(), script.clone())]).is_err()
-        );
-        assert!(
-            restore_inline_scripts(format!("{marker}{marker}"), vec![(marker, script)]).is_err()
+    fn missing_inline_script_marker_leaves_the_other_script_and_content() {
+        let source =
+            "before <script>void 0;</script> between <script>void 1;</script> after\n\n# After";
+        let mut options = markdown::Options::gfm();
+        options.compile.allow_dangerous_html = true;
+        let mut calls = 0;
+        let rendered = render_markdown_scripts(source, &mut options, |source, options| {
+            let mut html = markdown::to_html_with_options(source, options).unwrap();
+            calls += 1;
+            if calls == 1 {
+                let start = html.rfind("<!--mt-script:").unwrap();
+                html.replace_range(start..start + 1, "&lt;");
+            }
+            Ok(html)
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(
+            rendered,
+            "<p>before <script>void 0;</script> between &lt;script>void 1;&lt;/script> after</p>\n<h1>After</h1>"
         );
     }
 
     #[test]
-    fn inline_script_restoration_rejects_an_unclaimed_marker() {
+    fn inline_script_restoration_rejects_missing_or_duplicate_markers() {
+        let marker = "<!--mt-script:0123456789abcdef0123456789abcdef:0-->".to_string();
+        let script = "<script>author()</script>";
+
+        assert_eq!(
+            restore_inline_scripts(String::new(), vec![(marker.clone(), script)]),
+            Err(vec![true])
+        );
+        assert_eq!(
+            restore_inline_scripts(format!("{marker}{marker}"), vec![(marker, script)]),
+            Err(vec![true])
+        );
+    }
+
+    #[test]
+    fn inline_script_restoration_leaves_an_unclaimed_marker_inert() {
         let prefix = "<!--mt-script:0123456789abcdef0123456789abcdef";
-        assert!(
+        assert_eq!(
             restore_inline_scripts(
                 format!("{prefix}:0-->{prefix}:1-->"),
-                vec![(format!("{prefix}:0-->"), "<script>void 0</script>".into())],
-            )
-            .is_err()
+                vec![(format!("{prefix}:0-->"), "<script>void 0</script>")],
+            ),
+            Ok(format!("<script>void 0</script>{prefix}:1-->"))
         );
     }
 
@@ -1752,7 +1907,7 @@ mod tests {
                 break;
             }
             html.push_str(&marker);
-            scripts.push((marker, script.to_string()));
+            scripts.push((marker, script));
         }
         let expected = script.repeat(scripts.len());
         let started = std::time::Instant::now();
@@ -1769,7 +1924,7 @@ mod tests {
     fn inline_script_placeholder_generation_on_one_long_line_is_bounded() {
         let script = "<script>void 0</script>";
         let source = script.repeat(100_000);
-        let ranges = source
+        let ranges: Vec<_> = source
             .match_indices(script)
             .map(|(start, script)| ScriptRange {
                 start,
@@ -1779,7 +1934,7 @@ mod tests {
             })
             .collect();
         let started = std::time::Instant::now();
-        std::hint::black_box(protect_script_ranges(&source, ranges, Vec::new(), true).unwrap());
+        std::hint::black_box(protect_script_ranges(&source, &ranges, &[], true).unwrap());
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(500),
