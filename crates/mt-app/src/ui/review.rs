@@ -1934,13 +1934,13 @@ mod tests {
     }
 
     #[test]
-    fn production_cjk_optics_stays_at_plus_zero_and_same_weight() {
+    fn production_cjk_optics_step_the_size_and_weight_of_cjk_only() {
         let optics = tokens::CJK_OPTICS;
-        for is_cjk in [false, true] {
-            assert_eq!(optics.size(TYPE_MODEL, is_cjk), TYPE_MODEL);
-            assert_eq!(optics.weight(WEIGHT_MODEL, is_cjk), WEIGHT_MODEL);
-        }
-        assert!(!optics.changes_weight());
+        assert_eq!(optics.size(TYPE_MODEL, false), TYPE_MODEL);
+        assert_eq!(optics.weight(WEIGHT_MODEL, false), WEIGHT_MODEL);
+        assert_eq!(optics.size(TYPE_MODEL, true), TYPE_MODEL + 1.0);
+        assert_eq!(optics.weight(WEIGHT_MODEL, true).0, WEIGHT_MODEL.0 + 100);
+        assert!(optics.changes_weight());
     }
 
     #[test]

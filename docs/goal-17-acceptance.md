@@ -40,17 +40,20 @@ Verified head: (filled at merge)
 
 ## Desktop acceptance
 
-Pending on the owner's active, unlocked Windows 11 x64 desktop. No capture or
-native pass is claimed.
+Pending on the owner's active, unlocked Windows 11 x64 desktop. The CJK
+optical-sizing capture is recorded below; no native pass is claimed.
 
 - Run native acceptance against the final release executable and its expected
   SHA-256, as described in [verification.md](verification.md).
 - Run the visual matrix on the same executable. Capture before and after
   Settings, Review, and light-mode cooled model text. Check Settings at a
   900px window height, including the last section after scrolling.
-- Capture the same mixed CJK/Latin paragraph in the three optical variants.
-  The default remains unchanged; pick a variant from the captures before
-  changing the default in a follow-up.
+- The mixed CJK/Latin optical-variant capture ran on 2026-11-23, light theme
+  only (the recipe forces light), against markturbo.exe SHA-256
+  `a6ef8cfb758e6934f1a7b17713f240ad9ea4255f753d5ff160a07193580b567b`. The
+  owner picked **+1px with the next companion weight** (the third capture
+  column); it is the production default, and the +0 and +1px columns stay
+  capture-only.
 
 ```powershell
 uv run --locked --project scripts scripts/mt.py visual -- --goal17-cjk-optics --exe <release-exe> --out .scratch/goal-17-cjk

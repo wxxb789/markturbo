@@ -109,6 +109,20 @@ mod tests {
     }
 
     #[component]
+    fn ProductionOpticsProbe() -> impl IntoElement {
+        prims::script_text(
+            "Latin 中文かな한글",
+            tokens::TYPE_MODEL,
+            WEIGHT_MODEL,
+            tokens::CJK_OPTICS,
+        )
+        .font_family(FONT_MODEL)
+        .font_weight(WEIGHT_MODEL)
+        .text_size(px(tokens::TYPE_MODEL))
+        .line_height(px(tokens::TYPE_MODEL_LINE))
+    }
+
+    #[component]
     fn ScriptBoundaryProbe() -> impl IntoElement {
         prims::script_text(
             "A·B | e\u{0305} | 中\u{05B0} | 中文·中文 | 中文, Latin | Latin, 中文",
@@ -155,6 +169,32 @@ mod tests {
         assert_eq!(cjk.font_size.0, tokens::TYPE_MODEL + 1.0);
         assert_eq!(cjk.font_weight, WEIGHT_MODEL.0 + 100);
         assert_eq!(latin.font_family.unwrap().name().as_ref(), FONT_MODEL);
+        assert_eq!(cjk.font_family.unwrap().name().as_ref(), FONT_UI);
+    }
+
+    #[test]
+    fn the_production_default_steps_cjk_runs_on_the_system_fallback_list() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<ProductionOpticsProbe>().tokens(tokens::theme()),
+        ))
+        .expect("start the production optics probe");
+        app.wait_for("text:Latin 中文かな한글")
+            .expect("the mixed-script paragraph");
+
+        let latin = app
+            .screen()
+            .span_style("text:Latin")
+            .expect("the Latin run style");
+        let cjk = app
+            .screen()
+            .span_style("text:中文かな한글")
+            .expect("the CJK run style");
+
+        assert_eq!(latin.font_size.0, tokens::TYPE_MODEL);
+        assert_eq!(latin.font_weight, WEIGHT_MODEL.0);
+        assert_eq!(latin.font_family.unwrap().name().as_ref(), FONT_MODEL);
+        assert_eq!(cjk.font_size.0, tokens::TYPE_MODEL + 1.0);
+        assert_eq!(cjk.font_weight, WEIGHT_MODEL.0 + 100);
         assert_eq!(cjk.font_family.unwrap().name().as_ref(), FONT_UI);
     }
 
