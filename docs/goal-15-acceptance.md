@@ -189,3 +189,27 @@ Its cause was not established. The fast and CI tooling failures were both
 collector also walks workspace ancestors and this host has an additional
 `.cargo/config.toml` in the immediate ancestor. No shared configuration was
 changed to alter the result.
+
+## Native acceptance 2026-11-23
+
+One `mt.py accept all` run on `main` `c3aab06` (Goals 14–19 merged), on the
+owner's active, unlocked RDP desktop (Windows 11 x64, harness process session
+2, input desktop Default). The harness hash-verified the release executable
+(SHA-256 `a6ef8cfb758e6934f1a7b17713f240ad9ea4255f753d5ff160a07193580b567b`,
+44,480,000 bytes). Goal-02 PASS, goal-03 PASS, goal-06 PASS
+(`ALL_REQUIRED_CASES`); goal-07 **FAIL**
+(`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, phase `WEB_SECURITY`, case
+`revision_session`). **This is not a pass.**
+
+Diagnosis: the fixture's `window.open` leaves a visible WebView2 popup
+(`Chrome_WidgetWin_1`, `msedgewebview2.exe`, in the app job); an isolation run
+with only `window.open` reproduces it; nsh 0.6.1 handles `NewWindowRequested`
+only after the page closes (`nsh-platform-windows` `web.rs:991`); the iframe
+sandbox does not prevent it in WebView2. Upstream fixed it on nsh `main`
+([longbridge/nsh#2423](https://github.com/longbridge/nsh/pull/2423); issue
+[#2785](https://github.com/longbridge/nsh/issues/2785) closed 2026-11-23); no
+nsh release contains the fix yet. Owner decision 2026-11-23: wait for that
+release; no in-page workaround.
+
+The pending release checks above remain pending, and clause 3's native proof
+needs a goal-07 re-run on the first nsh release that contains the fix.

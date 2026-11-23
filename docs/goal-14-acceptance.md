@@ -121,3 +121,19 @@ desktop with a foreground window, build the
 release executable and run `mt.py accept all` with its exact SHA-256, then
 `mt.py visual -- --exe <release exe> --out .scratch/goal-14-visual`.
 Keep the goal active until the required evidence exists.
+
+## Native acceptance 2026-11-23
+
+One `mt.py accept all` run on `main` `c3aab06` (Goals 14–19 merged), on the
+owner's active, unlocked RDP desktop (Windows 11 x64, harness process session
+2, input desktop Default). The harness hash-verified the release executable
+(SHA-256 `a6ef8cfb758e6934f1a7b17713f240ad9ea4255f753d5ff160a07193580b567b`,
+44,480,000 bytes). Results: goal-02 PASS, goal-03 PASS, goal-06 PASS
+(`ALL_REQUIRED_CASES`), goal-07 **FAIL**
+(`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, phase `WEB_SECURITY`, case
+`revision_session`; diagnosed in
+[goal-15-acceptance.md](goal-15-acceptance.md#native-acceptance-2026-11-23)).
+
+Clause 6 therefore stays pending: the goal set did not pass, and the visual
+matrix and the native keyboard-focus check above have not run. This run is not
+a pass.

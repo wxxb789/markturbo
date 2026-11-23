@@ -86,3 +86,16 @@ release build:
 - The Goal 15 release checks in
   [goal-15-acceptance.md](goal-15-acceptance.md#pending-release-checks) still
   apply; the goal07 fixture no longer opens a browser during that run.
+
+## Native acceptance 2026-11-23
+
+One `mt.py accept all` run on `main` `c3aab06` (Goals 14–19 merged), on the
+owner's active, unlocked RDP desktop (Windows 11 x64, harness process session
+2, input desktop Default). The harness hash-verified the release executable
+(SHA-256 `a6ef8cfb758e6934f1a7b17713f240ad9ea4255f753d5ff160a07193580b567b`,
+44,480,000 bytes). It covers goals 02, 03, 06 and 07 only: goal-02 PASS,
+goal-03 PASS, goal-06 PASS (`ALL_REQUIRED_CASES`), goal-07 FAIL
+(`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, the nsh popup gap this goal's
+contract lists as out of scope, not the preview link bridge). It exercises
+none of the link checks listed above; those remain pending. This is not a
+pass.
