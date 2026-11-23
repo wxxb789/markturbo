@@ -743,6 +743,7 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
                     .bottom(px(0.0))
                     .w_full()
                     .h(px(FILAMENT_H))
+                    .test_id("consent-filament")
                     .origin_bottom_left()
                     .bind_background(&heat.filament_glow());
                 if motion::reduced_motion() {
@@ -1233,12 +1234,13 @@ impl Hold {
         self.charging.set(None);
         self.released.set(None);
         self.heat.stop();
-        self.heat.set(0.0);
         self.focused.set(false);
         if self.spent.get() {
-            // The send already left: its label stays put.
+            // The send already left: its label and full charge stay until the
+            // card unmounts.
             return;
         }
+        self.heat.set(0.0);
         self.end_notice();
         if !changed {
             // The same binding, a new body: the charge it may have started is
@@ -1999,6 +2001,33 @@ mod tests {
             .child(crate::ui::shell::overlay_layer(state, Language::English))
     }
 
+    #[component]
+    fn SentFadeHarness() -> impl IntoElement {
+        let state = AppState::new();
+        let open_state = state.clone();
+        let clear_state = state.clone();
+        view()
+            .w(px(1_200.0))
+            .h(px(800.0))
+            .child(prims::quiet_action("sent-fade-open", "Open", move || {
+                open_state
+                    .review_consent
+                    .set(Some(SharedString::from("disclosure text")));
+                open_state.review_manifest.set(Some(sample_consent()));
+            }))
+            .child(
+                view()
+                    .test_id("sent-fade-clear")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        clear_state.review_consent.set(None);
+                        clear_state.review_manifest.set(None);
+                    })
+                    .child(prims::rest("clear")),
+            )
+            .child(crate::ui::shell::overlay_layer(state, Language::English))
+    }
+
     pub(super) fn start_harness() -> Headless {
         // A late frame once ran hold completion before its watchdog; manual time orders them.
         let mut config = EngineConfig::new(Root::of::<Harness>());
@@ -2008,6 +2037,25 @@ mod tests {
             .expect("viewport");
         app.wait_for("id:consent-card").expect("the card");
         app
+    }
+
+    fn press_without_settling(app: &Headless, selector: &str) {
+        use std::sync::mpsc;
+
+        let id = app.screen().id(selector).expect("the control");
+        let engine = app.engine().control();
+        engine.dispatch_event(
+            id,
+            nsh_core::EventKind::Press,
+            nsh_core::EventPayload::Press(Default::default()),
+        );
+        let (sent, received) = mpsc::channel();
+        engine.flush(move |_| {
+            let _ = sent.send(());
+        });
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the press flushed");
     }
 
     #[test]
@@ -2211,6 +2259,84 @@ mod tests {
         let mut app = start_harness();
         app.long_press("id:consent-send").expect("hold to send");
         assert!(app.shows("Sent"), "a full hold authorized one send");
+    }
+
+    #[test]
+    fn the_consent_charge_stays_full_through_the_sent_fade() {
+        use nsh_core::{
+            MountItem,
+            animation::{AnimationProp, Animator},
+        };
+
+        let mut config = EngineConfig::new(Root::of::<SentFadeHarness>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the harness");
+        app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
+            .expect("viewport");
+        app.wait_for("id:sent-fade-open").expect("the harness");
+        let batches = Arc::new(Mutex::new(Vec::<MountItem>::new()));
+        app.observe({
+            let batches = batches.clone();
+            move |_, batch| {
+                batches
+                    .lock()
+                    .expect("lock the batch record")
+                    .extend(batch.items.iter().cloned());
+            }
+        });
+
+        app.press("id:sent-fade-open").expect("open the consent");
+        app.wait_for("id:consent-card").expect("the card");
+        app.long_press("id:consent-send").expect("hold to send");
+        assert!(app.shows("Sent"), "the hold authorized the send");
+
+        let filament = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("consent-filament"))
+            .expect("the charge bar")
+            .id;
+        let heat = {
+            let batches = batches.lock().expect("lock the batch record");
+            batches
+                .iter()
+                .find_map(|item| match item {
+                    MountItem::AnimationBindings { id, bindings } if *id == filament => {
+                        bindings.iter().find_map(|(property, node)| {
+                            matches!(
+                                property,
+                                AnimationProp::Transform(_) | AnimationProp::Opacity
+                            )
+                            .then_some(*node)
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("the charge bar's charge binding")
+        };
+
+        press_without_settling(&app, "id:sent-fade-clear");
+        app.catch_up();
+        assert_eq!(
+            app.screen().matches("id:consent-motion-card"),
+            Ok(true),
+            "the card is still up for its exit fade"
+        );
+        assert!(app.shows("Sent"), "the fade still reads sent");
+
+        let mut animator = Animator::default();
+        {
+            let batches = batches.lock().expect("lock the batch record");
+            for item in batches.iter() {
+                animator.apply(item);
+            }
+        }
+        assert_eq!(
+            animator.value(heat),
+            1.0,
+            "the charge bar stays full until the card unmounts"
+        );
     }
 
     #[test]
