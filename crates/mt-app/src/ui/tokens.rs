@@ -543,8 +543,9 @@ pub struct CjkOpticsVariant {
     pub optics: CjkOptics,
 }
 
-/// Preserve today's CJK size and weight until the owner selects a capture.
-pub const CJK_OPTICS: CjkOptics = CJK_OPTICS_BASELINE;
+/// The owner's pick from the 2026-11-23 Goal 17 capture: the comparison's
+/// third column, "+1px / next companion weight".
+pub const CJK_OPTICS: CjkOptics = CJK_OPTICS_CAPTURE_VARIANTS[2].optics;
 
 pub const CJK_OPTICS_CAPTURE_VARIANTS: [CjkOpticsVariant; 3] = [
     CjkOpticsVariant {
