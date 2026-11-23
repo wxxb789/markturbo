@@ -162,3 +162,12 @@
   Goal 18 merge; fidelity only, no request leaves). Carry the raw-text scope
   across the `collect_inline_script_ranges`/`next_flow_script` node boundaries
   without a parser.
+- [ ] **Upgrade nsh for the Goal 15 WebView2 popup fix** — the 2026-11-23
+  native run failed goal-07 (`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, case
+  `revision_session`): the fixture's `window.open` leaves a visible WebView2
+  popup, and nsh 0.6.1 handles `NewWindowRequested` only after the page
+  closes. Upgrade every nsh crate to the first release containing
+  [longbridge/nsh#2423](https://github.com/longbridge/nsh/pull/2423) (issue
+  [#2785](https://github.com/longbridge/nsh/issues/2785) closed 2026-11-23),
+  then re-run goal-07. See
+  [goal-15-acceptance.md](goal-15-acceptance.md#native-acceptance-2026-11-23).

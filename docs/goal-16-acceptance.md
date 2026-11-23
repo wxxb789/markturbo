@@ -102,3 +102,15 @@ executable or receipts were generated in this implementation stage.
   `.scratch/`, using `dede9c6` for the before build and the same release profile,
   viewport, language, and appearance for both builds. Neither the matrix nor
   captures have been attempted here.
+
+## Native acceptance 2026-11-23
+
+One `mt.py accept all` run on `main` `c3aab06` (Goals 14–19 merged), on the
+owner's active, unlocked RDP desktop (Windows 11 x64, harness process session
+2, input desktop Default). The harness hash-verified the release executable
+(SHA-256 `a6ef8cfb758e6934f1a7b17713f240ad9ea4255f753d5ff160a07193580b567b`,
+44,480,000 bytes). It covers goals 02, 03, 06 and 07 only: goal-02 PASS,
+goal-03 PASS, goal-06 PASS (`ALL_REQUIRED_CASES`), goal-07 FAIL
+(`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`). It exercises none of this goal's
+desktop acceptance items; the visual matrix, the before/after captures and the
+banner, card and menu checks listed above remain pending. This is not a pass.
