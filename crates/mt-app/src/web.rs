@@ -103,11 +103,18 @@ pub(crate) fn build_html_localized(
     host
 }
 
+#[derive(Clone, Copy)]
+enum LinkScope {
+    Document,
+    ForeignObject(usize),
+    Foreign(&'static str),
+}
+
 fn neutralize_document_links(page: &str) -> Cow<'_, str> {
     let mut remaining = page;
     let mut output = None;
     let mut copied = 0;
-    let mut foreign_roots = Vec::new();
+    let mut scopes = vec![LinkScope::Document];
     let mut tag_tail_len = None;
     while let Some((_, after_start)) = remaining.split_once('<') {
         remaining = after_start;
@@ -133,27 +140,52 @@ fn neutralize_document_links(page: &str) -> Cow<'_, str> {
             let end = scan_tag_end(attributes, |_| {});
             let after_tag = attributes.get(end.offset + 1..).unwrap_or_default();
             tag_tail_len = Some(after_tag.len());
-            if let Some(root) = ["svg", "math"]
-                .into_iter()
-                .find(|root| name.eq_ignore_ascii_case(root))
-            {
-                if closing && foreign_roots.last() == Some(&root) {
-                    foreign_roots.pop();
-                } else if !closing && !end.slash {
-                    foreign_roots.push(root);
+            match scopes.last().copied() {
+                Some(LinkScope::Foreign(root)) => {
+                    if closing && name.eq_ignore_ascii_case(root) {
+                        scopes.pop();
+                    } else if !closing && !end.slash {
+                        if root == "svg" && name.eq_ignore_ascii_case("foreignObject") {
+                            scopes.push(LinkScope::ForeignObject(0));
+                        } else if let Some(next) = ["svg", "math"]
+                            .into_iter()
+                            .find(|next| name.eq_ignore_ascii_case(next))
+                        {
+                            scopes.push(LinkScope::Foreign(next));
+                        }
+                    }
                 }
-            } else if !closing && foreign_roots.is_empty() {
-                if name.eq_ignore_ascii_case("plaintext") {
-                    break;
-                }
-                if [
-                    "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes",
-                    "noscript",
-                ]
-                .into_iter()
-                .any(|raw| name.eq_ignore_ascii_case(raw))
-                {
-                    remaining = raw_text_end_tail(after_tag, name).unwrap_or_default();
+                _ => {
+                    if closing {
+                        if name.eq_ignore_ascii_case("foreignObject") {
+                            let pop = match scopes.last_mut() {
+                                Some(LinkScope::ForeignObject(depth)) if *depth == 0 => true,
+                                Some(LinkScope::ForeignObject(depth)) => {
+                                    *depth -= 1;
+                                    false
+                                }
+                                _ => false,
+                            };
+                            if pop {
+                                scopes.pop();
+                            }
+                        }
+                    } else if name.eq_ignore_ascii_case("plaintext") {
+                        break;
+                    } else if is_html_raw_text_name(name) {
+                        remaining = raw_text_end_tail(after_tag, name).unwrap_or_default();
+                    } else if !end.slash
+                        && let Some(root) = ["svg", "math"]
+                            .into_iter()
+                            .find(|root| name.eq_ignore_ascii_case(root))
+                    {
+                        scopes.push(LinkScope::Foreign(root));
+                    } else if !end.slash
+                        && name.eq_ignore_ascii_case("foreignObject")
+                        && let Some(LinkScope::ForeignObject(depth)) = scopes.last_mut()
+                    {
+                        *depth += 1;
+                    }
                 }
             }
             continue;
@@ -298,6 +330,25 @@ fn build_html_raw(source: &str, head_prefix: &str) -> String {
 
 fn html_whitespace(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\r' | '\n' | '\x0c')
+}
+
+const HTML_RAW_TEXT_NAMES: [&str; 10] = [
+    "script",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+    "iframe",
+    "noembed",
+    "noframes",
+    "noscript",
+    "plaintext",
+];
+
+fn is_html_raw_text_name(name: &str) -> bool {
+    HTML_RAW_TEXT_NAMES
+        .into_iter()
+        .any(|raw| name.eq_ignore_ascii_case(raw))
 }
 
 fn html_doctype_end(source: &str) -> Option<&str> {
@@ -543,7 +594,14 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
     run.clear();
 }
 
-type ScriptPlaceholders<'a> = Vec<(String, &'a str)>;
+struct ScriptPlaceholder<'a> {
+    marker: String,
+    script: &'a str,
+    before: &'static str,
+    after: &'static str,
+}
+
+type ScriptPlaceholders<'a> = Vec<ScriptPlaceholder<'a>>;
 
 struct ScriptRange {
     start: usize,
@@ -634,20 +692,56 @@ fn protect_script_ranges<'a>(
     ) in ranges.iter().enumerate()
     {
         copy_mdx_text(&mut protected, source, cursor, start, &mut jsx_names);
-        // A punctuation guard keeps a line-leading comment in MDX's inline grammar.
-        let gap = &source[cursor..start];
-        let guard = if mdx && (flow || starts_mdx_line(gap, cursor == 0)) {
-            "."
+        let marker = format!("{marker_prefix}:{index}-->");
+        if flow && !mdx {
+            let (close, after) = if script_close_ends_block(script) {
+                (FLOW_CLOSE, FLOW_CLOSE_FILTERED)
+            } else {
+                (FLOW_CONTINUING_CLOSE, FLOW_CONTINUING_CLOSE_FILTERED)
+            };
+            protected.push_str(FLOW_OPEN);
+            protected.push_str(&marker);
+            protected.push_str(close);
+            scripts.push(ScriptPlaceholder {
+                marker,
+                script,
+                before: FLOW_OPEN_FILTERED,
+                after,
+            });
         } else {
-            ""
-        };
-        let marker = format!("{guard}{marker_prefix}:{index}-->");
-        protected.push_str(&marker);
-        scripts.push((marker, script.as_str()));
+            // A punctuation guard keeps a line-leading comment in MDX's inline grammar.
+            let gap = &source[cursor..start];
+            let guard = if mdx && (flow || starts_mdx_line(gap, cursor == 0)) {
+                "."
+            } else {
+                ""
+            };
+            let marker = format!("{guard}{marker}");
+            protected.push_str(&marker);
+            scripts.push(ScriptPlaceholder {
+                marker,
+                script,
+                before: "",
+                after: "",
+            });
+        }
         cursor = end;
     }
     copy_mdx_text(&mut protected, source, cursor, source.len(), &mut jsx_names);
     Ok((protected, scripts))
+}
+
+const FLOW_OPEN: &str = "<script>";
+const FLOW_CLOSE: &str = "</script>";
+const FLOW_CONTINUING_CLOSE: &str = "</script >";
+const FLOW_OPEN_FILTERED: &str = "&lt;script>";
+const FLOW_CLOSE_FILTERED: &str = "&lt;/script>";
+const FLOW_CONTINUING_CLOSE_FILTERED: &str = "&lt;/script >";
+
+fn script_close_ends_block(script: &str) -> bool {
+    script
+        .get(script.len().saturating_sub(FLOW_CLOSE.len())..)
+        .is_some_and(|close| close.eq_ignore_ascii_case(FLOW_CLOSE))
 }
 
 fn starts_mdx_line(gap: &str, first_script: bool) -> bool {
@@ -796,7 +890,25 @@ fn collect_inline_script_ranges(
         tags.sort_unstable_by_key(|(start, _, _)| *start);
 
         let mut opening = None;
+        let mut raw: Option<&'static str> = None;
         for (start, end, tag) in tags {
+            if let Some(name) = raw {
+                if is_html_end_tag(tag, name) {
+                    raw = None;
+                }
+                continue;
+            }
+            if opening.is_none() {
+                if !is_script_tag(tag, false)
+                    && let Some(name) = html_raw_text_name(tag)
+                {
+                    if name == "plaintext" {
+                        break;
+                    }
+                    raw = Some(name);
+                    continue;
+                }
+            }
             if is_script_tag(tag, false) {
                 opening.get_or_insert(start);
             } else if is_script_tag(tag, true)
@@ -868,10 +980,7 @@ fn collect_markdown_flow_scripts(
             script: value[start..end].to_string(),
             flow: true,
         });
-        let Some((offset, next, next_content)) = tail.match_indices('<').find_map(|(offset, _)| {
-            let candidate = &tail[offset..];
-            opening_tag_end(candidate, "script").map(|content| (offset, candidate, content))
-        }) else {
+        let Some((offset, next, next_content)) = next_flow_script(tail) else {
             break;
         };
         indentation = tail[..offset]
@@ -881,6 +990,51 @@ fn collect_markdown_flow_scripts(
             .map_or(0, str::len);
         remaining = next;
         content = next_content;
+    }
+}
+
+fn next_flow_script(tail: &str) -> Option<(usize, &str, &str)> {
+    let mut remaining = tail;
+    loop {
+        let offset = tail.len() - remaining.len();
+        let less_than = remaining.find('<')?;
+        let after = &remaining[less_than + 1..];
+        let position = offset + less_than;
+        if let Some(comment) = after.strip_prefix("!--") {
+            remaining = comment_end_tail(comment)?;
+            continue;
+        }
+        let (closing, tag) = match after.strip_prefix('/') {
+            Some(tag) => (true, tag),
+            None => (false, after),
+        };
+        if !tag.as_bytes().first().is_some_and(u8::is_ascii_alphabetic) {
+            remaining = after;
+            continue;
+        }
+        let name_end = tag
+            .find(|c| html_whitespace(c) || matches!(c, '/' | '>'))
+            .unwrap_or(tag.len());
+        let (name, attributes) = tag.split_at(name_end);
+        let end = scan_tag_end(attributes, |_| {});
+        let after_tag = attributes.get(end.offset + 1..).unwrap_or_default();
+        if !closing && name.eq_ignore_ascii_case("script") {
+            if let Some(content) = opening_tag_end(&tail[position..], "script") {
+                return Some((position, &tail[position..], content));
+            }
+            remaining = after;
+            continue;
+        }
+        if !closing {
+            if name.eq_ignore_ascii_case("plaintext") {
+                return None;
+            }
+            if is_html_raw_text_name(name) {
+                remaining = raw_text_end_tail(after_tag, name)?;
+                continue;
+            }
+        }
+        remaining = after_tag;
     }
 }
 
@@ -1006,21 +1160,48 @@ fn is_script_tag(tag: &str, closing: bool) -> bool {
         }
 }
 
+fn html_tag_name(tag: &str) -> Option<(&str, bool)> {
+    let (closing, rest) = match tag.strip_prefix("</") {
+        Some(rest) => (true, rest),
+        None => (false, tag.strip_prefix('<')?),
+    };
+    let name_end = rest
+        .find(|c| html_whitespace(c) || matches!(c, '/' | '>'))
+        .unwrap_or(rest.len());
+    Some((&rest[..name_end], closing))
+}
+
+fn html_raw_text_name(tag: &str) -> Option<&'static str> {
+    let (name, closing) = html_tag_name(tag)?;
+    if closing {
+        return None;
+    }
+    HTML_RAW_TEXT_NAMES
+        .into_iter()
+        .find(|raw| name.eq_ignore_ascii_case(raw))
+}
+
+fn is_html_end_tag(tag: &str, name: &str) -> bool {
+    html_tag_name(tag)
+        .is_some_and(|(tag_name, closing)| closing && tag_name.eq_ignore_ascii_case(name))
+}
+
 fn restore_inline_scripts(
     html: String,
     scripts: ScriptPlaceholders<'_>,
 ) -> Result<String, Vec<bool>> {
-    let Some((first_marker, _)) = scripts.first() else {
+    let Some(first) = scripts.first() else {
         return Ok(html);
     };
-    let (prefix, _) = first_marker
+    let (prefix, _) = first
+        .marker
         .rsplit_once(':')
         .expect("script marker includes an id");
     let prefix = prefix.trim_start_matches('.');
     let markers: HashMap<&str, usize> = scripts
         .iter()
         .enumerate()
-        .map(|(index, (marker, _))| (marker.as_str(), index))
+        .map(|(index, placeholder)| (placeholder.marker.as_str(), index))
         .collect();
     let mut counts = vec![0; scripts.len()];
     let mut matches = Vec::with_capacity(scripts.len());
@@ -1039,9 +1220,20 @@ fn restore_inline_scripts(
                     .flatten()
                     .map(|&index| (start - 1, index))
             });
-        if let Some((start, index)) = matched {
-            counts[index] += 1;
-            matches.push((start, end, index));
+        if let Some((marker_start, index)) = matched {
+            let placeholder = &scripts[index];
+            let span_start = marker_start
+                .checked_sub(placeholder.before.len())
+                .filter(|&span| {
+                    html.as_bytes().get(span..marker_start) == Some(placeholder.before.as_bytes())
+                });
+            let span_end = end.checked_add(placeholder.after.len()).filter(|&span| {
+                html.as_bytes().get(end..span) == Some(placeholder.after.as_bytes())
+            });
+            if let (Some(span_start), Some(span_end)) = (span_start, span_end) {
+                counts[index] += 1;
+                matches.push((span_start, span_end, index));
+            }
         }
         cursor = end;
     }
@@ -1052,7 +1244,7 @@ fn restore_inline_scripts(
     let mut cursor = 0;
     for (start, end, index) in matches {
         restored.push_str(&html[cursor..start]);
-        restored.push_str(scripts[index].1);
+        restored.push_str(scripts[index].script);
         cursor = end;
     }
     restored.push_str(&html[cursor..]);
@@ -1282,6 +1474,15 @@ mod tests {
 
     fn md(src: &str) -> Document {
         Document::with_type(DocType::Markdown, src.to_string())
+    }
+
+    fn inline_placeholder(marker: String, script: &str) -> ScriptPlaceholder<'_> {
+        ScriptPlaceholder {
+            marker,
+            script,
+            before: "",
+            after: "",
+        }
     }
 
     #[test]
@@ -2065,11 +2266,17 @@ mod tests {
         let script = "<script>author()</script>";
 
         assert_eq!(
-            restore_inline_scripts(String::new(), vec![(marker.clone(), script)]),
+            restore_inline_scripts(
+                String::new(),
+                vec![inline_placeholder(marker.clone(), script)]
+            ),
             Err(vec![true])
         );
         assert_eq!(
-            restore_inline_scripts(format!("{marker}{marker}"), vec![(marker, script)]),
+            restore_inline_scripts(
+                format!("{marker}{marker}"),
+                vec![inline_placeholder(marker, script)]
+            ),
             Err(vec![true])
         );
     }
@@ -2080,7 +2287,10 @@ mod tests {
         assert_eq!(
             restore_inline_scripts(
                 format!("{prefix}:0-->{prefix}:1-->"),
-                vec![(format!("{prefix}:0-->"), "<script>void 0</script>")],
+                vec![inline_placeholder(
+                    format!("{prefix}:0-->"),
+                    "<script>void 0</script>"
+                )],
             ),
             Ok(format!("<script>void 0</script>{prefix}:1-->"))
         );
@@ -2098,7 +2308,7 @@ mod tests {
                 break;
             }
             html.push_str(&marker);
-            scripts.push((marker, script));
+            scripts.push(inline_placeholder(marker, script));
         }
         let expected = script.repeat(scripts.len());
         let started = std::time::Instant::now();
@@ -2205,6 +2415,177 @@ mod tests {
         assert_eq!(exact, build(format!("<p>{inert}{text}</p>")));
         let above = build(format!("<p>{hint}{text}a</p>"));
         assert!(above.contains("This preview is too large to display."));
+    }
+
+    #[test]
+    fn foreign_object_keeps_script_raw_text_and_neutralizes_real_links() {
+        let script = "<script>const tag = /<link>/;</script>";
+        let source = format!(
+            "<svg><foreignObject>{script}</foreignObject></svg>\
+             <svg><foreignObject><link rel=preload></foreignObject></svg>\
+             <svg><foreignObject></foreignObject><script>const b = /<link>/;</script></svg>"
+        );
+        let filtered = neutralize_document_links(&source);
+        assert!(
+            filtered.contains(script),
+            "foreignObject script changed: {filtered}"
+        );
+        assert!(
+            filtered.contains(
+                "<svg><foreignObject><template data-mt-link rel=preload></template></foreignObject></svg>"
+            ),
+            "foreignObject link survived: {filtered}"
+        );
+        assert!(
+            filtered.contains(
+                "<svg><foreignObject></foreignObject><script>const b = /<template data-mt-link></template>/;</script></svg>"
+            ),
+            "SVG content after foreignObject was not scanned: {filtered}"
+        );
+
+        let document = page(
+            &Document::with_type(DocType::Html, source),
+            &registry(),
+            false,
+        );
+        assert!(
+            document.contains(script),
+            "page changed the script: {document}"
+        );
+        assert!(!document.contains("<link rel=preload>"), "{document}");
+    }
+
+    #[test]
+    fn flow_placeholders_keep_a_type_one_blocks_other_html() {
+        let source = concat!(
+            "<script>void 0;</script >\n",
+            "    <div>Keep me</div>\n",
+            "<script>void 1;</script>\n",
+            "\n# After\n",
+        );
+        let html = page(&md(source), &registry(), false);
+        let rendered = body(&html);
+        assert!(
+            rendered.contains(
+                "<script>void 0;</script >\n    <div>Keep me</div>\n<script>void 1;</script>"
+            ),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<h1>After</h1>"), "{rendered}");
+        assert!(
+            !rendered.contains("&lt;div&gt;Keep me&lt;/div&gt;"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn examples_inside_flow_raw_text_stay_examples() {
+        let example = "<script>void 1;</script>";
+        let mut failures = Vec::new();
+        for name in [
+            "textarea", "title", "xmp", "noscript", "style", "iframe", "noembed", "noframes",
+        ] {
+            let source = format!("<script>void 0;</script><{name}>{example}</{name}>");
+            let html = page(&md(&source), &registry(), false);
+            let rendered = body(&html);
+            if !rendered.contains("<script>void 0;</script>") || rendered.contains(example) {
+                failures.push((name, rendered.to_string()));
+            }
+        }
+        let commented = concat!(
+            "<script>void 0;</script >\n",
+            "<!-- <script>void 1;</script> -->\n",
+            "\n# After\n",
+        );
+        let html = page(&md(commented), &registry(), false);
+        let rendered = body(&html);
+        if rendered.contains("<script>void 1;</script>") {
+            failures.push(("comment", rendered.to_string()));
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn examples_inside_inline_raw_text_stay_examples() {
+        let source = "A <textarea><script>void 1;</script></textarea> B\n";
+        let html = page(&md(source), &registry(), false);
+        let rendered = body(&html);
+        assert!(!rendered.contains("<script>void 1;</script>"), "{rendered}");
+        assert!(rendered.contains("&lt;textarea>"), "{rendered}");
+    }
+
+    #[test]
+    fn plaintext_keeps_the_rest_of_the_inline_context_inert() {
+        let source = "A <plaintext><script>document.x=1</script></plaintext> \
+                      <script>document.y=2</script> B";
+        let html = page(&md(source), &registry(), false);
+        let rendered = body(&html);
+        assert!(!rendered.contains("<script>"), "{rendered}");
+        assert!(
+            rendered.contains("&lt;script>document.x=1&lt;/script>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("&lt;script>document.y=2&lt;/script>"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn nested_foreign_object_keeps_the_html_context_for_its_script() {
+        let source = "<svg><foreignObject><foreignObject></foreignObject>\
+                      <script>const tag = /<link>/;</script></foreignObject></svg>";
+        assert_eq!(neutralize_document_links(source).as_ref(), source);
+    }
+
+    #[test]
+    fn inline_script_restoration_does_not_slice_outside_char_boundaries() {
+        let placeholder = ScriptPlaceholder {
+            marker: "<!--mt-script:ABCD:0-->".to_string(),
+            script: "<script>void 0</script>",
+            before: "&lt;script>",
+            after: "&lt;/script>",
+        };
+        assert_eq!(
+            restore_inline_scripts(
+                "\u{1f600}<script><!--mt-script:ABCD:0--></script>".to_string(),
+                vec![placeholder]
+            ),
+            Err(vec![true])
+        );
+    }
+
+    #[test]
+    fn unrecoverable_flow_script_stays_tag_filtered_and_the_rest_renders() {
+        let source = concat!(
+            "<script>void 0;</script >\n",
+            "    <div>Keep me</div>\n",
+            "<script>void 1;</script>\n",
+            "\n# After\n",
+        );
+        let mut options = markdown::Options::gfm();
+        options.compile.allow_dangerous_html = true;
+        let mut calls = 0;
+        let rendered = render_markdown_scripts(source, &mut options, |source, options| {
+            let mut html = markdown::to_html_with_options(source, options).unwrap();
+            calls += 1;
+            if calls == 1 {
+                let start = html.rfind("<!--mt-script:").unwrap();
+                html.replace_range(start..start + 1, "&lt;");
+            }
+            Ok(html)
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert!(rendered.contains("<script>void 0;</script >"), "{rendered}");
+        assert!(!rendered.contains("<script>void 1;</script>"), "{rendered}");
+        assert!(
+            rendered.contains("&lt;script>void 1;&lt;/script>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<div>Keep me</div>"), "{rendered}");
+        assert!(rendered.contains("<h1>After</h1>"), "{rendered}");
+        assert!(!rendered.contains("mt-error"), "{rendered}");
     }
 
     #[test]
