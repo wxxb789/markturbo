@@ -345,10 +345,14 @@ const HTML_RAW_TEXT_NAMES: [&str; 10] = [
     "plaintext",
 ];
 
-fn is_html_raw_text_name(name: &str) -> bool {
+fn raw_text_name(name: &str) -> Option<&'static str> {
     HTML_RAW_TEXT_NAMES
         .into_iter()
-        .any(|raw| name.eq_ignore_ascii_case(raw))
+        .find(|raw| name.eq_ignore_ascii_case(raw))
+}
+
+fn is_html_raw_text_name(name: &str) -> bool {
+    raw_text_name(name).is_some()
 }
 
 fn html_doctype_end(source: &str) -> Option<&str> {
@@ -666,7 +670,15 @@ fn collect_script_ranges(
     let mut ranges = Vec::new();
     let mut jsx_names = Vec::new();
     let context = ScriptContext::default();
-    collect_inline_script_ranges(&ast, source, &mut ranges, &mut jsx_names, &context);
+    let mut scope = RawTextScope::None;
+    collect_inline_script_ranges(
+        &ast,
+        source,
+        &mut ranges,
+        &mut jsx_names,
+        &context,
+        &mut scope,
+    );
     (ranges, jsx_names)
 }
 
@@ -817,12 +829,20 @@ impl<'a> ListOpener<'a> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RawTextScope {
+    None,
+    Comment,
+    Element(&'static str),
+}
+
 fn collect_inline_script_ranges(
     node: &markdown::mdast::Node,
     source: &str,
     ranges: &mut Vec<ScriptRange>,
     jsx_names: &mut Vec<usize>,
     context: &ScriptContext<'_>,
+    scope: &mut RawTextScope,
 ) {
     use markdown::mdast::Node;
     let phrasing_block = matches!(
@@ -850,7 +870,7 @@ fn collect_inline_script_ranges(
     if context.inline_start.is_none()
         && let Node::Html(html) = node
     {
-        collect_markdown_flow_scripts(html, source, ranges);
+        collect_markdown_flow_scripts(html, source, ranges, scope);
         return;
     }
     let jsx = match node {
@@ -885,49 +905,61 @@ fn collect_inline_script_ranges(
     }
 
     if phrasing_block {
-        let mut tags = Vec::new();
-        collect_html_tags(node, &mut tags);
-        tags.sort_unstable_by_key(|(start, _, _)| *start);
+        let mut events = Vec::new();
+        collect_phrasing_events(node, source, &mut events);
+        events.sort_unstable_by_key(|(offset, _)| *offset);
 
         let mut opening = None;
-        let mut raw: Option<&'static str> = None;
-        for (start, end, tag) in tags {
-            if let Some(name) = raw {
-                if is_html_end_tag(tag, name) {
-                    raw = None;
-                }
-                continue;
-            }
-            if opening.is_none() {
-                if !is_script_tag(tag, false)
-                    && let Some(name) = html_raw_text_name(tag)
-                {
-                    if name == "plaintext" {
-                        break;
+        for (_, event) in events {
+            match event {
+                PhrasingEvent::CommentOpen => {
+                    if *scope == RawTextScope::None && opening.is_none() {
+                        *scope = RawTextScope::Comment;
                     }
-                    raw = Some(name);
-                    continue;
                 }
-            }
-            if is_script_tag(tag, false) {
-                opening.get_or_insert(start);
-            } else if is_script_tag(tag, true)
-                && let Some(start) = opening.take()
-                && let Some(script) = script_value(source, context, start, end)
-            {
-                ranges.push(ScriptRange {
-                    start,
-                    end,
-                    script,
-                    flow: false,
-                });
+                PhrasingEvent::CommentClose => {
+                    if *scope == RawTextScope::Comment {
+                        *scope = RawTextScope::None;
+                    }
+                }
+                PhrasingEvent::Tag(start, end, tag) => {
+                    if let RawTextScope::Element(name) = *scope {
+                        if name != "plaintext" && is_html_end_tag(tag, name) {
+                            *scope = RawTextScope::None;
+                        }
+                        continue;
+                    }
+                    if *scope == RawTextScope::Comment {
+                        continue;
+                    }
+                    if opening.is_none()
+                        && !is_script_tag(tag, false)
+                        && let Some(name) = html_raw_text_name(tag)
+                    {
+                        *scope = RawTextScope::Element(name);
+                        continue;
+                    }
+                    if is_script_tag(tag, false) {
+                        opening.get_or_insert(start);
+                    } else if is_script_tag(tag, true)
+                        && let Some(start) = opening.take()
+                        && let Some(script) = script_value(source, context, start, end)
+                    {
+                        ranges.push(ScriptRange {
+                            start,
+                            end,
+                            script,
+                            flow: false,
+                        });
+                    }
+                }
             }
         }
     }
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_inline_script_ranges(child, source, ranges, jsx_names, context);
+            collect_inline_script_ranges(child, source, ranges, jsx_names, context, scope);
         }
     }
 }
@@ -936,6 +968,7 @@ fn collect_markdown_flow_scripts(
     html: &markdown::mdast::Html,
     source: &str,
     ranges: &mut Vec<ScriptRange>,
+    scope: &mut RawTextScope,
 ) {
     let Some(position) = &html.position else {
         return;
@@ -943,8 +976,13 @@ fn collect_markdown_flow_scripts(
     let value = &html.value;
     let mut remaining = value.trim_start_matches([' ', '\t']);
     let Some(mut content) = opening_tag_end(remaining, "script") else {
+        scan_flow_scope(remaining, scope);
         return;
     };
+    if *scope != RawTextScope::None {
+        scan_flow_scope(remaining, scope);
+        return;
+    }
     let mut indentation = 0;
     let mut line_ends = value
         .split_inclusive(['\r', '\n'])
@@ -980,7 +1018,7 @@ fn collect_markdown_flow_scripts(
             script: value[start..end].to_string(),
             flow: true,
         });
-        let Some((offset, next, next_content)) = next_flow_script(tail) else {
+        let Some((offset, next, next_content)) = next_flow_script(tail, scope) else {
             break;
         };
         indentation = tail[..offset]
@@ -993,15 +1031,49 @@ fn collect_markdown_flow_scripts(
     }
 }
 
-fn next_flow_script(tail: &str) -> Option<(usize, &str, &str)> {
+fn scan_flow_scope(mut remaining: &str, scope: &mut RawTextScope) {
+    while let Some((_, _, content)) = next_flow_script(remaining, scope) {
+        let Some(tail) = raw_text_end_tail(content, "script") else {
+            return;
+        };
+        remaining = tail;
+    }
+}
+
+fn next_flow_script<'a>(
+    tail: &'a str,
+    scope: &mut RawTextScope,
+) -> Option<(usize, &'a str, &'a str)> {
     let mut remaining = tail;
     loop {
+        match *scope {
+            RawTextScope::Comment => {
+                remaining = comment_end_tail(remaining)?;
+                *scope = RawTextScope::None;
+                continue;
+            }
+            RawTextScope::Element(name) => {
+                if name == "plaintext" {
+                    return None;
+                }
+                remaining = raw_text_end_tail(remaining, name)?;
+                *scope = RawTextScope::None;
+                continue;
+            }
+            RawTextScope::None => {}
+        }
         let offset = tail.len() - remaining.len();
         let less_than = remaining.find('<')?;
         let after = &remaining[less_than + 1..];
         let position = offset + less_than;
         if let Some(comment) = after.strip_prefix("!--") {
-            remaining = comment_end_tail(comment)?;
+            match comment_end_tail(comment) {
+                Some(after_comment) => remaining = after_comment,
+                None => {
+                    *scope = RawTextScope::Comment;
+                    return None;
+                }
+            }
             continue;
         }
         let (closing, tag) = match after.strip_prefix('/') {
@@ -1025,14 +1097,19 @@ fn next_flow_script(tail: &str) -> Option<(usize, &str, &str)> {
             remaining = after;
             continue;
         }
-        if !closing {
-            if name.eq_ignore_ascii_case("plaintext") {
+        if !closing && let Some(raw) = raw_text_name(name) {
+            if raw == "plaintext" {
+                *scope = RawTextScope::Element("plaintext");
                 return None;
             }
-            if is_html_raw_text_name(name) {
-                remaining = raw_text_end_tail(after_tag, name)?;
-                continue;
+            match raw_text_end_tail(after_tag, raw) {
+                Some(after_raw) => remaining = after_raw,
+                None => {
+                    *scope = RawTextScope::Element(raw);
+                    return None;
+                }
             }
+            continue;
         }
         remaining = after_tag;
     }
@@ -1131,18 +1208,76 @@ fn html_node_at<'a>(
         .find_map(|child| html_node_at(child, source, offset))
 }
 
-fn collect_html_tags<'a>(node: &'a markdown::mdast::Node, tags: &mut Vec<(usize, usize, &'a str)>) {
-    if let markdown::mdast::Node::Html(html) = node
-        && let Some(position) = &html.position
-    {
-        tags.push((position.start.offset, position.end.offset, &html.value));
-    }
+enum PhrasingEvent<'a> {
+    Tag(usize, usize, &'a str),
+    CommentOpen,
+    CommentClose,
+}
 
+fn collect_phrasing_events<'a>(
+    node: &'a markdown::mdast::Node,
+    source: &str,
+    events: &mut Vec<(usize, PhrasingEvent<'a>)>,
+) {
+    match node {
+        markdown::mdast::Node::Html(html) => {
+            if let Some(position) = &html.position {
+                events.push((
+                    position.start.offset,
+                    PhrasingEvent::Tag(position.start.offset, position.end.offset, &html.value),
+                ));
+            }
+        }
+        markdown::mdast::Node::Text(text) => {
+            if let Some(position) = &text.position
+                && let Some(text_source) = source.get(position.start.offset..position.end.offset)
+            {
+                collect_text_comment_events(text_source, position.start.offset, events);
+            }
+        }
+        _ => {}
+    }
     if let Some(children) = node.children() {
         for child in children {
-            collect_html_tags(child, tags);
+            collect_phrasing_events(child, source, events);
         }
     }
+}
+
+fn collect_text_comment_events(
+    text: &str,
+    base: usize,
+    events: &mut Vec<(usize, PhrasingEvent<'_>)>,
+) {
+    let mut index = 0;
+    while let Some(found) = text[index..].find(['<', '-']) {
+        let at = index + found;
+        let rest = &text[at..];
+        if let Some(comment) = rest.strip_prefix("<!--") {
+            if !is_escaped(text, at) && comment_end_tail(comment).is_none() {
+                events.push((base + at, PhrasingEvent::CommentOpen));
+            }
+            index = at + 4;
+        } else if rest.starts_with("-->") {
+            events.push((base + at, PhrasingEvent::CommentClose));
+            index = at + 3;
+        } else if rest.starts_with("--!>") {
+            events.push((base + at, PhrasingEvent::CommentClose));
+            index = at + 4;
+        } else {
+            index = at + 1;
+        }
+    }
+}
+
+fn is_escaped(text: &str, offset: usize) -> bool {
+    text[..offset]
+        .bytes()
+        .rev()
+        .take_while(|&byte| byte == b'\\')
+        .count()
+        % 2
+        == 1
 }
 
 fn is_script_tag(tag: &str, closing: bool) -> bool {
@@ -1176,9 +1311,7 @@ fn html_raw_text_name(tag: &str) -> Option<&'static str> {
     if closing {
         return None;
     }
-    HTML_RAW_TEXT_NAMES
-        .into_iter()
-        .find(|raw| name.eq_ignore_ascii_case(raw))
+    raw_text_name(name)
 }
 
 fn is_html_end_tag(tag: &str, name: &str) -> bool {
@@ -2361,6 +2494,7 @@ mod tests {
             &mut ranges,
             &mut Vec::new(),
             &ScriptContext::default(),
+            &mut RawTextScope::None,
         );
         let elapsed = started.elapsed();
         assert!(
@@ -2528,6 +2662,79 @@ mod tests {
         assert!(
             rendered.contains("&lt;script>document.y=2&lt;/script>"),
             "{rendered}"
+        );
+    }
+
+    #[test]
+    fn flow_scripts_stay_inert_while_raw_text_from_an_earlier_block_stays_open() {
+        let script = "<script>void 0;</script>";
+        let mut failures = Vec::new();
+        for opener in [
+            "<textarea>",
+            "<title>",
+            "<xmp>",
+            "<noscript>",
+            "<style>",
+            "<iframe>",
+            "<noembed>",
+            "<noframes>",
+            "<plaintext>",
+        ] {
+            let source = format!("A {opener}\n\n{script}\n");
+            let html = page(&md(&source), &registry(), false);
+            let rendered = body(&html);
+            if rendered.contains(script) || !rendered.contains("&lt;script>void 0;&lt;/script>") {
+                failures.push((opener, rendered.to_string()));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[test]
+    fn flow_scripts_stay_inert_while_a_comment_from_an_earlier_block_stays_open() {
+        let script = "<script>void 0;</script>";
+        let source = format!("A <!--\n\n{script} -->\n");
+        let html = page(&md(&source), &registry(), false);
+        let rendered = body(&html);
+        assert!(!rendered.contains(script), "{rendered}");
+        assert!(
+            rendered.contains("&lt;script>void 0;&lt;/script>"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn raw_text_scope_closed_in_a_later_block_keeps_scripts_running() {
+        let script = "<script>void 1;</script>";
+        for source in [
+            format!("A <textarea>\n\nB </textarea> C\n\n{script}\n"),
+            format!("<textarea>\n\nB </textarea> C\n\n{script}\n"),
+            format!("A <!--\n\nB --> C\n\n{script}\n"),
+        ] {
+            let html = page(&md(&source), &registry(), false);
+            assert!(body(&html).contains(script), "{source:?}: {html}");
+        }
+    }
+
+    #[test]
+    fn unclosed_raw_text_scope_scanning_stays_linear() {
+        let source = "<textarea>\n\n<script>void 0;</script>\n\n".repeat(10_000);
+        let ast = markdown::to_mdast(&source, &markdown::ParseOptions::default()).unwrap();
+        let mut ranges = Vec::new();
+        let started = std::time::Instant::now();
+        collect_inline_script_ranges(
+            &ast,
+            &source,
+            &mut ranges,
+            &mut Vec::new(),
+            &ScriptContext::default(),
+            &mut RawTextScope::None,
+        );
+        let elapsed = started.elapsed();
+        assert!(ranges.is_empty(), "{} scripts were collected", ranges.len());
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{elapsed:?}"
         );
     }
 
