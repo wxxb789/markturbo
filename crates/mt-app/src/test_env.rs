@@ -19,11 +19,15 @@ pub(crate) fn hermetic() {
     static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
     ROOT.get_or_init(|| {
         let root = tempfile::tempdir().expect("the test binary's config dir");
-        // SAFETY: set once, under the `OnceLock`, before any state reads the
-        // variables; std's environment lock orders it with every reader.
+        // SAFETY: set once under the `OnceLock`, before any state reads the
+        // variables; on Windows `set_var` is thread-safe, other env changes use `test_env::lock`.
         unsafe {
             std::env::set_var("MARKTURBO_CONFIG_DIR", root.path());
             std::env::set_var("MARKTURBO_DATA_DIR", root.path().join("data"));
+            std::env::set_var(
+                "MARKTURBO_TEST_LOCK_NAMESPACE",
+                std::process::id().to_string(),
+            );
         }
         root
     });

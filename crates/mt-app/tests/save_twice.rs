@@ -18,6 +18,10 @@ fn saving_twice_does_not_report_its_own_first_save_as_a_conflict() {
         std::env::set_var("MARKTURBO_OPEN", &path);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
 
     let mut app =

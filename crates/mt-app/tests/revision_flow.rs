@@ -245,6 +245,10 @@ fn partial_accept_records_the_final_split_once() {
         std::env::set_var("MARKTURBO_OPEN", &document);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
 
@@ -568,6 +572,10 @@ fn revision_fixture(
         std::env::set_var("MARKTURBO_OPEN", &document);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
     (document, directory, config)
@@ -1008,6 +1016,10 @@ fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
         std::env::set_var("MARKTURBO_OTHER", &other);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
     let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionAcrossDocuments>()))

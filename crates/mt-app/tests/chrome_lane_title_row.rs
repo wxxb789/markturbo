@@ -72,6 +72,10 @@ fn the_title_row_holds_the_name_review_and_settings() {
         std::env::set_var("MARKTURBO_OPEN", &path);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         // The context chain reads the user's codex home; a fresh one keeps
         // the resolution this fixture's own.
         std::env::set_var("CODEX_HOME", codex_home.path());

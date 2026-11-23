@@ -63,6 +63,10 @@ fn a_second_review_replaces_the_loading_state_of_the_first() {
         std::env::set_var("MARKTURBO_OPEN", &document);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
 

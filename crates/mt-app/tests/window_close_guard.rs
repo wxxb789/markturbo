@@ -31,6 +31,10 @@ fn start(open: Option<&Path>, config: &Path) -> Headless {
         }
         std::env::set_var("MARKTURBO_CONFIG_DIR", config);
         std::env::set_var("MARKTURBO_DATA_DIR", config.join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
     engine.environment.os = Os::Windows;
