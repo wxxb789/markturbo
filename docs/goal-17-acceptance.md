@@ -58,3 +58,19 @@ optical-sizing capture is recorded below; no native pass is claimed.
 ```powershell
 uv run --locked --project scripts scripts/mt.py visual -- --goal17-cjk-optics --exe <release-exe> --out .scratch/goal-17-cjk
 ```
+
+## Native acceptance 2026-11-23
+
+One `mt.py accept all` run on `main` `c3aab06` (Goals 14–19 merged), on the
+owner's active, unlocked RDP desktop (Windows 11 x64, harness process session
+2, input desktop Default). The harness hash-verified the release executable
+(SHA-256 `a6ef8cfb758e6934f1a7b17713f240ad9ea4255f753d5ff160a07193580b567b`,
+44,480,000 bytes). It covers goals 02, 03, 06 and 07 only: goal-02 PASS,
+goal-03 PASS, goal-06 PASS (`ALL_REQUIRED_CASES`), goal-07 FAIL
+(`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`). It exercises none of this goal's
+desktop acceptance items; the visual matrix and the before/after Settings,
+Review and light-mode captures remain pending. The CJK optical capture is no
+longer pending: the light-theme capture (the recipe does not support the dark
+theme) ran on 2026-11-23 against the same hash-verified executable, and the
+owner picked +1px with the next companion weight, now the production default
+(recorded above). This is not a pass.

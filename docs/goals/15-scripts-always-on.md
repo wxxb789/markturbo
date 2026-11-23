@@ -38,6 +38,11 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
      `allow-same-origin` and no `allow-modals`. So `window.open`, a form submit, `top.location`
      and a `target=_top` or `_blank` link do nothing. The frame's own navigation to `http(s):` or
      `file:` is refused by the inherited CSP (`frame-src`/`default-src`).
+   - Live check 2026-11-23: the sandboxed frame's `window.open` still left a visible WebView2
+     popup in the release run, so that part of the claim stays pending the nsh upgrade that
+     contains the upstream fix ([longbridge/nsh#2423](https://github.com/longbridge/nsh/pull/2423),
+     issue [#2785](https://github.com/longbridge/nsh/issues/2785), closed 2026-11-23; no release
+     contains it yet).
    - The host page runs exactly one inline relay ([Goal 19](19-links-system-browser.md)) that forwards
      only string messages whose `event.source` is the document frame to the nsh bridge; the app acts
      on them only as link-open requests validated in `links.rs`.
