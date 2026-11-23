@@ -1018,10 +1018,14 @@ mod tests {
         );
         let global =
             lock_settings_writes_named(&SettingsWriteLockName::Global.into_lock_name()).unwrap();
-        let error = std::thread::spawn(|| lock_settings_writes().err().expect("the lock is busy"))
-            .join()
-            .unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let global_error = std::thread::spawn(|| {
+            lock_settings_writes()
+                .err()
+                .expect("the global lock is busy")
+        })
+        .join()
+        .unwrap();
+        assert_eq!(global_error.kind(), std::io::ErrorKind::WouldBlock);
 
         let namespace = format!("environment-selected-{}", std::process::id());
         unsafe { std::env::set_var("MARKTURBO_TEST_LOCK_NAMESPACE", &namespace) };
@@ -1029,12 +1033,26 @@ mod tests {
             settings_write_lock_name().unwrap(),
             format!("Local\\markturbo-settings-write-test-{namespace}")
         );
-        let selected = lock_settings_writes_named(&settings_write_lock_name().unwrap()).unwrap();
-        let error = std::thread::spawn(|| lock_settings_writes().err().expect("the lock is busy"))
+        let selected_name = settings_write_lock_name().unwrap();
+        let uncontended = std::thread::spawn(|| lock_settings_writes().map(|_| ()))
             .join()
             .unwrap();
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        drop((global, selected));
+        assert!(
+            uncontended.is_ok(),
+            "the selected namespace must be free while only the global lock is held: {uncontended:?}"
+        );
+
+        let selected = lock_settings_writes_named(&selected_name).unwrap();
+        drop(global);
+        let selected_error = std::thread::spawn(|| {
+            lock_settings_writes()
+                .err()
+                .expect("the selected lock is busy")
+        })
+        .join()
+        .unwrap();
+        assert_eq!(selected_error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(selected);
 
         unsafe { std::env::set_var("MARKTURBO_TEST_LOCK_NAMESPACE", "invalid value") };
         let error = lock_settings_writes().err().expect("an invalid namespace");
