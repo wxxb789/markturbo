@@ -65,13 +65,13 @@ runs the Rust checks that its draft pushes skipped.
 | preflight (fast + format) | every pull request | `check fast` over the same base..head range, then `cargo fmt --all -- --check` |
 | clippy (Linux) | code changes, not a draft | `cargo clippy --profile ci --workspace --all-targets --locked` |
 | mt-core tests (Linux) | code changes, not a draft | `cargo test --profile ci -p mt-core --features model-transport,test-support --locked` |
-| mt-app tests (Linux) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app` |
+| mt-app tests (Linux) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite` |
 | macOS arm64 compatibility | Rust changes, not a draft | `cargo build --release --locked -p mt-app --bin markturbo`, then `lipo -archs target/release/markturbo` must list arm64 |
-| release-tests (windows-2022) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core` |
+| release-tests (windows-2022) | Rust changes, not a draft | `cargo nextest run --locked --cargo-profile ci -p mt-core --features model-transport,test-support` and `cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite` |
 
-The app suites run under `cargo nextest`, which starts the twenty-odd test
-binaries in parallel instead of one process at a time (measured 22 s against
-57 s for the app suite on the development desktop). nextest does not run
+The app suites run under `cargo nextest`, which gives every test its own
+process and runs them in parallel; the environment-variable tests need that
+isolation. nextest does not run
 doctests; the workspace has none today (the CI log shows no `Doc-tests` harness
 and `cargo test --doc --workspace` compiles a separate unit set for zero tests,
 measured 11m33s), so the nightly `check ci` run keeps the plain `cargo test` path
@@ -91,9 +91,7 @@ documentation-only pull request pays only for the classifier and `preflight`,
 and a draft pull request stops there too; the skipped jobs still report success,
 so a required-check list keeps working.
 
-Linking is not the bottleneck, so the toolchain stays default: relinking every
-mt-app test binary with the MSVC linker takes 29.5 s on the development desktop
-(16 cores, warm cache), and pointing `CARGO_TARGET_*_LINKER` at `rust-lld` both
+The default MSVC linker stays: pointing `CARGO_TARGET_*_LINKER` at `rust-lld`
 invalidated the build fingerprint and produced no comparable measurement.
 
 Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
@@ -110,7 +108,7 @@ combinations that used to repeat on every platform run once a day in
 `.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
 `cargo test --locked --profile ci --workspace` and
 `cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
-release_suite` on `macos-15` and `windows-2022`);
+suite` on `macos-15` and `windows-2022`);
 the scheduled run is a non-blocking safety net and never gates a merge. It is
 also the only writer of the rust-cache entries the pull-request jobs restore, so
 per-PR jobs restore from the default branch instead of each paying a cache save.

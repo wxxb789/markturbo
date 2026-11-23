@@ -116,19 +116,11 @@
   inventory (`scripts/markturbo_tools/release.py:281-285,771`). Either stage it
   with the payload so the inventory covers every installed file, or document the
   exclusion in the release-notes template; decide before the next candidate.
-- [ ] **Merge the mt-app integration test binaries** — `crates/mt-app/tests/`
-  holds roughly twenty one- or two-test files, and each links the whole app, so
-  link time and per-process startup dominate the suite rather than the
-  assertions (measured 2026-11-15: the warm `--profile ci -p mt-app` run takes
-  about a minute locally, and the Windows per-PR job spends most of its time in
-  compilation and linking). Consolidating them behind one `tests/all.rs` with
-  `autotests = false`, or adopting `cargo nextest` for cross-binary parallelism,
-  would cut both costs. Treat it as its own small goal inside the upcoming UI
-  iteration, and keep `cargo test` as the local command either way. The PR app
-  suites already use nextest, and the nightly release-profile run already links
-  the files once through `tests/release_suite.rs`; what remains is the
-  per-file binaries under `cargo test`, most of which set process environment
-  variables and so need their own process.
+- [ ] **Merge the mt-app integration test binaries** — the per-PR app jobs and
+  the nightly release-profile run link `crates/mt-app/tests/*.rs` once through
+  `tests/suite.rs` under nextest. Plain `cargo test` still runs one binary per
+  file by design: most of these tests set process environment variables and so
+  need their own process.
 - [ ] **Dead-code candidate: multi-chain loopback provider** — Goal 07 now runs
   one Review→Revision chain, but `LoopbackRevisionServer` in
   `scripts/markturbo_tools/native/goal07_provider.py` still supports repeated
