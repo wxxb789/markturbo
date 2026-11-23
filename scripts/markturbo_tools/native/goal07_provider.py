@@ -134,9 +134,9 @@ class _LoopbackHttpServer(http.server.ThreadingHTTPServer):
 class LoopbackRevisionServer:
     """A deterministic OpenAI Responses-compatible loopback provider.
 
-    One server serves a whole app session: each `begin_chain` starts one
-    Review -> Revision chain against its own source, with its own consent
-    gates. A refused request fails every later check of the server.
+    One server serves one Review -> Revision chain: `begin_chain` binds its
+    source and closes its consent gates. A refused request fails every later
+    check of the server.
     """
 
     def __init__(self) -> None:
@@ -144,7 +144,6 @@ class LoopbackRevisionServer:
         self._source_sha256: str | None = None
         self._source_snapshot = {"revision": 0, "source_generation": 0}
         self.requests: list[dict[str, Any]] = []
-        self._request_count = 0
         self._server: _LoopbackHttpServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
@@ -159,8 +158,10 @@ class LoopbackRevisionServer:
         self._failure_code: str | None = None
 
     def begin_chain(self, source: str) -> None:
-        """Start the next Review -> Revision chain, bound to `source`."""
+        """Bind the server's one Review -> Revision chain to `source`."""
         with self._lock:
+            if self.source is not None:
+                raise HarnessFailure("LOOPBACK_CHAIN_ALREADY_STARTED")
             self.source = source
             self._source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
             self.requests = []
@@ -170,9 +171,9 @@ class LoopbackRevisionServer:
 
     @property
     def request_count(self) -> int:
-        """Every accepted request of every chain this server served."""
+        """The accepted requests of the server's one chain."""
         with self._lock:
-            return self._request_count
+            return len(self.requests)
 
     @staticmethod
     def _nested_values(value: Any, key: str) -> list[Any]:
@@ -453,7 +454,6 @@ class LoopbackRevisionServer:
                         return
                     with owner._lock:
                         owner.requests.append(record)
-                        owner._request_count += 1
                     response = (
                         revision_response(owner.source)
                         if operation == "revision"

@@ -56,7 +56,8 @@ release-profile app suite no longer run per PR: `.github/workflows/nightly.yml`
 suite` on `macos-15` and `windows-2022`, as a non-blocking safety net
 rather than a PR gate. `suite` links every `crates/mt-app/tests/*.rs`
 file into one binary, because every test binary links the whole app; plain
-`cargo test` never builds it and keeps the per-file binaries. The nightly run
+`cargo test` never builds it and keeps the per-file binaries: most of these
+tests set process environment variables and need their own process. The nightly run
 is also what saves the rust-cache entries the PR jobs restore; PR jobs only
 restore. The PR workflow
 classifies the diff before it spends runner time, in two steps. When every

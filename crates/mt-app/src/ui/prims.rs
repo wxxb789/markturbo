@@ -1,8 +1,8 @@
 //! Owner lane: foundation.
 //!
 //! The small primitives every surface composes: ink text at the spec's
-//! levels, the model's voice, quiet and primary actions, a text field, a
-//! hairline, emitter plates and `kbd` hints.
+//! levels, quiet and primary actions, a text field, a hairline, emitter
+//! plates and `kbd` hints.
 //!
 //! Two rules live here, because every surface must obey them and neither is
 //! easy to check by eye:
@@ -10,9 +10,9 @@
 //! * Local actions never glow. [`quiet_action`] and [`primary_action`] step
 //!   their ink and draw the designed focus ring; no colour in them comes from
 //!   the heat scale.
-//! * Only model output and outbound data emit. [`model_voice`], [`bloom`],
-//!   [`halo`] and [`emitter_plate`] take a [`Heat`] and are the only ways to
-//!   draw with the hot/ember colours.
+//! * Only model output and outbound data emit. [`bloom`], [`halo`] and
+//!   [`emitter_plate`] take a [`Heat`] and are the only ways to draw with the
+//!   hot/ember colours.
 
 use std::cell::Cell;
 
@@ -32,10 +32,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ui::{
     motion::{self, HOVER_MS, Heat, PRESS_RELEASE_MS},
-    tokens::{
-        self, FONT_INPUT, FONT_MODEL, FONT_SOURCE, FONT_UI, HAIRLINE, TYPE_MODEL, TYPE_MODEL_LINE,
-        TYPE_UI, TYPE_UI_LINE,
-    },
+    tokens::{self, FONT_INPUT, FONT_SOURCE, FONT_UI, HAIRLINE, TYPE_UI, TYPE_UI_LINE},
 };
 
 /// The native window controls' area, in points: their height (`top`) and the
@@ -96,23 +93,6 @@ pub fn source_ink(
         .text_size(px(tokens::TYPE_SOURCE))
         .line_height(px(tokens::TYPE_SOURCE_LINE))
         .text_color(color)
-}
-
-/// The model's voice: Martian Grotesk 300 at 22/30, the only large type in the
-/// app. Its colour follows `heat`, so the one HOT item and everything that has
-/// cooled to ember are drawn from one number.
-pub fn model_voice(content: impl IntoReactive<SharedString>, heat: Heat) -> impl IntoElement {
-    text(content)
-        .font_family(FONT_MODEL)
-        .font_weight(tokens::WEIGHT_MODEL)
-        .text_size(px(TYPE_MODEL))
-        .line_height(px(TYPE_MODEL_LINE))
-        .text_color(move || tokens::palette().ink)
-        .bind_color(&heat.glyph(
-            tokens::adaptive_color(|palette| palette.ink),
-            tokens::adaptive_color(|palette| palette.ember),
-            tokens::adaptive_color(|palette| palette.hot),
-        ))
 }
 
 pub(crate) fn script_text(
