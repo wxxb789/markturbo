@@ -100,6 +100,10 @@ fn start(held_keys: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
         std::env::set_var("MARKTURBO_OPEN", &document);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());

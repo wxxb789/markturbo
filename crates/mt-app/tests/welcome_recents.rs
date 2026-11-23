@@ -22,6 +22,10 @@ fn start(config: &std::path::Path) -> Headless {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config);
         std::env::set_var("MARKTURBO_DATA_DIR", config.join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
     let mut app =
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");

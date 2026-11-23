@@ -19,6 +19,10 @@ fn quit_save_all_saves_an_untitled_draft() {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
 
     let mut app =

@@ -124,6 +124,10 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
     let wait = Duration::from_secs(10);
     fs::create_dir_all(installed.parent().unwrap()).expect("fonts directory");

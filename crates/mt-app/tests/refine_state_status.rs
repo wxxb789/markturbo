@@ -22,6 +22,10 @@ fn the_status_line_names_the_file_and_fades_while_an_error_stays() {
         std::env::set_var("MARKTURBO_OPEN", &document);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
 
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());

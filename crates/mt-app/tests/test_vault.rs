@@ -29,6 +29,10 @@ fn a_key_stored_through_settings_lands_in_the_test_store() {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
     let mut app =
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");

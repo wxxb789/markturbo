@@ -135,6 +135,14 @@ keyboard/pointer events and check component state/focus/layout; it cannot prove
 Windows IME composition, the OS clipboard, native dialogs, WebView2 focus or
 DPAPI/session behavior. Keep native coverage for those boundaries.
 
+Test processes that redirect the app's data root with `MARKTURBO_DATA_DIR` also
+set `MARKTURBO_TEST_LOCK_NAMESPACE` to a per-process value; when it is set, the
+settings and usage write lock becomes
+`Local\markturbo-settings-write-test-<value>` instead of the production
+`Global\` mutex, so parallel test processes never contend with each other or
+with an installed app. It is test isolation only, not a user setting, and an
+invalid value fails those writes closed.
+
 `nsh-engine` and `nsh-testing` are dev-dependencies. A headless test starts the
 real app (`Headless::start`), finds controls by `testID`, text or accessibility
 label, presses/types/scrolls, and reads the text and state on screen. The shell

@@ -63,6 +63,10 @@ fn a_dirty_tab_close_is_guarded_from_the_rail_and_from_ctrl_w() {
         std::env::set_var("MARKTURBO_OPEN", &path);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
     engine.environment.os = Os::Windows;

@@ -24,6 +24,10 @@ pub(crate) fn hermetic() {
         unsafe {
             std::env::set_var("MARKTURBO_CONFIG_DIR", root.path());
             std::env::set_var("MARKTURBO_DATA_DIR", root.path().join("data"));
+            std::env::set_var(
+                "MARKTURBO_TEST_LOCK_NAMESPACE",
+                std::process::id().to_string(),
+            );
         }
         root
     });

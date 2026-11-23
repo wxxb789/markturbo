@@ -70,6 +70,10 @@ fn a_package_missing_a_referenced_file_is_reviewed_as_partial() {
         std::env::set_var("MARKTURBO_OPEN", &skill);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
 

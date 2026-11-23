@@ -56,6 +56,10 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         std::env::set_var("MARKTURBO_OPEN", &document);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
 

@@ -35,6 +35,10 @@ fn restore_reopens_the_checkpoint_and_dont_save_retires_it() {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
 
     // The interrupted session's checkpoint, written through the production

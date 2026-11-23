@@ -27,6 +27,10 @@ fn start_settings() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
         std::env::remove_var("OPENAI_API_KEY");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", data_dir);
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
         std::env::set_var("CODEX_HOME", codex_home.path());
     }
 

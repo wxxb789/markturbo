@@ -30,6 +30,10 @@ fn save_as_replaces_a_confirmed_existing_destination() {
         std::env::set_var("MARKTURBO_OPEN", &first);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
     }
 
     let mut app =
