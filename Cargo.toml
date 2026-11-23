@@ -26,6 +26,8 @@ encoding_rs = "0.8"
 # Its detector half. Same author as encoding_rs — this is Firefox's own
 # detector, and it is only consulted for bytes that are not valid UTF-8.
 chardetng = "1"
+unicode-script = "0.5.9"
+unicode-segmentation = "1.13"
 d2-little = "0.7.1-1"
 markdown = "1.0"
 # LaTeX math. RaTeX minus its own SVG emitter: `ratex-svg` is the natural

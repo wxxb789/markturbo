@@ -16,6 +16,7 @@ layer repeats only the wiring or OS behavior the lower layer cannot observe.
 | Review request validation, consent binding, effective-context selection | `mt-core` provider/context/revision contract tests | domain |
 | Review -> Revision consent, approval and apply | `crates/mt-app/tests/revision_flow.rs` (loopback provider, real UI path) | headless e2e |
 | Workspace open, editor, save, first-use shell | `crates/mt-app/tests/shell.rs` | headless e2e |
+| Press-down feedback, editor focus handback and surface motion | Goal 16 UI headless tests; [motion acceptance record](goal-16-acceptance.md) for native evidence | headless + native |
 | Web trust, CSP, script/network exclusion | `crates/mt-app/src/web.rs` unit tests | domain |
 | Settings, recent targets, credentials and endpoint authorization | `mt-core` settings/credentials tests; tooling tests for CLI evidence | domain + tooling |
 | Native window, UIA, SendInput, WM_CLOSE, WebView2, DPAPI session | Windows acceptance harness on the final hash | native (milestone) |

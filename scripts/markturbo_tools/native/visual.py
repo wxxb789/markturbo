@@ -30,6 +30,12 @@ packaged `MarkTurbo.exe` built from the same source revision::
         --exe target/release/markturbo.exe \\
         --out target/native-acceptance/goal-09
 
+Capture the Goal 17 CJK optical-size comparison separately::
+
+    uv run --locked --project scripts scripts/mt.py visual -- \\
+        --goal17-cjk-optics --exe target/release/markturbo.exe \\
+        --out target/native-acceptance/goal-17-cjk-optics
+
 `--out` names a scratch directory: the capture rewrites the cells it writes and
 has no existing-output guard, so it never points at retained evidence.
 
@@ -90,6 +96,16 @@ from .runtime import (
 
 SCHEMA = "markturbo.goal-09-visual-matrix"
 RECEIPT_SCHEMA = "markturbo.goal-09-visual-cell"
+CJK_OPTICS_STATE = "cjk-optics"
+CJK_OPTICS_ENV = "MARKTURBO_GOAL17_CJK_OPTICS"
+CJK_COMPANION_FONT_NAME = "SourceHanSansCN-VF.otf"
+CJK_COMPANION_FONT_LOADED = "CJK companion font loaded"
+CJK_COMPANION_FONT_UNAVAILABLE = "CJK companion font unavailable"
+CJK_OPTICS_VARIANTS = (
+    ("cjk-optics-plus-0", "+0"),
+    ("cjk-optics-plus-1px", "+1px"),
+    ("cjk-optics-plus-1px-next-weight", "+1px / next companion weight"),
+)
 STATES = (
     "clean-profile-welcome",
     "new-unsaved-document",
@@ -419,6 +435,10 @@ def matrix_cells(
         for viewport in viewports
         for mode in modes
     ]
+
+
+def cjk_optics_cell() -> Cell:
+    return Cell(CJK_OPTICS_STATE, "zh-cn", "default", "light")
 
 
 def state_code(state: str) -> str:
@@ -1254,6 +1274,94 @@ def remove_profile(profile: Path, timeout: float = PROFILE_REMOVAL_SECONDS) -> N
                 stop_profile_browsers(profile)
 
 
+def companion_font_data_dir() -> Path:
+    override = os.environ.get("MARKTURBO_DATA_DIR")
+    if override is not None and override.strip():
+        root = Path(override.strip())
+        if root.is_absolute():
+            return root
+        raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE")
+    if sys.platform != "win32":
+        raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE")
+
+    class Guid(ctypes.Structure):
+        _fields_ = [
+            ("data1", ctypes.c_uint32),
+            ("data2", ctypes.c_uint16),
+            ("data3", ctypes.c_uint16),
+            ("data4", ctypes.c_ubyte * 8),
+        ]
+
+    # FOLDERID_LocalAppData, matching dirs::data_local_dir() on Windows.
+    folder_id = Guid(
+        0xF1B32785,
+        0x6FBA,
+        0x4FCF,
+        (ctypes.c_ubyte * 8)(0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91),
+    )
+    path = ctypes.c_void_p()
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.SHGetKnownFolderPath.argtypes = (
+            ctypes.POINTER(Guid),
+            wt.DWORD,
+            wt.HANDLE,
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+        result = shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(path)
+        )
+        if result != 0 or not path.value:
+            raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE")
+        return Path(ctypes.wstring_at(path.value)) / "markturbo"
+    except HarnessBlocked:
+        raise
+    except (AttributeError, OSError):
+        raise HarnessBlocked("CJK_COMPANION_DATA_DIR_UNAVAILABLE") from None
+    finally:
+        if path.value:
+            ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+            ole32.CoTaskMemFree.argtypes = (ctypes.c_void_p,)
+            ole32.CoTaskMemFree(path)
+
+
+def seed_companion_font(capture_data: Path) -> None:
+    source_data = companion_font_data_dir()
+    source = source_data / "fonts" / CJK_COMPANION_FONT_NAME
+    if not source.is_file():
+        raise HarnessBlocked("CJK_COMPANION_FONT_MISSING")
+    try:
+        destination = capture_data / "fonts" / CJK_COMPANION_FONT_NAME
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    except OSError:
+        raise HarnessBlocked("CJK_COMPANION_FONT_SEED_FAILED") from None
+
+
+def require_companion_font_loaded(harness: VisualHarness, app: RunningApp) -> None:
+    def status() -> str | None:
+        if harness.shows_text(app, CJK_COMPANION_FONT_LOADED):
+            return "loaded"
+        if harness.shows_text(app, CJK_COMPANION_FONT_UNAVAILABLE):
+            return "unavailable"
+        return None
+
+    try:
+        result = wait_until(
+            status,
+            UI_TIMEOUT,
+            "CJK_COMPANION_FONT_STATE_MISSING",
+            interval=0.1,
+        )
+    except HarnessFailure as error:
+        if error.code == "CJK_COMPANION_FONT_STATE_MISSING":
+            raise HarnessBlocked(error.code) from None
+        raise
+    if result != "loaded":
+        raise HarnessBlocked("CJK_COMPANION_FONT_NOT_LOADED")
+
+
 def capture_cell(
     win32: Win32,
     exe: Path,
@@ -1264,12 +1372,14 @@ def capture_cell(
     ui_types: tuple[Any, ...],
     parent_context: Any,
 ) -> dict[str, Any]:
+    cjk_optics = cell.state == CJK_OPTICS_STATE
     started = utc_now()
     case_root = out / "cells" / cell.cell_id
     case_root.mkdir(parents=True, exist_ok=True)
     for stale in ("capture.png", "failure.png"):
         (case_root / stale).unlink(missing_ok=True)
-    profile = Path(tempfile.mkdtemp(prefix="markturbo-goal09-")).resolve()
+    prefix = "markturbo-goal17-cjk-" if cjk_optics else "markturbo-goal09-"
+    profile = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
     config, data, workspace, codex_home, local_app_data = (
         profile / name
         for name in ("config", "data", "workspace", "codex-home", "local-app-data")
@@ -1285,6 +1395,8 @@ def capture_cell(
     # cell, so a cell never joins the previous cell's still-exiting browser
     # (which ignores this cell's debugging port) nor the user's own profile.
     overrides = {"CODEX_HOME": str(codex_home), "LOCALAPPDATA": str(local_app_data)}
+    if cjk_optics:
+        overrides[CJK_OPTICS_ENV] = "1"
     web_port = free_port() if cell.state == "web-compatibility-preview" else None
     if web_port is not None:
         overrides["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
@@ -1312,9 +1424,11 @@ def capture_cell(
         "executable": executable,
     }
     try:
+        if cjk_optics:
+            seed_companion_font(data)
         with child_environment(overrides):
             app = harness.launch_app(
-                None if cell.state in EMPTY_STATES else plan,
+                None if cell.state in EMPTY_STATES or cjk_optics else plan,
                 data,
                 config,
                 workspace,
@@ -1325,7 +1439,44 @@ def capture_cell(
         dpi = int(win32.user32.GetDpiForWindow(window.hwnd))
         width, height = physical_viewport(cell.viewport, dpi)
         window.resize_client(width, height, dpi_awareness()[2])
-        markers = harness.prepare(app, cell, plan, server)
+        if cjk_optics:
+            harness.require(
+                app,
+                "goal17-cjk-optics",
+                "CJK_OPTICS_VIEW_MISSING",
+                control_type="Group",
+            )
+            for variant_id, _ in CJK_OPTICS_VARIANTS:
+                harness.require(
+                    app,
+                    variant_id,
+                    "CJK_OPTICS_VARIANT_GROUP_MISSING",
+                    control_type="Group",
+                )
+            wait_until(
+                lambda: harness.shows_text(app, "CJK optical sizing"),
+                UI_TIMEOUT,
+                "CJK_OPTICS_VIEW_MISSING",
+                interval=0.1,
+            )
+            require_companion_font_loaded(harness, app)
+            expected_names = (
+                "中文",
+                "Latin",
+                "かな",
+                "한글",
+                *(label for _, label in CJK_OPTICS_VARIANTS),
+            )
+            visible = lambda: all(harness.shows_text(app, name) for name in expected_names)
+            wait_until(visible, UI_TIMEOUT, "CJK_OPTICS_VARIANTS_MISSING", interval=0.1)
+            markers = {
+                "comparison_view": "goal17-cjk-optics",
+                "variant_ids": [variant_id for variant_id, _ in CJK_OPTICS_VARIANTS],
+                "paragraph_visible": True,
+                "companion_font_loaded": True,
+            }
+        else:
+            markers = harness.prepare(app, cell, plan, server)
         # Kept on a later failure too: the state was reached, and the
         # `failure.png` shows it.
         receipt["state_markers"] = markers
@@ -1404,6 +1555,11 @@ def capture_cell(
             }
         )
     except (VisualFailure, HarnessFailure, HarnessBlocked) as error:
+        receipt["status"] = (
+            "BLOCKED"
+            if cjk_optics and isinstance(error, HarnessBlocked)
+            else "FAILED"
+        )
         receipt["reason_code"] = error.code
         if error.detail:
             receipt["failure_type"] = error.detail
@@ -1450,7 +1606,7 @@ def parse_csv(value: str, allowed: Sequence[str]) -> list[str]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="mt.py visual",
-        description="Capture the Goal 09 visual-acceptance matrix.",
+        description="Capture the Goal 09 matrix or Goal 17 CJK optics comparison.",
     )
     result.add_argument("--exe", required=True, type=Path)
     result.add_argument("--out", required=True, type=Path)
@@ -1458,6 +1614,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--languages", default=",".join(LANGUAGES))
     result.add_argument("--viewports", default=",".join(VIEWPORTS))
     result.add_argument("--modes", default=",".join(MODES))
+    result.add_argument(
+        "--goal17-cjk-optics",
+        action="store_true",
+        help="capture the three CJK optical-size variants side by side",
+    )
     result.add_argument(
         "--allow-dirty",
         action="store_true",
@@ -1469,7 +1630,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     if sys.platform != "win32":
-        print("error: Goal 09 visual capture requires Windows", file=sys.stderr)
+        print("error: native visual capture requires Windows", file=sys.stderr)
         return 2
     arguments = parser().parse_args(argv)
     global DEBUG
@@ -1499,7 +1660,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as error:  # noqa: BLE001
         print(f"error: Windows APIs unavailable: {safe_exception_name(error)}", file=sys.stderr)
         return 2
-    cells = matrix_cells(states, languages, viewports, modes)
+    cells = (
+        [cjk_optics_cell()]
+        if arguments.goal17_cjk_optics
+        else matrix_cells(states, languages, viewports, modes)
+    )
     summary: dict[str, Any] = {
         "schema": SCHEMA,
         "started_at": utc_now(),
@@ -1533,19 +1698,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         win32.allow_display_sleep()
     captured = sum(item["status"] == "CAPTURED" for item in summary["cells"])
-    summary["status"] = "PASS" if captured == len(cells) else "FAIL"
+    blocked = sum(item["status"] == "BLOCKED" for item in summary["cells"])
+    failed = sum(item["status"] == "FAILED" for item in summary["cells"])
+    summary["status"] = (
+        "PASS"
+        if captured == len(cells)
+        else "BLOCKED"
+        if blocked and not failed and arguments.goal17_cjk_optics
+        else "FAIL"
+    )
     summary["completed_at"] = utc_now()
-    summary["summary"] = {
+    summary_counts = {
         "cell_count": len(cells),
         "captured_count": captured,
-        "failed_count": len(cells) - captured,
+        "failed_count": failed if arguments.goal17_cjk_optics else len(cells) - captured,
     }
+    if arguments.goal17_cjk_optics:
+        summary_counts["blocked_count"] = blocked
+    summary["summary"] = summary_counts
     (out / "matrix.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True, ensure_ascii=True) + "\n",
         encoding="utf-8",
     )
     print(f"{summary['status']}: {captured}/{len(cells)} captured", flush=True)
-    return 0 if summary["status"] == "PASS" else 1
+    return {"PASS": 0, "FAIL": 1, "BLOCKED": 2}[summary["status"]]
 
 
 if __name__ == "__main__":

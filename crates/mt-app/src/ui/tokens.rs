@@ -13,7 +13,15 @@
 //! one colour with that alpha, not a pre-blended grey, so it sits correctly on
 //! both the room and the column ground.
 
-use nsh_core::{Color, element::FontWeight, prelude::*};
+use nsh_core::{
+    Color,
+    element::{AdaptiveColor, FontWeight},
+    prelude::*,
+};
+
+pub fn mono_count<T: Styled>(element: T) -> T {
+    element.font_family(FONT_SOURCE)
+}
 
 /// `0xRRGGBB`, opaque.
 const fn hex(rgb: u32) -> Color {
@@ -174,7 +182,7 @@ pub const LIGHT: Palette = Palette {
     // 4.5:1.
     hot_bloom: hexa(0xFFB04D, A_22),
     halo: hexa(0xFFB04D, A_06),
-    ember: hex(0x7A6A5C),
+    ember: hex(0x8D6240),
     ember_bloom: hexa(0xB88458, A_08P),
     haze: hexa(0x4E8C84, A_12),
     haze_edge: hex(0x4E8C84),
@@ -199,6 +207,10 @@ pub const LIGHT: Palette = Palette {
 /// that calls it inside a style closure repaints on a theme change.
 pub fn palette() -> &'static Palette {
     if dark() { &DARK } else { &LIGHT }
+}
+
+pub(crate) fn adaptive_color(pick: impl Fn(&Palette) -> Color) -> AdaptiveColor {
+    AdaptiveColor::new(pick(&LIGHT), pick(&DARK))
 }
 
 impl Palette {
@@ -236,12 +248,15 @@ pub const SPACE_1: f32 = 4.0;
 pub const SPACE_2: f32 = 8.0;
 pub const SPACE_3: f32 = 16.0;
 pub const SPACE_4: f32 = 24.0;
+pub const SPACE_XL: f32 = SPACE_4;
+pub const SELECTION_UNDERLINE: f32 = SPACE_1 / 2.0;
 pub const SPACE_5: f32 = 40.0;
 pub const SPACE_6: f32 = 64.0;
 pub const SPACE_7: f32 = 88.0;
 
 /// The opaque title row.
 pub const TITLE_ROW_H: f32 = 32.0;
+pub const SETTINGS_HEADER_H: f32 = SPACE_4 + SPACE_2 + SPACE_1;
 /// The rail: a 44px strip that widens to 240px on hover.
 pub const RAIL_W: f32 = 44.0;
 pub const RAIL_HOVER_W: f32 = 240.0;
@@ -278,9 +293,6 @@ pub const HAIRLINE: f32 = 1.0;
 /// The focus ring: a designed 1px ink ring, offset from the control.
 pub const FOCUS_RING: f32 = 1.0;
 pub const FOCUS_RING_OFFSET: f32 = 2.0;
-/// The rail's hover widening, and the 4px the consent card rises.
-pub const RAIL_WIDEN_MS: f32 = 160.0;
-pub const CARD_RISE: f32 = 4.0;
 
 /// The type scale: 12.5, 14, 16, 22 (with their line heights).
 pub const TYPE_UI: f32 = 12.5;
@@ -491,6 +503,73 @@ pub const WEIGHT_UI: FontWeight = FontWeight(400);
 /// The few labels that must not be quiet.
 pub const WEIGHT_MEDIUM: FontWeight = FontWeight(500);
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CjkOptics {
+    size_step: f32,
+    weight_step: u16,
+}
+
+impl CjkOptics {
+    pub const fn size(self, base: f32, cjk: bool) -> f32 {
+        if cjk { base + self.size_step } else { base }
+    }
+
+    pub const fn weight(self, base: FontWeight, cjk: bool) -> FontWeight {
+        if cjk {
+            FontWeight(base.0 + self.weight_step)
+        } else {
+            base
+        }
+    }
+
+    pub const fn changes_weight(self) -> bool {
+        self.weight_step != 0
+    }
+
+    pub const fn is_unchanged(self) -> bool {
+        self.size_step == 0.0 && self.weight_step == 0
+    }
+}
+
+const CJK_OPTICS_BASELINE: CjkOptics = CjkOptics {
+    size_step: 0.0,
+    weight_step: 0,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CjkOpticsVariant {
+    pub label: &'static str,
+    pub id: &'static str,
+    pub optics: CjkOptics,
+}
+
+/// Preserve today's CJK size and weight until the owner selects a capture.
+pub const CJK_OPTICS: CjkOptics = CJK_OPTICS_BASELINE;
+
+pub const CJK_OPTICS_CAPTURE_VARIANTS: [CjkOpticsVariant; 3] = [
+    CjkOpticsVariant {
+        label: "+0",
+        id: "cjk-optics-plus-0",
+        optics: CJK_OPTICS_BASELINE,
+    },
+    CjkOpticsVariant {
+        label: "+1px",
+        id: "cjk-optics-plus-1px",
+        optics: CjkOptics {
+            size_step: 1.0,
+            weight_step: 0,
+        },
+    },
+    CjkOpticsVariant {
+        label: "+1px / next companion weight",
+        id: "cjk-optics-plus-1px-next-weight",
+        optics: CjkOptics {
+            size_step: 1.0,
+            weight_step: 100,
+        },
+    },
+];
+
 /// The app's nsh theme (`theme.json`): the root carries it in the app and in
 /// any probe that must draw with the app's own fonts and colours.
 pub fn theme() -> nsh_core::element::Tokens {
@@ -649,6 +728,31 @@ mod tests {
     fn contrast(ink: Color, ground: Color) -> f32 {
         let ground = Hsla::from(ground);
         ground.blend(Hsla::from(ink)).contrast_ratio(ground)
+    }
+
+    #[test]
+    fn light_ember_keeps_its_lightness_contrast_and_warmth() {
+        let (r, g, b, _) = LIGHT.ember.to_f64();
+        let linear = |v: f64| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let (r, g, b) = (linear(r), linear(g), linear(b));
+        let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+        let m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
+        let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+        let lightness = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s;
+        let a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+        let b = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
+        let chroma = a.hypot(b);
+        let ratio = contrast(LIGHT.ember, LIGHT.room);
+        assert!(
+            (lightness - 0.5354).abs() <= 0.02 && chroma >= 0.06 && ratio >= 4.5,
+            "lightness {lightness}, chroma {chroma}, contrast {ratio}"
+        );
     }
 
     /// `layer` composited over the opaque `ground`.

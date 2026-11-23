@@ -2,7 +2,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use mt_core::rendering::{RenderOutcome, RendererRegistry};
+use mt_core::settings::Language;
 use mt_core::{Block, BlockKind, DocType, Document};
+use nsh_core::Color;
 
 const CSP: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:";
 const HOST_FRAME_SRC: &str = "; frame-src 'self'";
@@ -51,19 +53,34 @@ const HOST_RELAY: &str = "<script>(() => {
 })();</script>";
 
 pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> String {
+    build_html_localized(doc, registry, dark, Language::default())
+}
+
+pub(crate) fn build_html_localized(
+    doc: &Document,
+    registry: &RendererRegistry,
+    dark: bool,
+    language: Language,
+) -> String {
     let head_prefix = format!("{}{FRAME_PRELUDE}", csp_meta(""));
     let page = match doc.doc_type() {
         DocType::Html => build_html_raw(doc.source(), &head_prefix),
         kind => {
             let body = if kind == DocType::Mdx {
-                render_mdx_body(doc, registry)
+                render_mdx_body(doc, registry, language)
             } else {
-                render_markdown_body(doc, registry)
+                render_markdown_body(doc, registry, language)
             };
             format!(
                 "<!doctype html><html><head>{head_prefix}<meta charset=\"utf-8\">\
-                 <style>{vars}\n{STYLE}</style></head><body>{body}</body></html>",
+                 <style>{vars}\n:root {{\n  --danger-color: {danger};\n}}\n{STYLE}</style>\
+                 </head><body>{body}</body></html>",
                 vars = css_variables(dark),
+                danger = css_hex_color(if dark {
+                    crate::ui::tokens::DARK.danger
+                } else {
+                    crate::ui::tokens::LIGHT.danger
+                }),
             )
         }
     };
@@ -470,7 +487,17 @@ fn css_variables(dark: bool) -> &'static str {
     }
 }
 
-fn render_markdown_body(doc: &Document, registry: &RendererRegistry) -> String {
+fn css_hex_color(color: Color) -> String {
+    let (red, green, blue, _) = color.to_f64();
+    format!(
+        "#{:02X}{:02X}{:02X}",
+        (red * 255.0).round() as u8,
+        (green * 255.0).round() as u8,
+        (blue * 255.0).round() as u8
+    )
+}
+
+fn render_markdown_body(doc: &Document, registry: &RendererRegistry, language: Language) -> String {
     let mut out = String::new();
     let mut markdown_run = String::new();
 
@@ -480,7 +507,7 @@ fn render_markdown_body(doc: &Document, registry: &RendererRegistry) -> String {
                 // Flush accumulated prose before the out-of-band block, so
                 // ordering is preserved.
                 flush_markdown(&mut out, &mut markdown_run, doc);
-                out.push_str(&render_out_of_band(block, id, registry));
+                out.push_str(&render_out_of_band(block, id, registry, language));
             }
             None => {
                 markdown_run.push_str(&doc.source()[block.range.clone()]);
@@ -511,7 +538,7 @@ fn flush_markdown(out: &mut String, run: &mut String, doc: &Document) {
     });
     match rendered {
         Ok(html) => out.push_str(&html),
-        Err(message) => out.push_str(&diagnostic_html("markdown", &message, run)),
+        Err(message) => out.push_str(&diagnostic_html("markdown rendering failed", &message, run)),
     }
     run.clear();
 }
@@ -1032,18 +1059,35 @@ fn restore_inline_scripts(
     Ok(restored)
 }
 
-fn render_out_of_band(block: &Block, id: &str, registry: &RendererRegistry) -> String {
+fn render_out_of_band(
+    block: &Block,
+    id: &str,
+    registry: &RendererRegistry,
+    language: Language,
+) -> String {
     match registry.render(id, &block.content) {
         RenderOutcome::Svg(markup) => {
             format!("<figure class=\"mt-render mt-{id}\">{markup}</figure>")
         }
-        RenderOutcome::Failed(diag) => diagnostic_html(&diag.source, &diag.message, &block.content),
+        RenderOutcome::Failed(diag) => {
+            let title = match &block.kind {
+                BlockKind::Diagram(kind) => {
+                    crate::i18n::diagram_failure_label(language, &kind.to_string())
+                }
+                _ => format!("{} rendering failed", diag.source),
+            };
+            diagnostic_html(&title, &diag.message, &block.content)
+        }
     }
 }
 
-fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
+fn render_mdx_body(doc: &Document, registry: &RendererRegistry, language: Language) -> String {
     if let Some(diag) = doc.diagnostics().iter().find(|diag| diag.source == "mdx") {
-        return diagnostic_html(&diag.source, &diag.message, doc.source());
+        return diagnostic_html(
+            &format!("{} rendering failed", diag.source),
+            &diag.message,
+            doc.source(),
+        );
     }
 
     let mut out = String::new();
@@ -1052,7 +1096,7 @@ fn render_mdx_body(doc: &Document, registry: &RendererRegistry) -> String {
     for block in doc.blocks() {
         if let Some(id) = block.renderer_id() {
             flush_markdown(&mut out, &mut markdown_run, doc);
-            out.push_str(&render_out_of_band(block, id, registry));
+            out.push_str(&render_out_of_band(block, id, registry, language));
             continue;
         }
         match block.kind {
@@ -1101,15 +1145,15 @@ fn mdx_placeholder(kind: mt_core::document::block::MdxKind, source: &str) -> Str
     )
 }
 
-fn diagnostic_html(source: &str, message: &str, original: &str) -> String {
+fn diagnostic_html(title: &str, message: &str, original: &str) -> String {
     let original = if original.trim().is_empty() {
         String::new()
     } else {
         format!("<pre>{}</pre>", escape(original))
     };
     format!(
-        "<div class=\"mt-error\"><div class=\"mt-error-title\">{} rendering failed</div><div class=\"mt-error-msg\">{}</div>{original}</div>",
-        escape(source),
+        "<div class=\"mt-error\"><div class=\"mt-error-title\">{}</div><div class=\"mt-error-msg\">{}</div>{original}</div>",
+        escape(title),
         escape(message)
     )
 }
@@ -1159,7 +1203,7 @@ img, svg { max-width: 100%; }
 .mt-render { margin: 1.4em 0; text-align: center; }
 .mt-error { border: 1px solid #d9534f; border-left-width: 4px; border-radius: 8px;
             padding: 10px 14px; margin: 1.2em 0; }
-.mt-error-title { font-weight: 600; color: #d9534f; }
+.mt-error-title { font-weight: 600; color: var(--danger-color); }
 .mt-error-msg   { white-space: pre-wrap; margin: .4em 0; font-size: .92em; }
 .mt-mdx { border: 1px dashed var(--border-color, rgba(127,127,127,.6)); border-radius: 8px;
           padding: 8px 12px; margin: 1.2em 0; }
@@ -1170,6 +1214,7 @@ img, svg { max-width: 100%; }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nsh_core::{Color, prelude::*};
 
     const DOCUMENT_POLICY: &str = r#"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:">"#;
     const HOST_POLICY: &str = r#"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; frame-src 'self'">"#;
@@ -1184,6 +1229,55 @@ mod tests {
         let start = html.find("<body>").expect("body") + "<body>".len();
         let end = html.rfind("</body>").expect("/body");
         &html[start..end]
+    }
+
+    fn css_color(html: &str, name: &str) -> Color {
+        let prefix = format!("{name}: ");
+        let value = html
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(&prefix))
+            .expect("CSS color variable");
+        css_hex(value)
+    }
+
+    fn css_rule_color(html: &str, selector: &str, property: &str) -> Color {
+        let selector = format!("{selector} {{");
+        let rule = html
+            .split_once(&selector)
+            .expect("CSS rule")
+            .1
+            .split_once('}')
+            .expect("CSS rule end")
+            .0;
+        let property = format!("{property}: ");
+        let value = rule
+            .split(';')
+            .find_map(|declaration| declaration.trim().strip_prefix(&property))
+            .expect("CSS rule color");
+        value
+            .strip_prefix("var(")
+            .and_then(|variable| variable.strip_suffix(')'))
+            .map(|variable| css_color(html, variable))
+            .unwrap_or_else(|| css_hex(value))
+    }
+
+    fn css_hex(value: &str) -> Color {
+        let value = value
+            .trim()
+            .trim_end_matches(';')
+            .strip_prefix('#')
+            .expect("hex color");
+        let [red, green, blue] = std::array::from_fn(|index| {
+            u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).expect("hex channel")
+        });
+        Color::rgba(red, green, blue, 0xff)
+    }
+
+    fn contrast_ratio(foreground: Color, background: Color) -> f32 {
+        let background = Hsla::from(background);
+        background
+            .blend(Hsla::from(foreground))
+            .contrast_ratio(background)
     }
 
     fn md(src: &str) -> Document {
@@ -1249,6 +1343,25 @@ mod tests {
             assert!(html.contains("var(--bg-color"));
             assert!(html.contains("var(--text-color"));
             assert!(html.contains("default-src 'none'"));
+        }
+    }
+
+    #[test]
+    fn failed_diagram_titles_use_theme_danger_with_aa_contrast() {
+        let doc = md("```mermaid\nnot a diagram\n```\n");
+        for dark in [false, true] {
+            let html = page(&doc, &registry(), dark);
+            assert!(body(&html).contains("class=\"mt-error-title\""));
+            let danger = css_rule_color(&html, ".mt-error-title", "color");
+            let background = css_color(&html, "--bg-color");
+            let contrast = contrast_ratio(danger, background);
+            assert!(contrast >= 4.5, "theme danger contrast was {contrast:.2}:1");
+            let token = if dark {
+                crate::ui::tokens::DARK.danger
+            } else {
+                crate::ui::tokens::LIGHT.danger
+            };
+            assert_eq!(danger, token);
         }
     }
 
@@ -2103,7 +2216,7 @@ mod tests {
         let diagnostic = &doc.diagnostics()[0];
         assert_eq!(
             rendered.trim(),
-            diagnostic_html("mdx", &diagnostic.message, source)
+            diagnostic_html("mdx rendering failed", &diagnostic.message, source)
         );
     }
 
