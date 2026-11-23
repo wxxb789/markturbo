@@ -427,11 +427,18 @@ residual risk; the in-page layers are not a process-level network block.
 The preview's policy allows inline scripts and styles and `data:` images and
 fonts. Documents are not allowed to access the network or file system, open
 popups, submit forms, or navigate out of the preview. Remote scripts and
-relative assets in HTML are not supported. The app does not open document
-links in another app. PlantUML runs outside the browser policy with
-`PLANTUML_SECURITY_PROFILE=SANDBOX`; a PlantUML launcher that sets its own
-security profile overrides ours. Release-build verification of the isolation
-policy is [pending](docs/goal-15-acceptance.md#pending-release-checks).
+relative assets in HTML are not supported. Activating an `http:`, `https:` or
+`mailto:` link hands that URL to the system's default handler, at most once
+per 500 ms; the preview itself never navigates, and every other scheme
+(`file:`, `javascript:`, `data:`, custom schemes) and relative URL does
+nothing. The owner accepts the residual risk that a document script can forge
+such an activation and make the browser open a URL. PlantUML runs outside the
+browser policy with `PLANTUML_SECURITY_PROFILE=SANDBOX`; a PlantUML launcher
+that sets its own security profile overrides ours. Release-build verification
+of the isolation policy is
+[pending](docs/goal-15-acceptance.md#pending-release-checks), and the
+link-open check is
+[pending](docs/goal-19-acceptance.md#pending-native-checks).
 
 ## Keyboard
 

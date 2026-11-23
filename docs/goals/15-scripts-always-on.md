@@ -38,12 +38,15 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
      `allow-same-origin` and no `allow-modals`. So `window.open`, a form submit, `top.location`
      and a `target=_top` or `_blank` link do nothing. The frame's own navigation to `http(s):` or
      `file:` is refused by the inherited CSP (`frame-src`/`default-src`).
-   - The host page runs no script of its own.
+   - The host page runs exactly one inline relay ([Goal 19](19-links-system-browser.md)) that forwards
+     only string messages whose `event.source` is the document frame to the nsh bridge; the app acts
+     on them only as link-open requests validated in `links.rs`.
    - Also configure the nsh 0.6.1 WebView capability to grant no external hosts, as defence in
      depth. Verify the API in the locked nsh source; if no such API is reachable from the app, say
      so and skip it.
-   - Nothing is opened in another app. A page cannot forge a request the app would act on: the
-     app reads no bridge messages.
+   - Nothing is opened in another app, except through the preview link message [Goal 19](19-links-system-browser.md)
+     defines: a scheme-checked, rate-limited open the owner accepted as forgeable. The app acts on
+     no other page request.
    - Unit tests on the built host page assert: the exact sandbox token set (and that none of the
      forbidden tokens appear); that the CSP comes first; that `srcdoc` is attribute-escaped, so a
      document containing `"` and `</iframe>` cannot break out; and that the document's own CSP
@@ -153,8 +156,9 @@ time. That keeps the PRODUCT.md guardrail "zero unconsented outbound requests", 
 
 ## Out of scope
 
-- Opening links in the system browser. It needs a trusted user gesture that a page script cannot
-  forge, so it is a separate owner decision.
+- Opening links in the system browser. It needed a trusted user gesture a page script cannot
+  forge; the owner instead accepted the forged-click risk and made it a separate owner decision
+  ([Goal 19](19-links-system-browser.md)).
 - Relative images and stylesheets in HTML files.
 - Remote or CDN scripts. They stay blocked by design.
 

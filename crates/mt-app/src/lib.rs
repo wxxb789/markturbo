@@ -16,6 +16,7 @@ pub mod app;
 pub mod app_paths;
 pub mod assets;
 pub mod i18n;
+mod links;
 pub mod logging;
 pub mod state;
 #[cfg(test)]

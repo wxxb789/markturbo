@@ -22,19 +22,36 @@ const FRAME_PRELUDE: &str = r#"<meta http-equiv="x-dns-prefetch-control" content
         }
         Object.defineProperty(window, name, disabled);
     }
-    const cancelLink = event => {
-        if (event.composedPath().some(node =>
+    const linkUrl = event => {
+        const link = event.composedPath().find(node =>
             (node.localName === "a" || node.localName === "area") &&
-            (node.hasAttribute("href") || node.hasAttribute("xlink:href")))) {
-            event.preventDefault();
-        }
+            (node.hasAttribute("href") || node.hasAttribute("xlink:href")));
+        if (!link) return null;
+        event.preventDefault();
+        const href = link.getAttribute("href") ?? link.getAttribute("xlink:href") ?? "";
+        const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(href);
+        return scheme && ["http", "https", "mailto"].includes(scheme[1].toLowerCase()) ? href : null;
     };
-    addEventListener("click", cancelLink, true);
-    addEventListener("auxclick", cancelLink, true);
+    const followLink = event => {
+        const url = linkUrl(event);
+        if (url !== null) parent.postMessage(url, "*");
+    };
+    addEventListener("click", followLink, true);
+    addEventListener("auxclick", followLink, true);
     addEventListener("submit", event => event.preventDefault(), true);
 })();</script>"#;
 
-/// Build a base-free WebView host; only the opaque-origin frame runs scripts.
+/// The document frame cannot reach the session bridge on every backend
+/// (`nsh-platform-linux` and `nsh-platform-macos` inject it into the top
+/// frame only), so the host carries the frame's URL message to the bridge.
+const HOST_RELAY: &str = "<script>(() => {
+    const frame = document.querySelector(\"iframe\");
+    addEventListener(\"message\", event => {
+        if (event.source !== frame.contentWindow || typeof event.data !== \"string\") return;
+        if (window.nsh && typeof window.nsh.postMessage === \"function\") window.nsh.postMessage(event.data);
+    });
+})();</script>";
+
 pub fn build_html(doc: &Document, registry: &RendererRegistry, dark: bool) -> String {
     build_html_localized(doc, registry, dark, Language::default())
 }
@@ -73,9 +90,9 @@ pub(crate) fn build_html_localized(
          </head><body><iframe sandbox=\"allow-scripts\" srcdoc=\"",
         host_csp = csp_meta(HOST_FRAME_SRC),
     );
-    const HOST_SUFFIX: &str = "\"></iframe></body></html>";
+    let host_suffix = format!("\"></iframe>{HOST_RELAY}</body></html>");
     let page = neutralize_document_links(&page);
-    let host = format!("{host_prefix}{}{HOST_SUFFIX}", escape_srcdoc(&page));
+    let host = format!("{host_prefix}{}{host_suffix}", escape_srcdoc(&page));
     if host.encode_utf16().count() > MAX_HOST_UTF16_UNITS {
         return format!(
             "<!doctype html><html><head>{}<meta charset=\"utf-8\"></head>\
@@ -1371,13 +1388,13 @@ mod tests {
         let (_, iframe) = host
             .split_once("<iframe sandbox=\"allow-scripts\" srcdoc=\"")
             .unwrap();
-        let (encoded, tail) = iframe.split_once('"').unwrap();
-        assert_eq!(tail, "></iframe></body></html>");
+        let (encoded, tail) = iframe.split_once("\"></iframe>").unwrap();
+        assert_eq!(tail, format!("{HOST_RELAY}</body></html>"));
         encoded.replace("&quot;", "\"").replace("&amp;", "&")
     }
 
     #[test]
-    fn host_is_static_and_author_markup_cannot_escape_srcdoc() {
+    fn the_host_carries_exactly_one_frame_and_the_frame_relay() {
         let author = r#"<script>const text = '"</iframe>&lt;&quot;';</script>"#;
         let doc = Document::with_type(DocType::Html, author.into());
         let host = build_html(&doc, &registry(), false);
@@ -1389,6 +1406,8 @@ mod tests {
             encoded
                 .contains(r#"<script>const text = '&quot;</iframe>&amp;lt;&amp;quot;';</script>"#)
         );
+        let (_, relay) = host.split_once("\"></iframe>").unwrap();
+        assert_eq!(relay, format!("{HOST_RELAY}</body></html>"));
         let document = frame_document(&host);
         assert_eq!(
             document,
@@ -1608,13 +1627,72 @@ mod tests {
                     "{kind:?}: {name}"
                 );
             }
-            assert!(before_author.contains(r#"addEventListener("click", cancelLink, true)"#));
-            assert!(before_author.contains(r#"addEventListener("auxclick", cancelLink, true)"#));
+            assert!(before_author.contains(r#"addEventListener("click", followLink, true)"#));
+            assert!(before_author.contains(r#"addEventListener("auxclick", followLink, true)"#));
             assert!(
                 before_author.contains(
                     r#"addEventListener("submit", event => event.preventDefault(), true)"#
                 )
             );
+        }
+    }
+
+    #[test]
+    fn the_frame_prelude_cancels_navigation_and_forwards_only_openable_links() {
+        let document = page(&md("[link](https://example.com/)\n"), &registry(), false);
+        assert!(
+            document.contains(r#"if (!link) return null;"#),
+            "{document}"
+        );
+        assert!(document.contains(r#"event.preventDefault();"#));
+        assert!(document.contains(
+            r#"return scheme && ["http", "https", "mailto"].includes(scheme[1].toLowerCase()) ? href : null;"#
+        ));
+        assert!(document.contains(r#"if (url !== null) parent.postMessage(url, "*");"#));
+        assert!(
+            document
+                .contains(r#"addEventListener("submit", event => event.preventDefault(), true)"#)
+        );
+    }
+
+    #[test]
+    fn the_host_relays_only_strings_sent_by_the_document_frame() {
+        let host = build_html(&md("# x\n"), &registry(), false);
+        let (host_before_frame, frame_and_after) = host.split_once(" srcdoc=\"").unwrap();
+        let (_, host_after_frame) = frame_and_after.split_once("\"></iframe>").unwrap();
+        let host_markup = format!("{host_before_frame} srcdoc=\"\"></iframe>{host_after_frame}");
+        assert_eq!(
+            host_markup.matches("<script").count(),
+            1,
+            "the host page must run only the relay: {host_markup}"
+        );
+
+        let (_, relay) = host.split_once("\"></iframe>").unwrap();
+        assert!(relay.starts_with(HOST_RELAY), "{relay}");
+        assert!(relay.contains(r#"const frame = document.querySelector("iframe");"#));
+        let guard = r#"if (event.source !== frame.contentWindow || typeof event.data !== "string") return;"#;
+        let guard_at = relay.find(guard).expect("relay checks source and type");
+        let forward_at = relay
+            .find(r#"window.nsh.postMessage(event.data)"#)
+            .expect("relay forwards to the bridge");
+        assert!(guard_at < forward_at, "{relay}");
+    }
+
+    #[test]
+    fn the_frame_sandbox_admits_scripts_and_no_escape_token() {
+        let host = build_html(&md("# x\n"), &registry(), false);
+        let (_, after) = host.split_once("<iframe sandbox=\"").unwrap();
+        let (tokens, _) = after.split_once('"').unwrap();
+        assert_eq!(tokens, "allow-scripts");
+        for forbidden in [
+            "allow-popups",
+            "allow-top-navigation",
+            "allow-forms",
+            "allow-same-origin",
+            "allow-modals",
+            "allow-downloads",
+        ] {
+            assert!(!tokens.contains(forbidden), "{forbidden} in {tokens}");
         }
     }
 
