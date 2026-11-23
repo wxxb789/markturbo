@@ -2,6 +2,13 @@
 
 ## Deferred
 
+- [ ] **Keyboard press feedback on Win32**: nsh 0.6.1 dispatches only `Press`
+  for keyboard activation, so pressables show no press-down visual for keyboard
+  use. Revisit when nsh exposes keyboard press-down and release events.
+- [ ] **Keep consent charge full during the Sent fade**: In
+  `crates/mt-app/src/ui/consent.rs`, `rebuild(None, 0)` clears the charge bar
+  before checking `spent`, so the bar is empty during the 150 ms fade. Keep it
+  full until the card unmounts.
 - [ ] **First-time-user and screen-reader evidence for the shipped UI** — Goal
   09 was accepted on 2026-11-13 without the five first-time-target-user sessions
   and the Windows 11 x64 keyboard/screen-reader smoke its completion evidence
@@ -135,3 +142,23 @@
   by that function and a path unit test. The nsh Windows backend computes
   its own profile in `native/web.rs`. Check for external callers before
   removing the public function or its helper.
+- [ ] **Dead-code candidate: `ui::prims::model_voice`** —
+  `rg -n 'model_voice\(' crates/mt-app/src -g '*.rs'` and
+  `git grep -n 'model_voice(' -- crates/mt-app/src` return only the definition
+  at `crates/mt-app/src/ui/prims.rs:101` (the file header also links it as a
+  doc symbol, but there are no call sites); the active review path is
+  `ui::review::voice`. Revalidate that no downstream consumer uses this
+  public helper before removing or consolidating it.
+- [ ] **Dead-code candidate: `Key::WebPreviewRetry`** —
+  `rg -n 'Key::WebPreviewRetry' crates/mt-app/src` finds its English and
+  Chinese table entries plus the exhaustive key list;
+  `git grep WebPreviewRetry -- crates/mt-app/src` also finds the enum declaration, but
+  no call site. Revalidate before removing the translations or key.
+- [ ] **Raw-text scope across Markdown block boundaries** — An unclosed
+  raw-text element (`<textarea>`, `<plaintext>`, and so on) whose scope crosses
+  Markdown block boundaries still lets a later `<script>` be collected and
+  restored: `A <textarea>` followed by `<script>void 0;</script>` renders
+  `<p>A &lt;textarea></p>` and restores the script raw (characterized on the
+  Goal 18 merge; fidelity only, no request leaves). Carry the raw-text scope
+  across the `collect_inline_script_ranges`/`next_flow_script` node boundaries
+  without a parser.

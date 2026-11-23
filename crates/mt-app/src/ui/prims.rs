@@ -14,18 +14,24 @@
 //!   [`halo`] and [`emitter_plate`] take a [`Heat`] and are the only ways to
 //!   draw with the hot/ember colours.
 
+use std::cell::Cell;
+
 use nsh_base::input;
 use nsh_core::{
-    Color,
+    Color, EventKind, EventPayload,
+    element::effect,
     element::{
-        Accessible, AdaptiveColor, AnimatedNode, Easing, Element, Interactive, IntoReactive,
-        ParentElement, SharedString, Styled,
+        Accessible, AdaptiveColor, AnimatedNode, ComponentBuilder, Element, Interactive,
+        IntoListener, IntoReactive, ParentElement, ReadSignal, SharedString, Signal,
+        StyleRefinement, Styled, Text,
     },
     prelude::*,
 };
+use unicode_script::{Script, UnicodeScript};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ui::{
-    motion::{HOVER_MS, Heat},
+    motion::{self, HOVER_MS, Heat, PRESS_RELEASE_MS},
     tokens::{
         self, FONT_INPUT, FONT_MODEL, FONT_SOURCE, FONT_UI, HAIRLINE, TYPE_MODEL, TYPE_MODEL_LINE,
         TYPE_UI, TYPE_UI_LINE,
@@ -62,7 +68,7 @@ pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 }
 
 /// Resting ink: quiet local actions and captions.
-pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
@@ -72,7 +78,7 @@ pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement {
 
 /// Caption ink: the quietest text that must still be read (hints,
 /// disclosures, secondary lines), at 4.5:1 or better on every ground.
-pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
@@ -103,10 +109,74 @@ pub fn model_voice(content: impl IntoReactive<SharedString>, heat: Heat) -> impl
         .line_height(px(TYPE_MODEL_LINE))
         .text_color(move || tokens::palette().ink)
         .bind_color(&heat.glyph(
-            tokens::palette().ink,
-            tokens::palette().ember,
-            tokens::palette().hot,
+            tokens::adaptive_color(|palette| palette.ink),
+            tokens::adaptive_color(|palette| palette.ember),
+            tokens::adaptive_color(|palette| palette.hot),
         ))
+}
+
+pub(crate) fn script_text(
+    content: impl IntoReactive<SharedString>,
+    base_size: f32,
+    base_weight: nsh_core::element::FontWeight,
+    optics: tokens::CjkOptics,
+) -> Text {
+    if optics.is_unchanged() {
+        return text(content);
+    }
+    let runs = content.into_reactive().map(|content| script_runs(&content));
+    text("").child(each(
+        move || runs.get(),
+        |run: &ScriptRun| (run.index, run.is_cjk),
+        move |run: ReadSignal<ScriptRun>, _| {
+            let current = run.get();
+            let span = text(move || run.get().text.clone())
+                .text_size(px(optics.size(base_size, current.is_cjk)))
+                .font_weight(optics.weight(base_weight, current.is_cjk));
+            if current.is_cjk && optics.changes_weight() {
+                // FONT_MODEL's Windows fallback starts with a fixed DengXian Light face.
+                span.font_family(FONT_UI)
+            } else {
+                span
+            }
+        },
+    ))
+}
+
+#[derive(Clone, PartialEq)]
+struct ScriptRun {
+    index: usize,
+    is_cjk: bool,
+    text: String,
+}
+
+fn script_runs(content: &str) -> Vec<ScriptRun> {
+    let graphemes = content.graphemes(true);
+    let mut previous = graphemes.clone().find_map(cjk_script).unwrap_or(false);
+    let mut runs: Vec<ScriptRun> = Vec::new();
+    for grapheme in graphemes {
+        let is_cjk = cjk_script(grapheme).unwrap_or(previous);
+        previous = is_cjk;
+        match runs.last_mut() {
+            Some(run) if run.is_cjk == is_cjk => run.text.push_str(grapheme),
+            _ => runs.push(ScriptRun {
+                index: runs.len(),
+                is_cjk,
+                text: grapheme.to_owned(),
+            }),
+        }
+    }
+    runs
+}
+
+fn cjk_script(grapheme: &str) -> Option<bool> {
+    match grapheme.chars().next().map(|character| character.script()) {
+        Some(
+            Script::Bopomofo | Script::Han | Script::Hangul | Script::Hiragana | Script::Katakana,
+        ) => Some(true),
+        Some(Script::Common | Script::Inherited) | None => None,
+        Some(_) => Some(false),
+    }
 }
 
 /// A quiet local action: resting ink that steps to full ink with an underline
@@ -123,8 +193,8 @@ pub fn quiet_action(
     press_target(test_id, label.clone())
         .px(px(2.0))
         .py(px(4.0))
-        .hover(|s| s.text_color(tokens::palette().ink).underline())
-        .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
+        .hover(|s| s.text_color(|| tokens::palette().ink).underline())
+        .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
         .on_press(on_press)
         .child(
             text(label)
@@ -148,8 +218,8 @@ pub fn primary_action(
         .py(px(tokens::SPACE_2))
         .border(px(HAIRLINE))
         .border_color(move || tokens::palette().ink_caption)
-        .hover(|s| s.border_color(tokens::palette().ink))
-        .focus_visible(|s| s.border_color(tokens::palette().ink))
+        .hover(|s| s.border_color(|| tokens::palette().ink))
+        .focus_visible(|s| s.border_color(|| tokens::palette().ink))
         .on_press(on_press)
         .child(
             text(label)
@@ -164,7 +234,7 @@ pub fn primary_action(
 /// its test id — UI Automation's AutomationId — names the element a press
 /// reaches and screen readers announce, rather than a view around it.
 fn press_target(test_id: &str, label: SharedString) -> View {
-    view()
+    press_feedback(view())
         .test_id(test_id)
         .role(AccessibilityRole::Button)
         .optional_label(Some(label))
@@ -175,8 +245,93 @@ fn press_target(test_id: &str, label: SharedString) -> View {
         .cursor_pointer()
         .bg(Color::TRANSPARENT)
         .rounded(px(0.0))
-        .transition_colors()
-        .duration(HOVER_MS)
+}
+
+/// Pointer press-down snaps the plate; release eases ink over [`PRESS_RELEASE_MS`].
+/// Win32 nsh 0.6.1 keyboard activation dispatches `Press`, not `PressDown` or `PressUp`.
+pub(crate) fn press_feedback<T: PressControl<Kind>, Kind>(control: T) -> T {
+    press_feedback_with_duration(control, press_color_duration())
+}
+
+pub(crate) fn press_color_duration() -> Signal<f32> {
+    signal(HOVER_MS)
+}
+
+pub(crate) fn press_feedback_with_duration<T: PressControl<Kind>, Kind>(
+    control: T,
+    duration: Signal<f32>,
+) -> T {
+    let pressed = signal(false);
+    let appearance = Cell::new(None::<bool>);
+    effect(move || {
+        let is_dark = tokens::palette().is_dark;
+        if appearance
+            .replace(Some(is_dark))
+            .is_some_and(|appearance| appearance != is_dark)
+        {
+            duration.set(0.0);
+        }
+    });
+    motion::ease_out(control.transition_colors().duration(move || duration.get()))
+        .feedback_on(EventKind::MouseEnter, move |_| {
+            if !pressed.get() {
+                duration.set(HOVER_MS);
+            }
+        })
+        .feedback_on(EventKind::MouseLeave, move |_| {
+            if !pressed.get() {
+                duration.set(HOVER_MS);
+            }
+        })
+        .feedback_on(EventKind::PressDown, move |_| {
+            pressed.set(true);
+            duration.set(PRESS_RELEASE_MS);
+        })
+        .feedback_on(EventKind::PressUp, move |_| {
+            pressed.set(false);
+            duration.set(PRESS_RELEASE_MS);
+        })
+        .feedback_styles()
+}
+
+fn hover_plate(style: StyleRefinement) -> StyleRefinement {
+    style.bg(move || tokens::palette().ink_at(0.06))
+}
+
+fn pressed_plate(style: StyleRefinement) -> StyleRefinement {
+    style
+        .transition_none()
+        .bg(move || tokens::palette().ink_at(0.16))
+}
+
+// nsh gives views and component roots separate builder traits. The adapters
+// keep the feedback and its timing identical without replacing native widgets.
+pub(crate) enum DirectControl {}
+pub(crate) enum ComponentControl {}
+
+pub(crate) trait PressControl<Kind>: Styled {
+    fn feedback_styles(self) -> Self;
+    fn feedback_on(self, event: EventKind, listener: impl Fn(&EventPayload) + 'static) -> Self;
+}
+
+impl<T: Interactive + Styled> PressControl<DirectControl> for T {
+    fn feedback_styles(self) -> Self {
+        self.hover(hover_plate).active(pressed_plate)
+    }
+
+    fn feedback_on(self, event: EventKind, listener: impl Fn(&EventPayload) + 'static) -> Self {
+        self.on(event, listener)
+    }
+}
+
+impl<T: ComponentBuilder + Styled> PressControl<ComponentControl> for T {
+    fn feedback_styles(self) -> Self {
+        self.hover(hover_plate).active(pressed_plate)
+    }
+
+    fn feedback_on(self, event: EventKind, listener: impl Fn(&EventPayload) + 'static) -> Self {
+        self.__listen(event, listener.into_listener())
+    }
 }
 
 /// A text field per spec: no plate of its own, a 1px hairline under it, ink
@@ -285,11 +440,6 @@ const BLOOM_EMBER: f32 = 0.18;
 /// The halo's cap.
 const HALO: f32 = 0.06;
 
-/// The ink step a hover makes, for a caller binding its own transition.
-pub fn hover_easing() -> Easing {
-    Easing::EaseOut
-}
-
 /// An animated node interpolating `cold`..`hot` for a caller that mixes its
 /// own scale.
 pub fn heat_levels(heat: Heat, cold: f32, ember: f32, hot: f32) -> AnimatedNode {
@@ -301,6 +451,28 @@ mod tests {
     use super::*;
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
+
+    #[test]
+    fn script_runs_follow_primary_scripts_and_keep_graphemes_whole() {
+        for (input, expected) in [
+            ("A·B", vec![(false, "A·B")]),
+            ("e\u{0305}", vec![(false, "e\u{0305}")]),
+            ("中\u{05B0}", vec![(true, "中\u{05B0}")]),
+            ("中文·中文", vec![(true, "中文·中文")]),
+            ("中文, Latin", vec![(true, "中文, "), (false, "Latin")]),
+            ("Latin, 中文", vec![(false, "Latin, "), (true, "中文")]),
+            ("·中文", vec![(true, "·中文")]),
+        ] {
+            let runs = script_runs(input);
+            assert_eq!(
+                runs.iter()
+                    .map(|run| (run.is_cjk, run.text.as_str()))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{input}"
+            );
+        }
+    }
 
     /// One of each action, and a line that counts the presses they hear.
     #[component]
@@ -314,6 +486,12 @@ mod tests {
             .child(primary_action("harness-primary", "Primary", move || {
                 presses.update(|n| *n += 1)
             }))
+            .child(
+                press_feedback(view())
+                    .test_id("harness-row")
+                    .on_press(move || presses.update(|n| *n += 1))
+                    .child(rest("A row")),
+            )
             .child(view().test_id("harness-presses").child(ink(move || {
                 SharedString::from(format!("{} presses", presses.get()))
             })))
@@ -383,5 +561,161 @@ mod tests {
         app.press("id:harness-primary")
             .expect("press the primary action");
         app.wait_for("text:2 presses").expect("both presses heard");
+    }
+
+    #[test]
+    fn all_three_controls_show_the_pressed_plate_before_activation() {
+        use nsh_core::geometry::point;
+
+        for id in ["harness-quiet", "harness-primary", "harness-row"] {
+            let mut app = Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start");
+            let selector = format!("id:{id}");
+            app.wait_for(&selector).expect("control");
+            assert_eq!(
+                app.screen()
+                    .view_style(&selector)
+                    .unwrap()
+                    .unwrap()
+                    .background_color,
+                None
+            );
+            app.drag_and_hold(&selector, point(px(0.0), px(0.0)))
+                .expect("pointer down");
+            // Headless sends the gesture, but the platform normally reports
+            // the native active state separately.
+            let node = node_with(&app, id);
+            let engine = app.engine().control();
+            engine.set_states(node, nsh_core::tailwind::state::PRESSED);
+            app.settle();
+            let color = app
+                .screen()
+                .view_style(&selector)
+                .unwrap()
+                .unwrap()
+                .background_color;
+            assert!(
+                [&tokens::DARK, &tokens::LIGHT]
+                    .iter()
+                    .any(|palette| color == Some(palette.ink_at(0.16).0)),
+                "{id} did not show the pressed plate: {color:?}"
+            );
+            app.wait_for("text:0 presses")
+                .expect("press does not fire on down");
+            engine.set_states(node, 0);
+            app.drop_held().expect("pointer up");
+            app.wait_for("text:1 presses")
+                .expect("activated on release");
+        }
+    }
+
+    #[test]
+    fn a_theme_switch_does_not_transition_a_stationary_hover_plate() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::{MountItem, platform::ColorScheme};
+
+        let mut config = EngineConfig::new(Root::of::<Harness>().tokens(tokens::theme()));
+        config.environment.color_scheme = ColorScheme::Light;
+        config.environment.reduce_motion = false;
+        let mut app = Headless::start(config).expect("start the harness");
+        app.wait_for("id:harness-quiet").expect("the quiet action");
+        let control = node_with(&app, "harness-quiet");
+        app.engine()
+            .control()
+            .set_states(control, nsh_core::tailwind::state::HOVERED);
+        app.settle();
+        assert_eq!(
+            app.screen()
+                .view_style("id:harness-quiet")
+                .unwrap()
+                .unwrap()
+                .background_color,
+            Some(tokens::LIGHT.ink_at(0.06).0),
+            "the light hover plate is visible before the theme changes"
+        );
+
+        let updates = Arc::new(Mutex::new(Vec::new()));
+        app.observe({
+            let updates = updates.clone();
+            move |_, batch| {
+                for item in &batch.items {
+                    if let MountItem::ViewStyle { id, style } = item
+                        && *id == control
+                    {
+                        updates
+                            .lock()
+                            .expect("lock the test record")
+                            .push((style.background_color, style.transition));
+                    }
+                }
+            }
+        });
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("report OS appearance");
+
+        let first_dark_update = updates
+            .lock()
+            .expect("lock the test record")
+            .iter()
+            .find(|(background, _)| *background == tokens::DARK.ink_at(0.06))
+            .copied()
+            .unwrap_or_else(|| panic!("the hovered control never took the dark plate"));
+        assert!(
+            first_dark_update
+                .1
+                .is_none_or(|transition| transition.duration == 0.0),
+            "the theme's hover plate applies without a transition: {first_dark_update:?}"
+        );
+    }
+
+    #[test]
+    fn press_down_does_not_transition_the_pressed_plate() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::MountItem;
+
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+        app.wait_for("id:harness-presses").expect("the harness");
+        app.drag_and_hold(
+            "id:harness-quiet",
+            nsh_core::geometry::point(px(0.0), px(0.0)),
+        )
+        .expect("pointer down");
+        let node = node_with(&app, "harness-quiet");
+        let engine = app.engine().control();
+        let transitions = Arc::new(Mutex::new(Vec::new()));
+        app.observe({
+            let transitions = transitions.clone();
+            move |_, batch| {
+                for item in &batch.items {
+                    if let MountItem::ViewStyle { id, style } = item
+                        && *id == node
+                    {
+                        transitions
+                            .lock()
+                            .expect("lock the test record")
+                            .push(style.transition);
+                    }
+                }
+            }
+        });
+        engine.set_states(node, nsh_core::tailwind::state::PRESSED);
+        app.settle();
+        let transition = transitions
+            .lock()
+            .expect("lock the test record")
+            .last()
+            .copied()
+            .unwrap_or_else(|| panic!("press-down emitted no style update"));
+        assert_eq!(transition, None, "the pressed plate snaps on");
+        app.wait_for("text:0 presses")
+            .expect("press does not fire on down");
+        engine.set_states(node, 0);
+        app.drop_held().expect("pointer up");
+        app.wait_for("text:1 presses")
+            .expect("activated on release");
     }
 }

@@ -17,7 +17,7 @@
 |`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore.|
 |`state/revision_ledger.rs`|`RevisionLedger`: where each hunk of a live Approved Revision sits in its tab's text.|
 |`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
-|`web.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, localized strings and disclosures, log setup.|
+|`web.rs`, `links.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, preview link openings, localized strings and disclosures, log setup.|
 
 ### Optional local usage counters
 
@@ -133,15 +133,15 @@ state: the captured result and source identity, the pending consent, answer
 bindings and the live proposal. Core `review::provider` binds frozen requests
 to disclosure and one-use consent, while its private Revision implementation
 validates provider coverage and proposed edits. Each Revision request carries
-the `revision_generation` current when it was sent; resetting or replacing
-the Review (another Review, Close) advances it, and an answer that returns
-under an older generation is dropped without touching the field or the busy
-flag. A validated proposal is placed over the reviewed tab by a
-`RevisionLedger` (`state/revision_ledger.rs`); nothing is written until the
-user decides. Each Accept writes that change's replacement into the tab's text
-at once, and a Reject after an Accept writes the reviewed bytes back exactly;
-`Ctrl+Z` returns the last-decided change, with its text, to the state it had
-before that decision. The ledger follows user edits between
+the `revision_generation` current when it was sent. Cancel, or resetting the
+Review, cancels the pending transport and advances that generation. A result
+from an older generation cannot change the field or busy flag. Cancel alone
+keeps the original Review and its answers. A validated proposal is placed over
+the reviewed tab by a `RevisionLedger` (`state/revision_ledger.rs`); nothing is
+written until the user decides. Each Accept writes that change's replacement
+into the tab's text at once. A Reject after an Accept writes the reviewed bytes
+back exactly. `Ctrl+Z` returns the last-decided change, with its text, to the
+state it had before that decision. The ledger follows user edits between
 decisions: hunks wholly before or after the edited span move, while a hunk the
 edit touched loses its place and can be neither accepted ("Can't apply — this
 part changed") nor, once accepted, taken back. Every write also checks that the
@@ -396,7 +396,9 @@ not bundle an MDX compiler or runtime.
 Markdown, MDX and HTML use the same path. The app supplies a base-free HTML
 string for a static host. It contains one full-viewport iframe with only
 `sandbox="allow-scripts"`, and the author document occupies its escaped
-`srcdoc` attribute. The app listens to no document bridge messages.
+`srcdoc` attribute. One inline host script relays only strings sent by that
+frame's window to the app's bridge (`window.nsh.postMessage`); the app reads
+those messages as link activations and nothing else.
 
 The document head starts with
 `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:`.
@@ -425,7 +427,15 @@ script-inserted resource hint can still trigger a connection attempt. The owner
 accepts this residual risk. Runtime verification remains pending.
 
 The capture-phase click and submit guard covers document links and forms,
-including links exposed in the event path from open shadow roots. The
+including links exposed in the event path from open shadow roots. An
+activation of an `http:`, `https:` or `mailto:` link cancels the navigation
+and sends only the URL through the host relay; the app parses it with the
+`url` crate, opens it through nsh's `open_url` (the OS default handler, no
+shell), and limits the opens to one per 500 ms. Every other scheme and
+relative URL sends nothing. The message is one-way: the app never loads the
+message URL in the WebView, and a message that is not one of the three
+schemes does nothing. The owner accepts the residual risk that a document
+script can forge an activation and make the browser open a URL. The
 Navigation API is not used in the opaque-origin frame. A link inside a closed
 shadow root is treated like other script-driven navigation: the browser may
 replace the frame with its block page, which the next document update replaces.

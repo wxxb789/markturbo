@@ -40,9 +40,12 @@ log.workspace = true
 tracing.workspace = true
 markdown.workspace = true
 encoding_rs.workspace = true
+unicode-script.workspace = true
+unicode-segmentation.workspace = true
 dirs.workspace = true
 getrandom = "0.4"
 rust-embed.workspace = true
+url.workspace = true
 
 nsh-core = "=0.6.1"
 # Only the parts the app uses: the editor and the preview's code highlighting.

@@ -92,6 +92,9 @@ fn with_webview_network_block<T>(
 fn app_capabilities() -> Capabilities {
     let mut capabilities = Capabilities::all();
     capabilities.webview = Some(Vec::new());
+    let mut open_url = nsh_core::access::OpenUrlGrant::default();
+    open_url.schemes = ["http", "https", "mailto"].map(str::to_owned).to_vec();
+    capabilities.open_url = Some(open_url);
     capabilities
 }
 
@@ -128,6 +131,11 @@ mod tests {
         assert!(access.allows_webview("about:blank"));
         assert!(!access.allows_webview("https://example.com/"));
         assert!(!access.allows_webview("file:///page.html"));
+        assert!(access.allows_open_url("https://example.com/"));
+        assert!(access.allows_open_url("http://example.com/"));
+        assert!(access.allows_open_url("mailto:owner@example.com"));
+        assert!(!access.allows_open_url("tel:+15550100"));
+        assert!(!access.allows_open_url("file:///page.html"));
     }
 
     #[test]

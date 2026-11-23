@@ -27,6 +27,9 @@ pub fn App() -> impl IntoElement {
     // A downloaded companion CJK face is read, verified and registered on a
     // blocking thread, after the first frame is on its way.
     state.companion_font.restore();
+    if ui::cjk_optics::capture_requested() {
+        return ui::cjk_optics::capture(state.companion_font.clone());
+    }
     if let Some(path) = startup_path() {
         log::debug!("startup: opening {}", path.display());
         if path.is_dir() {
@@ -49,6 +52,7 @@ pub fn App() -> impl IntoElement {
     }));
     let _ticker_guard = stored(TickerGuard(ticker_alive));
     let shell_state = state.clone();
+    let status = ui::notices::StatusPresence::new(state.clone());
     view()
         .flex_1()
         .h(relative(1.0))
@@ -72,7 +76,8 @@ pub fn App() -> impl IntoElement {
                         layout,
                         ui::shell::client_width_now()
                     );
-                    ui::shell(state.clone(), language, layout).into_element()
+                    ui::shell::shell_with_status(state.clone(), language, layout, status)
+                        .into_element()
                 }
             },
         ))

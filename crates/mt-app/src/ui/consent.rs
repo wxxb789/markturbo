@@ -66,29 +66,19 @@ use mt_core::{
     settings::Language,
 };
 use nsh_core::keymap::When;
-use nsh_core::{Color, TransformKind, prelude::*};
+use nsh_core::{Color, TransformKind, element::AnimatedValue, prelude::*};
 
 use crate::{
     i18n::{self, Key},
     state::{AppState, OutboundConsent, OutboundItem, OutboundOrigin, ReviewScopeChoice},
-    ui::{motion, prims, titlebar, tokens},
+    ui::{motion, prims, review, titlebar, tokens},
 };
 
-/// The filament's height: a 2px bar along the send control's bottom edge.
 const FILAMENT_H: f32 = 2.0;
-/// The hold the control declares to the platform: the spec's ~1.2s, one third
-/// longer than the charge so a held press always completes it.
-const HOLD_MS: f32 = 1_200.0;
-/// The card's rise into place, when the system allows motion.
-const CARD_RISE_MS: f32 = 160.0;
 /// How long a held key may stay silent before it counts as released: longer
 /// than the platform's slowest first auto-repeat, shorter than the charge, so
 /// a tap on its own can never complete a send.
 const KEY_ALIVE_MS: f32 = 700.0;
-/// How long 'Nothing was sent.' stays after an early release.
-const NOTICE_MS: f32 = 1500.0;
-/// A released filament is drawn cooling for three time constants.
-const COOL_MS: f32 = 3.0 * motion::FILAMENT_RELEASE_TAU_MS;
 /// The row height the height rule counts with (type plus its gap).
 const ROW_H: f32 = 22.0;
 /// What the card may take of the window, and the chrome around its rows.
@@ -122,18 +112,27 @@ pub fn is_open(state: &AppState) -> bool {
 struct Waiting {
     is_revision: bool,
     consent: Option<OutboundConsent>,
+    fallback: SharedString,
+    offers_selection: bool,
+    offers_context: bool,
 }
 
 fn waiting(state: &AppState) -> Waiting {
-    if state.review_consent.get().is_some() {
+    if let Some(fallback) = state.review_consent.get() {
         return Waiting {
             is_revision: false,
             consent: state.review_manifest.get(),
+            fallback,
+            offers_selection: state.review_consent_offers_selection(),
+            offers_context: state.review_consent_offers_context(),
         };
     }
     Waiting {
         is_revision: true,
         consent: state.revision_manifest.get(),
+        fallback: state.revision_consent.get().unwrap_or_default(),
+        offers_selection: false,
+        offers_context: false,
     }
 }
 
@@ -142,20 +141,8 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     // The card owns Enter, Escape and the hold: the source editor gives up
     // the focus it may still hold from the Ctrl+Enter that opened the card.
     state.blur_source_editor();
-    let is_revision = state.revision_consent.get().is_some();
-    // The app's only shadow: sending is the one thing that breaks the room.
-    // It takes its colour adaptively, so the theme stays current without a
-    // rebuild.
+    let is_revision = state.revision_consent.get_untracked().is_some();
     let shadow = shadow();
-    // The 4px rise: a motion, so it is skipped under reduced motion.
-    let rise = animated_value(tokens::CARD_RISE);
-    effect(move || {
-        if motion::reduced_motion() {
-            rise.set(0.0);
-        } else {
-            rise.timing(0.0, CARD_RISE_MS, motion::rail_easing());
-        }
-    });
     // One hold for as long as the card lives, shared with the keyboard
     // bindings below: the body resets it whenever it is built again.
     let hold = Hold::new(state.clone(), is_revision, language);
@@ -165,6 +152,18 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     keyboard(state.clone(), is_revision, hold.clone());
     let body_state = state.clone();
     let body_hold = hold.clone();
+    let presented = signal_with(None, SignalEquals::Never);
+    effect({
+        let state = state.clone();
+        let hold = hold.clone();
+        move || {
+            if is_open(&state) {
+                presented.set(Some(waiting(&state)));
+            } else {
+                hold.rebuild(None, 0);
+            }
+        }
+    });
     view()
         .test_id("consent-card")
         .w(px(tokens::CONSENT_CARD_MAX_W))
@@ -188,7 +187,6 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             Color::rgba(0, 0, 0, 36),
             Color::rgba(0, 0, 0, 115),
         ))
-        .bind_translate_y(&rise)
         .child(
             text(if is_revision {
                 S::HeadlineRevision.text(language)
@@ -202,15 +200,16 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             .text_color(move || tokens::palette().ink),
         )
         .child(dynamic(move || {
-            card_body(&body_state, language, &body_hold, is_revision)
+            presented.with(|waiting| {
+                waiting
+                    .as_ref()
+                    .map(|waiting| card_body(&body_state, language, &body_hold, waiting))
+            })
         }))
 }
 
-/// The card's body, as the manifest stands now: the rows, the total, the
-/// controls and the hold's bytes follow the binding that will actually leave.
-/// A `dynamic` region, so a scope switch redraws all of it.
-fn card_body(state: &AppState, language: Language, hold: &Hold, is_revision: bool) -> AnyElement {
-    let waiting = waiting(state);
+/// The disclosure and hold use the same manifest binding.
+fn card_body(state: &AppState, language: Language, hold: &Hold, waiting: &Waiting) -> AnyElement {
     let rows = waiting
         .consent
         .as_ref()
@@ -224,31 +223,24 @@ fn card_body(state: &AppState, language: Language, hold: &Hold, is_revision: boo
             .child(disclosure_body(
                 state,
                 language,
-                &waiting,
+                waiting,
                 consent,
                 rows.as_ref().expect("a manifest has its rows"),
             ))
             .child(buttons(
                 state.clone(),
-                is_revision,
+                waiting.is_revision,
                 language,
                 hold.clone(),
                 total,
             ))
             .into_element(),
-        // No manifest was kept: the state's own disclosure, verbatim.
-        None => text(
-            state
-                .review_consent
-                .get()
-                .or_else(|| state.revision_consent.get())
-                .unwrap_or_default(),
-        )
-        .font_family(tokens::FONT_UI)
-        .text_size(px(tokens::TYPE_UI))
-        .line_height(px(tokens::TYPE_UI_LINE))
-        .text_color(move || tokens::palette().ink_rest)
-        .into_element(),
+        None => text(waiting.fallback.clone())
+            .font_family(tokens::FONT_UI)
+            .text_size(px(tokens::TYPE_UI))
+            .line_height(px(tokens::TYPE_UI_LINE))
+            .text_color(move || tokens::palette().ink_rest)
+            .into_element(),
     }
 }
 
@@ -298,8 +290,7 @@ fn disclosure_body(
                         .gap(px(tokens::SPACE_2))
                         .child(view().flex_1().child(prims::rest(S::Total.text(language))))
                         .child(
-                            text(SharedString::from(bytes_label(rows.total)))
-                                .font_family(tokens::FONT_UI)
+                            tokens::mono_count(text(SharedString::from(bytes_label(rows.total))))
                                 .text_size(px(tokens::TYPE_UI))
                                 .line_height(px(tokens::TYPE_UI_LINE))
                                 .text_color(move || tokens::palette().ink),
@@ -372,11 +363,6 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
     } else {
         ReviewScopeChoice::Document
     };
-    let review = !waiting.is_revision;
-    let offers_selection = review && state.review_consent_offers_selection();
-    let offers_context = review && state.review_consent_offers_context();
-    // The current scope in ink; another one a quiet switch when it can be
-    // bound, and not drawn at all when it cannot.
     let option = |choice: ReviewScopeChoice, test_id: &'static str, label: S, offered: bool| {
         let label = label.text(language);
         if current == choice {
@@ -384,10 +370,14 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
         }
         let state = state.clone();
         offered.then(|| {
+            let enabled = state.clone();
+            let action = prims::quiet_action(test_id, label, move || {
+                state.set_review_consent_scope(choice)
+            });
+            #[cfg(test)]
+            let action = action.on_focus(|| tests::record_focus(tests::FocusStop::Scope));
             view()
-                .child(prims::quiet_action(test_id, label, move || {
-                    state.set_review_consent_scope(choice)
-                }))
+                .child(action.disabled(move || !is_open(&enabled)))
                 .into_element()
         })
     };
@@ -396,19 +386,19 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
             ReviewScopeChoice::Selection,
             "consent-scope-selection",
             S::ScopeSelection,
-            offers_selection,
+            waiting.offers_selection,
         ),
         option(
             ReviewScopeChoice::Document,
             "consent-scope-document",
             S::ScopeDocument,
-            review,
+            !waiting.is_revision,
         ),
         option(
             ReviewScopeChoice::DocumentWithContext,
             "consent-scope-context",
             S::ScopeContext,
-            offers_context,
+            waiting.offers_context,
         ),
     ]
     .into_iter()
@@ -558,14 +548,13 @@ fn row_view(row: &Row, tone: Tone) -> impl IntoElement {
             )
             .child(view().flex_1())
             .child(
-                text(move || {
+                tokens::mono_count(text(move || {
                     if has_bytes {
                         SharedString::from(bytes_label(bytes))
                     } else {
                         SharedString::from("")
                     }
-                })
-                .font_family(tokens::FONT_UI)
+                }))
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
                 .text_color(move || gloss().0),
@@ -619,18 +608,16 @@ fn buttons(
         )
 }
 
-/// Cancel: default focus, a quiet action, and it authorizes nothing.
 fn cancel_button(state: AppState, is_revision: bool, language: Language) -> impl IntoElement {
     let reference = element_ref();
-    // Cancel takes the keyboard focus as soon as the card is up, so Enter and
-    // Escape both land somewhere that authorizes nothing. The ref goes on the
-    // button itself: nsh focuses an input or a view that takes presses, and
-    // `prims::primary_action` takes no ref, so Cancel draws its own control.
+    // Initial focus lands on Cancel, which authorizes nothing.
     effect(move || reference.focus());
+    let enabled = state.clone();
     view().test_id("consent-cancel").child(cancel_action(
         i18n::t(language, Key::Cancel),
         move || cancel(&state, is_revision),
         reference,
+        move || !is_open(&enabled),
     ))
 }
 
@@ -645,8 +632,10 @@ fn cancel_action(
     label: &'static str,
     on_press: impl Fn() + 'static,
     reference: ElementRef,
+    disabled: impl Fn() -> bool + 'static,
 ) -> AnyElement {
-    view()
+    let duration = prims::press_color_duration();
+    let control = view()
         .test_id("consent-cancel-button")
         .flex_row()
         .items_center()
@@ -656,11 +645,14 @@ fn cancel_action(
         .cursor_pointer()
         .group()
         .focusable(true)
+        .disabled(disabled)
         .role(AccessibilityRole::Button)
         .label(SharedString::from(label))
-        .on_press(move |_: &PressEvent| on_press())
-        .element_ref(&reference)
-        .child(
+        .on_press(move |_: &PressEvent| on_press());
+    #[cfg(test)]
+    let control = control.on_focus(|| tests::record_focus(tests::FocusStop::Cancel));
+    prims::press_feedback_with_duration(
+        control.element_ref(&reference).child(
             text(label)
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
@@ -668,11 +660,13 @@ fn cancel_action(
                 .text_color(move || tokens::palette().ink_rest)
                 .underline_offset(px(4.0))
                 .transition_colors()
-                .duration(motion::HOVER_MS)
-                .group_hover(|s| s.text_color(tokens::palette().ink).underline())
-                .group_focus_visible(|s| s.text_color(tokens::palette().ink).underline()),
-        )
-        .into_element()
+                .duration(move || duration.get())
+                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
+        ),
+        duration,
+    )
+    .into_element()
 }
 
 /// Hold to send: a full [`motion::FILAMENT_CHARGE_MS`] of charge authorizes;
@@ -685,76 +679,79 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
     let up = hold.clone();
     let tap = hold.clone();
     let label_hold = hold.clone();
-    view()
-        .test_id("consent-send")
-        .w(px(tokens::CONSENT_BUTTON_W))
-        .h(px(tokens::CONSENT_BUTTON_H))
-        .relative()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .border(px(tokens::HAIRLINE))
-        .border_color(move || tokens::palette().ink_caption)
-        .focus_visible(|s| s.border_color(tokens::palette().ink))
-        .cursor_pointer()
-        .focusable(true)
-        .label(SharedString::from(hold_accessibility(language, total)))
-        // Where the keyboard is decides what `Space` and `Enter` do: on this
-        // control they charge it, anywhere else they cancel.
-        .on_focus(move || focused.focused.set(true))
-        // The window losing the keyboard ends any press in it.
-        .on_blur(move || {
-            blur.focused.set(false);
-            blur.release();
-        })
-        // How long the platform calls a press on this control a hold: the
-        // spec's ~1.2s, with the filament's [`motion::FILAMENT_CHARGE_MS`]
-        // charge inside it.
-        .long_press_delay(HOLD_MS)
-        .on_press_down(move |_: &PressEvent| down.press())
-        .on_press_up(move |_: &PressEvent| up.release())
-        // An assistive technology's activation arrives as one whole press: the
-        // press ended, so the charge cools and nothing is authorized.
-        .on_press(move |_: &PressEvent| tap.release())
-        .child(
-            text(move || match label_hold.label.get() {
-                HoldLabel::Idle => SharedString::from(S::HoldToSend.text(language)),
-                HoldLabel::Holding => SharedString::from(S::KeepHolding.text(language)),
-                HoldLabel::StepOne => SharedString::from(S::StepOne.text(language)),
-                HoldLabel::StepTwo => SharedString::from(S::StepTwo.text(language)),
-                HoldLabel::StepThree => SharedString::from(S::Sending.text(language)),
-                HoldLabel::Released => SharedString::from(S::NothingWasSent.text(language)),
-                HoldLabel::Sent => SharedString::from(S::Sent.text(language)),
+    let enabled = hold.state.clone();
+    prims::press_feedback(
+        view()
+            .test_id("consent-send")
+            .w(px(tokens::CONSENT_BUTTON_W))
+            .h(px(tokens::CONSENT_BUTTON_H))
+            .relative()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .border(px(tokens::HAIRLINE))
+            .border_color(move || tokens::palette().ink_caption)
+            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
+            .cursor_pointer()
+            .focusable(true)
+            .disabled(move || !is_open(&enabled))
+            .label(SharedString::from(hold_accessibility(language, total)))
+            .on_focus(move || {
+                focused.focused.set(true);
+                #[cfg(test)]
+                tests::record_focus(tests::FocusStop::Hold);
             })
-            .font_family(tokens::FONT_UI)
-            .text_size(px(tokens::TYPE_UI))
-            .line_height(px(tokens::TYPE_UI_LINE))
-            .text_color(move || tokens::palette().ink),
-        )
-        .child(
-            // The filament's track: the ramp's dull end, so the control shows
-            // its filament before the hold starts.
-            view()
-                .absolute()
-                .left(px(0.0))
-                .bottom(px(0.0))
-                .w_full()
-                .h(px(FILAMENT_H))
-                .bg(move || tokens::palette().filament[0]),
-        )
-        .child(
-            // The charge itself: the ramp from dull to white-hot, as wide as
-            // the hold.
-            view()
-                .absolute()
-                .left(px(0.0))
-                .bottom(px(0.0))
-                .w_full()
-                .h(px(FILAMENT_H))
-                .origin_bottom_left()
-                .bind_background(&heat.filament_glow())
-                .bind_transform(TransformKind::ScaleX, &heat),
-        )
+            // A hold must not authorize once focus leaves Send.
+            .on_blur(move || {
+                blur.focused.set(false);
+                blur.release();
+            })
+            .long_press_delay(motion::FILAMENT_HOLD_MS)
+            .on_press_down(move |_: &PressEvent| down.press())
+            .on_press_up(move |_: &PressEvent| up.release())
+            // An assistive technology's activation arrives as one whole press: the
+            // press ended, so the charge cools and nothing is authorized.
+            .on_press(move |_: &PressEvent| tap.release())
+            .child(
+                text(move || match label_hold.label.get() {
+                    HoldLabel::Idle => SharedString::from(S::HoldToSend.text(language)),
+                    HoldLabel::Holding => SharedString::from(S::KeepHolding.text(language)),
+                    HoldLabel::StepOne => SharedString::from(S::StepOne.text(language)),
+                    HoldLabel::StepTwo => SharedString::from(S::StepTwo.text(language)),
+                    HoldLabel::StepThree => SharedString::from(S::Sending.text(language)),
+                    HoldLabel::Released => SharedString::from(S::NothingWasSent.text(language)),
+                    HoldLabel::Sent => SharedString::from(S::Sent.text(language)),
+                })
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink),
+            )
+            .child(
+                view()
+                    .absolute()
+                    .left(px(0.0))
+                    .bottom(px(0.0))
+                    .w_full()
+                    .h(px(FILAMENT_H))
+                    .bg(move || tokens::palette().filament[0]),
+            )
+            .child(dynamic(move || {
+                let filament_fill = view()
+                    .absolute()
+                    .left(px(0.0))
+                    .bottom(px(0.0))
+                    .w_full()
+                    .h(px(FILAMENT_H))
+                    .origin_bottom_left()
+                    .bind_background(&heat.filament_glow());
+                if motion::reduced_motion() {
+                    filament_fill.bind_opacity(&heat)
+                } else {
+                    filament_fill.bind_transform(TransformKind::ScaleX, &heat)
+                }
+            })),
+    )
 }
 
 /// The keyboard routes: Esc always cancels; a held `Enter` or `Space` charges
@@ -781,8 +778,15 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
     });
     // Bound as the card comes, so it is newer than any binding made before.
     let ctrl_enter_state = state.clone();
-    effect(move || titlebar::bind_mod_enter(&ctrl_enter_state));
     effect(move || {
+        if is_open(&ctrl_enter_state) {
+            titlebar::bind_mod_enter(&ctrl_enter_state);
+        }
+    });
+    effect(move || {
+        if !is_open(&state) {
+            return;
+        }
         on_key_with("escape", KeyOptions::default(), {
             let state = state.clone();
             move |_| cancel(&state, is_revision)
@@ -878,7 +882,7 @@ fn last_key() -> Rc<Cell<Option<Instant>>> {
 /// Cancel the waiting consent, whatever it is.
 fn cancel(state: &AppState, is_revision: bool) {
     if is_revision {
-        state.cancel_revision();
+        review::cancel_revision(state);
     } else {
         state.cancel_review();
     }
@@ -1294,7 +1298,7 @@ impl Hold {
             self.label.set(HoldLabel::Holding);
         }
         self.heat
-            .timing_with(1.0, Timing::new(remaining, Easing::Linear));
+            .timing_with(1.0, Timing::new(remaining, motion::LINEAR));
         let hold = self.clone();
         let slot = self.completion.clone();
         *slot.borrow_mut() = Some(set_timeout(
@@ -1362,7 +1366,7 @@ impl Hold {
         let hold = self.clone();
         let slot = self.notice.clone();
         *slot.borrow_mut() = Some(set_timeout(
-            Duration::from_millis(NOTICE_MS as u64),
+            Duration::from_millis(motion::CONSENT_NOTICE_MS),
             move || {
                 hold.notice.borrow_mut().take();
                 if hold.charging.get().is_none() && !hold.spent.get() {
@@ -1409,11 +1413,12 @@ impl Hold {
         } else {
             HoldLabel::Sent
         });
-        self.state.notify(format!(
-            "{} · {}",
-            S::Sent.text(self.language),
-            sent_bytes(self.language, self.total.get())
-        ));
+        self.state.notify_count_at(
+            crate::state::StatusSurface::Review,
+            crate::state::StatusKind::Success,
+            format!("{} · ", S::Sent.text(self.language)),
+            sent_bytes(self.language, self.total.get()),
+        );
         if self.is_revision {
             self.state.send_revision();
         } else {
@@ -1428,17 +1433,17 @@ impl Hold {
         self.heat.stop();
         if motion::reduced_motion() {
             self.heat
-                .timing(0.0, motion::REDUCED_CROSSFADE_MS, Easing::EaseInOut);
+                .timing(0.0, motion::REDUCED_CROSSFADE_MS, motion::EASE_IN_OUT);
             return;
         }
         let frames: Vec<Keyframe> = (0..16)
             .map(|index| {
                 let u = index as f32 / 15.0;
-                Keyframe::at(u, cooled(from, u * COOL_MS)).ease(Easing::Linear)
+                Keyframe::at(u, cooled(from, u * motion::FILAMENT_COOL_MS)).ease(motion::LINEAR)
             })
             .collect();
-        let mut timing = KeyframeTiming::new(COOL_MS);
-        timing.easing = Easing::Linear;
+        let mut timing = KeyframeTiming::new(motion::FILAMENT_COOL_MS);
+        timing.easing = motion::LINEAR;
         self.heat.keyframes(frames, timing);
     }
 
@@ -1649,6 +1654,26 @@ mod tests {
     use mt_core::model::{ModelOperation, ModelRequestDisclosure, OutboundScope, Provider};
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default, Clone, Debug, PartialEq, Eq)]
+    pub(super) struct FocusTrace(Vec<FocusStop>);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum FocusStop {
+        Scope,
+        Cancel,
+        Hold,
+    }
+
+    pub(super) fn record_focus(stop: FocusStop) {
+        global::<FocusTrace>().update(|trace| {
+            if trace.0.len() == 3 {
+                trace.0.remove(0);
+            }
+            trace.0.push(stop);
+        });
+    }
 
     fn disclosure(scope: OutboundScope) -> ModelRequestDisclosure {
         ModelRequestDisclosure::new(
@@ -1895,6 +1920,7 @@ mod tests {
     /// switch rebinds a prepared Review, which this harness does not have).
     #[component]
     fn Harness() -> impl IntoElement {
+        let focus_trace = global::<FocusTrace>();
         let state = AppState::new();
         state
             .review_consent
@@ -1945,12 +1971,36 @@ mod tests {
                 move || is_open(&state),
                 move || card(card_state.clone(), Language::English),
             ))
+            .child(
+                view()
+                    .absolute()
+                    .w(px(1.0))
+                    .h(px(1.0))
+                    .opacity(0.0)
+                    .child(text(move || {
+                        SharedString::from(format!("focus order: {:?}", focus_trace.get().0))
+                    })),
+            )
+    }
+
+    #[component]
+    fn ReducedMotionHarness() -> impl IntoElement {
+        let state = AppState::new();
+        let open_state = state.clone();
+        view()
+            .w(px(1_200.0))
+            .h(px(800.0))
+            .child(prims::quiet_action("reduced-open", "Open", move || {
+                open_state
+                    .review_consent
+                    .set(Some(SharedString::from("disclosure text")));
+                open_state.review_manifest.set(Some(sample_consent()));
+            }))
+            .child(crate::ui::shell::overlay_layer(state, Language::English))
     }
 
     pub(super) fn start_harness() -> Headless {
-        // A manual clock: the hold's charge, its watchdogs and the notice move
-        // only as the harness steps time, so a loaded machine cannot reorder
-        // them (a late frame once ran the completion before the watchdog).
+        // A late frame once ran hold completion before its watchdog; manual time orders them.
         let mut config = EngineConfig::new(Root::of::<Harness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the harness");
@@ -1958,6 +2008,92 @@ mod tests {
             .expect("viewport");
         app.wait_for("id:consent-card").expect("the card");
         app
+    }
+
+    #[test]
+    fn reduced_motion_keeps_transforms_out_of_the_card_subtree() {
+        let mut config = EngineConfig::new(Root::of::<ReducedMotionHarness>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = Headless::start(config).expect("start the harness");
+        app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
+            .expect("viewport");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("the environment");
+        let binding_events = Arc::new(Mutex::new(Vec::<(
+            nsh_core::NodeId,
+            Vec<nsh_core::animation::AnimationProp>,
+        )>::new()));
+        app.observe({
+            let binding_events = binding_events.clone();
+            move |_, batch| {
+                for item in &batch.items {
+                    if let nsh_core::MountItem::AnimationBindings { id, bindings } = item {
+                        binding_events.lock().expect("lock the test record").push((
+                            *id,
+                            bindings.iter().map(|(property, _)| *property).collect(),
+                        ));
+                    }
+                }
+            }
+        });
+        app.press("id:reduced-open").expect("open consent");
+        app.wait_for("id:consent-card").expect("the consent card");
+        let motion_card = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some("consent-motion-card"))
+            .expect("the consent motion card")
+            .id;
+        use nsh_core::geometry::point;
+        app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
+            .expect("start the hold");
+        app.drop_held().expect("release the hold");
+        app.settle();
+
+        let layout_nodes = app.screen().layout_nodes();
+        let card_nodes: Vec<_> = layout_nodes
+            .iter()
+            .filter(|node| {
+                let mut current = node.id;
+                loop {
+                    if current == motion_card {
+                        return true;
+                    }
+                    let Some(parent) = layout_nodes
+                        .iter()
+                        .find(|candidate| candidate.id == current)
+                        .map(|candidate| candidate.parent)
+                    else {
+                        return false;
+                    };
+                    if parent == current {
+                        return false;
+                    }
+                    current = parent;
+                }
+            })
+            .map(|node| node.id)
+            .collect();
+        let binding_events = binding_events.lock().expect("lock the test record");
+        let card_bindings: Vec<_> = binding_events
+            .iter()
+            .filter(|(id, _)| card_nodes.contains(id))
+            .collect();
+        assert!(
+            card_bindings
+                .iter()
+                .any(|(_, properties)| !properties.is_empty()),
+            "the card subtree has recorded animation bindings"
+        );
+        assert!(
+            card_bindings.iter().all(|(_, properties)| {
+                properties.iter().all(|property| {
+                    !matches!(property, nsh_core::animation::AnimationProp::Transform(_))
+                })
+            }),
+            "no animated binding in the reduced-motion card subtree uses a transform"
+        );
     }
 
     #[test]
@@ -2097,6 +2233,79 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_changes_during_a_hold_keep_progress_and_focus() {
+        let mut app = start_harness();
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduced motion");
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab");
+        }
+        assert!(
+            app.shows("focus order: [Scope, Cancel, Hold]"),
+            "the three Tab stops were {:?}",
+            app.screen().texts()
+        );
+        app.press_key("space").expect("start the hold");
+        app.wait(Duration::from_millis(350))
+            .expect("the first third of the hold");
+        assert!(app.shows("1/3"), "the hold reached its first third");
+
+        app.set_environment("motion enabled", |env| env.reduce_motion = false)
+            .expect("enable motion");
+        let progress_kept = app.shows("1/3");
+        app.press_key("space")
+            .expect("the focused hold still owns Space");
+        let focus_kept = app.shows("Send for review?");
+        assert!(
+            progress_kept && focus_kept,
+            "progress kept: {progress_kept}; hold kept focus: {focus_kept}"
+        );
+    }
+
+    #[test]
+    fn a_theme_switch_keeps_consent_hold_progress_and_focus() {
+        use nsh_core::platform::ColorScheme;
+
+        let mut app = start_harness();
+        app.set_environment("a platform that focuses views", |env| {
+            env.os = nsh_core::element::Os::Linux;
+        })
+        .expect("the environment");
+        app.set_environment("reduced motion", |env| env.reduce_motion = true)
+            .expect("reduced motion");
+        app.set_environment("light appearance", |env| {
+            env.color_scheme = ColorScheme::Light;
+        })
+        .expect("light appearance");
+
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab");
+        }
+        app.press_key("space").expect("start the hold");
+        app.wait(Duration::from_millis(350))
+            .expect("the first third of the hold");
+        let progress_before = app.shows("1/3");
+
+        app.set_environment("system appearance becomes dark", |env| {
+            env.color_scheme = ColorScheme::Dark;
+        })
+        .expect("dark appearance");
+        let progress_kept = app.shows("1/3");
+        app.press_key("space")
+            .expect("the focused hold still owns Space");
+        let hold_responds = app.shows("Send for review?");
+
+        assert!(
+            progress_before && progress_kept && hold_responds,
+            "charged before theme change: {progress_before}; charge kept: {progress_kept}; hold responds: {hold_responds}"
+        );
+    }
+
+    #[test]
     fn the_reduced_motion_steps_are_thirds_of_the_charge() {
         assert_eq!(reduced_step(0.0), 0, "nothing yet");
         assert_eq!(reduced_step(0.32), 0, "just short of the first third");
@@ -2127,6 +2336,27 @@ mod tests {
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("the first press cancelled the card");
         assert!(!app.shows("Sent"), "nothing was sent");
+    }
+
+    fn assert_mono_consent_bytes(selector: &str) {
+        let mut app = start_harness();
+        app.wait_for("id:consent-total").expect("consent total");
+        let style = app.screen().span_style(selector).expect(selector);
+        assert_eq!(
+            style.font_family.expect(selector).name().as_ref(),
+            tokens::FONT_SOURCE,
+            "{selector}"
+        );
+    }
+
+    #[test]
+    fn consent_total_bytes_use_mono_figures() {
+        assert_mono_consent_bytes("id:consent-total >> text:800 B");
+    }
+
+    #[test]
+    fn consent_item_bytes_use_mono_figures() {
+        assert_mono_consent_bytes("id:consent-row-source >> text:200 B");
     }
 
     #[component]

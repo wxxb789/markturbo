@@ -25,9 +25,8 @@ use nsh_core::{Color, file_dialog::OpenDialog, prelude::*};
 use crate::{
     app_paths,
     i18n::{self, Key},
-    state::{AppState, Entry},
+    state::{AppState, Entry, StatusMessage},
     ui::{
-        motion::HOVER_MS,
         prims,
         tokens::{
             self, FONT_UI, HAIRLINE, SPACE_1, SPACE_2, SPACE_3, SPACE_5, SPACE_6, TYPE_UI,
@@ -154,25 +153,27 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
                     .map(|root| tree::display_relative(&root, &entry.path))
                     .unwrap_or_else(|| entry.name.clone());
                 let path = entry.path.clone();
-                view()
-                    .test_id("workspace-home-file")
-                    .role(AccessibilityRole::Button)
-                    .optional_label(Some(SharedString::from(label.clone())))
-                    .window_drag(false)
-                    .cursor_pointer()
-                    .pl(px(SPACE_3))
-                    .py(px(SPACE_1))
-                    .hover(|s| s.text_color(tokens::palette().ink))
-                    .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-                    .on_press(move || state.open_file(path.clone()))
-                    .child(
-                        text(label)
-                            .font_family(FONT_UI)
-                            .text_size(px(TYPE_UI))
-                            .line_height(px(TYPE_UI_LINE))
-                            .text_color(move || tokens::palette().ink_rest)
-                            .truncate(),
-                    )
+                prims::press_feedback(
+                    view()
+                        .test_id("workspace-home-file")
+                        .role(AccessibilityRole::Button)
+                        .optional_label(Some(SharedString::from(label.clone())))
+                        .window_drag(false)
+                        .cursor_pointer()
+                        .pl(px(SPACE_3))
+                        .py(px(SPACE_1))
+                        .hover(|s| s.text_color(|| tokens::palette().ink))
+                        .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
+                        .on_press(move || state.open_file(path.clone())),
+                )
+                .child(
+                    text(label)
+                        .font_family(FONT_UI)
+                        .text_size(px(TYPE_UI))
+                        .line_height(px(TYPE_UI_LINE))
+                        .text_color(move || tokens::palette().ink_rest)
+                        .truncate(),
+                )
             },
         ))
         .child(when(
@@ -215,30 +216,30 @@ fn open_folder_action(
 ) -> impl Interactive + ParentElement {
     let handle = element_ref();
     effect(move || handle.focus());
-    view()
-        .test_id(test_id)
-        .role(AccessibilityRole::Button)
-        .optional_label(Some(SharedString::from(label)))
-        .window_drag(false)
-        .cursor_pointer()
-        .bg(Color::TRANSPARENT)
-        .px(px(SPACE_3))
-        .py(px(SPACE_2))
-        .border(px(HAIRLINE))
-        .border_color(move || tokens::palette().ink_caption)
-        .transition_colors()
-        .duration(HOVER_MS)
-        .hover(|s| s.border_color(tokens::palette().ink))
-        .focus_visible(|s| s.border_color(tokens::palette().ink))
-        .on_press(move || choose_folder(state.clone()))
-        .child(
-            text(SharedString::from(label))
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink),
-        )
-        .element_ref(&handle)
+    prims::press_feedback(
+        view()
+            .test_id(test_id)
+            .role(AccessibilityRole::Button)
+            .optional_label(Some(SharedString::from(label)))
+            .window_drag(false)
+            .cursor_pointer()
+            .bg(Color::TRANSPARENT)
+            .px(px(SPACE_3))
+            .py(px(SPACE_2))
+            .border(px(HAIRLINE))
+            .border_color(move || tokens::palette().ink_caption)
+            .hover(|s| s.border_color(|| tokens::palette().ink))
+            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
+            .on_press(move || choose_folder(state.clone())),
+    )
+    .child(
+        text(SharedString::from(label))
+            .font_family(FONT_UI)
+            .text_size(px(TYPE_UI))
+            .line_height(px(TYPE_UI_LINE))
+            .text_color(move || tokens::palette().ink),
+    )
+    .element_ref(&handle)
 }
 
 /// The paths opened before, quiet under the four choices: a person who comes
@@ -289,52 +290,56 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                     format!("{kind} {}", target.display_name)
                 };
                 let target_for_open = target.clone();
-                view()
-                    .test_id("welcome-recent")
-                    .role(AccessibilityRole::Button)
-                    .optional_label(Some(SharedString::from(label)))
-                    .disabled(missing)
-                    .flex_row()
-                    .items_center()
-                    .gap(px(SPACE_2))
-                    .pl(px(SPACE_3))
-                    .py(px(SPACE_1))
-                    .when(!missing, |row| {
-                        row.cursor_pointer()
-                            .hover(|s| s.text_color(tokens::palette().ink))
-                            .focus_visible(|s| s.text_color(tokens::palette().ink).underline())
-                    })
-                    .on_press(move || {
-                        // Checked again at the press: the target may have gone
-                        // since the row was drawn.
-                        if target_exists(&target_for_open) {
-                            state.open_recent(&target_for_open);
-                        }
-                    })
-                    .child(
-                        text(kind)
-                            .font_family(FONT_UI)
-                            .text_size(px(TYPE_UI))
-                            .line_height(px(TYPE_UI_LINE))
-                            .text_color(move || tokens::palette().ink_caption),
-                    )
-                    .child(
-                        text(target.display_name.clone())
-                            .font_family(FONT_UI)
-                            .text_size(px(TYPE_UI))
-                            .line_height(px(TYPE_UI_LINE))
-                            .text_color(move || {
-                                if missing {
-                                    tokens::palette().ink_caption
-                                } else {
-                                    tokens::palette().ink_rest
-                                }
-                            })
-                            .truncate(),
-                    )
-                    .when(missing, |row| {
-                        row.child(prims::faint(s(S::Missing, language)))
-                    })
+                prims::press_feedback(
+                    view()
+                        .test_id("welcome-recent")
+                        .role(AccessibilityRole::Button)
+                        .optional_label(Some(SharedString::from(label)))
+                        .disabled(missing)
+                        .flex_row()
+                        .items_center()
+                        .gap(px(SPACE_2))
+                        .pl(px(SPACE_3))
+                        .py(px(SPACE_1))
+                        .when(!missing, |row| {
+                            row.cursor_pointer()
+                                .hover(|s| s.text_color(|| tokens::palette().ink))
+                                .focus_visible(|s| {
+                                    s.text_color(|| tokens::palette().ink).underline()
+                                })
+                        })
+                        .on_press(move || {
+                            // Checked again at the press: the target may have gone
+                            // since the row was drawn.
+                            if target_exists(&target_for_open) {
+                                state.open_recent(&target_for_open);
+                            }
+                        }),
+                )
+                .child(
+                    text(kind)
+                        .font_family(FONT_UI)
+                        .text_size(px(TYPE_UI))
+                        .line_height(px(TYPE_UI_LINE))
+                        .text_color(move || tokens::palette().ink_caption),
+                )
+                .child(
+                    text(target.display_name.clone())
+                        .font_family(FONT_UI)
+                        .text_size(px(TYPE_UI))
+                        .line_height(px(TYPE_UI_LINE))
+                        .text_color(move || {
+                            if missing {
+                                tokens::palette().ink_caption
+                            } else {
+                                tokens::palette().ink_rest
+                            }
+                        })
+                        .truncate(),
+                )
+                .when(missing, |row| {
+                    row.child(prims::faint(s(S::Missing, language)))
+                })
             },
         ))
 }
@@ -361,7 +366,7 @@ pub(crate) fn choose_folder(state: AppState) {
             Ok(None) => {}
             Err(why) => state
                 .status
-                .set(SharedString::from(format!("Folder picker failed: {why}"))),
+                .set(StatusMessage::plain(format!("Folder picker failed: {why}"))),
         }
     });
 }

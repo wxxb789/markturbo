@@ -123,8 +123,9 @@ no release-bound native isolation evidence.
   `NavigateToString`. CSP fetch restrictions are not evidence about other
   browser network facilities: the CSP draft defines a separate
   [RTC pre-connect check](https://w3c.github.io/webappsec-csp/#should-block-rtc-connection),
-  which the prescribed policy does not configure. The app does not register
-  a handler for the bridge messages nsh can deliver.
+  which the prescribed policy does not configure. The app's only bridge-message
+  handler is the preview link message [Goal 19](goals/19-links-system-browser.md)
+  defines; it opens the URL outside the app and never loads it in the WebView.
 - The shared diagram registry runs before the WebView receives the host.
   The PlantUML child gets `PLANTUML_SECURITY_PROFILE=SANDBOX`; browser policy
   does not govern that subprocess. A PlantUML launcher that sets its own

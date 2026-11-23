@@ -150,7 +150,7 @@ FIXTURE_ATTEMPT_SOURCE = (
     "  { run: () => linkProbe(\"dns-prefetch\", `http://${probeHost}`) },",
     "  { run: () => linkProbe(\"preconnect\", `https://127.0.0.1:${tcpPort}`) },",
     "  { run: () => linkProbe(\"preconnect\", `https://${probeHost}:${tcpPort}`) },",
-    "  { run: () => { const link = document.getElementById(\"goal07-user-link\"); let prevented = false; link.href = `${tcpLoopback}/link`; link.addEventListener(\"click\", event => { prevented = event.defaultPrevented; }, { once: true }); link.click(); if (!prevented) throw new Error(); } },",
+    "  { run: () => { const link = document.getElementById(\"goal07-user-link\"); let prevented = false; link.href = \"file:///goal07/link\"; link.addEventListener(\"click\", event => { prevented = event.defaultPrevented; }, { once: true }); link.click(); if (!prevented) throw new Error(); } },",
     "  { run: () => { const form = document.getElementById(\"goal07-user-form\"); form.action = `${tcpLoopback}/user-form`; const submitEvent = new SubmitEvent(\"submit\", { bubbles: true, cancelable: true }); form.dispatchEvent(submitEvent); form.requestSubmit(); if (!submitEvent.defaultPrevented) throw new Error(); } },",
     "  { run: () => { if (typeof window.open !== \"function\") throw new Error(); try { window.open(`${tcpLoopback}/popup`, \"_blank\"); } catch (_) {} } },",
     "  { run: () => { try { top.location = `https://${probeHost}/top`; } catch (_) {} } },",

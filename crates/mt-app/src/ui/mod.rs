@@ -15,13 +15,14 @@
 //!
 //! A surface says whether it is on screen with its own `is_open(state)` and
 //! draws itself with `field(state, language)`; [`settings`] replaces the whole
-//! room with `page(state, language)`; [`notices`] contributes banners to the
+//! room with its page; [`notices`] contributes banners to the
 //! column, the bottom status line and the overlay's guard.
 //!
 //! Only model output and outbound data emit light (see [`motion::Heat`] and
 //! the emitters in [`prims`]); everything else is ambient ink. Local actions
 //! never glow.
 
+pub mod cjk_optics;
 pub mod consent;
 pub mod context;
 pub mod document;

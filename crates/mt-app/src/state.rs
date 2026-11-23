@@ -10,7 +10,10 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -36,8 +39,9 @@ use mt_core::{
         ReviewRequest, ReviewResult, ReviewScope, ReviewSource, ReviewStatus, SkillFilePayload,
         SourceAnchor, SourceLocation, SourceSnapshot,
         provider::{
-            PreparedDocumentReviewRequest, PreparedReview, PreparedRevisionRequest, ReviewError,
-            ReviewLanguage, RevisionAnswer, RevisionAnswers, RevisionError,
+            PreparedDocumentReviewRequest, PreparedReview, PreparedRevisionRequest,
+            REVISION_REQUEST_TIMEOUT, ReviewError, ReviewLanguage, RevisionAnswer, RevisionAnswers,
+            RevisionError, RevisionExecutionError,
         },
         revision::{ChangeId, RevisionProposal},
     },
@@ -115,6 +119,47 @@ impl PartialEq for Tab {
 /// A mounted source editor's handle and the tab it edits.
 type SourceEditor = (u64, ComponentRef<Editor>);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusSurface {
+    Editor,
+    Review,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatusKind {
+    Info,
+    Success,
+    Error,
+}
+
+/// A status line's content: the message, then the changing count it names.
+#[derive(Clone, Default, PartialEq)]
+pub struct StatusMessage {
+    pub(crate) text: SharedString,
+    pub(crate) count: Option<SharedString>,
+}
+
+impl StatusMessage {
+    pub(crate) fn plain(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            count: None,
+        }
+    }
+
+    pub(crate) fn counted(text: impl Into<SharedString>, count: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            count: Some(count.into()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
 /// The shell's state.
 #[derive(Clone)]
 pub struct AppState {
@@ -122,7 +167,12 @@ pub struct AppState {
     pub entries: Signal<Vec<Entry>>,
     pub tabs: Signal<Vec<Tab>>,
     pub active: Signal<Option<u64>>,
-    pub status: Signal<SharedString>,
+    pub status: Signal<StatusMessage>,
+    pub(crate) status_surface: Signal<StatusSurface>,
+    pub(crate) status_error: Signal<bool>,
+    /// Distinguishes notifications even when their text is identical, so an
+    /// older fade cannot clear a newer status line.
+    pub(crate) status_generation: Signal<u64>,
     /// Whether the status line's message holds until the next one (an error,
     /// a refusal, a wait) rather than fading after a moment (something done).
     /// Write both through [`AppState::notify`] and [`AppState::notify_held`].
@@ -136,6 +186,7 @@ pub struct AppState {
     pub settings_open: Signal<bool>,
     pub settings_credential: Signal<String>,
     pub settings_notice: Signal<SharedString>,
+    pub(crate) settings_notice_error: Signal<bool>,
     /// Bumped after a credential is stored or removed, so the settings page
     /// re-reads the credential status: the vault has no signal of its own.
     pub settings_credential_revision: Signal<u64>,
@@ -178,6 +229,7 @@ pub struct AppState {
     pub revision_manifest: Signal<Option<OutboundConsent>>,
     pub revision_hunks: Signal<Vec<RevisionHunkView>>,
     pub revision_status: Signal<Option<SharedString>>,
+    pub(crate) revision_status_error: Signal<bool>,
     pub revision_busy: Signal<bool>,
     /// How many hunks the last `Done` discarded undecided (never written);
     /// zero when there is nothing to report.
@@ -224,6 +276,7 @@ pub struct AppState {
     /// answer sent under an older generation belongs to no live proposal and
     /// is dropped unread.
     revision_generation: Rc<Cell<u64>>,
+    revision_cancellation: Rc<RefCell<Option<Arc<AtomicBool>>>>,
     /// Bumped by every context resolution and reset: only the latest
     /// resolution lands, so a slower one for the document that was active
     /// before cannot replace the chain of the one active now.
@@ -457,16 +510,16 @@ pub struct ReviewView {
     pub partial: bool,
 }
 
-/// The column's camera: the document line a surface asked the source editor to
-/// level with its docked reading position (a review's racked finding, a
-/// revision's current hunk). The document lane's `ui::document` scrolls to it;
-/// nothing here changes the document.
+/// A request to align one source line with the column's reading position.
+/// The request scrolls the source view only; document contents are unchanged.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DocumentFocus {
     /// The tab the line belongs to; another tab's request is ignored.
     pub tab: u64,
     /// The line, from 0.
     pub line: u32,
+    /// Whether this request may glide; frequent and keyboard navigation cuts.
+    pub animated: bool,
     /// Bumped by every request, so asking again for the same line levels it
     /// again.
     pub request: u64,
@@ -585,7 +638,7 @@ impl AppState {
         };
         // With nothing to report the status line starts empty: the welcome's
         // own choices and its local-only line say how to begin, once.
-        let status = notice.clone().unwrap_or_default();
+        let status = StatusMessage::plain(notice.clone().unwrap_or_default());
         let usage = UsageStore::open(settings.usage_metrics_enabled);
         let state = Self {
             owner: Owner::current(),
@@ -594,7 +647,10 @@ impl AppState {
             tabs: signal(Vec::new()),
             active: signal(None),
             status: signal(status),
+            status_generation: signal(0_u64),
             status_held: signal(notice.is_some()),
+            status_surface: signal(StatusSurface::Editor),
+            status_error: signal(notice.is_some()),
             search_query: signal(String::new()),
             search_results: signal(Vec::new()),
             search_ran: signal(false),
@@ -604,6 +660,7 @@ impl AppState {
             settings_open: signal(false),
             settings_credential: signal(String::new()),
             settings_notice: signal(SharedString::from("")),
+            settings_notice_error: signal(false),
             settings_credential_revision: signal(0_u64),
             settings_credential_status: signal(None),
             usage_counts: signal(UsageAggregate::default()),
@@ -629,6 +686,7 @@ impl AppState {
             revision_manifest: signal(None),
             revision_hunks: signal(Vec::new()),
             revision_status: signal(None),
+            revision_status_error: signal(false),
             revision_busy: signal(false),
             revision_not_applied: signal(0),
             preview_slot: signal(None),
@@ -648,6 +706,7 @@ impl AppState {
             review_binding: Rc::new(RefCell::new(None)),
             revision_context: Rc::new(RefCell::new(None)),
             revision_generation: Rc::new(Cell::new(0)),
+            revision_cancellation: Rc::default(),
             context_generation: Rc::new(Cell::new(0)),
             pending_revision: Rc::new(RefCell::new(None)),
             revision_ledger: Rc::new(RefCell::new(None)),
@@ -694,23 +753,75 @@ impl AppState {
     }
 
     fn usage_notice(&self, key: crate::i18n::Key) {
-        self.settings_notice.set(SharedString::from(crate::i18n::t(
-            self.settings.get().language,
-            key,
-        )));
+        self.set_settings_notice(
+            crate::i18n::t(self.settings.get().language, key),
+            matches!(
+                key,
+                crate::i18n::Key::UsageUnavailable
+                    | crate::i18n::Key::UsageConsentSaveFailed
+                    | crate::i18n::Key::UsageExportFailed
+            ),
+        );
+    }
+
+    pub(crate) fn set_settings_notice(&self, message: impl Into<SharedString>, error: bool) {
+        self.settings_notice_error.set(error);
+        self.settings_notice.set(message.into());
     }
 
     /// Say something the app did on the status line; it fades after a moment.
     pub fn notify(&self, message: impl Into<SharedString>) {
-        self.status_held.set(false);
-        self.status.set(message.into());
+        self.notify_at(StatusSurface::Editor, StatusKind::Success, message);
     }
 
     /// Say why something did not happen (an error, a refusal) or what is
     /// still happening: the line holds it until the next message.
     pub fn notify_held(&self, message: impl Into<SharedString>) {
-        self.status_held.set(true);
-        self.status.set(message.into());
+        self.notify_at(StatusSurface::Editor, StatusKind::Info, message);
+    }
+
+    fn notify_error(&self, message: impl Into<SharedString>) {
+        self.notify_at(StatusSurface::Editor, StatusKind::Error, message);
+    }
+
+    fn notify_review_error(&self, message: impl Into<SharedString>) {
+        let surface = if self.review_open.get_untracked()
+            || self.review_unavailable.get_untracked().is_some()
+        {
+            StatusSurface::Review
+        } else {
+            StatusSurface::Editor
+        };
+        self.notify_at(surface, StatusKind::Error, message);
+    }
+
+    pub(crate) fn notify_at(
+        &self,
+        surface: StatusSurface,
+        kind: StatusKind,
+        message: impl Into<SharedString>,
+    ) {
+        self.publish(surface, kind, StatusMessage::plain(message));
+    }
+
+    /// A status whose trailing count changes: the count renders in the mono family.
+    pub(crate) fn notify_count_at(
+        &self,
+        surface: StatusSurface,
+        kind: StatusKind,
+        text: impl Into<SharedString>,
+        count: impl Into<SharedString>,
+    ) {
+        self.publish(surface, kind, StatusMessage::counted(text, count));
+    }
+
+    fn publish(&self, surface: StatusSurface, kind: StatusKind, message: StatusMessage) {
+        self.status_surface.set(surface);
+        self.status_error.set(kind == StatusKind::Error);
+        self.status_held.set(kind != StatusKind::Success);
+        self.status_generation
+            .set(self.status_generation.get_untracked().wrapping_add(1));
+        self.status.set(message);
     }
 
     /// `Opened plan.md`: a done message naming its file or folder, never the
@@ -728,7 +839,7 @@ impl AppState {
     fn notify_failure(&self, key: crate::i18n::Key, error: &dyn std::fmt::Display) {
         let language = self.settings.get().language;
         let label = crate::i18n::t(language, key);
-        self.notify_held(match language {
+        self.notify_error(match language {
             Language::English => format!("{label}: {error}"),
             Language::Chinese => format!("{label}：{error}"),
         });
@@ -1264,22 +1375,28 @@ impl AppState {
     pub fn open_bundled_sample(&self) {
         match crate::app_paths::bundled_sample_dir() {
             Ok(directory) => self.open_folder(directory),
-            Err(error) => {
-                self.notify_held(SharedString::from(format!("Sample unavailable: {error}")))
-            }
+            Err(error) => self.notify_error(format!("Sample unavailable: {error}")),
         }
     }
 
-    /// Ask the source column to level `line` (from 0) of tab `tab_id` with
-    /// its docked reading position — the review's racked finding, a
-    /// revision's current hunk. The document lane's `ui::document` does the
-    /// scrolling, so the anchored lines and the field's docked explanation
-    /// sit level; the document itself is never touched.
+    /// Ask the column to align `line` in `tab_id` with its reading position.
+    /// Use [`Self::focus_document_line_instant`] for frequent or keyboard navigation.
     pub fn focus_document_line(&self, tab_id: u64, line: u32) {
+        self.request_document_line(tab_id, line, true);
+    }
+
+    /// Ask the source column to level `line` (from 0) of tab `tab_id` at once.
+    /// Use for frequent or keyboard-driven navigation.
+    pub fn focus_document_line_instant(&self, tab_id: u64, line: u32) {
+        self.request_document_line(tab_id, line, false);
+    }
+
+    fn request_document_line(&self, tab_id: u64, line: u32, animated: bool) {
         let request = self.document_focus.get().request.wrapping_add(1);
         self.document_focus.set(DocumentFocus {
             tab: tab_id,
             line,
+            animated,
             request,
         });
     }
@@ -1388,9 +1505,7 @@ impl AppState {
             }
         }
         if let Some(error) = failure {
-            self.notify_held(SharedString::from(format!(
-                "Recovery checkpoint failed: {error}"
-            )));
+            self.notify_error(format!("Recovery checkpoint failed: {error}"));
         }
     }
 
@@ -1553,9 +1668,7 @@ impl AppState {
                     state.search_results.set(hits);
                     state.search_truncated.set(results.truncated);
                 }
-                Err(error) => {
-                    state.notify_held(SharedString::from(format!("Search failed: {error}")))
-                }
+                Err(error) => state.notify_error(format!("Search failed: {error}")),
             }
         });
     }
@@ -1728,9 +1841,7 @@ impl AppState {
                                     "Still open: a document could not be saved.",
                                 )));
                             }
-                            state.notify_held(SharedString::from(
-                                "Quit cancelled: a document could not be saved.",
-                            ));
+                            state.notify_error("Quit cancelled: a document could not be saved.");
                             return;
                         }
                     }
@@ -1775,9 +1886,7 @@ impl AppState {
 
     /// The guard's Cancel: nothing changes and the guard goes.
     pub fn guard_cancel(&self) {
-        if let Some(request) = self.guard.get() {
-            request.busy.set(false);
-            request.notice.set(None);
+        if self.guard.get().is_some() {
             self.guard.set(None);
         }
     }
@@ -1837,9 +1946,12 @@ impl AppState {
     fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
-        tab.text.set(SharedString::from(text));
-        tab.dirty.set(false);
-        tab.conflict.set(false);
+        // The retiring comparison must not diff the reloaded buffer.
+        batch(|| {
+            tab.text.set(SharedString::from(text));
+            tab.dirty.set(false);
+            tab.conflict.set(false);
+        });
         tab.revision.update(|revision| *revision += 1);
         self.retire_tab_recovery(tab);
         self.recovery_tracks.borrow_mut().remove(&tab.id);
@@ -1967,9 +2079,7 @@ impl AppState {
             }
             Ok(None) => false,
             Err(error) => {
-                self.notify_held(SharedString::from(format!(
-                    "Save As picker failed: {error}"
-                )));
+                self.notify_error(format!("Save As picker failed: {error}"));
                 false
             }
         }
@@ -2093,9 +2203,7 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_translation_failure(&error);
-                self.notify_held(SharedString::from(format!(
-                    "Translation unavailable: {error}"
-                )));
+                self.notify_error(format!("Translation unavailable: {error}"));
                 return;
             }
         };
@@ -2126,9 +2234,7 @@ impl AppState {
             let authorization = match prepared.authorize(&mut consent) {
                 Ok(authorization) => authorization,
                 Err(error) => {
-                    state.notify_held(SharedString::from(format!(
-                        "Translation unavailable: {error}"
-                    )));
+                    state.notify_error(format!("Translation unavailable: {error}"));
                     return;
                 }
             };
@@ -2179,11 +2285,9 @@ impl AppState {
                     } else {
                         state.record_usage(UsageEvent::ProviderFailure);
                     }
-                    state.notify_held(SharedString::from(format!("Translation failed: {error}")));
+                    state.notify_error(format!("Translation failed: {error}"));
                 }
-                Err(error) => state.notify_held(SharedString::from(format!(
-                    "Translation task failed: {error}"
-                ))),
+                Err(error) => state.notify_error(format!("Translation task failed: {error}")),
             }
         });
     }
@@ -2206,6 +2310,43 @@ impl AppState {
     /// whose live selection `Review selection` reviews.
     pub fn attach_source_editor(&self, tab: u64, editor: ComponentRef<Editor>) {
         self.source_editor.set(Some((tab, editor)));
+    }
+
+    /// Return a local action's keyboard focus without moving the caret.
+    pub fn focus_editor(&self) {
+        let Some(active) = self.active.get() else {
+            return;
+        };
+        if self.focus_mounted_editor(active) {
+            return;
+        }
+        // A tab switch can replace the editor in the next commit.
+        let state = self.clone();
+        request_animation_frame(move |_| {
+            if state.active.get() == Some(active) {
+                state.focus_mounted_editor(active);
+            }
+        });
+    }
+
+    fn focus_mounted_editor(&self, active: u64) -> bool {
+        if self.settings_open.get()
+            || self.guard.get().is_some()
+            || self.review_consent.get().is_some()
+            || self.revision_consent.get().is_some()
+        {
+            return false;
+        }
+        let Some(api) = self
+            .source_editor
+            .get()
+            .filter(|(tab, _)| *tab == active)
+            .and_then(|(_, editor)| editor.api::<EditorApi>())
+        else {
+            return false;
+        };
+        api.focus();
+        true
     }
 
     /// Take the keyboard focus from the mounted source editor, if it has it:
@@ -2285,7 +2426,7 @@ impl AppState {
                     | ReviewError::NoAvailableCredential => ReviewUnavailable::NotSetUp,
                     _ => ReviewUnavailable::Unpreparable,
                 }));
-                self.notify_held(SharedString::from(format!("Review unavailable: {error}")));
+                self.notify_review_error(format!("Review unavailable: {error}"));
                 return;
             }
         };
@@ -2326,9 +2467,7 @@ impl AppState {
             Err(error) => {
                 self.review_unavailable
                     .set(Some(ReviewUnavailable::Unpreparable));
-                self.notify_held(SharedString::from(format!(
-                    "Review request rejected: {error}"
-                )));
+                self.notify_review_error(format!("Review request rejected: {error}"));
                 return;
             }
         };
@@ -2340,18 +2479,14 @@ impl AppState {
                 let selected = match context.select_sources(&selected) {
                     Ok(selected) => selected,
                     Err(error) => {
-                        self.notify_held(SharedString::from(format!(
-                            "Context selection rejected: {error}"
-                        )));
+                        self.notify_review_error(format!("Context selection rejected: {error}"));
                         return;
                     }
                 };
                 request = match request.with_effective_agent_context(selected) {
                     Ok(request) => request,
                     Err(error) => {
-                        self.notify_held(SharedString::from(format!(
-                            "Context request rejected: {error}"
-                        )));
+                        self.notify_review_error(format!("Context request rejected: {error}"));
                         return;
                     }
                 };
@@ -2361,9 +2496,7 @@ impl AppState {
         let bound = match prepared.bind_document_request(request, language) {
             Ok(bound) => bound,
             Err(error) => {
-                self.notify_held(SharedString::from(format!(
-                    "Review request rejected: {error}"
-                )));
+                self.notify_review_error(format!("Review request rejected: {error}"));
                 return;
             }
         };
@@ -2466,9 +2599,7 @@ impl AppState {
                 match ByteRange::new(start as u64, end as u64) {
                     Ok(range) => ReviewScope::selection(range),
                     Err(error) => {
-                        self.notify_held(SharedString::from(format!(
-                            "Review request rejected: {error}"
-                        )));
+                        self.notify_review_error(format!("Review request rejected: {error}"));
                         return;
                     }
                 }
@@ -2483,9 +2614,7 @@ impl AppState {
         let mut request = match ReviewRequest::new(base.lens, scope, base.source, base.snapshot) {
             Ok(request) => request,
             Err(error) => {
-                self.notify_held(SharedString::from(format!(
-                    "Review request rejected: {error}"
-                )));
+                self.notify_review_error(format!("Review request rejected: {error}"));
                 return;
             }
         };
@@ -2494,18 +2623,14 @@ impl AppState {
                 Ok(Some(context)) => context,
                 Ok(None) => return,
                 Err(error) => {
-                    self.notify_held(SharedString::from(format!(
-                        "Context selection rejected: {error}"
-                    )));
+                    self.notify_review_error(format!("Context selection rejected: {error}"));
                     return;
                 }
             };
             request = match request.with_effective_agent_context(context) {
                 Ok(request) => request,
                 Err(error) => {
-                    self.notify_held(SharedString::from(format!(
-                        "Context request rejected: {error}"
-                    )));
+                    self.notify_review_error(format!("Context request rejected: {error}"));
                     return;
                 }
             };
@@ -2515,7 +2640,7 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
-                self.notify_held(SharedString::from(format!("Review unavailable: {error}")));
+                self.notify_review_error(format!("Review unavailable: {error}"));
                 self.cancel_review();
                 return;
             }
@@ -2524,9 +2649,7 @@ impl AppState {
         let bound = match prepared.bind_document_request(request, language) {
             Ok(bound) => bound,
             Err(error) => {
-                self.notify_held(SharedString::from(format!(
-                    "Review request rejected: {error}"
-                )));
+                self.notify_review_error(format!("Review request rejected: {error}"));
                 self.cancel_review();
                 return;
             }
@@ -2785,9 +2908,7 @@ impl AppState {
         let authorization = match bound.authorize(&mut consent) {
             Ok(authorization) => authorization,
             Err(error) => {
-                self.notify_held(SharedString::from(format!(
-                    "Review consent rejected: {error}"
-                )));
+                self.notify_review_error(format!("Review consent rejected: {error}"));
                 return;
             }
         };
@@ -2884,11 +3005,8 @@ impl AppState {
             output,
             language,
         });
-        self.revision_generation
-            .set(self.revision_generation.get().wrapping_add(1));
-        *self.pending_revision.borrow_mut() = None;
+        self.cancel_revision();
         *self.revision_ledger.borrow_mut() = None;
-        self.revision_busy.set(false);
         self.revision_not_applied.set(0);
         self.revision_questions.set(questions);
         self.revision_consent.set(None);
@@ -2899,9 +3017,7 @@ impl AppState {
 
     fn reset_revision(&self) {
         *self.revision_context.borrow_mut() = None;
-        self.revision_generation
-            .set(self.revision_generation.get().wrapping_add(1));
-        *self.pending_revision.borrow_mut() = None;
+        self.cancel_revision();
         *self.revision_ledger.borrow_mut() = None;
         self.revision_not_applied.set(0);
         self.revision_questions.set(Vec::new());
@@ -2909,7 +3025,6 @@ impl AppState {
         self.revision_manifest.set(None);
         self.revision_hunks.set(Vec::new());
         self.revision_status.set(None);
-        self.revision_busy.set(false);
     }
 
     /// Build a Revision request from the frozen Review output and the answer
@@ -2917,6 +3032,9 @@ impl AppState {
     /// happens once the text changed since the Review: the Review describes
     /// text that is gone, and Review again is the only next step.
     pub fn start_revision(&self) {
+        if self.revision_busy.get_untracked() {
+            return;
+        }
         let context = self.revision_context.borrow().as_ref().map(|context| {
             (
                 context.tab_id,
@@ -2927,8 +3045,7 @@ impl AppState {
             )
         });
         let Some((tab_id, reviewed, request, output, language)) = context else {
-            self.revision_status
-                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            self.set_revision_status(REVISION_UNAVAILABLE, true);
             return;
         };
         let current = self
@@ -2957,9 +3074,7 @@ impl AppState {
         let answers = match RevisionAnswers::new(answers) {
             Ok(answers) => answers,
             Err(error) => {
-                self.revision_status.set(Some(SharedString::from(format!(
-                    "Answers rejected: {error}"
-                ))));
+                self.set_revision_status(format!("Answers rejected: {error}"), true);
                 return;
             }
         };
@@ -2968,18 +3083,14 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
-                self.revision_status.set(Some(SharedString::from(format!(
-                    "Revision unavailable: {error}"
-                ))));
+                self.set_revision_status(format!("Revision unavailable: {error}"), true);
                 return;
             }
         };
         let bound = match prepared.bind_revision_request(request, output, answers, language) {
             Ok(bound) => bound,
             Err(error) => {
-                self.revision_status.set(Some(SharedString::from(format!(
-                    "Revision request rejected: {error}"
-                ))));
+                self.set_revision_status(format!("Revision request rejected: {error}"), true);
                 return;
             }
         };
@@ -2993,6 +3104,14 @@ impl AppState {
     }
 
     pub fn cancel_revision(&self) {
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
+        if let Some(cancelled) = self.revision_cancellation.borrow_mut().take() {
+            cancelled.store(true, Ordering::Release);
+            if self.status_surface.get_untracked() == StatusSurface::Review {
+                self.status.set(StatusMessage::default());
+            }
+        }
         *self.pending_revision.borrow_mut() = None;
         self.revision_consent.set(None);
         self.revision_manifest.set(None);
@@ -3013,8 +3132,7 @@ impl AppState {
             .as_ref()
             .map(|context| context.tab_id)
         else {
-            self.revision_status
-                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            self.set_revision_status(REVISION_UNAVAILABLE, true);
             return;
         };
         let generation = self.revision_generation.get();
@@ -3023,15 +3141,15 @@ impl AppState {
         let authorization = match bound.authorize(&mut consent) {
             Ok(authorization) => authorization,
             Err(error) => {
-                self.revision_status.set(Some(SharedString::from(format!(
-                    "Revision consent rejected: {error}"
-                ))));
+                self.set_revision_status(format!("Revision consent rejected: {error}"), true);
                 return;
             }
         };
         self.revision_consent.set(None);
         self.revision_manifest.set(None);
         self.revision_busy.set(true);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.revision_cancellation.borrow_mut() = Some(Arc::clone(&cancelled));
         for answer in bound.answers().as_slice() {
             if matches!(answer, RevisionAnswer::Answered(_)) {
                 self.record_usage(UsageEvent::ClarificationAnswered);
@@ -3039,13 +3157,16 @@ impl AppState {
         }
         let state = self.clone();
         self.spawn_task(async move {
-            let result = blocking(move || bound.execute(authorization)).await;
+            let result = blocking(move || {
+                bound
+                    .execute_with(authorization, &cancelled, REVISION_REQUEST_TIMEOUT)
+                    .map_err(RevisionExecutionError::into_revision_error)
+            })
+            .await;
             if state.revision_generation.get() != generation {
-                // Its Review was reset or replaced while the request was out
-                // (another tab's Review, Close): the answer is no live
-                // proposal's, and must not touch the field or the busy flag.
                 return;
             }
+            state.revision_cancellation.borrow_mut().take();
             state.revision_busy.set(false);
             match result {
                 Ok(Ok(transport)) => state.present_revision_for(tab_id, transport.into_proposal()),
@@ -3061,13 +3182,11 @@ impl AppState {
                     ) {
                         state.record_usage(UsageEvent::ProviderFailure);
                     }
-                    state.revision_status.set(Some(SharedString::from(format!(
-                        "Revision failed: {error}"
-                    ))));
+                    state.set_revision_status(format!("Revision failed: {error}"), true);
                 }
-                Err(error) => state.revision_status.set(Some(SharedString::from(format!(
-                    "Revision task failed: {error}"
-                )))),
+                Err(error) => {
+                    state.set_revision_status(format!("Revision task failed: {error}"), true)
+                }
             }
         });
     }
@@ -3104,8 +3223,12 @@ impl AppState {
         *self.revision_ledger.borrow_mut() = Some(RevisionLedger::new(tab_id, &proposal));
         self.revision_not_applied.set(0);
         self.revision_hunks.set(hunks);
-        self.revision_status
-            .set(Some(SharedString::from(REVISION_READY)));
+        self.set_revision_status(REVISION_READY, false);
+    }
+
+    fn set_revision_status(&self, message: impl Into<SharedString>, error: bool) {
+        self.revision_status_error.set(error);
+        self.revision_status.set(Some(message.into()));
     }
 
     /// Write one change into the buffer now, as one edit: `applied` puts its
@@ -3118,8 +3241,7 @@ impl AppState {
         let mut slot = self.revision_ledger.borrow_mut();
         let Some(ledger) = slot.as_mut() else {
             drop(slot);
-            self.revision_status
-                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            self.set_revision_status(REVISION_UNAVAILABLE, true);
             return false;
         };
         if ledger.applied(change) == applied {
@@ -3128,9 +3250,10 @@ impl AppState {
         let Some(tab) = self.active_tab().filter(|tab| tab.id == ledger.tab_id()) else {
             drop(slot);
             self.record_usage(UsageEvent::StaleResultBlocked);
-            self.revision_status.set(Some(SharedString::from(
+            self.set_revision_status(
                 "This Revision belongs to another document. Return to it to decide.",
-            )));
+                false,
+            );
             return false;
         };
         let written = match tab
@@ -3150,7 +3273,7 @@ impl AppState {
                         "Can't undo — this part was edited after it was accepted."
                     }
                 };
-                self.revision_status.set(Some(SharedString::from(message)));
+                self.set_revision_status(message, true);
                 return false;
             }
         };
@@ -3169,8 +3292,7 @@ impl AppState {
         if let Some(text) = written {
             self.write_model_text(&tab, text);
         }
-        self.revision_status
-            .set(Some(SharedString::from(REVISION_READY)));
+        self.set_revision_status(REVISION_READY, false);
         true
     }
 
@@ -3245,8 +3367,7 @@ impl AppState {
     /// never written; the outcome line counts them. Nothing is saved.
     pub fn finish_revision(&self, undecided: usize) {
         if self.revision_ledger.borrow_mut().take().is_none() {
-            self.revision_status
-                .set(Some(SharedString::from(REVISION_UNAVAILABLE)));
+            self.set_revision_status(REVISION_UNAVAILABLE, true);
             return;
         }
         let hunks = self.revision_hunks.get();
@@ -3260,12 +3381,14 @@ impl AppState {
         }
         self.revision_hunks.set(Vec::new());
         self.revision_not_applied.set(undecided);
-        self.revision_status
-            .set(Some(SharedString::from(if accepted_hunks > 0 {
+        self.set_revision_status(
+            if accepted_hunks > 0 {
                 "Approved changes applied to the buffer."
             } else {
                 "No changes approved."
-            })));
+            },
+            false,
+        );
     }
 
     /// Whether the live proposal belongs to a tab other than the one on
@@ -3313,16 +3436,32 @@ impl AppState {
     }
 
     pub fn close_settings(&self) {
-        self.settings_open.set(false);
-        self.save_settings();
+        if self.persist_settings(StatusSurface::Editor) {
+            self.settings_open.set(false);
+        }
     }
 
     pub fn save_settings(&self) {
-        self.settings.get().save();
-        self.notify(crate::i18n::t(
-            self.settings.get().language,
-            crate::i18n::Key::SettingsSaved,
-        ));
+        self.persist_settings(StatusSurface::Settings);
+    }
+
+    fn persist_settings(&self, success_surface: StatusSurface) -> bool {
+        use crate::i18n::{Key, t};
+        let settings = self.settings.get();
+        let (key, kind, saved) = match settings.try_save_general() {
+            Ok(_) => (Key::SettingsSaved, StatusKind::Success, true),
+            Err(error) => {
+                log::warn!("cannot save settings: {}", error.kind());
+                (Key::SettingsSaveFailed, StatusKind::Error, false)
+            }
+        };
+        let surface = if saved {
+            success_surface
+        } else {
+            StatusSurface::Settings
+        };
+        self.notify_at(surface, kind, t(settings.language, key));
+        saved
     }
 
     pub fn set_language(&self, language: Language) {
