@@ -76,13 +76,26 @@ release build:
   an `https:` and an `http:` link, one of them `target=_blank`: the exact URL
   opens once in the default browser, and the preview stays at the same
   position without navigating.
+  **Partly done 2026-11-24:** in Markdown, an `https:` link and an `http:`
+  `target=_blank` link each opened once in the default browser and the preview
+  did not navigate; an `https:` link also opened from an HTML and an MDX
+  document. The preview mode (column or field) was not recorded, so the other
+  mode stays pending (see
+  [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Click a `mailto:` link: the system's default mail handler opens.
+  **Done 2026-11-24:** the mail handler opened (see
+  [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Activate `file:`, `javascript:`, `data:`, a custom scheme and a relative
   link: nothing opens, the preview does not navigate, and no request leaves.
+  **Partly done 2026-11-24:** nothing opened and the preview did not
+  navigate; network egress was not measured, so "no request leaves" stays
+  pending (see [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Have the document forge a burst (repeated `link.click()` or repeated
   `parent.postMessage`): at most one open per 500 ms. The owner accepted the
   forged-click risk, so this check bounds a flood; it cannot distinguish a
   forged activation from a user's.
+  **Done 2026-11-24:** a forged 20-click burst opened at most one URL (see
+  [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - The Goal 15 release checks in
   [goal-15-acceptance.md](goal-15-acceptance.md#pending-release-checks) still
   apply; the goal07 fixture no longer opens a browser during that run.
@@ -99,3 +112,26 @@ goal-03 PASS, goal-06 PASS (`ALL_REQUIRED_CASES`), goal-07 FAIL
 contract lists as out of scope, not the preview link bridge). It exercises
 none of the link checks listed above; those remain pending. This is not a
 pass.
+
+## Desktop acceptance 2026-11-24
+
+Owner manual checks on the `32f324d` executable (release executable SHA-256
+`d9dc951ffe19fb1a3e3fe64456658f00f9e40d6398437f5b80673b8c2c6d77bd`) on
+2026-11-24, all observed as expected:
+
+- In a Markdown document's Web preview, an `https:` link and an `http:`
+  `target=_blank` link each opened once in the default browser and the preview
+  did not navigate; the preview mode (column or field) was not recorded.
+- `mailto:` opened the mail handler.
+- `file:`, `javascript:`, `data:`, a custom scheme and a relative link did
+  nothing; network egress was not measured.
+- A forged 20-click burst opened at most once.
+- An `https:` link also opened in the browser from an HTML and an MDX
+  document.
+
+The Goal 15 release checks in
+[goal-15-acceptance.md](goal-15-acceptance.md#pending-release-checks) still
+apply and remain pending; the goal-07 re-run on 2026-11-24 failed the same
+way. Still pending from the checks above: the preview mode (column or field)
+and network egress for the inert schemes. This is not a full pass for the
+goal set.

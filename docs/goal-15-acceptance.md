@@ -213,3 +213,17 @@ release; no in-page workaround.
 
 The pending release checks above remain pending, and clause 3's native proof
 needs a goal-07 re-run on the first nsh release that contains the fix.
+
+## Desktop acceptance 2026-11-24
+
+One `mt.py accept all` run on `main` `cc4cf0a` (release executable SHA-256
+`4b5a0747dff742eb5749dce3fdc58b13b6893a954cdc9191751287d9f744fb36`) on the
+owner's active, unlocked RDP desktop (Windows 11 x64). The first attempt,
+2026-11-23, ran with four concurrent cargo builds holding the CPU at 100% and
+reported goal-07 FAIL (`PROCESS_JOB_QUIESCENCE_TIMEOUT`). The one retry after
+the environment correction (no builds running), 2026-11-24, reported goal-07
+**FAIL** (`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`) — the same result as the
+`c3aab06` run. The pending release checks above stay pending, and clause 3's
+native proof still waits for the first nsh release that contains
+[longbridge/nsh#2423](https://github.com/longbridge/nsh/pull/2423). This is
+not a pass.

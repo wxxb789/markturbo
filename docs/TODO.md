@@ -65,7 +65,11 @@
   it is a disconnected-session artifact or a real defect needs an **active,
   unlocked desktop**; do that before any future release, keeping the installed
   executable, document and profile unchanged, and record the result without
-  converting the recorded failure into a pass. Evidence:
+  converting the recorded failure into a pass. On 2026-11-24, on an active,
+  unlocked desktop, a new document's Markdown source pane had a normal size;
+  that supports the disconnected-session explanation, but it used a different
+  build and profile from the recorded failure, so this entry stays open.
+  Evidence:
   [goal-10-acceptance.md](goal-10-acceptance.md) environment dispositions 2, 3
   and 7 plus its post-acceptance fixes section.
 - [ ] **Finish verifying the uninstall close helper** — `close-instances.ps1`
@@ -108,3 +112,13 @@
   [#2785](https://github.com/longbridge/nsh/issues/2785) closed 2026-11-23),
   then re-run goal-07. See
   [goal-15-acceptance.md](goal-15-acceptance.md#native-acceptance-2026-11-23).
+- [ ] **Visual harness observation channel for the WebView states** — the
+  2026-11-24 visual matrix captured 20 of 22 cells; both
+  `web-compatibility-preview` cells failed with
+  `WEB_COMPATIBILITY_PREVIEW_WEB_VIEW_MISSING_UIA_CONTRACT_MISMATCH` because
+  the harness looks for the WebView through UIA, and nsh 0.6.1 hosts WebView2
+  in a composition controller with no automation provider. Rebuild that proof
+  on an observation channel nsh 0.6.1 exposes (for example pixels from a window
+  capture), and add consent-card and title-menu states if before/after
+  captures of them are still wanted. See
+  [goal-16-acceptance.md](goal-16-acceptance.md#desktop-acceptance-2026-11-24).
