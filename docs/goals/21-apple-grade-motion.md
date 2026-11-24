@@ -73,6 +73,27 @@ UX behaviour changes (Goal 20), except where a motion fix needs a reserved slot.
 
 Each lane is mergeable alone on `main`.
 
+## Contract amendments (GPT contract review and owner decision, 2026-11-24)
+
+These override any conflicting text in the motion direction below.
+
+1. **Consent filament (spec row 12).** The owner decided that one continuous 900 ms hold authorizes the send and that
+   releasing resets authorization to zero (Goal 20, amendment 1). The filament drains visually on release. A new press
+   charges from 0; it never resumes from the cooled value.
+2. **Fix 1, cooling from the actual value.** When a finding loses focus, it cools from its current heat. When ignition
+   had already finished, that is 1.0. When focus left mid-ignite, it is the partial value. Cooling never jumps upward.
+   Test both cases: fully lit, and losing focus mid-ignite. Both must start at the displayed value and decrease
+   monotonically.
+3. **Frame-cost gate (Done when 6).**
+   - **Build and fixture:** a production-profile build, and a generated Markdown document of 10,000 lines open in Split.
+   - **Scenarios:** the banner reveal, the rail widen and collapse, and the card enter and exit, each triggered 20
+     times.
+   - **Metric:** the interval between presented frames during the animation windows: p50, p95 and max.
+   - **Pass:** after p95 ≤ before p95 + 1 ms, and no frame above 33 ms inside an animation window.
+   - **Instrument:** lane 21-E adds the smallest content-free probe. Examples: an env-gated frame-time log, or
+     PresentMon if it is available on the machine. Document the probe in `docs/verification.md`.
+   - **Missing data is never a pass:** without numbers, Done when 6 stays pending.
+
 ---
 
 # Motion direction (contract body)

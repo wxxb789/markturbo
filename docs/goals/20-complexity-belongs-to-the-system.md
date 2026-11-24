@@ -77,6 +77,71 @@ release build after all three lanes merge, recorded in `docs/goal-20-acceptance.
 
 Each lane is mergeable alone on `main`.
 
+## Contract amendments (GPT contract review and owner decision, 2026-11-24)
+
+These override any conflicting text in the advisor body below.
+
+1. **Consent authorization (owner decision).** One continuous hold of `motion::FILAMENT_CHARGE_MS` (900 ms)
+   authorizes a send.
+   - Releasing, blurring or cancelling resets the authorization to zero. The filament may drain visually, but a new
+     press starts from 0; charge never resumes.
+   - This applies to Review, Revision and Translation, with and without reduced motion. Keyboard holds
+     (`Ctrl+Enter`) follow the same rule.
+   - Tests: a short press does not send; split presses (for example 500 ms, release, 500 ms within the cool-down) do
+     not send; a full continuous hold sends exactly once.
+   - Remove the unused 1.2 s threshold (`FILAMENT_HOLD_MS` / `long_press_delay`) or align it to 900 ms. Update
+     `docs/verification.md` and the native harness hold durations if they depend on 1.2 s; holding longer stays valid.
+   - Lane: 20-B.
+2. **Tier 2 Undo lifecycle.**
+   - Each Undo binds to the exact target captured at press time. For a credential, that is the endpoint identity and
+     the stored credential it removes; it is never re-resolved when it commits. If the endpoint or credential changed
+     during the hold, the commit removes only the captured one, or does nothing if that is already gone.
+   - There is one pending-undo slot. A second Tier 2 action commits the first pending one immediately, then starts its
+     own.
+   - A newer status message does not cancel a pending commit or hide its Undo: the Undo stays reachable on the status
+     line until its deadline, on whichever surface is shown (decision 18 routing). Leaving Settings keeps the hold
+     running.
+   - `Clear counts`: events recorded during the hold count toward the cleared state; Undo restores the old counts
+     plus those events.
+   - Tests: two Discards in a row; an Undo notice overwritten by another notice; an endpoint switch during a
+     credential hold.
+3. **Save As result.** Replace the `bool` with three results: `Saved(new_tab_id)`, `Cancelled` and `Failed(reason)`.
+   - Close-tab guard: `Cancelled` keeps the guard open with "Save cancelled — the document stays open."; `Failed` keeps
+     it open with the failure copy; `Saved` closes the guard and acts on the new tab id.
+   - Quit guard: the same rules; after `Saved`, continue to the next dirty tab.
+4. **Review preservation (decision 1).**
+   - Preparing a new Review snapshots the whole Review session: `review_view`, `review_binding`, the selection scope,
+     the stale tracking and the Revision state. Cancel restores the snapshot unchanged, and stale tracking continues.
+   - Closing the field hides the result without clearing it, and the titlebar Review reopens it.
+   - Results are per tab; switching tabs shows that tab's result or none.
+5. **Escape and focus.**
+   - Escape on a waiting Review closes the wait and discards the late result by generation. The notice says nothing
+     will be applied, and never claims the request was recalled.
+   - Escape on a busy Revision cancels its transport.
+   - Escape after a Translation is sent behaves like Review.
+   - Focus return: if the active pane mounts the source editor (Source or Split), focus it. In Preview or Web, focus the
+     document view, and never switch panes. If another layer is still open, focus goes to that layer.
+6. **Settings persistence (decision 7).** Save each field independently, on blur and on choice press, never per
+   keystroke. Save valid values only: an invalid Base URL shows its error, is not saved, and does not block saving the
+   other fields. This replaces the `on_change` wording.
+7. **Asynchronous folder open (decision 9).** Each open carries a request token, and only the latest request may
+   commit the root, files, context, recents and status. Test it with a slow first open and a fast second one that
+   completes in reverse order.
+8. **nsh API (decision 12).** Use nsh 0.6.1's unnamed `.group()`, `.group_hover(f)` and `.group_focus_visible(f)`, as
+   `ui/titlebar.rs` does, so keyboard focus gets the same label feedback as hover. The named variants are
+   `.group_named` and `.group_hover_named`.
+9. **Copy corrections.**
+   - UTC day 20410 is `2025-11-18`.
+   - `ModelHelp`: "Leave empty to use MARKTURBO_MODEL, then MARKTURBO_TRANSLATE_MODEL, then the wire format's default
+     model." / "留空则依次使用 MARKTURBO_MODEL、MARKTURBO_TRANSLATE_MODEL，再使用该协议格式的默认模型。" Keep that fallback
+     chain in code.
+10. **Chinese error scope (Done when 3).**
+    - These error categories must render in the UI language: revision outcomes and refusals, credential errors, picker
+      errors, save, reload and overwrite errors, translation results and errors, and context diagnostics.
+    - Each must have a localized outer message with a next step.
+    - An embedded `{why}` / `{error}` may stay the operating system's text (Windows localizes it). It must never contain
+      document text, secrets or credential material.
+
 ## Contract notes (conductor, 2026-11-24)
 
 - **Decision 22, untitled numbering.** Use the smallest positive integer not taken by another open untitled tab (`Untitled 1`, `Untitled 2`...), not the internal tab id.
