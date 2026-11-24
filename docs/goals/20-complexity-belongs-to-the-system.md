@@ -157,6 +157,12 @@ These override any conflicting text in the advisor body below.
         holds never authorize, and the pointer hold remains.
     - Test through an injectable key-state source: a key reported up at 900 ms with the text input focused sends
       nothing; a key reported down sends exactly once.
+    - Continuity, not just the end state:
+      - While a keyboard hold charges, sample the platform key state every frame (at most 16 ms apart) for the hold's
+        900 ms only. This is bounded to an active hold; it is not background polling.
+      - Any sample with `Enter` or the modifier up cancels the hold to zero, and so does a non-repeat press of either
+        key.
+      - Test: Ctrl released at 550 ms and pressed again at 800 ms while Enter stays down. Nothing is sent.
 12. **Undo commit boundary (amends Done when 4 and amendment 2).**
     - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
       pending slot. When the slot is taken, the older action's Undo ends at the same moment.

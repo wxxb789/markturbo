@@ -42,6 +42,11 @@ app must never lock files while picking up other editors' changes promptly, with
      - The reload re-checks the same tab and its edit revision after the disk read, before anything is applied.
      - If the user edited during the read, keep the edits and the recovery record, and raise the conflict banner
        instead of `adopt_disk_version`.
+     - Every disk event for a tab advances that tab's disk-event generation. A reload applies only if the generation
+       is unchanged since its read began. A newer delete or move notice is never cleared by an older read.
+   - Symlinked documents: watch the parent directory of the resolved target, non-recursively, and map its events back
+     to the tab. This is in addition to the link's own location, and also applies inside the workspace when the target
+     is outside the workspace.
    - When a **dirty** document changes on disk, raise the conflict banner immediately, not at save.
    - When a document is moved or deleted on disk, raise a banner that offers Save As.
    - The app's own saves never trigger a reload or conflict: ignore events whose disk stamp matches our last write.
@@ -72,6 +77,8 @@ app must never lock files while picking up other editors' changes promptly, with
    - the view button cycles in order, and the shortcut cycles too;
    - drops:
      - a drop event opens the files, a folder drop sets the workspace, and an unsupported drop shows the count notice;
+     - coordinates are optional: Windows sends `FileDrop(uris)` with no position. Test that form as well as
+       `FileDropAt`;
      - a drag that enters and then leaves without dropping clears the affordance. `Headless::drop_files` only sends
        `FileDrop`, so dispatch `FileDragEnter`/`FileDragLeave` directly or test the handler state;
    - external writes:
@@ -79,6 +86,10 @@ app must never lock files while picking up other editors' changes promptly, with
        our own save triggers nothing;
      - a document that turns dirty during the reload's read keeps its edits and recovery record and shows the conflict
        banner;
+     - when the sequence is snapshot read → delete or move event → the old read completes, the delete or move banner
+       remains;
+     - an external replacement of a symlink target outside the workspace reloads the clean tab, or raises the conflict
+       on a dirty one;
    - watch scope:
      - a file opened with no workspace is watched;
      - a workspace with no tabs updates its tree;

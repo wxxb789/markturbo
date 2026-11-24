@@ -108,7 +108,9 @@ These override any conflicting text in the motion direction below.
    - The frame scenario "rail widen and collapse" becomes "sidebar collapse and expand".
    - If a scenario is instant in the baseline, it has no animation-window frames to compare. Two measures replace the
      p95 comparison for it:
-     - **Toggle latency:** from input to the first presented frame of the new state. After p95 ≤ before p95 + 1 ms.
+     - **Toggle latency:** from input to the first presented frame in which the sidebar itself visibly changes, by
+       opacity or by width, whichever comes first. Button feedback and the animation's final frame do not count.
+       After p95 ≤ before p95 + 1 ms.
      - **Absolute bound:** no frame above 33 ms inside the after build's animation window.
 
 ---
