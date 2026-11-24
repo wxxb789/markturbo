@@ -67,11 +67,51 @@ UX behaviour changes (Goal 20), except where a motion fix needs a reserved slot.
 - **21-C Pointer and keyboard motion:** `ui/prims.rs`, `ui/titlebar.rs`, `ui/rail.rs` (widen/collapse), and the
   revision scroll. Fixes 3, 4, 9.
 - **21-D Editor retention:** `ui/shell.rs`, `app.rs`, `ui/document.rs`. The owner decision above.
-- **21-E Measurement:** the frame-time probe and the acceptance numbers (Done-when 6). Runs after 21-A to 21-D merge.
+- **21-E Measurement:** the frame-time probe and the acceptance numbers (Done-when 6). The probe lands first, then the
+  baseline is recorded. The after numbers are recorded once 21-A to 21-D merge.
 
 ## Mergeable alone
 
 Each lane is mergeable alone on `main`.
+
+## Contract amendments (GPT contract review and owner decision, 2026-11-24)
+
+These override any conflicting text in the motion direction below.
+
+1. **Consent filament (spec row 12).** The owner decided that one continuous 900 ms hold authorizes the send and that
+   releasing resets authorization to zero (Goal 20, amendment 1). The filament drains visually on release. A new press
+   charges from 0; it never resumes from the cooled value.
+2. **Fix 1, cooling from the actual value.** When a finding loses focus, it cools from its current heat. When ignition
+   had already finished, that is 1.0. When focus left mid-ignite, it is the partial value. Cooling never jumps upward.
+   Test both cases: fully lit, and losing focus mid-ignite. Both must start at the displayed value and decrease
+   monotonically.
+3. **Frame-cost gate (Done when 6).**
+   - **Build and fixture:** a production-profile build, and a generated Markdown document of 10,000 lines open in Split.
+   - **Scenarios:** the banner reveal, the rail widen and collapse, and the card enter and exit, each triggered 20
+     times.
+   - **Metric:** the interval between presented frames during the animation windows: p50, p95 and max.
+   - **Pass:** after p95 ≤ before p95 + 1 ms, and no frame above 33 ms inside an animation window.
+   - **Instrument:** lane 21-E adds the smallest content-free probe. Examples: an env-gated frame-time log, or
+     PresentMon if it is available on the machine. Document the probe in `docs/verification.md`.
+   - **Missing data is never a pass:** without numbers, Done when 6 stays pending.
+   - **Baseline:** lane 21-E's probe lands first. `before` is measured on the commit that adds the probe, before any
+     motion lane. `after` is measured on the integrated head, with the same probe, machine and fixture.
+   - **Per scenario:** each scenario passes on its own. Pooling the scenarios is not a pass.
+4. **Cooling below `EMBER`.** When focus leaves while heat is below `EMBER` (for example 0.10, 9 ms into ignition),
+   cooling ends at that value and never rises to `EMBER`. The target is `min(current, EMBER)`. Test that case alongside
+   amendment 2's cases.
+5. **Order after Goal 22.**
+   - Goal 21 starts after Goal 22, because Goal 22 replaces the dot rail with a persistent file sidebar.
+   - Before any lane starts, the owner picks one of three distinct interactive HTML motion prototypes (owner rule,
+     2026-11-24). The chosen direction refines the motion spec below.
+   - Fixes 4 and 11 and lane 21-C's rail widen and collapse apply to the sidebar's collapse and expand.
+   - The frame scenario "rail widen and collapse" becomes "sidebar collapse and expand".
+   - If a scenario is instant in the baseline, it has no animation-window frames to compare. Two measures replace the
+     p95 comparison for it:
+     - **Toggle latency:** from input to the first presented frame in which the sidebar itself visibly changes, by
+       opacity or by width, whichever comes first. Button feedback and the animation's final frame do not count.
+       After p95 ≤ before p95 + 1 ms.
+     - **Absolute bound:** no frame above 33 ms inside the after build's animation window.
 
 ---
 

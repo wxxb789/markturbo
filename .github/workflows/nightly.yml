@@ -2,9 +2,10 @@ name: Nightly
 
 # The pull-request pipeline runs one platform per tier, and its jobs restore
 # caches without saving them, so this workflow is also what keeps the default
-# branch's rust-cache entries warm for every pull request. The combinations
-# that no longer run per pull request run here once a day as a non-blocking
-# safety net: they are not a pull-request check and never gate a merge.
+# branch's rust-cache entries and the apt archive cache warm for every pull
+# request. The combinations that no longer run per pull request run here once
+# a day as a non-blocking safety net: they are not a pull-request check and
+# never gate a merge.
 # It is also the plain `cargo test` backstop: the per-pull-request app suites
 # use `cargo nextest`, which does not run doctests.
 on:
@@ -54,18 +55,7 @@ jobs:
           shared-key: markturbo-linux
 
       - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            pkg-config \
-            clang \
-            libclang-dev \
-            libgtk-4-dev \
-            libwebkitgtk-6.0-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-good
+        uses: ./.github/actions/install-linux-deps
 
       - name: Check
         run: uv run --locked --project scripts scripts/mt.py check ci

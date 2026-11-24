@@ -77,6 +77,126 @@ release build after all three lanes merge, recorded in `docs/goal-20-acceptance.
 
 Each lane is mergeable alone on `main`.
 
+## Contract amendments (GPT contract review and owner decision, 2026-11-24)
+
+These override any conflicting text in the advisor body below.
+
+1. **Consent authorization (owner decision).** One continuous hold of `motion::FILAMENT_CHARGE_MS` (900 ms)
+   authorizes a send.
+   - Releasing, blurring or cancelling resets the authorization to zero. The filament may drain visually, but a new
+     press starts from 0; charge never resumes.
+   - This applies to Review, Revision and Translation, with and without reduced motion. Keyboard holds
+     (`Ctrl+Enter`) follow the same rule.
+   - Tests: a short press does not send; split presses (for example 500 ms, release, 500 ms within the cool-down) do
+     not send; a full continuous hold sends exactly once.
+   - Remove the unused 1.2 s threshold (`FILAMENT_HOLD_MS` / `long_press_delay`) or align it to 900 ms. Update
+     `docs/verification.md` and the native harness hold durations if they depend on 1.2 s; holding longer stays valid.
+   - Lane: 20-B.
+2. **Tier 2 Undo lifecycle.**
+   - Each Undo binds to the exact target captured at press time. For a credential, that is the endpoint identity and
+     the stored credential it removes; it is never re-resolved when it commits. If the endpoint or credential changed
+     during the hold, the commit removes only the captured one, or does nothing if that is already gone.
+   - There is one pending-undo slot. A second Tier 2 action commits the first pending one immediately, then starts its
+     own.
+   - A newer status message does not cancel a pending commit or hide its Undo: the Undo stays reachable on the status
+     line until its deadline, on whichever surface is shown (decision 18 routing). Leaving Settings keeps the hold
+     running.
+   - `Clear counts`: events recorded during the hold count toward the cleared state; Undo restores the old counts
+     plus those events.
+   - Tests: two Discards in a row; an Undo notice overwritten by another notice; an endpoint switch during a
+     credential hold.
+3. **Save As result.** Replace the `bool` with three results: `Saved(new_tab_id)`, `Cancelled` and `Failed(reason)`.
+   - Close-tab guard: `Cancelled` keeps the guard open with "Save cancelled — the document stays open."; `Failed` keeps
+     it open with the failure copy; `Saved` closes the guard and acts on the new tab id.
+   - Quit guard: the same rules; after `Saved`, continue to the next dirty tab.
+4. **Review preservation (decision 1).**
+   - Preparing a new Review snapshots the whole Review session: `review_view`, `review_binding`, the selection scope,
+     the stale tracking and the Revision state. Cancel restores the snapshot unchanged, and stale tracking continues.
+   - Closing the field hides the result without clearing it, and the titlebar Review reopens it.
+   - Results are per tab; switching tabs shows that tab's result or none.
+5. **Escape and focus.**
+   - Escape on a waiting Review closes the wait and discards the late result by generation. The notice says nothing
+     will be applied, and never claims the request was recalled.
+   - Escape on a busy Revision cancels its transport.
+   - Escape after a Translation is sent behaves like Review.
+   - Focus return: if the active pane mounts the source editor (Source or Split), focus it. In Preview or Web, focus the
+     document view, and never switch panes. If another layer is still open, focus goes to that layer.
+6. **Settings persistence (decision 7).** Save each field independently, on blur and on choice press, never per
+   keystroke. Save valid values only: an invalid Base URL shows its error, is not saved, and does not block saving the
+   other fields. This replaces the `on_change` wording.
+7. **Asynchronous folder open (decision 9).** Each open carries a request token, and only the latest request may
+   commit the root, files, context, recents and status. Test it with a slow first open and a fast second one that
+   completes in reverse order.
+8. **nsh API (decision 12).** Use nsh 0.6.1's unnamed `.group()`, `.group_hover(f)` and `.group_focus_visible(f)`, as
+   `ui/titlebar.rs` does, so keyboard focus gets the same label feedback as hover. The named variants are
+   `.group_named` and `.group_hover_named`.
+9. **Copy corrections.**
+   - UTC day 20410 is `2025-11-18`.
+   - `ModelHelp`: "Leave empty to use MARKTURBO_MODEL, then MARKTURBO_TRANSLATE_MODEL, then the wire format's default
+     model." / "留空则依次使用 MARKTURBO_MODEL、MARKTURBO_TRANSLATE_MODEL，再使用该协议格式的默认模型。" Keep that fallback
+     chain in code.
+10. **Chinese error scope (Done when 3).**
+    - These error categories must render in the UI language: revision outcomes and refusals, credential errors, picker
+      errors, save, reload and overwrite errors, translation results and errors, and context diagnostics.
+    - Each must have a localized outer message with a next step.
+    - An embedded `{why}` / `{error}` may stay the operating system's text (Windows localizes it). It must never contain
+      document text, secrets or credential material.
+    - This exception amends Done when 3: OS-provided detail may appear in the OS language. Detail the app itself
+      produces, such as `TranslationError::InvalidTranslationResponse` or provider and parser messages, is not OS text.
+      It gets a localized mapping, or it is omitted.
+11. **Keyboard release ends the hold (amends 1).**
+    - A keyboard hold ends on the actual release of `Enter` or of the modifier. Observe it with nsh 0.6.1's view
+      `KeyUp` events (`nsh-platform-windows` `keyboard.rs`) wherever the focus is.
+    - The silence timer (`KEY_ALIVE_MS`) may still end a hold whose release went unobserved. It never authorizes.
+    - Test: press at 0 ms, an auto-repeat at 500 ms, a `KeyUp` at 550 ms. Nothing is sent at 900 ms or later.
+    - `KeyUp` reaches only a focused custom view, while `Ctrl+Enter` is focus-independent: a native text input can hold
+      the focus.
+      - So at the authorization moment, confirm through a platform key-state query that `Enter` and the modifier are
+        still physically down. On Windows, `GetAsyncKeyState` for `VK_RETURN` and `VK_CONTROL`.
+      - Unconfirmed means no send. Where no reliable query exists (the non-Windows compatibility targets), keyboard
+        holds never authorize, and the pointer hold remains.
+    - Test through an injectable key-state source: a key reported up at 900 ms with the text input focused sends
+      nothing; a key reported down sends exactly once.
+    - Continuity, not just the end state:
+      - Sampling cannot see a release and re-press between two samples. So observe every transition instead:
+        - On Windows, install a thread keyboard hook only while a keyboard hold charges:
+          `SetWindowsHookExW(WH_KEYBOARD, …, 0, GetCurrentThreadId())` on the UI thread.
+        - The hook sees `WM_KEYUP`/`WM_KEYDOWN` for the thread wherever the focus is, native text inputs included. It is
+          removed when the hold ends.
+      - Any up transition of `Enter` or the modifier cancels the hold to zero, and so does any non-repeat down
+        transition of either key.
+      - If the hook cannot be installed, keyboard holds do not authorize. On platforms without such a hook, the same
+        applies, and the pointer hold remains.
+      - Tests, through an injectable transition source:
+        - Ctrl released at 548 ms and pressed again at 556 ms while Enter stays down, with the text input focused.
+          Nothing is sent.
+        - A hook that fails to install sends nothing.
+      - The end-state query above stays as a final check.
+      - **Queued input is never skipped.** A transition can be queued while the hook has not yet seen it, for example
+        when the UI thread was busy and nsh's posted wake ran first.
+        - Authorize only when all three hold at that moment:
+          1. `GetQueueStatus(QS_KEY | QS_RAWINPUT)` reports no pending keyboard input;
+          2. the hook has seen no transition;
+          3. `GetAsyncKeyState` reports both keys down.
+        - Otherwise defer the decision. Let the message loop deliver the queued input, and decide again at the next
+          turn. A transition delivered then cancels the hold.
+        - Test through injectable queue-status, key-state and transition sources: a release and re-press queued at
+          886/894 ms, while the hook has not yet seen them at 900 ms, sends nothing.
+12. **Undo commit boundary (amends Done when 4 and amendment 2).**
+    - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
+      pending slot. When the slot is taken, the older action's Undo ends at the same moment.
+    - Test both paths.
+13. **Quit re-checks dirty tabs (amends 3).**
+    - After each Save As and before closing the window, Quit reads the current set of dirty tabs, not a list taken when
+      the quit started.
+    - A tab that became dirty during the guard is guarded too, for example when a translation returns.
+    - Test that interleaving.
+14. **Restored Review recomputes stale (amends 4).**
+    - Cancel restores the results, answers and Revision state from the snapshot.
+    - Stale is recomputed against the document's current revision, so a result the document has moved past shows as
+      stale.
+    - Test: an edit or a translation write while the new consent card is open.
+
 ## Contract notes (conductor, 2026-11-24)
 
 - **Decision 22, untitled numbering.** Use the smallest positive integer not taken by another open untitled tab (`Untitled 1`, `Untitled 2`...), not the internal tab id.
