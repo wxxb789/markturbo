@@ -1,0 +1,51 @@
+name: Install Linux build dependencies
+description: Reuse the cached apt archives, then install the GTK/WebKit/gstreamer build dependencies.
+
+runs:
+  using: composite
+  steps:
+    - name: Restore the apt archive cache
+      id: apt-archives
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/apt-archives
+        key: apt-archives-ubuntu-24.04-${{ hashFiles('.github/actions/install-linux-deps/action.yml') }}
+
+    - name: Install Linux build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        archives="$HOME/apt-archives"
+        mkdir -p "$archives"
+        cached=("$archives"/*.deb)
+        if ((${#cached[@]})); then
+          sudo cp --update=none "${cached[@]}" /var/cache/apt/archives/
+        fi
+
+        sudo apt-get update -o Acquire::Retries=3
+        sudo apt-get install -y --no-install-recommends -o Acquire::Retries=3 \
+          build-essential \
+          pkg-config \
+          clang \
+          libclang-dev \
+          libgtk-4-dev \
+          libwebkitgtk-6.0-dev \
+          libgstreamer1.0-dev \
+          libgstreamer-plugins-base1.0-dev \
+          gstreamer1.0-plugins-good
+
+        downloaded=(/var/cache/apt/archives/*.deb)
+        if ((${#downloaded[@]})); then
+          sudo cp --update=none "${downloaded[@]}" "$archives"/
+          sudo chown -R "$(id -u):$(id -g)" "$archives"
+        fi
+
+    - name: Save the apt archive cache
+      # Pull requests restore the default branch's cache; only main saves it.
+      if: github.ref == 'refs/heads/main' && steps.apt-archives.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/apt-archives
+        key: apt-archives-ubuntu-24.04-${{ hashFiles('.github/actions/install-linux-deps/action.yml') }}
