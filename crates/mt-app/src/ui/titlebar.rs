@@ -170,6 +170,8 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             save_as_state.save_as_active();
         }
     });
+    let settings_state = state.clone();
+    on_key("mod+,", move |_: &str| settings_state.toggle_settings());
     // Escape closes the menu from anywhere. The binding passes the key on, so
     // it takes nothing from the surfaces that bind Escape themselves.
     on_key_with(
@@ -653,7 +655,7 @@ fn pane_row(
 
 /// A shortcut as the menu names it: `Ctrl+S`, `Ctrl+Shift+S`; `⌘S`, `⇧⌘S`
 /// where `mod` is Command.
-fn shortcut(shift: bool, key: &str) -> SharedString {
+pub(crate) fn shortcut(shift: bool, key: &str) -> SharedString {
     SharedString::from(match (apple_keys(), shift) {
         (true, false) => format!("\u{2318}{key}"),
         (true, true) => format!("\u{21E7}\u{2318}{key}"),

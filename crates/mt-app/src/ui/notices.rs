@@ -1256,12 +1256,17 @@ pub(crate) fn status_line_at(
     let error = state.status_error;
     let message = state.status;
     let owner = state.status_surface;
+    let undo_state = state;
+    let undo_message = message;
     view().test_id("status").w_full().pt(px(SPACE_3)).child(
         view()
             .w_full()
             .h(px(tokens::TYPE_UI_LINE))
             .bind_opacity(&presence.opacity)
             .bind_translate_y(&presence.rise)
+            .flex_row()
+            .items_center()
+            .gap(px(SPACE_2))
             .child(
                 text(move || {
                     if owner.get() == surface {
@@ -1288,8 +1293,60 @@ pub(crate) fn status_line_at(
                         SharedString::default()
                     }
                 }))),
-            ),
+            )
+            .child(when(
+                move || undo_message.get().action.is_some(),
+                move || status_undo(undo_state.clone()),
+            )),
     )
+}
+
+/// The status line's Tier 2 reversal: the `· Undo` control a notice offers
+/// until its hold commits, with the transient step to full ink a local action
+/// gets.
+fn status_undo(state: AppState) -> impl IntoElement {
+    let duration = prims::press_color_duration();
+    let label_state = state.clone();
+    let press_state = state;
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_2))
+        .child(prims::faint("\u{00b7}"))
+        .child(
+            prims::press_feedback(
+                view()
+                    .test_id("status-undo")
+                    .role(AccessibilityRole::Button)
+                    .optional_label({
+                        let label_state = label_state.clone();
+                        move || label_state.status.get().action.map(|action| action.label)
+                    })
+                    .window_drag(false)
+                    .cursor_pointer()
+                    .bg(Color::TRANSPARENT)
+                    .group()
+                    .on_press(move |_: &PressEvent| press_state.undo_last()),
+            )
+            .child(
+                text(move || {
+                    label_state
+                        .status
+                        .get()
+                        .action
+                        .map(|action| action.label)
+                        .unwrap_or_default()
+                })
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink_rest)
+                .transition_colors()
+                .duration(move || duration.get())
+                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
+            ),
+        )
 }
 
 fn observe_status(watched: AppState, presence: StatusPresence) {
@@ -1304,7 +1361,9 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
     effect(move || {
         let message = watched.status.get();
         let generation = watched.status_generation.get();
-        let held = watched.status_held.get_untracked();
+        // A live Undo on the line holds it open too: its deadline is the
+        // hold's, not the message's fade.
+        let held = watched.status_held.get_untracked() || message.action.is_some();
         let reduced = reduced_motion();
         let before = previous.replace(Some((generation, message.is_empty(), reduced)));
         let same_status = before.is_some_and(|(old_generation, was_empty, _)| {

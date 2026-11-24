@@ -32,6 +32,8 @@ mod conflict_compare;
 mod ctrl_enter_editor;
 #[path = "goal17_settings.rs"]
 mod goal17_settings;
+#[path = "goal20_settings_lane.rs"]
+mod goal20_settings_lane;
 #[path = "hierarchy_layouts.rs"]
 mod hierarchy_layouts;
 #[path = "hierarchy_welcome.rs"]

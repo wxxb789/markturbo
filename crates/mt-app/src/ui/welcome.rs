@@ -27,7 +27,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Entry, StatusMessage},
     ui::{
-        prims,
+        prims, titlebar,
         tokens::{
             self, FONT_UI, HAIRLINE, SPACE_1, SPACE_2, SPACE_3, SPACE_5, SPACE_6, TYPE_UI,
             TYPE_UI_LINE,
@@ -189,9 +189,19 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
             view().pt(px(SPACE_6)).child(
                 view()
                     .test_id("workspace-home-find")
-                    .child(prims::faint(s(S::FindAFile, language))),
+                    .child(prims::faint(find_a_file(language))),
             ),
         )
+}
+
+/// The platform's own shortcut label (`Ctrl+P` / `⌘P`) for the palette hint.
+fn find_a_file(language: Language) -> SharedString {
+    let keys = titlebar::shortcut(false, "P");
+    match language {
+        Language::English => format!("{keys} finds any file in this folder."),
+        Language::Chinese => format!("按 {keys} 查找此文件夹中的任意文件。"),
+    }
+    .into()
 }
 
 /// The files [`workspace_home`] lists: the workspace's files, in the
@@ -383,7 +393,6 @@ enum S {
     StaysOnThisDevice,
     Missing,
     NoFiles,
-    FindAFile,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -396,7 +405,6 @@ fn s(key: S, language: Language) -> &'static str {
             S::StaysOnThisDevice => "Opening, editing and search stay on this device.",
             S::Missing => "Missing",
             S::NoFiles => "No files in this folder yet.",
-            S::FindAFile => "Ctrl+P finds any file in this folder.",
         },
         Language::Chinese => match key {
             S::OpenFolder => "打开文件夹",
@@ -406,7 +414,6 @@ fn s(key: S, language: Language) -> &'static str {
             S::StaysOnThisDevice => "打开、编辑与搜索都在这台设备上完成。",
             S::Missing => "已不存在",
             S::NoFiles => "这个文件夹里还没有文件。",
-            S::FindAFile => "按 Ctrl+P 查找这个文件夹中的任意文件。",
         },
     }
 }

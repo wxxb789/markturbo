@@ -58,20 +58,18 @@ fn settings_actions_end_at_the_field_column() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (app, _config, _codex_home) = start_settings();
     let field = node(&app, "settings-model").bounds;
-    let save = node(&app, "settings-save").bounds;
     let close = node(&app, "settings-close").bounds;
     let field_right = field.origin.x.0 + field.size.width.0;
     let action_right = close.origin.x.0 + close.size.width.0;
-    let save_right = save.origin.x.0 + save.size.width.0;
-    let save_center_y = save.origin.y.0 + save.size.height.0 / 2.0;
-    let close_center_y = close.origin.y.0 + close.size.height.0 / 2.0;
-    assert!(
-        (save_center_y - close_center_y).abs() <= 0.5 && save_right <= close.origin.x.0 + 0.5,
-        "Save and Close share one ordered row: save={save:?}, close={close:?}"
-    );
     assert!(
         (action_right - field_right).abs() <= 0.5,
-        "actions end at field column x={field_right}: save={save:?}, close={close:?}, field={field:?}"
+        "the header action ends at field column x={field_right}: close={close:?}, field={field:?}"
+    );
+    assert!(
+        !app.screen()
+            .matches("id:settings-save")
+            .expect("valid settings-save selector"),
+        "auto-save leaves no Save control in the header"
     );
 }
 
@@ -163,8 +161,10 @@ fn the_last_settings_section_is_reachable_by_scrolling() {
 fn settings_notice_info_uses_neutral_ink() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, _config, _codex_home) = start_settings();
-    app.wait_for("id:settings-credential-session")
-        .expect("session credential action");
+    app.press("text:OpenAI Chat Completions")
+        .expect("configure a wire format");
+    app.wait_for("text:No credential stored")
+        .expect("configured status");
     app.press("id:settings-credential-session")
         .expect("empty credential reports an info notice");
     let info = "text:Enter a credential first.";
@@ -199,9 +199,9 @@ fn settings_save_failure_uses_danger_status_on_the_settings_surface() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, config, _codex_home) = start_settings();
     make_settings_file_unwritable(&config);
-    app.press("id:settings-save")
-        .expect("save settings to the unwritable settings file");
-    let error = "id:status >> text:Could not save settings.";
+    app.press("id:settings-theme-light")
+        .expect("auto-save a theme choice against the unwritable settings file");
+    let error = "id:status >> text:Could not save settings. Check that the settings file is writable, then try again.";
     app.wait_for(error)
         .expect("settings save failure on its surface");
     assert_eq!(

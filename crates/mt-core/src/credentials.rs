@@ -325,6 +325,42 @@ impl CredentialVault {
         Ok(())
     }
 
+    /// Delete exactly the credential `resolved` names, and only while the vault
+    /// still holds that same value under its source: a replacement written
+    /// during an undo hold is left alone. Session and persistent entries are
+    /// distinct credentials, so a captured session key never deletes a
+    /// persistent one stored meanwhile (and the other way around). A captured
+    /// credential that is already gone is a no-op.
+    pub fn delete_resolved(
+        &self,
+        target: &str,
+        resolved: &ResolvedCredential,
+    ) -> Result<(), CredentialError> {
+        let _operation = self.lock_operations()?;
+        match resolved.source {
+            CredentialSource::Session => {
+                let mut session = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if session.get(target) == Some(&resolved.secret) {
+                    session.remove(target);
+                }
+            }
+            CredentialSource::Persistent => {
+                if self.secure.is_supported()
+                    && self.read_persistent_unless_pending(target)?.as_ref()
+                        == Some(&resolved.secret)
+                {
+                    self.secure.delete(target)?;
+                    self.secure.delete(&Self::pending_target(target))?;
+                }
+            }
+            CredentialSource::Environment => {}
+        }
+        Ok(())
+    }
+
     fn lock_operations(&self) -> Result<CredentialOperationGuard, CredentialError> {
         #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
         if self.isolate_test_operations {
@@ -829,6 +865,53 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.source(), CredentialSource::Session);
         assert_eq!(resolved.secret(), "session");
+    }
+
+    #[test]
+    fn delete_resolved_removes_exactly_the_captured_credential() {
+        let store = Arc::new(FakeStore::default());
+        let vault = CredentialVault::with_store(store);
+        let target = "markturbo:model:captured";
+        let resolved = |vault: &CredentialVault| {
+            vault
+                .resolve(target, None, false)
+                .unwrap()
+                .expect("a credential is stored")
+        };
+
+        // A captured persistent key that was replaced during the hold: the
+        // replacement stays.
+        vault.replace_persistent(target, "first".into()).unwrap();
+        let captured = resolved(&vault);
+        vault.replace_persistent(target, "second".into()).unwrap();
+        vault.delete_resolved(target, &captured).unwrap();
+        assert_eq!(resolved(&vault).secret(), "second");
+
+        // The same persistent key, still there at the commit: it goes.
+        let captured = resolved(&vault);
+        vault.delete_resolved(target, &captured).unwrap();
+        assert!(
+            vault.resolve(target, None, false).unwrap().is_none(),
+            "the captured credential was not removed"
+        );
+
+        // A captured session key never deletes a persistent one stored
+        // meanwhile, and a replaced session key stays.
+        vault
+            .replace_persistent(target, "persistent".into())
+            .unwrap();
+        vault.replace_session(target, "session".into()).unwrap();
+        let captured = resolved(&vault);
+        assert_eq!(captured.source(), CredentialSource::Session);
+        vault.replace_session(target, "replacement".into()).unwrap();
+        vault.delete_resolved(target, &captured).unwrap();
+        assert_eq!(resolved(&vault).secret(), "replacement");
+
+        vault.replace_session(target, "session".into()).unwrap();
+        let captured = resolved(&vault);
+        vault.delete_resolved(target, &captured).unwrap();
+        assert_eq!(resolved(&vault).source(), CredentialSource::Persistent);
+        assert_eq!(resolved(&vault).secret(), "persistent");
     }
 
     #[test]

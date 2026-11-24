@@ -173,12 +173,8 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
             .expect("valid download selector"),
         "download is hidden after restore removal failure"
     );
-    assert!(
-        !app.screen()
-            .matches("id:settings-cjk-font-retry")
-            .expect("valid retry selector"),
-        "retry is hidden after restore removal failure"
-    );
+    app.wait_for("id:settings-cjk-font-retry")
+        .expect("retry offered beside remove with the file on disk");
     assert!(installed.exists());
     assert!(
         !registrations
@@ -319,7 +315,7 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         "startup fetched nothing"
     );
 
-    // A disk failure offers another removal, not a new download.
+    // A disk failure with the file on disk offers another removal and a retry.
     fs::remove_file(&installed).expect("clear the installed file");
     fs::create_dir(&installed).expect("make the file path unremovable as a file");
     app.press("id:settings-cjk-font-remove").expect("remove");
@@ -330,12 +326,8 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     .expect("removal disk failure");
     app.wait_for("id:settings-cjk-font-remove")
         .expect("retry removal");
-    assert!(
-        !app.screen()
-            .matches("id:settings-cjk-font-retry")
-            .expect("valid retry selector"),
-        "retry is hidden after removal failure"
-    );
+    app.wait_for("id:settings-cjk-font-retry")
+        .expect("retry offered beside remove");
     assert!(
         !app.screen()
             .matches("id:settings-cjk-font-download")
@@ -384,12 +376,8 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
     assert!(!app.shows("Installed and applied: Chinese text is set in Source Han Sans CN."));
     app.wait_for("id:settings-cjk-font-remove")
         .expect("remove after registration failure");
-    assert!(
-        !app.screen()
-            .matches("id:settings-cjk-font-retry")
-            .expect("valid retry selector"),
-        "retry is hidden while the verified file remains on disk"
-    );
+    app.wait_for("id:settings-cjk-font-retry")
+        .expect("retry offered beside remove while the file is on disk");
     assert_eq!(
         std::fs::read(&installed).expect("verified font file"),
         INVALID_FONT
