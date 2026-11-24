@@ -15,11 +15,12 @@ doctest = false
 name = "markturbo"
 path = "src/main.rs"
 
-# All of `tests/*.rs` as one binary, for the nightly release-profile run only
-# (see the file header). `test = false` keeps it out of plain `cargo test`.
+# All of `tests/*.rs` as one binary for the app suites (see the file header).
+# `test = false` keeps it out of plain `cargo test`, which runs the per-file
+# binaries instead.
 [[test]]
-name = "release_suite"
-path = "tests/release_suite.rs"
+name = "suite"
+path = "tests/suite.rs"
 test = false
 
 [features]

@@ -5,10 +5,6 @@
 - [ ] **Keyboard press feedback on Win32**: nsh 0.6.1 dispatches only `Press`
   for keyboard activation, so pressables show no press-down visual for keyboard
   use. Revisit when nsh exposes keyboard press-down and release events.
-- [ ] **Keep consent charge full during the Sent fade**: In
-  `crates/mt-app/src/ui/consent.rs`, `rebuild(None, 0)` clears the charge bar
-  before checking `spent`, so the bar is empty during the 150 ms fade. Keep it
-  full until the card unmounts.
 - [ ] **First-time-user and screen-reader evidence for the shipped UI** — Goal
   09 was accepted on 2026-11-13 without the five first-time-target-user sessions
   and the Windows 11 x64 keyboard/screen-reader smoke its completion evidence
@@ -39,19 +35,6 @@
   40-node flow 638 µs vs 436 µs) with larger SVG output. Revisit with a
   benchmark against `mermaid-svg` on representative documents, a measured
   improvement threshold, and no new JS/script-execution requirement.
-- [ ] **Retired native acceptance adapters** — `mt.py accept goal-02`,
-  `goal-03`, `goal-06`, `goal-07` and their `scripts/markturbo_tools/native/*`
-  modules still drive the retired GPUI shell (`crates/mt-app/src/views/` no
-  longer exists; `docs/goal-09-acceptance.md` states the selectors are retired
-  and that rebuilding them for nsh is not part of that gate). They cannot
-  produce acceptance for the current nsh app; `check native` still compiles and
-  unit-tests them. Decide per adapter whether to rebuild on the nsh UIA surface
-  or delete the adapter, its module, and its `ACCEPTANCE_GOALS` entry, so the
-  CLI stops advertising an acceptance path that cannot pass. Revalidate the
-  candidate before removing anything. This entry also owns the stale pending
-  native items in [dependency-review.md](dependency-review.md): the GPUI/Kit
-  artifact's native acceptance and its focused Windows CJK/IME, selection/undo,
-  clipboard, save-dialog and WebView-focus acceptance can no longer be produced.
 - [ ] **Release renewal after the archived Goal 10/11 sequence** — On
   2026-11-14 the owner archived Goals 10 and 11 as execution deferred, not
   accepted: the product is not considered ready, no target users are available
@@ -116,27 +99,6 @@
   inventory (`scripts/markturbo_tools/release.py:281-285,771`). Either stage it
   with the payload so the inventory covers every installed file, or document the
   exclusion in the release-notes template; decide before the next candidate.
-- [ ] **Merge the mt-app integration test binaries** — `crates/mt-app/tests/`
-  holds roughly twenty one- or two-test files, and each links the whole app, so
-  link time and per-process startup dominate the suite rather than the
-  assertions (measured 2026-11-15: the warm `--profile ci -p mt-app` run takes
-  about a minute locally, and the Windows per-PR job spends most of its time in
-  compilation and linking). Consolidating them behind one `tests/all.rs` with
-  `autotests = false`, or adopting `cargo nextest` for cross-binary parallelism,
-  would cut both costs. Treat it as its own small goal inside the upcoming UI
-  iteration, and keep `cargo test` as the local command either way. The PR app
-  suites already use nextest, and the nightly release-profile run already links
-  the files once through `tests/release_suite.rs`; what remains is the
-  per-file binaries under `cargo test`, most of which set process environment
-  variables and so need their own process.
-- [ ] **Raw-text scope across Markdown block boundaries** — An unclosed
-  raw-text element (`<textarea>`, `<plaintext>`, and so on) whose scope crosses
-  Markdown block boundaries still lets a later `<script>` be collected and
-  restored: `A <textarea>` followed by `<script>void 0;</script>` renders
-  `<p>A &lt;textarea></p>` and restores the script raw (characterized on the
-  Goal 18 merge; fidelity only, no request leaves). Carry the raw-text scope
-  across the `collect_inline_script_ranges`/`next_flow_script` node boundaries
-  without a parser.
 - [ ] **Upgrade nsh for the Goal 15 WebView2 popup fix** — the 2026-11-23
   native run failed goal-07 (`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, case
   `revision_session`): the fixture's `window.open` leaves a visible WebView2
