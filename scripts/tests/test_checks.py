@@ -165,14 +165,14 @@ class ReleaseArtifactTests(unittest.TestCase):
                     checks.build_release_binary()
 
 
-class ReleaseSuiteTests(unittest.TestCase):
-    def test_release_suite_includes_every_app_integration_test(self) -> None:
-        # The nightly release-profile run builds only `release_suite`, so a test
-        # file it does not name would silently drop out of that run.
+class SuiteTests(unittest.TestCase):
+    def test_suite_includes_every_app_integration_test(self) -> None:
+        # The app suites build only `suite`, so a test file it does not name
+        # would silently drop out of them.
         tests = checks.ROOT / "crates" / "mt-app" / "tests"
-        suite = (tests / "release_suite.rs").read_text(encoding="utf-8")
+        suite = (tests / "suite.rs").read_text(encoding="utf-8")
         included = set(re.findall(r'^#\[path = "([^"]+)"\]\nmod \w+;$', suite, re.MULTILINE))
-        files = {path.name for path in tests.glob("*.rs")} - {"release_suite.rs"}
+        files = {path.name for path in tests.glob("*.rs")} - {"suite.rs"}
         self.assertEqual(included, files)
 
 

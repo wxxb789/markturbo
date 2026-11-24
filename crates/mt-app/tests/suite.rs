@@ -1,14 +1,14 @@
 //! Every integration test in this directory, linked into one binary for the
-//! nightly release-profile run.
+//! app suites: the per-pull-request `ci` runs and the nightly release-profile
+//! run.
 //!
-//! Under the release profile (thin LTO, one codegen unit) every test binary
-//! re-optimizes the whole app at link time, so linking the thirty-odd one-file
-//! binaries was nearly all of that run. This target compiles the same files as
-//! modules and links once. It is `test = false` in `Cargo.toml`, so plain
+//! Each test binary links the whole app, so one binary per
+//! file dominated the suite's build time. This target compiles the same files
+//! as modules and links once. It is `test = false` in `Cargo.toml`, so plain
 //! `cargo test` keeps running the individual binaries and never this one; the
-//! nightly selects it with `--test release_suite` under `cargo nextest`, which
-//! runs each test in its own process. That matters: most of these tests set
-//! process environment variables and rely on being alone in their process.
+//! workflows select it with `--test suite` under `cargo nextest`, which runs
+//! each test in its own process. That matters: most of these tests set process
+//! environment variables and rely on being alone in their process.
 //!
 //! Keep the list in step with the directory; `scripts/tests/test_checks.py`
 //! fails when a test file is missing here.

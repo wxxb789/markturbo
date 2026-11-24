@@ -39,22 +39,27 @@ authoritative Rust gate, now as four jobs that run the same commands `check ci`
 runs locally: `preflight` (`check fast` plus `cargo fmt --all -- --check`),
 `clippy` (`cargo clippy --profile ci --workspace --all-targets --locked`),
 `mt-core tests` (`cargo test --profile ci -p mt-core --features
-model-transport,test-support --locked`) and `mt-app tests` (`cargo test
---profile ci -p mt-app --locked`). Every heavier job needs `preflight`, so a
+model-transport,test-support --locked`) and `mt-app tests` (`cargo nextest run
+--locked --cargo-profile ci -p mt-app --lib --bins --test suite`). Every heavier
+job needs `preflight`, so a
 whitespace or formatting error fails in about two minutes instead of after the
-workspace has compiled. Windows 11 x64 runs the app/UI suite (`cargo test
---locked --profile ci -p mt-app -p mt-core`); the separate `macos-15` arm64 job
+workspace has compiled. Windows 11 x64 runs the app/UI suite (`cargo nextest
+run --locked --cargo-profile ci -p mt-app --lib --bins --test suite`, plus
+`-p mt-core --features model-transport,test-support`); the separate
+`macos-15` arm64 job
 builds the release executable, verifies the Mach-O arm64 slice and runs
 `cargo test --locked --profile ci -p mt-core`. The macOS workspace suite and the
 release-profile app suite no longer run per PR: `.github/workflows/nightly.yml`
 (schedule plus manual dispatch) reruns the combined `check ci` on
 `ubuntu-24.04`, `cargo test --locked --profile ci --workspace` and
 `cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
-release_suite` on `macos-15` and `windows-2022`, as a non-blocking safety net
-rather than a PR gate. `release_suite` links every `crates/mt-app/tests/*.rs`
-file into one binary, because under thin LTO each test binary re-optimizes the
-whole app at link time; plain `cargo test` never builds it. It is also what saves the
-rust-cache entries the PR jobs restore; PR jobs only restore. The PR workflow
+suite` on `macos-15` and `windows-2022`, as a non-blocking safety net
+rather than a PR gate. `suite` links every `crates/mt-app/tests/*.rs`
+file into one binary, because every test binary links the whole app; plain
+`cargo test` never builds it and keeps the per-file binaries: most of these
+tests set process environment variables and need their own process. The nightly run
+is also what saves the rust-cache entries the PR jobs restore; PR jobs only
+restore. The PR workflow
 classifies the diff before it spends runner time, in two steps. When every
 changed path is under `docs/**` or is a Markdown file at the repository root,
 only `preflight` runs and the Rust jobs are skipped; a draft pull request stops

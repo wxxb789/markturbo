@@ -36,11 +36,6 @@ pub fn data_dir() -> Option<PathBuf> {
     }
 }
 
-/// Persistent WebView profile shared by every MarkTurbo instance for this user.
-pub fn webview_data_dir() -> Option<PathBuf> {
-    Some(webview_data_dir_in(&data_dir()?))
-}
-
 /// Directory containing every process's log file.
 pub fn log_dir() -> Option<PathBuf> {
     Some(data_dir()?.join("logs"))
@@ -223,10 +218,6 @@ fn is_safe_embedded_relative_path(path: &Path) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn webview_data_dir_in(root: &Path) -> PathBuf {
-    root.join("webview2")
-}
-
 fn recovery_dir_in(root: &Path) -> PathBuf {
     root.join("recovery")
 }
@@ -406,7 +397,6 @@ mod tests {
     fn runtime_paths_share_one_user_data_root() {
         let root = Path::new("user-data");
 
-        assert_eq!(webview_data_dir_in(root), root.join("webview2"));
         assert_eq!(recovery_dir_in(root), root.join("recovery"));
         assert_eq!(
             log_path_in(&root.join("logs"), 42),

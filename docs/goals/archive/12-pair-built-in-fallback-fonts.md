@@ -30,10 +30,10 @@ to a serif. Martian stays embedded; no font is added to the executable.
 3. `cargo test --profile ci -p mt-app` passes on Windows, and so does the
    per-PR CI. This includes a test of each platform's exact ordered fallback
    suffix per role and the Windows CJK fallback probe
-   `document::tests::the_cjk_fallback_prefers_dengxian`. The per-PR macOS job
-   builds but does not run tests, so the macOS token tests are evidenced by a
-   Nightly run dispatched on the PR head, whose macOS heavy-tests job runs
-   them.
+   `document::tests::the_cjk_fallback_takes_the_first_available_face`. The
+   per-PR macOS job builds but does not run tests, so the macOS token tests are
+   evidenced by a Nightly run dispatched on the PR head, whose macOS
+   heavy-tests job runs them.
 4. A release-build visual capture of `settings` and `review-result-questions`
    (en-us and zh-cn, light and dark) shows Settings input placeholders in a
    sans face, not a serif, and zh-CN text set in the CJK fallback.

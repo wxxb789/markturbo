@@ -273,10 +273,10 @@ jobs:
           tool: nextest
 
       - name: Test
-        # nextest runs the twenty-odd mt-app test binaries in parallel instead of
-        # one process at a time: measured 22 s against 57 s for this suite on the
-        # development desktop, and the same order on a runner.
-        run: cargo nextest run --locked --cargo-profile ci -p mt-app
+        # `suite` links every tests/*.rs file into one binary instead of one
+        # per file; nextest still runs each test in its own process, which the
+        # environment-variable tests need.
+        run: cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite
 
   # Compatibility evidence for the arm64 build: the release binary and its Mach-O
   # arm64 slice. Behavior on macOS runs in the nightly workflow, whose
@@ -358,9 +358,12 @@ jobs:
           tool: nextest
 
       - name: Test
-        # Same parallel runner; the nightly plain `cargo test` run is the
-        # doctest backstop, so no extra compile pass is needed here.
-        run: cargo nextest run --locked --cargo-profile ci -p mt-app -p mt-core
+        # `--test suite` links the mt-app files once but filters out mt-core's
+        # per-file tests, so mt-core runs separately; nextest gives each test
+        # its own process, which the environment-variable tests need.
+        run: |
+          cargo nextest run --locked --cargo-profile ci -p mt-core --features model-transport,test-support
+          cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite
 
       - name: Test Credential Manager in the disposable runner
         env:
