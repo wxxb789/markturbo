@@ -1,0 +1,2711 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MarkTurbo — Goal 22 Prototype B: Shoji</title>
+<style>
+  /*
+   * MarkTurbo — Afterglow visual vocabulary & motion constants
+   * Source: crates/mt-app/src/ui/tokens.rs & crates/mt-app/src/ui/motion.rs
+   *
+   * Motion tokens (motion.rs):
+   *   HOVER_MS:             100ms
+   *   PRESS_RELEASE_MS:     120ms
+   *   MENU_ENTER_MS:        125ms
+   *   MENU_EXIT_MS:          90ms
+   *   EXIT_MS:              150ms
+   *   RAIL_WIDEN_MS:        160ms
+   *   ENTER_MS:             200ms
+   *   CAMERA_MS:            360ms
+   *   STATUS_HOLD_MS:      3000ms
+   *   REDUCED_CROSSFADE_MS: 100ms
+   *   CARD_RISE_PX:           4px
+   *   EASE_OUT:             cubic-bezier(0.23, 1.0, 0.32, 1.0)
+   *   camera_easing():      cubic-bezier(0.22, 1.0, 0.36, 1.0)
+   *
+   * Space & Type scale (tokens.rs):
+   *   SPACE_1..7:           4, 8, 16, 24, 40, 64, 88 px
+   *   TITLE_ROW_H:          32px
+   *   RAIL_W:               44px
+   *   RAIL_HOVER_W:        240px
+   *   RAIL_DOT:              6px
+   *   COLUMN_GAP:           40px
+   *   FIELD_GAP:            40px
+   *   NARROW_MAX_W:       1040px
+   *   WIDE_MIN_W:         1280px
+   *   MEASURE_NARROW:      560px
+   *   MEASURE_WIDE:        680px
+   *   HAIRLINE:              1px
+   *   TYPE_UI:            12.5px / 18px
+   *   TYPE_SOURCE:          14px / 24px
+   *   TYPE_PREVIEW:         16px / 27px
+   */
+
+  :root {
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 16px;
+    --space-4: 24px;
+    --space-5: 40px;
+    --space-6: 64px;
+    --space-7: 88px;
+
+    --title-row-h: 32px;
+    --rail-w: 44px;
+    --rail-hover-w: 240px;
+    --rail-dot: 6px;
+    --column-gap: 40px;
+    --field-gap: 40px;
+    --hairline-w: 1px;
+
+    --type-ui: 12.5px;
+    --type-ui-line: 18px;
+    --type-source: 14px;
+    --type-source-line: 24px;
+    --type-preview: 16px;
+    --type-preview-line: 27px;
+
+    --font-ui: "Martian Grotesk Std Rg", "Martian Grotesk", "DengXian", "Microsoft YaHei UI", "Bahnschrift", "Segoe UI Variable Text", system-ui, sans-serif;
+    --font-medium: "Martian Grotesk Std Md", "Martian Grotesk", "DengXian", "Microsoft YaHei UI", "Bahnschrift", "Segoe UI Variable Text", system-ui, sans-serif;
+    --font-source: "Martian Mono Cn Rg", "Martian Mono", "Cascadia Mono", "Consolas", ui-monospace, monospace;
+
+    --hover-ms: 100ms;
+    --press-release-ms: 120ms;
+    --exit-ms: 150ms;
+    --rail-widen-ms: 160ms;
+    --enter-ms: 200ms;
+    --camera-ms: 360ms;
+    --reduced-crossfade-ms: 100ms;
+    --ease-out: cubic-bezier(0.23, 1.0, 0.32, 1.0);
+    --camera-ease: cubic-bezier(0.22, 1.0, 0.36, 1.0);
+  }
+
+  /* DARK palette (tokens::DARK) */
+  [data-theme="dark"] {
+    --room: #101113;
+    --column-ground: #101113;
+    --card-ground: #15161A;
+    --shoji-paper: rgba(255, 255, 255, 0.04); /* tokens::DARK.afterimage_plate over room */
+    --shoji-paper-solid: #15161A;             /* tokens::DARK.card_ground */
+    --ink: rgba(217, 220, 225, 0.84);
+    --ink-rest: rgba(217, 220, 225, 0.56);
+    --ink-caption: rgba(217, 220, 225, 0.54);
+    --ink-faint: rgba(217, 220, 225, 0.34);
+    --ink-dot-rest: rgba(217, 220, 225, 0.38);
+    --punctuation-ink: rgba(217, 220, 225, 0.34);
+    --hairline: rgba(217, 220, 225, 0.08);
+    --conflict: #A39B8E;
+    --danger: #FF6B5E;
+    --ember: #C98A5A;
+    --ember-bloom: rgba(122, 74, 42, 0.18);
+    --stage-bg: #090A0C;
+  }
+
+  /* LIGHT palette (tokens::LIGHT) */
+  [data-theme="light"] {
+    --room: #F2F0EB;
+    --column-ground: #F2F0EB;
+    --card-ground: #F2F0EB;
+    --shoji-paper: rgba(0, 0, 0, 0.03);       /* tokens::LIGHT.afterimage_plate over room */
+    --shoji-paper-solid: #EAE8E3;             /* room + afterimage_plate pre-composited for overlay */
+    --ink: rgba(35, 38, 43, 0.88);
+    --ink-rest: rgba(35, 38, 43, 0.70);
+    --ink-caption: rgba(35, 38, 43, 0.66);
+    --ink-faint: rgba(35, 38, 43, 0.38);
+    --ink-dot-rest: rgba(35, 38, 43, 0.40);
+    --punctuation-ink: rgba(35, 38, 43, 0.38);
+    --hairline: rgba(35, 38, 43, 0.10);
+    --conflict: #8A8174;
+    --danger: #C2372B;
+    --ember: #8D6240;
+    --ember-bloom: rgba(184, 132, 88, 0.08);
+    --stage-bg: #E4E1DA;
+  }
+
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+    border-radius: 0;
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--stage-bg);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+    overflow: auto;
+  }
+
+  /* ─── Prototype harness outside the window ─── */
+  .harness {
+    min-height: 100%;
+    padding: var(--space-3) var(--space-4) var(--space-4);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-3);
+  }
+
+  .dev-strip {
+    width: 100%;
+    max-width: 1460px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    background: var(--room);
+    border: var(--hairline-w) solid var(--hairline);
+  }
+
+  .dev-group {
+    display: flex;
+    align-items: center;
+    gap: var(--space-1);
+    padding-right: var(--space-2);
+    border-right: var(--hairline-w) solid var(--hairline);
+  }
+  .dev-group:last-child {
+    border-right: none;
+    padding-right: 0;
+  }
+
+  .dev-label {
+    color: var(--ink-caption);
+    padding-right: var(--space-1);
+  }
+
+  .dev-btn {
+    appearance: none;
+    background: transparent;
+    color: var(--ink-rest);
+    border: var(--hairline-w) solid var(--hairline);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    padding: 3px var(--space-2);
+    cursor: pointer;
+    transition: color var(--hover-ms) var(--ease-out), border-color var(--hover-ms) var(--ease-out);
+  }
+  .dev-btn:hover {
+    color: var(--ink);
+    border-color: var(--ink-caption);
+  }
+  .dev-btn[aria-pressed="true"],
+  .dev-btn.active {
+    color: var(--ink);
+    border-color: var(--ink);
+  }
+
+  .stage-row {
+    width: 100%;
+    max-width: 1460px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    gap: var(--space-4);
+  }
+
+  /* ─── Legend panel (≤ 8 lines) ─── */
+  .legend {
+    width: 236px;
+    flex-shrink: 0;
+    background: var(--room);
+    border: var(--hairline-w) solid var(--hairline);
+    padding: var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .legend-title {
+    font-family: var(--font-medium);
+    font-weight: 500;
+    color: var(--ink);
+  }
+  .legend-line {
+    color: var(--ink-rest);
+  }
+  .legend-line strong {
+    color: var(--ink);
+    font-weight: 400;
+  }
+  .legend-meta {
+    color: var(--ink-caption);
+    padding-top: var(--space-1);
+    border-top: var(--hairline-w) solid var(--hairline);
+  }
+
+  /* ─── The simulated MarkTurbo window ─── */
+  .app-window {
+    position: relative;
+    width: 1200px;
+    height: 760px;
+    min-width: 720px;
+    max-width: 1360px;
+    min-height: 520px;
+    background: var(--room);
+    color: var(--ink);
+    border: var(--hairline-w) solid var(--hairline);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    resize: horizontal;
+  }
+
+  /* ─── Title row (32px, tokens::TITLE_ROW_H) ─── */
+  .title-row {
+    position: relative;
+    z-index: 20;
+    height: var(--title-row-h);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    background: var(--room);
+    padding-right: var(--space-2);
+    gap: var(--space-3);
+  }
+
+  /* Left edge aligns with sidebar Toggle / Rail */
+  .title-left {
+    display: flex;
+    align-items: center;
+    height: 100%;
+    padding-left: 14px;
+    gap: var(--space-3);
+    min-width: 0;
+    flex: 1;
+  }
+
+  .quiet-btn {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--ink-rest);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    padding: var(--space-1);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    transition: color var(--hover-ms) var(--ease-out);
+  }
+  .quiet-btn:hover,
+  .quiet-btn:focus-visible {
+    color: var(--ink);
+    outline: none;
+  }
+  .quiet-btn:focus-visible {
+    outline: var(--hairline-w) solid var(--ink);
+    outline-offset: 2px;
+  }
+
+  /* Sidebar toggle glyph: minimal sliding screen mark */
+  .shoji-toggle-glyph {
+    width: 14px;
+    height: 11px;
+    border: var(--hairline-w) solid currentColor;
+    position: relative;
+    display: inline-block;
+  }
+  .shoji-toggle-bar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 4px;
+    background: currentColor;
+    transition: transform var(--rail-widen-ms) var(--ease-out), opacity var(--hover-ms) var(--ease-out);
+  }
+  .app-window[data-sidebar-collapsed="true"] .shoji-toggle-bar {
+    width: 2px;
+    opacity: 0.55;
+  }
+
+  /* Breadcrumb + open document tabs in titlebar */
+  .title-file-group {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .title-active-path {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    background: transparent;
+    border: none;
+    color: var(--ink-rest);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    cursor: pointer;
+    padding: var(--space-1) 0;
+    white-space: nowrap;
+  }
+  .title-active-path:hover {
+    color: var(--ink);
+    text-decoration: underline;
+    text-underline-offset: 4px;
+  }
+  .title-folder-prefix {
+    color: var(--ink-caption);
+  }
+  .title-active-name {
+    color: var(--ink);
+  }
+  .title-dirty-dot {
+    color: var(--ink);
+    font-size: 9px;
+    line-height: 1;
+  }
+
+  .title-tabs {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding-left: var(--space-3);
+    border-left: var(--hairline-w) solid var(--hairline);
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .title-tab {
+    appearance: none;
+    background: transparent;
+    border: none;
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    color: var(--ink-caption);
+    padding: var(--space-1) 0;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    position: relative;
+    transition: color var(--hover-ms) var(--ease-out);
+  }
+  .title-tab:hover {
+    color: var(--ink);
+  }
+  .title-tab[aria-selected="true"] {
+    color: var(--ink);
+  }
+  .title-tab[aria-selected="true"]::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 1px;
+    height: 1.5px;
+    background: var(--ink);
+  }
+  .title-tab-close {
+    opacity: 0;
+    color: var(--ink-caption);
+    padding: 0 2px;
+    font-size: 11px;
+    transition: opacity var(--hover-ms) var(--ease-out), color var(--hover-ms) var(--ease-out);
+  }
+  .title-tab:hover .title-tab-close {
+    opacity: 1;
+  }
+  .title-tab-close:hover {
+    color: var(--ink);
+  }
+
+  /* Right side of title row: View control, Review, Settings, Window controls */
+  .title-right {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-shrink: 0;
+  }
+
+  /* View button: 3-segment glyph showing split ratio + current mode label at rest */
+  .view-cycle-btn {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--ink-rest);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    padding: var(--space-1) var(--space-2);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    transition: color var(--hover-ms) var(--ease-out);
+  }
+  .view-cycle-btn:hover,
+  .view-cycle-btn:focus-visible {
+    color: var(--ink);
+    outline: none;
+  }
+  .view-cycle-btn:focus-visible {
+    outline: var(--hairline-w) solid var(--ink);
+    outline-offset: 2px;
+  }
+
+  /* Three-segment glyph showing split ratio and sliding divider */
+  .view-glyph {
+    position: relative;
+    width: 24px;
+    height: 11px;
+    border: var(--hairline-w) solid currentColor;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    overflow: hidden;
+  }
+  .view-glyph-seg {
+    height: 100%;
+    border-right: var(--hairline-w) solid var(--hairline);
+  }
+  .view-glyph-seg:last-child {
+    border-right: none;
+  }
+  .view-glyph-screen {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    background: currentColor;
+    opacity: 0.24;
+    pointer-events: none;
+  }
+  .view-glyph-needle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1.5px;
+    background: currentColor;
+    transform: translateX(-0.75px);
+    pointer-events: none;
+  }
+
+  .title-action {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--ink-rest);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    padding: var(--space-1);
+    cursor: pointer;
+    text-underline-offset: 4px;
+    transition: color var(--hover-ms) var(--ease-out);
+  }
+  .title-action:hover {
+    color: var(--ink);
+    text-decoration: underline;
+  }
+  .title-action.strong {
+    text-decoration: underline;
+    text-decoration-color: var(--ink-faint);
+  }
+  .title-action.strong:hover {
+    text-decoration-color: var(--ink);
+  }
+
+  /* Settings dropdown menu (keeps Web compatibility preview out of cycle) */
+  .menu-anchor {
+    position: relative;
+  }
+  .title-menu {
+    position: absolute;
+    top: calc(100% + var(--space-1));
+    right: 0;
+    width: 240px;
+    background: var(--card-ground);
+    border: var(--hairline-w) solid var(--hairline);
+    padding: var(--space-2) 0;
+    display: none;
+    flex-direction: column;
+    z-index: 40;
+  }
+  .title-menu[data-open="true"] {
+    display: flex;
+  }
+  .menu-row {
+    appearance: none;
+    background: transparent;
+    border: none;
+    width: 100%;
+    padding: 5px var(--space-3);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--ink-rest);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    cursor: pointer;
+    text-align: left;
+  }
+  .menu-row:hover {
+    color: var(--ink);
+    background: var(--shoji-paper);
+  }
+  .menu-sep {
+    height: var(--hairline-w);
+    background: var(--hairline);
+    margin: var(--space-1) 0;
+  }
+  .menu-kbd {
+    color: var(--ink-caption);
+    font-family: var(--font-source);
+    font-size: 11px;
+  }
+
+  /* Native Windows caption controls */
+  .win-controls {
+    display: flex;
+    align-items: center;
+    margin-left: var(--space-1);
+  }
+  .win-btn {
+    width: 34px;
+    height: var(--title-row-h);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--ink-rest);
+    font-size: 11px;
+  }
+
+  /* ─── Workspace body: Shoji tracks ─── */
+  .workspace {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    overflow: hidden;
+    background: var(--room);
+  }
+
+  /*
+   * Left edge strip (44px, tokens::RAIL_W).
+   * Always present when collapsed; holds one short vertical tick per open document.
+   */
+  .edge-strip {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: var(--rail-w);
+    z-index: 12;
+    padding-top: var(--space-4);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    pointer-events: auto;
+  }
+  .app-window[data-sidebar-visible="true"] .edge-strip {
+    pointer-events: none;
+    opacity: 0;
+  }
+
+  .tick-row {
+    position: relative;
+    width: var(--rail-w);
+    height: 24px;
+    padding-left: 18px;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    background: transparent;
+    border: none;
+  }
+  /* Short vertical tick mark for each open document in collapsed strip */
+  .tick-mark {
+    width: 2px;
+    height: 10px;
+    background: var(--ink-dot-rest);
+    transition: height var(--hover-ms) var(--ease-out), background-color var(--hover-ms) var(--ease-out);
+  }
+  .tick-row:hover .tick-mark {
+    height: 14px;
+    background: var(--ink);
+  }
+  .tick-row[aria-current="true"] .tick-mark {
+    height: 14px;
+    background: var(--ink);
+  }
+  .tick-row[data-dirty="true"] .tick-mark::after {
+    content: "";
+    display: block;
+    width: 4px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--ink);
+    transform: translate(5px, 3px);
+  }
+  /* Hovering a tick slides out its name label */
+  .tick-label {
+    position: absolute;
+    left: 34px;
+    top: 3px;
+    padding: 0 var(--space-2);
+    background: var(--shoji-paper-solid);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateX(-6px);
+    transition: opacity var(--hover-ms) var(--ease-out), transform var(--rail-widen-ms) var(--ease-out);
+  }
+  .tick-row:hover .tick-label {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  [data-reduced-motion="true"] .tick-label {
+    transform: none;
+    transition: opacity var(--reduced-crossfade-ms) var(--ease-out);
+  }
+
+  /*
+   * Shoji Sidebar Screen (240px, tokens::RAIL_HOVER_W).
+   * Toned paper ground (`shoji-paper`), no border line — ma & paper tone define the boundary.
+   * Driven continuously by JS spring-like ease-out interpolation so mid-way re-pressing reverses cleanly.
+   */
+  .shoji-sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: var(--rail-hover-w);
+    z-index: 15;
+    background: var(--shoji-paper-solid);
+    padding: var(--space-4) var(--space-3) var(--space-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    overflow-y: auto;
+    overflow-x: hidden;
+    will-change: transform, opacity;
+  }
+
+  .sidebar-section {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .sidebar-heading {
+    color: var(--ink-caption);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    padding: 0 var(--space-2) var(--space-1);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .tree-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .tree-row {
+    appearance: none;
+    background: transparent;
+    border: none;
+    width: 100%;
+    height: 26px;
+    padding-right: var(--space-2);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    color: var(--ink-rest);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    cursor: pointer;
+    text-align: left;
+    transition: color var(--hover-ms) var(--ease-out), background-color var(--hover-ms) var(--ease-out);
+  }
+  .tree-row:hover {
+    color: var(--ink);
+  }
+  .tree-row[aria-current="page"] {
+    color: var(--ink);
+    font-family: var(--font-medium);
+    font-weight: 500;
+  }
+
+  /* Gutter slot for folder chevron or open-file ink dot */
+  .tree-mark {
+    width: 14px;
+    height: 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    color: var(--ink-caption);
+    font-size: 10px;
+  }
+  .ink-dot {
+    width: var(--rail-dot);
+    height: var(--rail-dot);
+    border-radius: 50%;
+    background: var(--ink-dot-rest);
+    transition: background-color var(--hover-ms) var(--ease-out), transform var(--hover-ms) var(--ease-out);
+  }
+  .tree-row[aria-current="page"] .ink-dot {
+    background: var(--ink);
+  }
+  .tree-row[data-dirty="true"] .ink-dot {
+    box-shadow: 0 0 0 1.5px var(--shoji-paper-solid), 0 0 0 2.5px var(--ink);
+  }
+
+  .tree-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tree-subpath {
+    color: var(--ink-caption);
+    font-size: 11px;
+    margin-left: var(--space-1);
+  }
+
+  .tree-close {
+    opacity: 0;
+    color: var(--ink-caption);
+    font-size: 11px;
+    padding: 0 4px;
+    transition: opacity var(--hover-ms) var(--ease-out), color var(--hover-ms) var(--ease-out);
+  }
+  .tree-row:hover .tree-close {
+    opacity: 1;
+  }
+  .tree-close:hover {
+    color: var(--ink);
+  }
+
+  .sidebar-footer {
+    margin-top: auto;
+    padding: var(--space-2) var(--space-2) 0;
+    color: var(--ink-caption);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  /*
+   * Main stage: shifted physically by sidebar push on >= 1040px,
+   * or stays in place with 44px rail margin below 1040px while sidebar slides over.
+   */
+  .stage-track {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    left: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--room);
+    transition: opacity var(--enter-ms) var(--ease-out);
+  }
+  /* Dim underlay slightly when narrow overlay sidebar is open (tokens::Layout::DIMMED spirit) */
+  .app-window[data-narrow-overlay-open="true"] .stage-track {
+    opacity: 0.45;
+  }
+
+  /* ─── Banners slot (Conflict / Deleted on disk) ─── */
+  .banner-slot {
+    width: 100%;
+    padding: 0 var(--column-gap);
+    flex-shrink: 0;
+    overflow: hidden;
+  }
+  .banner {
+    padding-top: var(--space-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+  }
+  .banner-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    flex-wrap: wrap;
+  }
+  .banner-msg {
+    flex: 1;
+    color: var(--ink);
+    min-width: 200px;
+  }
+  .banner-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+  }
+  .primary-action {
+    appearance: none;
+    background: transparent;
+    border: var(--hairline-w) solid var(--ink);
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    padding: 3px var(--space-2);
+    cursor: pointer;
+  }
+  .primary-action:hover {
+    background: var(--shoji-paper);
+  }
+  .quiet-action {
+    appearance: none;
+    background: transparent;
+    border: none;
+    color: var(--ink-rest);
+    font-family: var(--font-ui);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    padding: 3px var(--space-1);
+    cursor: pointer;
+    text-underline-offset: 4px;
+  }
+  .quiet-action:hover {
+    color: var(--ink);
+    text-decoration: underline;
+  }
+  .banner-compare-box {
+    padding: var(--space-2) var(--space-3);
+    background: var(--shoji-paper-solid);
+    font-family: var(--font-source);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    color: var(--ink-rest);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .diff-mark {
+    text-decoration: underline dashed var(--conflict);
+    text-underline-offset: 4px;
+    color: var(--ink);
+  }
+  .banner-rule {
+    height: var(--hairline-w);
+    background: var(--hairline);
+    width: 100%;
+  }
+
+  /* ─── Dual-screen Shoji Pane Stage (Editor & Preview separated by sliding divider) ─── */
+  .panes-viewport {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    overflow: hidden;
+  }
+
+  /* Left screen: Source Editor */
+  .pane-editor {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    overflow: hidden;
+    background: var(--column-ground);
+  }
+
+  .editor-inner {
+    width: 100%;
+    height: 100%;
+    padding: var(--space-5) var(--column-gap) var(--space-4);
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .editor-measure {
+    width: 100%;
+    max-width: 680px;
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+  .app-window[data-layout="narrow"] .editor-measure,
+  .app-window[data-layout="medium"] .editor-measure {
+    max-width: 560px;
+  }
+
+  /* Clean reload sliding text container */
+  .reload-stage {
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .source-textarea {
+    width: 100%;
+    flex: 1;
+    min-height: 420px;
+    resize: none;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--ink);
+    font-family: var(--font-source);
+    font-size: var(--type-source);
+    line-height: var(--type-source-line);
+    tab-size: 2;
+    user-select: text;
+    white-space: pre-wrap;
+  }
+  .app-window[data-conflict="true"] .source-textarea {
+    text-decoration: underline dashed var(--conflict);
+    text-underline-offset: 5px;
+  }
+
+  /* Ghost layer for clean reload: old text slides out by a few pixels while new text slides in */
+  .reload-ghost {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    font-family: var(--font-source);
+    font-size: var(--type-source);
+    line-height: var(--type-source-line);
+    color: var(--ink-rest);
+    white-space: pre-wrap;
+    opacity: 0;
+  }
+
+  /* Right screen: Rendered Preview */
+  .pane-preview {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 0;
+    overflow: hidden;
+    background: var(--room);
+  }
+
+  .preview-inner {
+    width: 100%;
+    height: 100%;
+    padding: var(--space-4) var(--space-5) var(--space-4) var(--field-gap);
+    overflow-y: auto;
+  }
+
+  .preview-measure {
+    max-width: 560px;
+    color: var(--ink);
+    font-family: var(--font-ui);
+    font-size: var(--type-preview);
+    line-height: var(--type-preview-line);
+    user-select: text;
+  }
+  .app-window[data-view-mode="preview"] .preview-measure {
+    max-width: 680px;
+  }
+  .preview-quiet-label {
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    color: var(--ink-rest);
+    margin-bottom: var(--space-3);
+  }
+  .preview-body h1 {
+    font-family: var(--font-medium);
+    font-size: 22px;
+    line-height: 30px;
+    font-weight: 500;
+    margin: 0 0 var(--space-3);
+    color: var(--ink);
+  }
+  .preview-body h2 {
+    font-family: var(--font-medium);
+    font-size: 16px;
+    line-height: 24px;
+    font-weight: 500;
+    margin: var(--space-4) 0 var(--space-2);
+    color: var(--ink);
+  }
+  .preview-body p {
+    margin: 0 0 var(--space-3);
+  }
+  .preview-body ul {
+    list-style: none;
+    margin: 0 0 var(--space-3);
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .preview-body li {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-2);
+  }
+  .preview-checkbox {
+    display: inline-block;
+    width: 11px;
+    height: 11px;
+    border: var(--hairline-w) solid var(--ink-caption);
+    flex-shrink: 0;
+    transform: translateY(1px);
+  }
+  .preview-checkbox.checked {
+    background: var(--ink-rest);
+  }
+  .preview-body code {
+    font-family: var(--font-source);
+    font-size: 13.5px;
+    background: var(--shoji-paper-solid);
+    padding: 1px 5px;
+  }
+  .preview-body pre {
+    font-family: var(--font-source);
+    font-size: 13px;
+    line-height: 21px;
+    background: var(--shoji-paper-solid);
+    padding: var(--space-3);
+    margin: 0 0 var(--space-3);
+    overflow-x: auto;
+  }
+  .preview-body blockquote {
+    padding-left: var(--space-3);
+    border-left: 2px solid var(--hairline);
+    color: var(--ink-rest);
+    margin: 0 0 var(--space-3);
+  }
+
+  /*
+   * Shoji Sliding Track Divider between Editor and Preview.
+   * Dragging slides it physically across the room; releasing snaps to Edit (1.0), Split (0.5), or Preview (0.0).
+   */
+  .shoji-divider {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 16px;
+    margin-left: -8px;
+    z-index: 10;
+    cursor: col-resize;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .shoji-divider-line {
+    width: var(--hairline-w);
+    height: 100%;
+    background: var(--hairline);
+    transition: background-color var(--hover-ms) var(--ease-out);
+  }
+  .shoji-divider-handle {
+    position: absolute;
+    width: 3px;
+    height: 28px;
+    background: var(--ink-faint);
+    transition: background-color var(--hover-ms) var(--ease-out), height var(--hover-ms) var(--ease-out);
+  }
+  .shoji-divider:hover .shoji-divider-line,
+  .shoji-divider[data-dragging="true"] .shoji-divider-line {
+    background: var(--ink-faint);
+  }
+  .shoji-divider:hover .shoji-divider-handle,
+  .shoji-divider[data-dragging="true"] .shoji-divider-handle {
+    background: var(--ink);
+    height: 40px;
+  }
+
+  /* ─── Quiet Status Line at foot of column (notices.rs status_line) ─── */
+  .status-bar {
+    height: 34px;
+    padding: 0 var(--column-gap);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+    background: var(--room);
+  }
+  .status-text {
+    color: var(--ink-rest);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity var(--enter-ms) var(--ease-out), transform var(--enter-ms) var(--ease-out);
+  }
+  .status-text[data-visible="true"] {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  [data-reduced-motion="true"] .status-text {
+    transform: none;
+    transition: opacity var(--reduced-crossfade-ms) var(--ease-out);
+  }
+  .status-meta {
+    color: var(--ink-faint);
+    font-family: var(--font-source);
+    font-size: 11.5px;
+  }
+
+  /*
+   * Drop Screen: slides in from the side being dragged over (left or right).
+   * Toned paper screen, quiet ink, never glows.
+   */
+  .drop-screen {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 320px;
+    z-index: 30;
+    background: var(--shoji-paper-solid);
+    border-left: var(--hairline-w) solid var(--ink-caption);
+    border-right: var(--hairline-w) solid var(--ink-caption);
+    padding: var(--space-5);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: var(--space-2);
+    pointer-events: none;
+    will-change: transform, opacity;
+  }
+  .drop-screen[aria-hidden="true"] {
+    visibility: hidden;
+  }
+  .drop-screen-title {
+    font-family: var(--font-medium);
+    font-weight: 500;
+    color: var(--ink);
+    font-size: var(--type-source);
+    line-height: var(--type-source-line);
+  }
+  .drop-screen-sub {
+    color: var(--ink-rest);
+    font-size: var(--type-ui);
+    line-height: var(--type-ui-line);
+  }
+</style>
+</head>
+<body data-theme="dark" data-reduced-motion="false">
+
+<div class="harness">
+  <!-- Dev strip outside the window -->
+  <div class="dev-strip" role="toolbar" aria-label="Prototype controls">
+    <div class="dev-group">
+      <span class="dev-label">Theme</span>
+      <button class="dev-btn" id="btn-theme" type="button">Dark (Afterglow)</button>
+    </div>
+    <div class="dev-group">
+      <span class="dev-label">Window</span>
+      <button class="dev-btn" id="btn-size" type="button">Wide (1200 px)</button>
+    </div>
+    <div class="dev-group">
+      <span class="dev-label">Motion</span>
+      <button class="dev-btn" id="btn-motion" type="button" aria-pressed="false">Reduced motion: Off</button>
+    </div>
+    <div class="dev-group">
+      <span class="dev-label">Disk events</span>
+      <button class="dev-btn" id="btn-ext-clean" type="button">External change (clean)</button>
+      <button class="dev-btn" id="btn-ext-dirty" type="button">External change (dirty)</button>
+      <button class="dev-btn" id="btn-ext-delete" type="button">File deleted on disk</button>
+    </div>
+    <div class="dev-group">
+      <span class="dev-label">Drop</span>
+      <button class="dev-btn" id="btn-sim-drag" type="button">Simulate drag</button>
+    </div>
+  </div>
+
+  <div class="stage-row">
+    <!-- Simulated App Window (1200x760 default, resizable) -->
+    <div class="app-window" id="app-window"
+         data-layout="medium"
+         data-view-mode="edit"
+         data-sidebar-collapsed="false"
+         data-sidebar-visible="true"
+         data-narrow-overlay-open="false"
+         data-conflict="false">
+
+      <!-- Titlebar -->
+      <header class="title-row">
+        <div class="title-left">
+          <button class="quiet-btn" id="btn-sidebar-toggle" type="button"
+                  title="Toggle file sidebar (Ctrl+B)"
+                  aria-label="Toggle file sidebar">
+            <span class="shoji-toggle-glyph" aria-hidden="true">
+              <span class="shoji-toggle-bar"></span>
+            </span>
+          </button>
+
+          <div class="title-file-group">
+            <button class="title-active-path" id="title-active-path" type="button" title="Effective Agent Context">
+              <span class="title-folder-prefix" id="title-folder-prefix">notes /</span>
+              <span class="title-active-name" id="title-active-name">plan.md</span>
+              <span class="title-dirty-dot" id="title-dirty-dot" hidden>●</span>
+            </button>
+
+            <nav class="title-tabs" id="title-tabs" aria-label="Open documents"></nav>
+          </div>
+        </div>
+
+        <div class="title-right">
+          <!-- View control: shows current state at rest; cycles Edit -> Split -> Preview (Ctrl+E) -->
+          <button class="view-cycle-btn" id="btn-view-cycle" type="button"
+                  data-mode="edit"
+                  title="View: Edit — next: Split (Ctrl+E)">
+            <span class="view-glyph" aria-hidden="true">
+              <span class="view-glyph-seg"></span>
+              <span class="view-glyph-seg"></span>
+              <span class="view-glyph-seg"></span>
+              <span class="view-glyph-screen" id="glyph-screen"></span>
+              <span class="view-glyph-needle" id="glyph-needle"></span>
+            </span>
+            <span id="view-cycle-label">Edit</span>
+          </button>
+
+          <button class="title-action strong" id="btn-review" type="button">Review</button>
+
+          <div class="menu-anchor">
+            <button class="title-action" id="btn-settings" type="button" aria-expanded="false">Settings</button>
+            <div class="title-menu" id="title-menu" data-open="false" role="menu">
+              <button class="menu-row" type="button" data-action="new-file">
+                <span>New file</span><span class="menu-kbd">Ctrl+N</span>
+              </button>
+              <button class="menu-row" type="button" data-action="pin-external">
+                <span>Open external note…</span><span class="menu-kbd">Ctrl+O</span>
+              </button>
+              <div class="menu-sep"></div>
+              <button class="menu-row" type="button" data-action="toggle-web-compat">
+                <span id="menu-web-label">Web compatibility preview</span>
+                <span class="menu-kbd" id="menu-web-state">Off</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="win-controls" aria-hidden="true">
+            <span class="win-btn">─</span>
+            <span class="win-btn">□</span>
+            <span class="win-btn">✕</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Workspace -->
+      <div class="workspace" id="workspace">
+        <!-- Collapsed thin edge strip (44px): vertical ticks for open documents -->
+        <aside class="edge-strip" id="edge-strip" aria-label="Open documents strip"></aside>
+
+        <!-- Shoji sliding sidebar panel (240px, toned paper, no border line) -->
+        <aside class="shoji-sidebar" id="shoji-sidebar" aria-label="Workspace files">
+          <!-- "Pinned on top" group: appears ONLY when an open file is outside the folder -->
+          <div class="sidebar-section" id="pinned-outside-section" hidden>
+            <div class="sidebar-heading">
+              <span>Outside folder</span>
+            </div>
+            <div class="tree-list" id="pinned-outside-list"></div>
+          </div>
+
+          <!-- Unified folder tree + open document ink dots -->
+          <div class="sidebar-section">
+            <div class="sidebar-heading">
+              <span>workspace</span>
+              <button class="quiet-action" id="btn-toggle-external-doc" type="button"
+                      title="Open or close an outside-folder file to see Pinned group">
+                + scratch.md
+              </button>
+            </div>
+            <div class="tree-list" id="folder-tree-list"></div>
+          </div>
+
+          <div class="sidebar-footer">
+            <span>Ctrl+B screen</span>
+            <span id="sidebar-mode-hint">Push track</span>
+          </div>
+        </aside>
+
+        <!-- Main Editor + Preview stage track -->
+        <main class="stage-track" id="stage-track">
+          <!-- Conflict / Deleted banner slot -->
+          <div class="banner-slot" id="banner-slot" hidden></div>
+
+          <!-- Dual-screen Shoji track -->
+          <div class="panes-viewport" id="panes-viewport">
+            <!-- Editor screen -->
+            <section class="pane-editor" id="pane-editor" aria-label="Markdown source editor">
+              <div class="editor-inner">
+                <div class="editor-measure">
+                  <div class="reload-stage" id="reload-stage">
+                    <textarea class="source-textarea" id="source-textarea" spellcheck="false" aria-label="Source text"></textarea>
+                    <div class="reload-ghost" id="reload-ghost" aria-hidden="true"></div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- Draggable & animated Shoji screen divider -->
+            <div class="shoji-divider" id="shoji-divider" role="separator"
+                 aria-orientation="vertical"
+                 aria-label="Slide divider between Edit, Split, and Preview"
+                 tabindex="0">
+              <div class="shoji-divider-line"></div>
+              <div class="shoji-divider-handle"></div>
+            </div>
+
+            <!-- Preview screen -->
+            <section class="pane-preview" id="pane-preview" aria-label="Rendered preview" aria-hidden="true">
+              <div class="preview-inner">
+                <div class="preview-measure">
+                  <div class="preview-quiet-label" id="preview-mode-caption">Preview</div>
+                  <div class="preview-body" id="preview-body"></div>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <!-- Foot status line -->
+          <footer class="status-bar">
+            <div class="status-text" id="status-text" data-visible="false"></div>
+            <div class="status-meta" id="status-meta">Ln 1, Col 1 · Clean</div>
+          </footer>
+        </main>
+
+        <!-- Sliding Drop Screen (enters from left or right edge on dragover) -->
+        <div class="drop-screen" id="drop-screen" aria-hidden="true">
+          <div class="drop-screen-title" id="drop-screen-title">Drop to open on track</div>
+          <div class="drop-screen-sub" id="drop-screen-sub">Opens document in a tab · folder sets workspace</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Legend panel beside the window (<= 8 lines) -->
+    <aside class="legend" aria-label="Direction legend">
+      <div class="legend-title">B — “Shoji” (sliding screens)</div>
+      <div class="legend-line">Every surface is a toned paper screen sliding on a continuous track; space is rearranged physically, never swapped.</div>
+      <div class="legend-line"><strong>Sidebar:</strong> Toned paper panel pushes the stage ≥1040 px and slides over it below; collapses to a 44 px vertical-tick edge strip.</div>
+      <div class="legend-line"><strong>Unified list:</strong> Open files mark the tree with an ink dot; outside-folder tabs pin at the top only when present.</div>
+      <div class="legend-line"><strong>View track:</strong> One 3-segment glyph &amp; draggable divider slide between Edit (100%), Split (50%), and Preview (0%).</div>
+      <div class="legend-line"><strong>Motion:</strong> Interruptible spring-settle ease-out (<code>CAMERA_MS</code> 360 ms, <code>RAIL_WIDEN_MS</code> 160 ms); 8 px slip on clean reload; opacity-only when reduced.</div>
+      <div class="legend-meta">Keys: <code>Ctrl+B</code> sidebar · <code>Ctrl+E</code> view</div>
+    </aside>
+  </div>
+</div>
+
+<script>
+(() => {
+  /*
+   * Motion constants from crates/mt-app/src/ui/motion.rs & tokens.rs
+   */
+  const RAIL_W = 44;
+  const SIDEBAR_W = 240;
+  const NARROW_MAX_W = 1040;
+  const WIDE_MIN_W = 1280;
+  const RAIL_WIDEN_MS = 160;
+  const ENTER_MS = 200;
+  const EXIT_MS = 150;
+  const CAMERA_MS = 360;
+  const REDUCED_CROSSFADE_MS = 100;
+  const STATUS_HOLD_MS = 3000;
+
+  /*
+   * Spring-like ease-out with subtle settle for Shoji screens
+   * Derived from camera_easing (0.22, 1.0, 0.36, 1.0) with a gentle physical settle.
+   */
+  function shojiSpringEase(t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    return 1 - Math.pow(1 - t, 3.2) * Math.cos(t * Math.PI * 1.35);
+  }
+
+  function easeOutCubic(t) {
+    return 1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3);
+  }
+
+  /*
+   * Interruptible value animator:
+   * Calling .to(target, duration) mid-flight starts smoothly from the current live value without jumping.
+   */
+  class TrackValue {
+    constructor(initial, onUpdate) {
+      this.value = initial;
+      this.startValue = initial;
+      this.target = initial;
+      this.startTime = 0;
+      this.duration = 0;
+      this.raf = 0;
+      this.easing = shojiSpringEase;
+      this.onUpdate = onUpdate;
+    }
+    setImmediate(val) {
+      if (this.raf) cancelAnimationFrame(this.raf);
+      this.raf = 0;
+      this.value = val;
+      this.target = val;
+      this.onUpdate(this.value);
+    }
+    to(nextTarget, durationMs, easingFn = shojiSpringEase) {
+      if (state.reducedMotion || durationMs <= 0) {
+        this.setImmediate(nextTarget);
+        return;
+      }
+      if (Math.abs(this.target - nextTarget) < 0.0005 && this.raf) return;
+      if (Math.abs(this.value - nextTarget) < 0.0005 && !this.raf) {
+        this.setImmediate(nextTarget);
+        return;
+      }
+      this.startValue = this.value;
+      this.target = nextTarget;
+      this.duration = durationMs;
+      this.easing = easingFn;
+      this.startTime = performance.now();
+      if (!this.raf) {
+        const tick = (now) => {
+          const elapsed = now - this.startTime;
+          const t = Math.min(1, elapsed / this.duration);
+          const eased = this.easing(t);
+          this.value = this.startValue + (this.target - this.startValue) * eased;
+          this.onUpdate(this.value);
+          if (t < 1) {
+            this.raf = requestAnimationFrame(tick);
+          } else {
+            this.raf = 0;
+            this.value = this.target;
+            this.onUpdate(this.value);
+          }
+        };
+        this.raf = requestAnimationFrame(tick);
+      }
+    }
+  }
+
+  /*
+   * Neutral sample workspace tree & documents.
+   * Each file maintains `localText` (the user's untouched local buffer) separately from
+   * simulated clean-reload disk writes so testing "External change (dirty)" after
+   * "External change (clean)" never leaks disk text into the local buffer.
+   */
+  const INITIAL_FILES = {
+    "notes/plan.md": {
+      path: "notes/plan.md",
+      folder: "notes",
+      name: "plan.md",
+      insideWorkspace: true,
+      open: true,
+      text: `# Release plan
+
+Describe the next release and list **one** risk.
+
+- [ ] verify install
+- [ ] verify uninstall
+
+Ship after the install check passes.
+
+## Verification notes
+
+Run \`mt.py check ci\` before opening the pull request. Keep file handles closed between snapshots so external editors can save atomically.`
+    },
+    "skills/review/SKILL.md": {
+      path: "skills/review/SKILL.md",
+      folder: "skills/review",
+      name: "SKILL.md",
+      insideWorkspace: true,
+      open: true,
+      text: `# Review Skill
+
+Inspect the active document for unverified claims and missing constraints.
+
+## Steps
+
+- [x] Read the document structure
+- [ ] Check boundary conditions
+- [ ] Report findings in plain ink
+
+> Only model output emits light. Local file actions remain quiet.`
+    },
+    "AGENTS.md": {
+      path: "AGENTS.md",
+      folder: "",
+      name: "AGENTS.md",
+      insideWorkspace: true,
+      open: true,
+      text: `# Workspace instructions
+
+Keep components modular and concerns separated.
+
+- Use \`ui::tokens\` for every colour, size and font family.
+- Prefer space (\`ma\`) over decorative borders.
+- Open snapshots with \`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE\`.`
+    },
+    "notes/inbox.md": {
+      path: "notes/inbox.md",
+      folder: "notes",
+      name: "inbox.md",
+      insideWorkspace: true,
+      open: false,
+      text: `# Inbox
+
+Captured notes waiting to be triaged into workspace plans.
+
+- [ ] Verify sliding divider snap stops
+- [ ] Check sidebar auto-collapse below 1040 px
+- [ ] Keep file handles closed between reads`
+    },
+    "notes/architecture.md": {
+      path: "notes/architecture.md",
+      folder: "notes",
+      name: "architecture.md",
+      insideWorkspace: true,
+      open: false,
+      text: `# Architecture
+
+The shell owns the three breakpoints:
+
+1. **Wide** (1280 px and above): 680 px measure.
+2. **Medium** (1040 to 1279 px): 560 px measure.
+3. **Narrow** (below 1040 px): sidebar and field slide over the column.`
+    },
+    "docs/goals/22-files-feel-native.md": {
+      path: "docs/goals/22-files-feel-native.md",
+      folder: "docs/goals",
+      name: "22-files-feel-native.md",
+      insideWorkspace: true,
+      open: false,
+      text: `# Goal 22 — Files feel native
+
+1. Persistent file sidebar (\`Ctrl+B\`).
+2. One view button cycling Edit → Split → Preview (\`Ctrl+E\`).
+3. Quiet drag-and-drop for documents and folders.
+4. Event-driven live reload without file locks.`
+    },
+    "../scratch/notes-outside.md": {
+      path: "../scratch/notes-outside.md",
+      folder: "../scratch",
+      name: "notes-outside.md",
+      insideWorkspace: false,
+      open: false,
+      text: `# Scratchpad (outside workspace)
+
+This file lives outside the open workspace folder.
+In the Shoji sidebar, a pinned top section appears only while an outside file like this one is open.`
+    }
+  };
+
+  const FILES = {};
+  Object.keys(INITIAL_FILES).forEach((k) => {
+    const seed = INITIAL_FILES[k];
+    FILES[k] = {
+      ...seed,
+      localText: seed.text,
+      diskText: "",
+      dirty: false,
+      conflict: false,
+      deletedOnDisk: false,
+      diskVersionCounter: 1
+    };
+  });
+
+  const FOLDERS = [
+    { id: "notes", name: "notes", depth: 0, expanded: true },
+    { id: "skills", name: "skills", depth: 0, expanded: true },
+    { id: "skills/review", name: "review", depth: 1, expanded: true, parent: "skills" },
+    { id: "docs", name: "docs", depth: 0, expanded: true },
+    { id: "docs/goals", name: "goals", depth: 1, expanded: true, parent: "docs" }
+  ];
+
+  const state = {
+    theme: "dark",
+    reducedMotion: Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches),
+    userSidebarExpanded: true, // remembered choice for Ctrl+B in wide/medium
+    narrowOverlayOpen: false,  // when < 1040px, sidebar auto-collapses; Ctrl+B overlays it
+    clientWidth: 1200,
+    activePath: "notes/plan.md",
+    viewMode: "edit",          // "edit" (1.0) -> "split" (0.5) -> "preview" (0.0)
+    webCompatPreview: false,
+    compareOpen: false,
+    statusTimer: 0,
+    dropSide: "right"
+  };
+
+  // DOM Elements
+  const appWindow = document.getElementById("app-window");
+  const edgeStripEl = document.getElementById("edge-strip");
+  const sidebarEl = document.getElementById("shoji-sidebar");
+  const stageTrackEl = document.getElementById("stage-track");
+  const pinnedSectionEl = document.getElementById("pinned-outside-section");
+  const pinnedListEl = document.getElementById("pinned-outside-list");
+  const folderTreeListEl = document.getElementById("folder-tree-list");
+  const sidebarModeHint = document.getElementById("sidebar-mode-hint");
+  const btnToggleExternal = document.getElementById("btn-toggle-external-doc");
+
+  const titleFolderPrefix = document.getElementById("title-folder-prefix");
+  const titleActiveName = document.getElementById("title-active-name");
+  const titleDirtyDot = document.getElementById("title-dirty-dot");
+  const titleTabsEl = document.getElementById("title-tabs");
+
+  const btnSidebarToggle = document.getElementById("btn-sidebar-toggle");
+  const btnViewCycle = document.getElementById("btn-view-cycle");
+  const viewCycleLabel = document.getElementById("view-cycle-label");
+  const glyphScreen = document.getElementById("glyph-screen");
+  const glyphNeedle = document.getElementById("glyph-needle");
+
+  const btnSettings = document.getElementById("btn-settings");
+  const titleMenu = document.getElementById("title-menu");
+  const menuWebState = document.getElementById("menu-web-state");
+
+  const panesViewport = document.getElementById("panes-viewport");
+  const paneEditor = document.getElementById("pane-editor");
+  const panePreview = document.getElementById("pane-preview");
+  const shojiDivider = document.getElementById("shoji-divider");
+  const sourceTextarea = document.getElementById("source-textarea");
+  const reloadGhost = document.getElementById("reload-ghost");
+  const previewBody = document.getElementById("preview-body");
+  const previewModeCaption = document.getElementById("preview-mode-caption");
+  const bannerSlot = document.getElementById("banner-slot");
+  const statusTextEl = document.getElementById("status-text");
+  const statusMetaEl = document.getElementById("status-meta");
+  const dropScreen = document.getElementById("drop-screen");
+  const dropScreenTitle = document.getElementById("drop-screen-title");
+  const dropScreenSub = document.getElementById("drop-screen-sub");
+
+  /*
+   * Continuous Shoji Track Animators
+   * 1. sidebarTrack: 0 (collapsed to 44px tick rail) .. 1 (240px open paper screen)
+   * 2. splitTrack:   1.0 (Edit: divider at right) .. 0.5 (Split: middle) .. 0.0 (Preview: left)
+   * 3. dropTrack:    0 (hidden) .. 1 (slid in from hovered edge)
+   */
+  const sidebarTrack = new TrackValue(1, applySidebarGeometry);
+  const splitTrack = new TrackValue(1.0, applySplitGeometry);
+  const dropTrack = new TrackValue(0, applyDropGeometry);
+
+  function isNarrow() {
+    return state.clientWidth < NARROW_MAX_W;
+  }
+
+  function isSidebarEffectiveOpen() {
+    return isNarrow() ? state.narrowOverlayOpen : state.userSidebarExpanded;
+  }
+
+  function syncSidebarState(animate = true) {
+    const open = isSidebarEffectiveOpen();
+    const narrow = isNarrow();
+    appWindow.dataset.sidebarCollapsed = String(!open);
+    appWindow.dataset.sidebarVisible = String(open);
+    appWindow.dataset.narrowOverlayOpen = String(narrow && open);
+    sidebarModeHint.textContent = narrow ? "Overlay (<1040 px)" : "Push track";
+
+    const duration = state.reducedMotion ? REDUCED_CROSSFADE_MS : RAIL_WIDEN_MS;
+    if (animate) {
+      sidebarTrack.to(open ? 1 : 0, duration, shojiSpringEase);
+    } else {
+      sidebarTrack.setImmediate(open ? 1 : 0);
+    }
+  }
+
+  function applySidebarGeometry(p) {
+    const narrow = isNarrow();
+    if (state.reducedMotion) {
+      sidebarEl.style.transform = "translateX(0px)";
+      sidebarEl.style.opacity = String(p);
+      sidebarEl.style.visibility = p > 0.05 ? "visible" : "hidden";
+      sidebarEl.style.pointerEvents = p > 0.5 ? "auto" : "none";
+      sidebarEl.setAttribute("aria-hidden", String(p <= 0.05));
+      const stageLeft = narrow ? RAIL_W : (p > 0.5 ? SIDEBAR_W : RAIL_W);
+      stageTrackEl.style.left = `${stageLeft}px`;
+    } else {
+      const x = (p - 1) * SIDEBAR_W;
+      sidebarEl.style.transform = `translateX(${x.toFixed(2)}px)`;
+      sidebarEl.style.opacity = "1";
+      sidebarEl.style.visibility = p > 0.01 ? "visible" : "hidden";
+      sidebarEl.style.pointerEvents = p > 0.1 ? "auto" : "none";
+      sidebarEl.setAttribute("aria-hidden", String(p <= 0.01));
+
+      // Above 1040px, sidebar physically pushes the stage from 44px to 240px.
+      // Below 1040px, stage stays anchored at 44px while sidebar slides over it.
+      const stageLeft = narrow ? RAIL_W : (RAIL_W + p * (SIDEBAR_W - RAIL_W));
+      stageTrackEl.style.left = `${stageLeft.toFixed(2)}px`;
+    }
+    applySplitGeometry(splitTrack.value);
+  }
+
+  function ratioForMode(mode) {
+    if (mode === "edit") return 1.0;
+    if (mode === "split") return 0.5;
+    return 0.0;
+  }
+
+  function nextViewMode(mode) {
+    if (mode === "edit") return "split";
+    if (mode === "split") return "preview";
+    return "edit";
+  }
+
+  function formatModeName(mode) {
+    if (mode === "edit") return "Edit";
+    if (mode === "split") return "Split";
+    return "Preview";
+  }
+
+  function setViewMode(mode, animate = true) {
+    state.viewMode = mode;
+    const currentName = formatModeName(mode);
+    const nextName = formatModeName(nextViewMode(mode));
+
+    // At rest, the button label and accessible name show the current state ("Edit", "Split", "Preview")
+    appWindow.dataset.viewMode = mode;
+    btnViewCycle.dataset.mode = mode;
+    viewCycleLabel.textContent = currentName;
+    btnViewCycle.setAttribute("title", `View: ${currentName} — next: ${nextName} (Ctrl+E)`);
+
+    const targetRatio = ratioForMode(mode);
+    if (animate) {
+      splitTrack.to(targetRatio, CAMERA_MS, shojiSpringEase);
+    } else {
+      splitTrack.setImmediate(targetRatio);
+    }
+  }
+
+  function applySplitGeometry(ratio) {
+    const clamped = Math.max(0, Math.min(1, ratio));
+    const viewportW = panesViewport.clientWidth || (state.clientWidth - (isNarrow() ? RAIL_W : SIDEBAR_W));
+
+    // Update the 3-segment glyph in titlebar continuously
+    const pct = (clamped * 100).toFixed(1);
+    glyphScreen.style.width = `${pct}%`;
+    glyphNeedle.style.left = `${pct}%`;
+
+    const r = state.reducedMotion ? splitTrack.target : clamped;
+    const dividerX = r * viewportW;
+    const editorW = Math.max(0, dividerX);
+    const previewW = Math.max(0, viewportW - dividerX);
+
+    const editorActive = r > 0.005;
+    const previewActive = r < 0.995;
+
+    paneEditor.style.width = `${editorW.toFixed(1)}px`;
+    paneEditor.style.opacity = editorActive ? "1" : "0";
+    paneEditor.style.visibility = editorActive ? "visible" : "hidden";
+    paneEditor.style.pointerEvents = editorActive ? "auto" : "none";
+    paneEditor.setAttribute("aria-hidden", String(!editorActive));
+
+    panePreview.style.width = `${previewW.toFixed(1)}px`;
+    panePreview.style.opacity = previewActive ? "1" : "0";
+    panePreview.style.visibility = previewActive ? "visible" : "hidden";
+    panePreview.style.pointerEvents = previewActive ? "auto" : "none";
+    panePreview.setAttribute("aria-hidden", String(!previewActive));
+
+    shojiDivider.style.left = `${dividerX.toFixed(1)}px`;
+  }
+
+  function applyDropGeometry(p) {
+    const clamped = Math.max(0, Math.min(1, p));
+    const isLeft = state.dropSide === "left";
+    const visible = clamped > 0.01;
+    dropScreen.style.left = isLeft ? "0px" : "auto";
+    dropScreen.style.right = isLeft ? "auto" : "0px";
+    dropScreen.setAttribute("aria-hidden", String(!visible));
+
+    if (state.reducedMotion) {
+      dropScreen.style.transform = "translateX(0px)";
+      dropScreen.style.opacity = visible ? String(clamped) : "0";
+      return;
+    }
+    const offset = (1 - clamped) * (isLeft ? -320 : 320);
+    dropScreen.style.transform = `translateX(${offset.toFixed(1)}px)`;
+    dropScreen.style.opacity = visible ? "1" : "0";
+  }
+
+  /*
+   * Markdown -> Plain HTML renderer (neutral, zero external deps)
+   */
+  function escapeHtml(str) {
+    return str
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function formatInline(text) {
+    let out = escapeHtml(text);
+    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+    out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    return out;
+  }
+
+  function renderMarkdown(md) {
+    const lines = md.split(/\r?\n/);
+    let html = "";
+    let inList = false;
+    let inCode = false;
+    let codeBuf = [];
+
+    const closeList = () => {
+      if (inList) {
+        html += "</ul>";
+        inList = false;
+      }
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.startsWith("```")) {
+        closeList();
+        if (!inCode) {
+          inCode = true;
+          codeBuf = [];
+        } else {
+          html += `<pre><code>${escapeHtml(codeBuf.join("\n"))}</code></pre>`;
+          inCode = false;
+        }
+        continue;
+      }
+      if (inCode) {
+        codeBuf.push(line);
+        continue;
+      }
+      if (!line.trim()) {
+        closeList();
+        continue;
+      }
+      if (line.startsWith("# ")) {
+        closeList();
+        html += `<h1>${formatInline(line.slice(2))}</h1>`;
+      } else if (line.startsWith("## ")) {
+        closeList();
+        html += `<h2>${formatInline(line.slice(3))}</h2>`;
+      } else if (line.startsWith("> ")) {
+        closeList();
+        html += `<blockquote>${formatInline(line.slice(2))}</blockquote>`;
+      } else if (/^-\s+\[([ xX])\]\s+/.test(line)) {
+        if (!inList) { html += "<ul>"; inList = true; }
+        const checked = /^-\s+\[[xX]\]/.test(line);
+        const content = line.replace(/^-\s+\[[ xX]\]\s+/, "");
+        html += `<li><span class="preview-checkbox ${checked ? "checked" : ""}"></span><span>${formatInline(content)}</span></li>`;
+      } else if (/^(\d+\.|-)\s+/.test(line)) {
+        if (!inList) { html += "<ul>"; inList = true; }
+        const content = line.replace(/^(\d+\.|-)\s+/, "");
+        html += `<li><span>·</span><span>${formatInline(content)}</span></li>`;
+      } else {
+        closeList();
+        html += `<p>${formatInline(line)}</p>`;
+      }
+    }
+    closeList();
+    return html;
+  }
+
+  /*
+   * Render UI lists:
+   * - Collapsed edge strip vertical ticks
+   * - Unified folder tree (with ink dots on open files)
+   * - Pinned outside-folder section (ONLY when an outside file is open)
+   * - Titlebar tabs & breadcrumb
+   */
+  function renderChrome() {
+    const activeDoc = FILES[state.activePath];
+
+    // Titlebar active breadcrumb
+    titleFolderPrefix.textContent = activeDoc.folder ? `${activeDoc.folder} /` : "";
+    titleActiveName.textContent = activeDoc.name;
+    titleDirtyDot.hidden = !activeDoc.dirty;
+    appWindow.dataset.conflict = String(activeDoc.conflict);
+
+    // Open documents list
+    const openDocs = Object.values(FILES).filter(f => f.open);
+
+    // Titlebar tabs
+    titleTabsEl.innerHTML = "";
+    openDocs.forEach(doc => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "title-tab";
+      btn.setAttribute("aria-selected", String(doc.path === state.activePath));
+      btn.innerHTML = `
+        <span>${escapeHtml(doc.name)}${doc.dirty ? " ●" : ""}</span>
+        <span class="title-tab-close" data-close="${escapeHtml(doc.path)}" title="Close tab">×</span>
+      `;
+      btn.addEventListener("click", (e) => {
+        const closePath = e.target.getAttribute("data-close");
+        if (closePath) {
+          e.stopPropagation();
+          closeDocument(closePath);
+          return;
+        }
+        activateDocument(doc.path);
+      });
+      titleTabsEl.appendChild(btn);
+    });
+
+    // Collapsed 44px edge strip with short vertical ticks
+    edgeStripEl.innerHTML = "";
+    openDocs.forEach(doc => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "tick-row";
+      btn.setAttribute("aria-current", String(doc.path === state.activePath));
+      btn.setAttribute("data-dirty", String(doc.dirty));
+      btn.setAttribute("aria-label", doc.name);
+      btn.innerHTML = `
+        <span class="tick-mark"></span>
+        <span class="tick-label">${escapeHtml(doc.name)}</span>
+      `;
+      btn.addEventListener("click", () => activateDocument(doc.path));
+      edgeStripEl.appendChild(btn);
+    });
+
+    // Outside-folder pinned section: shown ONLY when an open file is outside the workspace folder
+    const outsideOpenDocs = openDocs.filter(d => !d.insideWorkspace);
+    pinnedSectionEl.hidden = outsideOpenDocs.length === 0;
+    pinnedListEl.innerHTML = "";
+    outsideOpenDocs.forEach(doc => {
+      pinnedListEl.appendChild(createFileRow(doc, 0, true));
+    });
+
+    const scratchDoc = FILES["../scratch/notes-outside.md"];
+    btnToggleExternal.textContent = scratchDoc.open ? "− scratch.md" : "+ scratch.md";
+
+    // Unified folder tree (folders + inside-workspace files)
+    folderTreeListEl.innerHTML = "";
+
+    const isFolderVisible = (folder) => {
+      if (!folder.parent) return true;
+      const parent = FOLDERS.find(f => f.id === folder.parent);
+      return parent ? parent.expanded && isFolderVisible(parent) : true;
+    };
+
+    const isFileInExpandedFolder = (file) => {
+      if (!file.folder) return true;
+      const folder = FOLDERS.find(f => f.id === file.folder);
+      return folder ? folder.expanded && isFolderVisible(folder) : true;
+    };
+
+    FOLDERS.forEach(folder => {
+      if (!isFolderVisible(folder)) return;
+      const fRow = document.createElement("button");
+      fRow.type = "button";
+      fRow.className = "tree-row";
+      fRow.style.paddingLeft = `${8 + folder.depth * 14}px`;
+      fRow.innerHTML = `
+        <span class="tree-mark">${folder.expanded ? "▾" : "▸"}</span>
+        <span class="tree-name">${escapeHtml(folder.name)}</span>
+      `;
+      fRow.addEventListener("click", () => {
+        folder.expanded = !folder.expanded;
+        renderChrome();
+      });
+      folderTreeListEl.appendChild(fRow);
+
+      Object.values(FILES)
+        .filter(f => f.insideWorkspace && f.folder === folder.id && !f.deletedOnDisk)
+        .forEach(file => {
+          if (isFileInExpandedFolder(file)) {
+            folderTreeListEl.appendChild(createFileRow(file, folder.depth + 1, false));
+          }
+        });
+    });
+
+    // Root-level workspace files
+    Object.values(FILES)
+      .filter(f => f.insideWorkspace && !f.folder && !f.deletedOnDisk)
+      .forEach(file => {
+        folderTreeListEl.appendChild(createFileRow(file, 0, false));
+      });
+
+    renderBanner();
+  }
+
+  function createFileRow(file, depth, showSubpath) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "tree-row";
+    row.style.paddingLeft = `${8 + depth * 14}px`;
+    if (file.path === state.activePath) {
+      row.setAttribute("aria-current", "page");
+    }
+    row.setAttribute("data-dirty", String(file.dirty));
+
+    const dotHtml = file.open ? `<span class="ink-dot" title="Open document"></span>` : "";
+    const closeHtml = file.open
+      ? `<span class="tree-close" data-close="${escapeHtml(file.path)}" title="Close">×</span>`
+      : "";
+    const subpathHtml = showSubpath && file.folder
+      ? `<span class="tree-subpath">${escapeHtml(file.folder)}</span>`
+      : "";
+
+    row.innerHTML = `
+      <span class="tree-mark">${dotHtml}</span>
+      <span class="tree-name">${escapeHtml(file.name)}${subpathHtml}</span>
+      ${closeHtml}
+    `;
+
+    row.addEventListener("click", (e) => {
+      const closeTarget = e.target.getAttribute("data-close");
+      if (closeTarget) {
+        e.stopPropagation();
+        closeDocument(closeTarget);
+        return;
+      }
+      openAndActivateDocument(file.path);
+    });
+    return row;
+  }
+
+  function openAndActivateDocument(path) {
+    const doc = FILES[path];
+    if (!doc) return;
+    doc.open = true;
+    doc.deletedOnDisk = false;
+    activateDocument(path);
+    if (isNarrow() && state.narrowOverlayOpen) {
+      state.narrowOverlayOpen = false;
+      syncSidebarState(true);
+    }
+  }
+
+  function activateDocument(path) {
+    if (!FILES[path]) return;
+    state.activePath = path;
+    state.compareOpen = false;
+    const doc = FILES[path];
+    sourceTextarea.value = doc.text;
+    updatePreview();
+    renderChrome();
+    updateCaretStatus();
+  }
+
+  function closeDocument(path) {
+    const doc = FILES[path];
+    if (!doc) return;
+    const openDocs = Object.values(FILES).filter(f => f.open);
+    if (openDocs.length <= 1) {
+      notifyStatus("At least one document stays on the track");
+      return;
+    }
+    doc.open = false;
+    doc.dirty = false;
+    doc.conflict = false;
+    if (state.activePath === path) {
+      const next = Object.values(FILES).find(f => f.open);
+      if (next) activateDocument(next.path);
+    } else {
+      renderChrome();
+    }
+  }
+
+  function updatePreview() {
+    const doc = FILES[state.activePath];
+    previewModeCaption.textContent = state.webCompatPreview ? "Web preview" : "Preview";
+    previewBody.innerHTML = renderMarkdown(doc.text);
+  }
+
+  /*
+   * Conflict & Deleted-on-disk Banners (notices.rs contract)
+   */
+  function renderBanner() {
+    const doc = FILES[state.activePath];
+    if (!doc.conflict && !doc.deletedOnDisk) {
+      bannerSlot.hidden = true;
+      bannerSlot.innerHTML = "";
+      return;
+    }
+
+    bannerSlot.hidden = false;
+    if (doc.deletedOnDisk) {
+      bannerSlot.innerHTML = `
+        <div class="banner" role="region" aria-label="File moved or deleted notice">
+          <div class="banner-row">
+            <div class="banner-msg">${escapeHtml(doc.name)} was moved or deleted on disk.</div>
+            <div class="banner-actions">
+              <button class="primary-action" type="button" id="banner-save-as">Save As…</button>
+              <button class="quiet-action" type="button" id="banner-keep-open">Keep buffer</button>
+            </div>
+          </div>
+          <div class="banner-rule"></div>
+        </div>
+      `;
+      document.getElementById("banner-save-as").addEventListener("click", () => {
+        doc.deletedOnDisk = false;
+        doc.dirty = false;
+        doc.open = true;
+        doc.localText = doc.text;
+        renderChrome();
+        updateCaretStatus();
+        notifyStatus(`Saved ${doc.name} to disk`);
+      });
+      document.getElementById("banner-keep-open").addEventListener("click", () => {
+        doc.deletedOnDisk = false;
+        doc.dirty = true;
+        renderChrome();
+        updateCaretStatus();
+      });
+      return;
+    }
+
+    // Dirty conflict banner: local buffer stays untouched; user chooses Compare, Keep mine, or Use disk version
+    const compareHtml = state.compareOpen ? `
+      <div class="banner-compare-box">
+        <div>Difference 1 of 1 · Local buffer vs disk version:</div>
+        <div>Disk: <span class="diff-mark">${escapeHtml((doc.diskText || "").split("\n").slice(-1)[0] || "Updated line on disk")}</span></div>
+      </div>
+    ` : "";
+
+    bannerSlot.innerHTML = `
+      <div class="banner" role="region" aria-label="External disk conflict">
+        <div class="banner-row">
+          <div class="banner-msg">Changed on disk</div>
+          <div class="banner-actions">
+            <button class="primary-action" type="button" id="conflict-compare">Compare</button>
+            <button class="quiet-action" type="button" id="conflict-keep-mine">Keep mine</button>
+            <button class="quiet-action" type="button" id="conflict-use-disk">Use disk version</button>
+            <button class="quiet-action" type="button" id="conflict-save-as">Save As…</button>
+          </div>
+        </div>
+        ${compareHtml}
+        <div class="banner-rule"></div>
+      </div>
+    `;
+
+    document.getElementById("conflict-compare").addEventListener("click", () => {
+      state.compareOpen = !state.compareOpen;
+      renderBanner();
+    });
+    document.getElementById("conflict-keep-mine").addEventListener("click", () => {
+      doc.conflict = false;
+      state.compareOpen = false;
+      // Keep local buffer as is
+      doc.text = doc.localText;
+      sourceTextarea.value = doc.text;
+      updatePreview();
+      renderChrome();
+      updateCaretStatus();
+    });
+    document.getElementById("conflict-use-disk").addEventListener("click", () => {
+      doc.conflict = false;
+      doc.dirty = false;
+      state.compareOpen = false;
+      const incoming = doc.diskText || doc.text;
+      doc.localText = incoming;
+      performCleanSlideReload(doc, incoming);
+      renderChrome();
+      updateCaretStatus();
+    });
+    document.getElementById("conflict-save-as").addEventListener("click", () => {
+      doc.conflict = false;
+      doc.dirty = false;
+      state.compareOpen = false;
+      doc.localText = doc.text;
+      renderChrome();
+      updateCaretStatus();
+      notifyStatus(`Saved copy of ${doc.name}`);
+    });
+  }
+
+  /*
+   * Clean Reload:
+   * "the old text slides out by a few pixels as the new text slides in"
+   * Keeps caret and scroll position, shows quiet status notice ("Updated from disk").
+   */
+  function performCleanSlideReload(doc, nextText) {
+    const prevText = sourceTextarea.value;
+    const selStart = sourceTextarea.selectionStart;
+    const selEnd = sourceTextarea.selectionEnd;
+    const scrollTop = sourceTextarea.scrollTop;
+
+    doc.text = nextText;
+    sourceTextarea.value = nextText;
+    sourceTextarea.scrollTop = scrollTop;
+    sourceTextarea.setSelectionRange(
+      Math.min(selStart, nextText.length),
+      Math.min(selEnd, nextText.length)
+    );
+    updatePreview();
+
+    if (state.reducedMotion) {
+      notifyStatus("Updated from disk");
+      return;
+    }
+
+    reloadGhost.textContent = prevText;
+    const start = performance.now();
+    const duration = ENTER_MS;
+
+    const step = (now) => {
+      const t = Math.min(1, (now - start) / duration);
+      const e = easeOutCubic(t);
+      reloadGhost.style.opacity = String((1 - e) * 0.55);
+      reloadGhost.style.transform = `translateX(${(-8 * e).toFixed(2)}px)`;
+      sourceTextarea.style.transform = `translateX(${(8 * (1 - e)).toFixed(2)}px)`;
+      if (t < 1) {
+        requestAnimationFrame(step);
+      } else {
+        reloadGhost.style.opacity = "0";
+        reloadGhost.style.transform = "translateX(0px)";
+        sourceTextarea.style.transform = "translateX(0px)";
+      }
+    };
+    requestAnimationFrame(step);
+    notifyStatus("Updated from disk");
+  }
+
+  function clearStatus() {
+    if (state.statusTimer) {
+      clearTimeout(state.statusTimer);
+      state.statusTimer = 0;
+    }
+    statusTextEl.textContent = "";
+    statusTextEl.dataset.visible = "false";
+  }
+
+  function notifyStatus(message) {
+    if (state.statusTimer) clearTimeout(state.statusTimer);
+    statusTextEl.textContent = message;
+    statusTextEl.dataset.visible = "true";
+    state.statusTimer = setTimeout(() => {
+      statusTextEl.dataset.visible = "false";
+    }, STATUS_HOLD_MS);
+  }
+
+  function updateCaretStatus() {
+    const val = sourceTextarea.value;
+    const pos = sourceTextarea.selectionStart || 0;
+    const upToCaret = val.slice(0, pos).split("\n");
+    const ln = upToCaret.length;
+    const col = upToCaret[upToCaret.length - 1].length + 1;
+    const doc = FILES[state.activePath];
+    statusMetaEl.textContent = `Ln ${ln}, Col ${col} · ${doc.dirty ? "Modified" : "Clean"}`;
+  }
+
+  /*
+   * Interactive Events
+   */
+  sourceTextarea.addEventListener("input", () => {
+    const doc = FILES[state.activePath];
+    doc.text = sourceTextarea.value;
+    doc.localText = sourceTextarea.value;
+    if (!doc.dirty) {
+      doc.dirty = true;
+      renderChrome();
+    }
+    updatePreview();
+    updateCaretStatus();
+  });
+  sourceTextarea.addEventListener("click", updateCaretStatus);
+  sourceTextarea.addEventListener("keyup", updateCaretStatus);
+
+  // Sidebar Toggle button & Ctrl+B
+  function toggleSidebar() {
+    if (isNarrow()) {
+      state.narrowOverlayOpen = !state.narrowOverlayOpen;
+    } else {
+      state.userSidebarExpanded = !state.userSidebarExpanded;
+    }
+    syncSidebarState(true);
+  }
+  btnSidebarToggle.addEventListener("click", toggleSidebar);
+
+  // View Cycle button & Ctrl+E
+  function cycleView() {
+    setViewMode(nextViewMode(state.viewMode), true);
+  }
+  btnViewCycle.addEventListener("click", cycleView);
+
+  // Global keyboard shortcuts: Ctrl+B (sidebar), Ctrl+E (view), Ctrl+S (save)
+  window.addEventListener("keydown", (e) => {
+    const mod = e.ctrlKey || e.metaKey;
+    const key = (e.key || "").toLowerCase();
+    if (mod && (key === "b" || e.code === "KeyB")) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleSidebar();
+    } else if (mod && (key === "e" || e.code === "KeyE")) {
+      e.preventDefault();
+      e.stopPropagation();
+      cycleView();
+    } else if (mod && (key === "s" || e.code === "KeyS")) {
+      e.preventDefault();
+      e.stopPropagation();
+      const doc = FILES[state.activePath];
+      doc.dirty = false;
+      doc.conflict = false;
+      doc.localText = doc.text;
+      renderChrome();
+      notifyStatus(`Saved ${doc.name}`);
+      updateCaretStatus();
+    } else if (e.key === "Escape") {
+      if (titleMenu.dataset.open === "true") {
+        titleMenu.dataset.open = "false";
+        btnSettings.setAttribute("aria-expanded", "false");
+      }
+      if (isNarrow() && state.narrowOverlayOpen) {
+        state.narrowOverlayOpen = false;
+        syncSidebarState(true);
+      }
+    }
+  }, { capture: true });
+
+  // Draggable Shoji Divider with 3-stop snap (Edit 1.0, Split 0.5, Preview 0.0)
+  let draggingDivider = false;
+  shojiDivider.addEventListener("pointerdown", (e) => {
+    draggingDivider = true;
+    shojiDivider.dataset.dragging = "true";
+    shojiDivider.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  });
+  shojiDivider.addEventListener("pointermove", (e) => {
+    if (!draggingDivider) return;
+    const rect = panesViewport.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / Math.max(1, rect.width);
+    splitTrack.setImmediate(Math.max(0, Math.min(1, ratio)));
+  });
+  const finishDividerDrag = () => {
+    if (!draggingDivider) return;
+    draggingDivider = false;
+    shojiDivider.dataset.dragging = "false";
+    const r = splitTrack.value;
+    const stops = [
+      { mode: "preview", val: 0.0 },
+      { mode: "split", val: 0.5 },
+      { mode: "edit", val: 1.0 }
+    ];
+    stops.sort((a, b) => Math.abs(a.val - r) - Math.abs(b.val - r));
+    setViewMode(stops[0].mode, true);
+  };
+  shojiDivider.addEventListener("pointerup", finishDividerDrag);
+  shojiDivider.addEventListener("pointercancel", finishDividerDrag);
+
+  // Outside-folder file toggle in sidebar header
+  btnToggleExternal.addEventListener("click", () => {
+    const extPath = "../scratch/notes-outside.md";
+    const extDoc = FILES[extPath];
+    if (extDoc.open) {
+      closeDocument(extPath);
+    } else {
+      openAndActivateDocument(extPath);
+      notifyStatus("Opened ../scratch/notes-outside.md (pinned outside folder)");
+    }
+  });
+
+  // Settings menu
+  btnSettings.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const next = titleMenu.dataset.open !== "true";
+    titleMenu.dataset.open = String(next);
+    btnSettings.setAttribute("aria-expanded", String(next));
+  });
+  document.addEventListener("click", () => {
+    titleMenu.dataset.open = "false";
+    btnSettings.setAttribute("aria-expanded", "false");
+  });
+  titleMenu.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const btn = e.target.closest("[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    if (action === "new-file") {
+      const name = "draft.md";
+      const path = `notes/${name}`;
+      if (!FILES[path]) {
+        const seedText = "# Untitled draft\n\nWrite here.\n";
+        FILES[path] = {
+          path,
+          folder: "notes",
+          name,
+          insideWorkspace: true,
+          open: true,
+          dirty: true,
+          conflict: false,
+          deletedOnDisk: false,
+          diskVersionCounter: 1,
+          text: seedText,
+          localText: seedText,
+          diskText: ""
+        };
+      }
+      openAndActivateDocument(path);
+    } else if (action === "pin-external") {
+      openAndActivateDocument("../scratch/notes-outside.md");
+    } else if (action === "toggle-web-compat") {
+      state.webCompatPreview = !state.webCompatPreview;
+      menuWebState.textContent = state.webCompatPreview ? "On" : "Off";
+      updatePreview();
+      notifyStatus(state.webCompatPreview ? "Web compatibility preview enabled" : "Native preview enabled");
+    }
+    titleMenu.dataset.open = "false";
+    btnSettings.setAttribute("aria-expanded", "false");
+  });
+
+  document.getElementById("btn-review").addEventListener("click", () => {
+    notifyStatus("Review is ready (consent card stays quiet on local files)");
+  });
+
+  document.getElementById("title-active-path").addEventListener("click", () => {
+    notifyStatus(`Effective Agent Context: AGENTS.md → ${state.activePath}`);
+  });
+
+  /*
+   * Real Drag-and-Drop on the window + "Simulate drag" button.
+   * A Shoji screen slides in from the side being dragged over, hovers ~800ms on simulate,
+   * drops `notes/inbox.md`, activates it, and clears the drop affordance completely.
+   */
+  let dragDepth = 0;
+
+  function showDropScreen(side, title, sub) {
+    state.dropSide = side;
+    dropScreenTitle.textContent = title || "Drop to open on track";
+    dropScreenSub.textContent = sub || "Opens document in a tab · folder sets workspace";
+    dropTrack.to(1, ENTER_MS, shojiSpringEase);
+  }
+
+  function hideDropScreen() {
+    dropTrack.to(0, EXIT_MS, shojiSpringEase);
+  }
+
+  appWindow.addEventListener("dragenter", (e) => {
+    e.preventDefault();
+    dragDepth++;
+    const rect = appWindow.getBoundingClientRect();
+    const side = (e.clientX - rect.left) < rect.width / 2 ? "left" : "right";
+    showDropScreen(side, "Drop to open on track", "Supported: .md, .txt, or workspace folder");
+  });
+
+  appWindow.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    const rect = appWindow.getBoundingClientRect();
+    const side = (e.clientX - rect.left) < rect.width / 2 ? "left" : "right";
+    if (side !== state.dropSide) {
+      state.dropSide = side;
+      applyDropGeometry(dropTrack.value);
+    }
+  });
+
+  appWindow.addEventListener("dragleave", (e) => {
+    e.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0 || (e.relatedTarget && !appWindow.contains(e.relatedTarget))) {
+      dragDepth = 0;
+      hideDropScreen();
+    }
+  });
+
+  window.addEventListener("dragend", () => {
+    dragDepth = 0;
+    hideDropScreen();
+  });
+
+  appWindow.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    hideDropScreen();
+
+    const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+    if (files.length === 0) {
+      completeSimulatedDrop();
+      return;
+    }
+
+    let skipped = 0;
+    let lastOpened = null;
+    files.forEach(file => {
+      if (/\.(md|markdown|txt)$/i.test(file.name)) {
+        const path = `notes/${file.name}`;
+        const reader = new FileReader();
+        reader.onload = () => {
+          const loadedText = String(reader.result || `# ${file.name}\n`);
+          FILES[path] = {
+            path,
+            folder: "notes",
+            name: file.name,
+            insideWorkspace: true,
+            open: true,
+            dirty: false,
+            conflict: false,
+            deletedOnDisk: false,
+            diskVersionCounter: 1,
+            text: loadedText,
+            localText: loadedText,
+            diskText: ""
+          };
+          openAndActivateDocument(path);
+          notifyStatus(`Opened ${file.name}`);
+        };
+        reader.readAsText(file);
+        lastOpened = path;
+      } else {
+        skipped++;
+      }
+    });
+
+    if (skipped > 0) {
+      notifyStatus(`Skipped ${skipped} unsupported ${skipped === 1 ? "file" : "files"}`);
+    } else if (!lastOpened) {
+      completeSimulatedDrop();
+    }
+  });
+
+  function completeSimulatedDrop() {
+    const path = "notes/inbox.md";
+    const notesFolder = FOLDERS.find(f => f.id === "notes");
+    if (notesFolder) notesFolder.expanded = true;
+    openAndActivateDocument(path);
+    notifyStatus("Opened notes/inbox.md");
+  }
+
+  // Dev strip: Simulate drag button (enter -> hover ~800ms -> drop notes/inbox.md -> clear)
+  let simDragTimer = 0;
+  document.getElementById("btn-sim-drag").addEventListener("click", () => {
+    if (simDragTimer) clearTimeout(simDragTimer);
+    showDropScreen("right", "Drop notes/inbox.md", "Release to open in a tab on the Shoji track");
+    simDragTimer = setTimeout(() => {
+      simDragTimer = 0;
+      hideDropScreen();
+      completeSimulatedDrop();
+    }, 800);
+  });
+
+  /*
+   * Dev strip controls:
+   * - Dark / Light theme
+   * - Narrow (900 px) / Wide (1200 px)
+   * - Reduced motion
+   * - External change (clean)
+   * - External change (dirty)
+   * - File deleted on disk
+   */
+  const btnTheme = document.getElementById("btn-theme");
+  btnTheme.addEventListener("click", () => {
+    state.theme = state.theme === "dark" ? "light" : "dark";
+    document.body.dataset.theme = state.theme;
+    btnTheme.textContent = state.theme === "dark" ? "Dark (Afterglow)" : "Light (Afterglow)";
+  });
+
+  const btnSize = document.getElementById("btn-size");
+  btnSize.addEventListener("click", () => {
+    const targetW = state.clientWidth >= NARROW_MAX_W ? 900 : 1200;
+    appWindow.style.width = `${targetW}px`;
+    handleResize(targetW);
+  });
+
+  const btnMotion = document.getElementById("btn-motion");
+  function syncReducedMotionUI() {
+    document.body.dataset.reducedMotion = String(state.reducedMotion);
+    btnMotion.setAttribute("aria-pressed", String(state.reducedMotion));
+    btnMotion.textContent = `Reduced motion: ${state.reducedMotion ? "On" : "Off"}`;
+  }
+  btnMotion.addEventListener("click", () => {
+    state.reducedMotion = !state.reducedMotion;
+    syncReducedMotionUI();
+    syncSidebarState(false);
+    applySplitGeometry(splitTrack.target);
+    applyDropGeometry(dropTrack.target);
+  });
+  syncReducedMotionUI();
+
+  // External change (clean): replaces buffer with disk text, status reads "Updated from disk", no banner
+  document.getElementById("btn-ext-clean").addEventListener("click", () => {
+    const doc = FILES[state.activePath];
+    doc.dirty = false;
+    doc.conflict = false;
+    doc.deletedOnDisk = false;
+    state.compareOpen = false;
+    doc.diskVersionCounter++;
+    const stamp = `v${doc.diskVersionCounter}`;
+    const updatedDiskText = doc.localText.replace(/\n*$/, "") +
+      `\n\n- [x] synced from external editor (${stamp})`;
+    doc.diskText = updatedDiskText;
+    performCleanSlideReload(doc, updatedDiskText);
+    renderChrome();
+    updateCaretStatus();
+  });
+
+  // External change (dirty): local buffer stays untouched (doc.localText); conflict banner appears; no "Updated from disk"
+  document.getElementById("btn-ext-dirty").addEventListener("click", () => {
+    const doc = FILES[state.activePath];
+    clearStatus();
+    doc.dirty = true;
+    doc.conflict = true;
+    doc.deletedOnDisk = false;
+    state.compareOpen = false;
+    doc.diskVersionCounter++;
+    const stamp = `v${doc.diskVersionCounter}`;
+
+    // Keep the local buffer untouched (never merge disk text in until user picks "Use disk version")
+    doc.text = doc.localText;
+    sourceTextarea.value = doc.localText;
+    doc.diskText = doc.localText.replace(/\n*$/, "") +
+      `\n\n- [x] synced from external editor (${stamp})`;
+
+    updatePreview();
+    renderChrome();
+    updateCaretStatus();
+  });
+
+  // File deleted on disk: raise Save As banner; keep buffer intact
+  document.getElementById("btn-ext-delete").addEventListener("click", () => {
+    const doc = FILES[state.activePath];
+    clearStatus();
+    doc.deletedOnDisk = true;
+    doc.conflict = false;
+    state.compareOpen = false;
+    renderChrome();
+    updateCaretStatus();
+  });
+
+  /*
+   * Responsive breakpoint observer (1040px auto-collapse / expand)
+   */
+  let wasNarrow = false;
+  function handleResize(measuredWidth) {
+    state.clientWidth = measuredWidth;
+    const layout = measuredWidth >= WIDE_MIN_W
+      ? "wide"
+      : (measuredWidth >= NARROW_MAX_W ? "medium" : "narrow");
+    appWindow.dataset.layout = layout;
+
+    const narrow = measuredWidth < NARROW_MAX_W;
+    btnSize.textContent = narrow
+      ? `Narrow (${Math.round(measuredWidth)} px)`
+      : `Wide (${Math.round(measuredWidth)} px)`;
+
+    if (narrow !== wasNarrow) {
+      wasNarrow = narrow;
+      if (narrow) {
+        state.narrowOverlayOpen = false;
+      }
+      syncSidebarState(true);
+    } else {
+      applySidebarGeometry(sidebarTrack.value);
+    }
+  }
+
+  const ro = new ResizeObserver((entries) => {
+    for (const entry of entries) {
+      const w = entry.contentRect.width;
+      if (w > 0) handleResize(w);
+    }
+  });
+  ro.observe(appWindow);
+
+  // Initialize state and first render
+  activateDocument(state.activePath);
+  syncSidebarState(false);
+  setViewMode("edit", false);
+  dropTrack.setImmediate(0);
+})();
+</script>
+</body>
+</html>

@@ -68,6 +68,33 @@ app must never lock files while picking up other editors' changes promptly, with
    - Before implementation, the owner picks one of three distinct interactive HTML prototypes. The prototypes include
      motion and interaction, dark/light themes, narrow/wide windows, and reduced motion. The chosen direction is
      recorded here.
+6. **Chosen direction: B, "Shoji" (sliding screens). Owner, 2026-11-24.**
+   - The reference prototype is [`docs/design/goal-22-shoji.html`](../design/goal-22-shoji.html). Open it in a browser.
+     Where it conflicts with this contract, the contract wins. The prototype's dev strip and legend are tooling, not
+     product.
+   - **Idea.** Every surface is a paper screen sliding on a track. Space is rearranged physically, never swapped.
+   - **Sidebar.** A slightly toned panel, a different paper tone from `ui::tokens` rather than a border.
+     - At 1040 px or wider it pushes the editor. Below that it slides over the editor.
+     - Collapsed (`Ctrl+B`), it leaves an edge strip of about 44 px, where each open document is a short vertical tick.
+       Hovering a tick shows the document's name; clicking it switches to that document.
+   - **One list.** This replaces decision 1's separate "open documents" section.
+     - The folder tree marks open files with a small ink dot. The active file has full ink.
+     - An "Outside folder" group appears at the top only when an open file lies outside the workspace.
+   - **View control.**
+     - A small three-segment glyph that shows the split ratio, plus the current state's label.
+     - Cycling (`Ctrl+E`, or a click) slides the divider between the panes: Edit puts it at the right edge, Split in the
+       middle, Preview at the left edge.
+     - The divider can also be dragged, and it snaps to those three stops only. There is no free ratio.
+   - **Motion.**
+     - Spatial and continuous: ease-out with a slight settle, from `ui::motion` tokens. The divider uses the camera
+       duration; the sidebar uses the rail widen duration.
+     - Every movement can be interrupted and reverses from its current value.
+     - With reduced motion, movement becomes an opacity change.
+     - This goal owns the sidebar and divider motion. Goal 21 later tunes it, and does not redo it.
+   - **Drop.** While a file is dragged over the window, a screen slides in from the side being dragged over. It names
+     the file and says "Release to open". It clears on leave or drop.
+   - **Clean reload.** The changed text slips about 6 px as the old text leaves and the new text arrives. It never
+     glows; only model output emits light.
 
 ## Done when
 
