@@ -116,14 +116,6 @@
   inventory (`scripts/markturbo_tools/release.py:281-285,771`). Either stage it
   with the payload so the inventory covers every installed file, or document the
   exclusion in the release-notes template; decide before the next candidate.
-- [ ] **Raw-text scope across Markdown block boundaries** — An unclosed
-  raw-text element (`<textarea>`, `<plaintext>`, and so on) whose scope crosses
-  Markdown block boundaries still lets a later `<script>` be collected and
-  restored: `A <textarea>` followed by `<script>void 0;</script>` renders
-  `<p>A &lt;textarea></p>` and restores the script raw (characterized on the
-  Goal 18 merge; fidelity only, no request leaves). Carry the raw-text scope
-  across the `collect_inline_script_ranges`/`next_flow_script` node boundaries
-  without a parser.
 - [ ] **Upgrade nsh for the Goal 15 WebView2 popup fix** — the 2026-11-23
   native run failed goal-07 (`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, case
   `revision_session`): the fixture's `window.open` leaves a visible WebView2
