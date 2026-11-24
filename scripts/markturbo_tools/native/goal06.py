@@ -72,7 +72,7 @@ REVIEW_RESULT_MARKER = "Understood:"
 CONSENT_SEND_AUTOMATION_ID = "consent-send"
 # `ui/consent.rs` `scope_row`: the scope word a selection binding shows.
 CONSENT_SELECTION_SCOPE = "Selection"
-# Longer than the control's 1.2s hold (`HOLD_MS`), so a send completes.
+# Longer than the control's 900 ms hold (`FILAMENT_CHARGE_MS`), so a send completes.
 CONSENT_HOLD_SECONDS = 1.8
 # `ui/titlebar.rs`: the settings-glyph menu's Review row (`Review selection`).
 REVIEW_MENU_AUTOMATION_ID = "title-menu-review-selection"

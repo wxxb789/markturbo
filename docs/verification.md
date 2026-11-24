@@ -177,7 +177,7 @@ How nsh 0.6.1 exposes views to UIA, and so how the harnesses select them:
   restores it once at its end. Selection and Review use the editor's own keys
   (Ctrl+A, Ctrl+Enter).
 - UIA Invoke is one tap. The consent card's `consent-send` sends only after a
-  held press, so the harnesses hold the real pointer past the control's 1.2 s
+  held press, so the harnesses hold the real pointer past the control's 900 ms
   threshold; an Invoke is never consent.
 - Ctrl+Enter depends on state: it starts Review from the title row, sends from
   the consent card, and is Done on the Revision field. The harnesses send it

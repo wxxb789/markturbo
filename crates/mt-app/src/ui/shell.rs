@@ -417,8 +417,7 @@ pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoEle
                 effect({
                     let state = consent_state.clone();
                     move || {
-                        let kind = consent::is_open(&state)
-                            .then(|| state.revision_consent.get().is_some());
+                        let kind = consent::kind_of(&state);
                         if previous.replace(kind) != kind && kind.is_some() {
                             session.update(|session| *session += 1);
                         }

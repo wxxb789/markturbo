@@ -106,6 +106,9 @@ fn start(held_keys: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
         );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
+    // Synthetic keys never reach the platform's key state or thread hook: the
+    // harness drives the hold's keyboard source as physically held.
+    mt_app::ui::consent::test_harness::held_keys();
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
     engine.environment.os = Os::Windows;
     engine.environment.idiom = Idiom::Desktop;
@@ -283,7 +286,7 @@ fn ctrl_enter_from_the_focused_editor_is_done_while_hunks_are_docked() {
     blur_and_refocus_editor(&mut app);
     app.press_key("ctrl+enter").expect("ctrl+enter");
     assert!(
-        app.wait_for("text:Approved changes applied to the buffer.")
+        app.wait_for("text:/^Approved changes applied to the document/")
             .is_ok(),
         "Ctrl+Enter from the focused editor is Done: {:?}",
         app.screen().texts()
@@ -389,6 +392,36 @@ fn a_refocus_in_the_middle_of_a_ctrl_enter_hold_keeps_one_tap_from_sending() {
     );
     assert!(app.shows("Send for review?"), "the card stayed up");
     assert_eq!(editor_lines(&app), lines(SOURCE), "nothing edited the text");
+}
+
+#[test]
+fn a_ctrl_release_and_repress_mid_hold_sends_nothing_from_the_editor() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The same manual clock and reduced motion as the held-key test above.
+    let (mut app, _directory, _config) = start(true);
+    app.press("id:title-review").expect("start review");
+    app.wait_for("id:consent-card").expect("review disclosure");
+    focus_editor(&mut app);
+    let keys = mt_app::ui::consent::test_harness::held_keys();
+
+    // A held Ctrl+Enter: the control key comes up at 548 ms and back down at
+    // 556 ms while Enter stays down, with the editor's text input focused.
+    app.press_key("ctrl+enter").expect("press ctrl+enter");
+    app.run_for(Duration::from_millis(548)).expect("to 548 ms");
+    keys.transition();
+    app.run_for(Duration::from_millis(8)).expect("to 556 ms");
+    app.press_key("ctrl+enter")
+        .expect("the repeat after the re-press");
+    app.run_for(Duration::from_millis(400))
+        .expect("past the first hold's 900 ms");
+    assert!(
+        !app.screen()
+            .matches("text:/^Sent · /")
+            .expect("the selector"),
+        "a broken hold cannot authorize: {:?}",
+        app.screen().texts()
+    );
+    assert!(app.shows("Send for review?"), "the card stayed up");
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

@@ -151,6 +151,24 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     let review_state = state.clone();
     effect(move || bind_mod_enter(&review_state));
 
+    // Escape stands a waiting Translation down, as it does a waiting Review:
+    // the late answer is discarded by generation and nothing is applied.
+    let translation_state = state.clone();
+    effect(move || {
+        if !translation_state.translation_busy.get() {
+            return;
+        }
+        let keys_state = translation_state.clone();
+        on_key_with(
+            "escape",
+            KeyOptions {
+                when: When::Always,
+                ..KeyOptions::default()
+            },
+            move |_| keys_state.cancel_translation_in_flight(),
+        );
+    });
+
     let menu = MenuMotion::new();
 
     // The menu's document commands, reachable without it.
@@ -282,6 +300,7 @@ fn mod_enter(state: &AppState) {
         && state.revision_hunks.get().is_empty()
         && !notices::guard_is_open(state)
         && !state.review_busy.get()
+        && !state.reopen_review()
     {
         state.start_review();
     }
@@ -373,7 +392,7 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
         true,
         enabled,
         move || {
-            if enabled() {
+            if enabled() && !start.reopen_review() {
                 // A newly opened consent card keeps focus; focus_editor
                 // only restores it when Review did not open a modal.
                 start.start_review();
@@ -653,7 +672,7 @@ fn pane_row(
 
 /// A shortcut as the menu names it: `Ctrl+S`, `Ctrl+Shift+S`; `⌘S`, `⇧⌘S`
 /// where `mod` is Command.
-fn shortcut(shift: bool, key: &str) -> SharedString {
+pub(crate) fn shortcut(shift: bool, key: &str) -> SharedString {
     SharedString::from(match (apple_keys(), shift) {
         (true, false) => format!("\u{2318}{key}"),
         (true, true) => format!("\u{21E7}\u{2318}{key}"),

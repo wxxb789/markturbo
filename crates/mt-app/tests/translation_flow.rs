@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use nsh_engine::{EngineConfig, Root};
-use nsh_testing::{DialogAnswer, Headless};
+use nsh_testing::Headless;
 
 mod support;
 
@@ -73,14 +73,17 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
-    // Translation's consent is the state's one-shot dialog; it discloses the
-    // outbound request and authorizes nothing until it is answered.
-    app.on_dialog(|_| DialogAnswer::Press("Send".to_owned()));
+    // Translation's consent is the same in-app hold-to-send card as Review
+    // and Revision: it discloses the outbound request and authorizes nothing
+    // until the hold completes.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-translate")
         .expect("start translation");
+    app.wait_for("id:consent-card")
+        .expect("translation disclosure");
+    app.long_press("id:consent-send").expect("send translation");
     app.wait_for_within(
-        "text:Translated 1 segment(s) into zh.",
+        "text:/^Translated 1 segments into zh\\./",
         Duration::from_secs(20),
     )
     .expect("translation status");
@@ -103,6 +106,10 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-translate")
         .expect("start another translation");
+    app.wait_for("id:consent-card")
+        .expect("the second translation's disclosure");
+    app.long_press("id:consent-send")
+        .expect("send the second translation");
     app.wait_for("text:Waiting for model request approval…")
         .expect("second translation is pending");
     // Open another document and dirty it: the pending translation must land on

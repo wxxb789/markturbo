@@ -58,7 +58,9 @@ use std::{
 
 use mt_core::settings::Language;
 use nsh_base::editor::EditorDecoration;
-use nsh_core::{Color, PropertyValue, StyleKey, TextDecoration, element::Style, prelude::*};
+use nsh_core::{
+    Color, PropertyValue, StyleKey, TextDecoration, element::Style, keymap::When, prelude::*,
+};
 
 use crate::{
     i18n::{self, Key},
@@ -97,6 +99,9 @@ enum S {
     ReviewAgain,
     Move,
     Copy,
+    Copied,
+    Dismiss,
+    Hunk(usize),
     Proposed,
 }
 
@@ -112,11 +117,16 @@ impl S {
                 S::Done => "Done".to_owned(),
                 S::Decided(n, m) => format!("{n} of {m} decided"),
                 S::NotApplied(n) => format!("{n} not applied"),
-                S::CannotApply => "Can't apply — this part changed".to_owned(),
+                S::CannotApply => {
+                    "Can't apply — this section was edited since the review.".to_owned()
+                }
                 S::OtherDocument => "This Revision belongs to another document".to_owned(),
                 S::ReviewAgain => "Review again".to_owned(),
                 S::Move => "Move".to_owned(),
                 S::Copy => "Copy".to_owned(),
+                S::Copied => "Approved result copied to the clipboard.".to_owned(),
+                S::Dismiss => "Dismiss".to_owned(),
+                S::Hunk(n) => format!("Revision hunk {n}"),
                 S::Proposed => "Proposed text".to_owned(),
             },
             Language::Chinese => match self {
@@ -128,11 +138,14 @@ impl S {
                 S::Done => "完成".to_owned(),
                 S::Decided(n, m) => format!("已决定 {n} / {m}"),
                 S::NotApplied(n) => format!("{n} 项未应用"),
-                S::CannotApply => "无法应用——这部分已改动".to_owned(),
+                S::CannotApply => "无法应用——此段落自审查后已被修改。".to_owned(),
                 S::OtherDocument => "此修订属于另一个文档".to_owned(),
-                S::ReviewAgain => "重新审阅".to_owned(),
+                S::ReviewAgain => "重新审查".to_owned(),
                 S::Move => "切换".to_owned(),
                 S::Copy => "复制".to_owned(),
+                S::Copied => "已将批准后的文本复制到剪贴板。".to_owned(),
+                S::Dismiss => "关闭提示".to_owned(),
+                S::Hunk(n) => format!("修订片段 {n}"),
                 S::Proposed => "建议的文本".to_owned(),
             },
         }
@@ -374,6 +387,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
     // reads it.
     sync_session(&hunks.get_untracked(), now);
     bind_keys(&state, heat);
+    bind_busy_escape(&state);
     watch_proposal(hunks, now);
     watch_heat(hunks, now, heat);
 
@@ -426,6 +440,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
             move || {
                 let state = cancel_state.clone();
                 view()
+                    .test_id("revision-busy")
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_3))
@@ -433,8 +448,12 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                     .child(prims::quiet_action(
                         "revision-cancel",
                         i18n::t(language, Key::Cancel),
-                        move || review::cancel_revision(&state),
+                        move || {
+                            review::cancel_revision(&state);
+                            state.focus_editor();
+                        },
                     ))
+                    .child(prims::kbd("Esc"))
             },
         ))
         // The hunks, the current one docked in the reading position: the
@@ -518,14 +537,10 @@ fn outcome(state: AppState, language: Language) -> impl IntoElement {
             },
             move || {
                 let state = close_state.clone();
-                prims::quiet_action(
-                    "revision-dismiss",
-                    i18n::t(language, Key::Close),
-                    move || {
-                        dismiss(&state);
-                        state.focus_editor();
-                    },
-                )
+                prims::quiet_action("revision-dismiss", S::Dismiss.text(language), move || {
+                    dismiss(&state);
+                    state.focus_editor();
+                })
             },
         ))
 }
@@ -799,7 +814,7 @@ fn one_line(
 ) -> impl IntoElement {
     let word = move || hunk.with(|hunk| format!("{}", hunk.ordinal + 1));
     let label =
-        move || hunk.with(|hunk| SharedString::from(format!("Revision hunk {}", hunk.ordinal + 1)));
+        move || hunk.with(|hunk| SharedString::from(S::Hunk(hunk.ordinal + 1).text(language)));
     let digest_text = move || {
         let decided = hunk.with(|hunk| now.with(|now| now.decision(hunk.change_id)));
         let digest_line = hunk.with(|hunk| digest(&hunk.rationale, DIGEST_CHARS));
@@ -925,9 +940,11 @@ fn decisions(
             view()
                 .flex_row()
                 .items_center()
-                .justify_end()
+                .justify_start()
                 .w_full()
                 .gap(px(SPACE_3))
+                // `Done` first: the field's one next action leads its footer.
+                .child(done_action(done_state, language, hunks, now))
                 .child(copy_action(copy_state, language))
                 .child(prims::quiet_action(
                     "revision-close",
@@ -936,10 +953,7 @@ fn decisions(
                         close_state.close_review();
                         close_state.focus_editor();
                     },
-                ))
-                // `Done` is the one next action only once nothing is left to
-                // judge; while hunks wait it stays the quiet one.
-                .child(done_action(done_state, language, hunks, now)),
+                )),
         )
 }
 
@@ -959,7 +973,7 @@ fn copy_action(state: AppState, language: Language) -> impl IntoElement {
             .py(px(4.0))
             .hover(|s| s.text_color(|| tokens::palette().ink).underline())
             .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
-            .on_press(move || copy_approved(&state)),
+            .on_press(move || copy_approved(&state, language)),
     )
     .child(
         text(label)
@@ -1046,20 +1060,48 @@ fn key_hints(language: Language) -> impl IntoElement {
 
 /// `A` / `R` decide the current hunk, `J` / `K` move between them, and
 /// `Ctrl+Z` takes the last decision back — all while no text input has the
-/// keyboard focus, so the document stays fully editable. They do nothing
-/// without a proposal, so they may stay bound; `Done`'s own key has a side
-/// effect with none, and is bound by [`bind_done_key`] only where it applies.
+/// keyboard focus, so the document stays fully editable. The bindings exist
+/// only while a proposal is on screen: with no hunks there is nothing for
+/// them to do.
 fn bind_keys(state: &AppState, heat: Heat) {
-    let keys = state.clone();
-    on_key("a", move |_| decide(&keys, heat, true));
-    let keys = state.clone();
-    on_key("r", move |_| decide(&keys, heat, false));
-    let keys = state.clone();
-    on_key("j", move |_| move_by(&keys, 1));
-    let keys = state.clone();
-    on_key("k", move |_| move_by(&keys, -1));
-    let keys = state.clone();
-    on_key("ctrl+z", move |_| undo_decision(&keys));
+    let state = state.clone();
+    effect(move || {
+        if state.revision_hunks.get().is_empty() {
+            return;
+        }
+        let keys = state.clone();
+        on_key("a", move |_| decide(&keys, heat, true));
+        let keys = state.clone();
+        on_key("r", move |_| decide(&keys, heat, false));
+        let keys = state.clone();
+        on_key("j", move |_| move_by(&keys, 1));
+        let keys = state.clone();
+        on_key("k", move |_| move_by(&keys, -1));
+        let keys = state.clone();
+        on_key("ctrl+z", move |_| undo_decision(&keys));
+    });
+}
+
+/// `Esc` cancels a Revision in flight, wherever the focus is.
+fn bind_busy_escape(state: &AppState) {
+    let state = state.clone();
+    effect(move || {
+        if !state.revision_busy.get() {
+            return;
+        }
+        let keys = state.clone();
+        on_key_with(
+            "escape",
+            KeyOptions {
+                when: When::Always,
+                ..KeyOptions::default()
+            },
+            move |_| {
+                review::cancel_revision(&keys);
+                keys.focus_editor();
+            },
+        );
+    });
 }
 
 /// Whether `Ctrl+Enter` is `Done` (else it is `Review`,
@@ -1166,9 +1208,14 @@ pub(crate) fn done(state: &AppState) {
 
 /// `Copy`: the approved result on the clipboard. Nothing else changes — not
 /// the editor, not the dirty flag, not the file.
-fn copy_approved(state: &AppState) {
+fn copy_approved(state: &AppState, language: Language) {
     if let Some(text) = state.revision_approved_text() {
         set_clipboard(text.to_string());
+        state.notify_at(
+            crate::state::StatusSurface::Review,
+            crate::state::StatusKind::Success,
+            S::Copied.text(language),
+        );
     }
 }
 
@@ -1484,7 +1531,7 @@ mod tests {
             .expect("start the field");
         app.wait_for("id:revision-proposal-blocked")
             .expect("the edited hunk says it cannot apply");
-        assert!(app.shows("Can't apply — this part changed"));
+        assert!(app.shows(&S::CannotApply.text(Language::English)));
         assert!(
             app.screen()
                 .matches("id:revision-accept")
@@ -1504,7 +1551,7 @@ mod tests {
         app.press_key("j").expect("press J");
         app.wait_for("id:revision-accept")
             .expect("the untouched hunk can be accepted");
-        assert!(!app.shows("Can't apply — this part changed"));
+        assert!(!app.shows(&S::CannotApply.text(Language::English)));
     }
 
     /// The two-change proposal, then another document comes on screen.
@@ -1710,10 +1757,60 @@ mod tests {
         // `Done` is reachable without the mouse: the key runs it, keeping
         // the accepted change and discarding the one still undecided.
         app.press_key("ctrl+enter").expect("press Ctrl+Enter");
-        app.wait_for("text:Approved changes applied to the buffer.")
+        app.wait_for("text:/^Approved changes applied to the document/")
             .expect("Done ran from the keyboard");
         app.wait_for("text:1 not applied")
             .expect("the undecided hunk was discarded, not written");
+    }
+
+    /// The field with the status line beside it, for `Copy`'s feedback.
+    #[component]
+    fn CopyStatusProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let status_state = state.clone();
+        view()
+            .flex_col()
+            .child(text(move || status_state.status.get().text.clone()).test_id("status-line"))
+            .child(field(state, Language::English))
+    }
+
+    #[test]
+    fn copy_reports_its_status() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<CopyStatusProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-copy").expect("the copy action");
+        app.press("id:revision-copy").expect("press Copy");
+        app.wait_for("text:Approved result copied to the clipboard.")
+            .expect("Copy reports its status");
+    }
+
+    /// A surface with nothing to decide: a Revision in flight, no hunks.
+    #[component]
+    fn BusyEscapeProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        state.revision_busy.set(true);
+        let open_state = state.clone();
+        view()
+            .child(when(
+                move || is_open(&open_state),
+                move || field(state.clone(), Language::English),
+            ))
+            .child(text("probe-tail"))
+    }
+
+    #[test]
+    fn escape_cancels_a_busy_revision_and_its_row_shows_the_hint() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<BusyEscapeProbe>())).expect("start");
+        app.wait_for("id:revision-busy").expect("the busy row");
+        assert!(app.shows("Esc"), "the busy row carries the Esc hint");
+        app.press_key("escape").expect("press Esc");
+        app.wait_for_gone("id:revision-field", Duration::from_secs(2))
+            .expect("the cancelled revision left the field");
+        app.wait_for("text:probe-tail").expect("the probe's tail");
     }
 
     /// A surface that routes on `is_open`, as the shell does.
@@ -1933,7 +2030,7 @@ mod tests {
         app.wait_for("text:Revision failed: Timed out after 60 s")
             .expect("the failure is on screen");
         app.wait_for("id:revision-dismiss").expect("a way out");
-        app.press("text:Close").expect("dismiss");
+        app.press("id:revision-dismiss").expect("dismiss");
         app.wait_for("text:probe-tail").expect("the probe's tail");
         assert!(
             !app.shows("Revision failed: Timed out after 60 s"),
@@ -1972,7 +2069,7 @@ mod tests {
             app.screen().texts()
         );
         assert!(
-            !app.shows("Run Review first to prepare a Revision."),
+            !app.shows(crate::state::flow_copy::S::RevisionUnavailable.text(Language::English)),
             "and `Done` did not claim the key: {:?}",
             app.screen().texts()
         );
@@ -2370,7 +2467,7 @@ mod tests {
         app.wait_for(&format!("text:{applied}"))
             .expect("the accepted hunk is in the buffer");
         app.press_key("ctrl+enter").expect("press Ctrl+Enter");
-        app.wait_for("text:Approved changes applied to the buffer.")
+        app.wait_for("text:/^Approved changes applied to the document/")
             .expect("Done ran");
         assert_eq!(
             app.screen()

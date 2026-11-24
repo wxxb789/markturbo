@@ -493,7 +493,7 @@ pub fn model_request_disclosure(language: Language, disclosure: &ModelRequestDis
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "范围：文档及 Effective Agent Context，{} UTF-8 文档字节\nContext 来源：\n{sources}",
+                "范围：文档及有效智能体上下文，{} UTF-8 文档字节\n上下文来源：\n{sources}",
                 disclosure.scope().primary_content_byte_size()
             )
         }
@@ -549,7 +549,7 @@ pub fn model_request_disclosure(language: Language, disclosure: &ModelRequestDis
             .join("\n");
         match language {
             Language::English => format!("{scope}\nEffective Agent Context sources:\n{sources}"),
-            Language::Chinese => format!("{scope}\nEffective Agent Context 来源：\n{sources}"),
+            Language::Chinese => format!("{scope}\n有效智能体上下文来源：\n{sources}"),
         }
     } else {
         scope

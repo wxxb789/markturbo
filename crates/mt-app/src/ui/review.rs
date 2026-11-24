@@ -49,8 +49,14 @@ use crate::{
 };
 
 /// Whether the field is showing a review, or explaining why it cannot.
+/// Results belong to their tab: a result whose tab is not the active one is
+/// hidden, and switching back shows it again.
 pub fn is_open(state: &AppState) -> bool {
-    state.review_open.get() || state.review_unavailable.get().is_some()
+    let belongs = state
+        .review_view
+        .get()
+        .is_none_or(|view| view.tab_id.is_none() || view.tab_id == state.active.get());
+    (state.review_open.get() && belongs) || state.review_unavailable.get().is_some()
 }
 
 /// The review field.
@@ -132,6 +138,19 @@ fn focus_request() -> Signal<Option<Focus>> {
 /// next step of the executor.
 fn focus_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
+}
+
+/// Which state takes the keyboard when a result arrives. A question never
+/// takes it from the source editor the user is typing in; without that focus
+/// it is the field's one next action (`Prepare revision`, `Review again`, or
+/// the question itself).
+fn arrival_focus(stale: bool, current: Option<usize>, editor_focused: bool) -> Option<Focus> {
+    match (stale, current) {
+        (true, _) => Some(Focus::ReviewAgain),
+        (false, Some(_)) if editor_focused => None,
+        (false, Some(index)) => Some(Focus::Answer(index)),
+        (false, None) => Some(Focus::Prepare),
+    }
 }
 
 fn focus_soon(reference: ElementRef) {
@@ -238,11 +257,14 @@ fn observe(state: &AppState, session: Signal<Session>) {
                 // until `J`/`K` (or the stepper) steps to a finding.
                 glow::focus_finding(None);
                 level_finding(&state, view.tab_id, 0, true);
-                focus_request().set(Some(match (view.stale, current) {
-                    (true, _) => Focus::ReviewAgain,
-                    (false, Some(index)) => Focus::Answer(index),
-                    (false, None) => Focus::Prepare,
-                }));
+                // A result must not take the keyboard from the source
+                // editor: while the user is typing there, the question waits
+                // for a press instead.
+                focus_request().set(arrival_focus(
+                    view.stale,
+                    current,
+                    state.source_editor_focused.get_untracked(),
+                ));
             }
             None => {
                 emitters.set(Emitters::default());
@@ -292,10 +314,12 @@ fn keys(state: &AppState, session: Signal<Session>) {
                 if state.review_busy.get_untracked() {
                     session.update(|session| session.cancelled = true);
                     state.cancel_review_in_flight();
-                } else if session.get_untracked().view.is_none()
-                    && state.review_consent.get_untracked().is_none()
+                    state.focus_editor();
+                } else if state.review_consent.get_untracked().is_none()
+                    && state.translation_consent.get_untracked().is_none()
                 {
                     state.close_review();
+                    state.focus_editor();
                 }
             }
         },
@@ -884,6 +908,7 @@ fn current_question_block(
                 SharedString::from(question.question),
                 answer,
                 index,
+                state.source_editor_focused,
                 submit.clone(),
             ))
             .child(
@@ -1285,6 +1310,7 @@ fn empty(language: Language) -> impl IntoElement {
 /// Why Review cannot run, with the one way forward that can help.
 fn unavailable(state: AppState, language: Language, reason: ReviewUnavailable) -> impl IntoElement {
     let action_state = state.clone();
+    let retry_state = state.clone();
     let close = state.clone();
     let (headline, hint, label, opens_settings) = match reason {
         ReviewUnavailable::NotSetUp => (
@@ -1300,6 +1326,29 @@ fn unavailable(state: AppState, language: Language, reason: ReviewUnavailable) -
             false,
         ),
     };
+    let mut actions =
+        view()
+            .flex_row()
+            .items_center()
+            .gap(px(SPACE_4))
+            .child(prims::primary_action(
+                "review-open-settings",
+                label,
+                move || {
+                    if opens_settings {
+                        action_state.open_settings();
+                    } else {
+                        action_state.start_review();
+                    }
+                },
+            ));
+    if reason == ReviewUnavailable::NotSetUp {
+        actions = actions.child(prims::quiet_action(
+            "review-again",
+            s(S::TryAgain, language),
+            move || retry_state.start_review(),
+        ));
+    }
     view()
         .test_id("review-unavailable")
         .pt(px(SPACE_XL))
@@ -1308,31 +1357,14 @@ fn unavailable(state: AppState, language: Language, reason: ReviewUnavailable) -
         .gap(px(SPACE_3))
         .child(prims::ink(headline))
         .child(prims::rest(hint))
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap(px(SPACE_4))
-                .child(prims::primary_action(
-                    "review-open-settings",
-                    label,
-                    move || {
-                        if opens_settings {
-                            action_state.open_settings();
-                        } else {
-                            action_state.start_review();
-                        }
-                    },
-                ))
-                .child(prims::quiet_action(
-                    "review-close",
-                    s(S::Close, language),
-                    move || {
-                        close.close_review();
-                        close.focus_editor();
-                    },
-                )),
-        )
+        .child(actions.child(prims::quiet_action(
+            "review-close",
+            s(S::Close, language),
+            move || {
+                close.close_review();
+                close.focus_editor();
+            },
+        )))
 }
 
 // ─── copy ────────────────────────────────────────────────────────────────
@@ -1396,7 +1428,9 @@ fn s(key: S, language: Language) -> &'static str {
             S::Cancelled => "Cancelled — nothing changed.",
             S::Stale => "Text changed since this review",
             S::NoModelSetUp => "No model set up",
-            S::NoModelHint => "Add a provider and an API key in Settings, then run Review again.",
+            S::NoModelHint => {
+                "Choose a wire format and enter an API credential in Settings, then run Review again."
+            }
             S::OpenSettings => "Open settings",
             S::CouldNotPrepare => "Couldn't prepare the request",
             S::CouldNotPrepareHint => {
@@ -1410,11 +1444,13 @@ fn s(key: S, language: Language) -> &'static str {
             S::StepThrough => "to step through",
             S::StepFindings => "Next finding",
             S::StepFindingsBack => "Previous finding",
-            S::CouldNotRead => "Couldn't read the response — Try again",
+            S::CouldNotRead => {
+                "The model returned an invalid response. Nothing was changed — try again."
+            }
             S::PartialHint => {
                 "A supporting file of the package was not sent; this result does not cover it."
             }
-            S::Empty => "No review result yet.",
+            S::Empty => "No review result yet. Run Review to inspect this document.",
         },
         Language::Chinese => match key {
             S::Lens => "视角",
@@ -1434,7 +1470,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::Cancelled => "已取消——没有任何更改。",
             S::Stale => "审查后文本已更改",
             S::NoModelSetUp => "未配置模型",
-            S::NoModelHint => "请在设置中添加服务商和 API 密钥，然后重新运行审查。",
+            S::NoModelHint => "请在“设置”中选择协议格式并配置 API 凭据，然后重新运行审查。",
             S::OpenSettings => "打开设置",
             S::CouldNotPrepare => "无法准备请求",
             S::CouldNotPrepareHint => "此文档及其上下文无法构成审查请求。",
@@ -1446,9 +1482,9 @@ fn s(key: S, language: Language) -> &'static str {
             S::StepThrough => "切换",
             S::StepFindings => "下一个发现",
             S::StepFindingsBack => "上一个发现",
-            S::CouldNotRead => "无法读取响应——请重试",
+            S::CouldNotRead => "模型返回了无效响应，文档未做任何更改——请重试。",
             S::PartialHint => "包中有支持文件未发送；此结果未涵盖该文件。",
-            S::Empty => "暂无审查结果。",
+            S::Empty => "暂无审查结果。运行“审查”以检查此文档。",
         },
     }
 }
@@ -1473,7 +1509,10 @@ fn step_hint(findings: usize, language: Language) -> String {
             1 => "1 finding".to_owned(),
             _ => format!("{findings} findings"),
         },
-        Language::Chinese => format!("{findings} 个发现"),
+        Language::Chinese => match findings {
+            0 => "没有发现".to_owned(),
+            _ => format!("{findings} 个发现"),
+        },
     }
 }
 
@@ -1636,16 +1675,20 @@ fn answer_field(
     label: SharedString,
     answer: Signal<String>,
     index: usize,
+    editor_focused: Signal<bool>,
     submit: impl Fn() + 'static,
 ) -> impl ParentElement {
     // The field takes the focus when its state is entered — never on a plain
     // rebuild, which would take it from `J`/`K` (or the stepper) on every
-    // step.
+    // step — and never while the user is typing in the source editor.
     let reference = element_ref();
     let focus_reference = reference;
     effect(move || {
         if focus_request().get() == Some(Focus::Answer(index)) {
             focus_request().set(None);
+            if editor_focused.get_untracked() {
+                return;
+            }
             focus_soon(focus_reference);
         }
     });
@@ -1818,7 +1861,7 @@ mod tests {
                 && nodes.iter().any(|node| {
                     node.text
                         .as_ref()
-                        .is_some_and(|text| text.text.text == "No review result yet.")
+                        .is_some_and(|text| text.text.text == s(S::Empty, Language::English))
                 }),
             "the idle review field names its empty state"
         );
@@ -1838,7 +1881,7 @@ mod tests {
                 && nodes.iter().any(|node| {
                     node.text
                         .as_ref()
-                        .is_some_and(|text| text.text.text == "No review result yet.")
+                        .is_some_and(|text| text.text.text == s(S::Empty, Language::English))
                 })
                 && !nodes
                     .iter()
@@ -2939,6 +2982,111 @@ mod tests {
             )
     }
 
+    /// A result with one question waiting.
+    fn questioned_view() -> ReviewView {
+        ReviewView {
+            sections: vec![crate::state::ReviewSection {
+                title: "Stated goal".to_owned(),
+                items: vec!["one".to_owned()],
+            }],
+            questions_detail: vec![ReviewQuestionView {
+                priority: ClarificationPriority::High,
+                question: "Which one?".to_owned(),
+                impact: None,
+            }],
+            ..ReviewView::default()
+        }
+    }
+
+    /// The whole room over a document; the result arrives the moment the
+    /// source editor takes the keyboard, as a slow provider's answer would.
+    #[component]
+    fn ArrivalDuringTypingProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        if let Some(tab) = state.active_tab() {
+            tab.text.set(SharedString::from(
+                "probe
+",
+            ));
+        }
+        state.review_open.set(true);
+        state
+            .revision_questions
+            .set(vec![crate::state::RevisionQuestionView {
+                ordinal: 0,
+                question: "Which one?".to_owned(),
+                priority: format!("{:?}", ClarificationPriority::High),
+                answer: signal(String::new()),
+            }]);
+        let arrive = state.clone();
+        effect(move || {
+            if arrive.source_editor_focused.get() {
+                arrive.review_view.set(Some(questioned_view()));
+            }
+        });
+        let text_state = state.clone();
+        view()
+            .flex_col()
+            .h(relative(1.0))
+            .child(
+                text(move || {
+                    if text_state
+                        .active_tab()
+                        .is_some_and(|tab| tab.text.get().contains('q'))
+                    {
+                        "typed"
+                    } else {
+                        "untouched"
+                    }
+                })
+                .test_id("editor-state"),
+            )
+            .child(crate::ui::shell::shell(
+                state,
+                Language::English,
+                crate::ui::tokens::Layout::Wide,
+            ))
+    }
+
+    #[test]
+    fn an_arriving_result_does_not_steal_the_keyboard_from_the_editor() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ArrivalDuringTypingProbe>()))
+            .expect("start the shell");
+        app.set_viewport(Size {
+            width: Points(1440.0),
+            height: Points(900.0),
+        })
+        .expect("a 1440x900 window");
+        app.first_render().expect("first render");
+        app.wait_for("label:Markdown source").expect("the editor");
+        app.type_text("label:Markdown source", "x")
+            .expect("type in the editor");
+        app.wait_for("id:review-question")
+            .expect("the result arrives while the editor holds the keyboard");
+        app.settle();
+        app.press_key("q").expect("keep typing");
+        app.wait_for("text:typed")
+            .expect("the editor kept the keyboard");
+        let answer = app
+            .screen()
+            .input_text("id:review-answer-input")
+            .expect("the answer input")
+            .expect("the answer field is on screen");
+        assert!(
+            answer.is_empty(),
+            "the question did not take the character: {answer:?}"
+        );
+    }
+
+    #[test]
+    fn arrival_focus_never_takes_the_keyboard_from_the_editor() {
+        assert_eq!(arrival_focus(false, Some(2), true), None);
+        assert_eq!(arrival_focus(false, Some(2), false), Some(Focus::Answer(2)));
+        assert_eq!(arrival_focus(true, Some(2), true), Some(Focus::ReviewAgain));
+        assert_eq!(arrival_focus(false, None, true), Some(Focus::Prepare));
+    }
+
     /// Preparing a review supersedes whatever was in flight: the loading flag
     /// its task would have cleared goes straight away, so an early return
     /// (no request can be prepared in this probe) cannot leave the field
@@ -2960,5 +3108,88 @@ mod tests {
             "false:1",
             "the superseded loading state must go with its request"
         );
+    }
+
+    /// The unavailable state with no configured model: Settings leads, and
+    /// `Try again` stays reachable beside it.
+    #[component]
+    fn NotSetUpReviewProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.review_open.set(true);
+        state
+            .review_unavailable
+            .set(Some(ReviewUnavailable::NotSetUp));
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(field(state, Language::English))
+    }
+
+    #[test]
+    fn no_model_set_up_offers_try_again_and_settings() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<NotSetUpReviewProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:review-open-settings")
+            .expect("the Settings action");
+        app.wait_for("id:review-again")
+            .expect("the Try again action");
+        assert!(
+            app.shows(s(S::TryAgain, Language::English)),
+            "Try again is rendered"
+        );
+    }
+
+    /// The whole room over a review result, for the Escape focus round-trip.
+    #[component]
+    fn EscapeFocusProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        if let Some(tab) = state.active_tab() {
+            tab.text.set(SharedString::from("probe\n"));
+        }
+        state.review_view.set(Some(ReviewView::default()));
+        state.review_open.set(true);
+        let text_state = state.clone();
+        view()
+            .flex_col()
+            .h(relative(1.0))
+            .child(
+                text(move || {
+                    if text_state
+                        .active_tab()
+                        .is_some_and(|tab| tab.text.get().contains('q'))
+                    {
+                        "typed"
+                    } else {
+                        "untouched"
+                    }
+                })
+                .test_id("escape-editor-state"),
+            )
+            .child(crate::ui::shell::shell(
+                state,
+                Language::English,
+                crate::ui::tokens::Layout::Wide,
+            ))
+    }
+
+    #[test]
+    fn escape_closes_the_result_and_returns_focus_to_the_editor() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<EscapeFocusProbe>()))
+            .expect("start the shell");
+        app.set_viewport(Size {
+            width: Points(1440.0),
+            height: Points(900.0),
+        })
+        .expect("a 1440x900 window");
+        app.first_render().expect("first render");
+        app.wait_for("id:review-empty").expect("the result field");
+        app.press_key("escape").expect("close the review");
+        app.wait_for_gone("id:review-field", Duration::from_secs(2))
+            .expect("the field closed");
+        app.press_key("q").expect("type into the focused editor");
+        app.wait_for("text:typed")
+            .expect("the source buffer receives the character");
     }
 }

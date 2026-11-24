@@ -48,7 +48,7 @@ REVIEW_RESULT_MARKER = "Understood:"
 REVIEW_ANSWER_INPUT_AUTOMATION_ID = "review-answer-input"
 REVIEW_ANSWER_AUTOMATION_ID = "review-answer-submit"
 PREPARE_REVISION_AUTOMATION_ID = "review-prepare"
-# `ui/consent.rs` `send_button`: only a pointer hold past `HOLD_MS` sends.
+# `ui/consent.rs` `send_button`: only a pointer hold past `FILAMENT_CHARGE_MS` sends.
 CONSENT_SEND_AUTOMATION_ID = "consent-send"
 CONSENT_HOLD_SECONDS = 1.8
 # How long a request may take to reach the loopback after its consent hold

@@ -62,6 +62,9 @@ fn start(provider: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
         std::env::set_var("CODEX_HOME", config.path().join("codex"));
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
+    // Synthetic keys never reach the platform's key state or thread hook: the
+    // harness drives the hold's keyboard source as physically held.
+    mt_app::ui::consent::test_harness::held_keys();
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
     engine.environment.os = Os::Windows;
     engine.environment.idiom = Idiom::Desktop;

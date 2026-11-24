@@ -29,8 +29,6 @@ pub const AFTERIMAGE_MS: f32 = 1200.0;
 pub const EMBER: f32 = 0.18;
 /// The filament's charge (hold to send), linear from dull red to white.
 pub const FILAMENT_CHARGE_MS: f32 = 900.0;
-/// Consent's 1.2s threshold (`docs/verification.md`) exceeds [`FILAMENT_CHARGE_MS`].
-pub const FILAMENT_HOLD_MS: f32 = 1_200.0;
 /// Its release: decay toward dull, tau 250ms.
 pub const FILAMENT_RELEASE_TAU_MS: f32 = 250.0;
 pub const FILAMENT_COOL_MS: f32 = 3.0 * FILAMENT_RELEASE_TAU_MS;

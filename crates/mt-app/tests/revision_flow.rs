@@ -325,7 +325,7 @@ fn partial_accept_records_the_final_split_once() {
         .expect("the second hunk stays rejected");
     app.press("label:Done")
         .expect("apply the approved revision");
-    app.wait_for("text:Approved changes applied to the buffer.")
+    app.wait_for("text:/^Approved changes applied to the document/")
         .expect("apply status");
     // Save through the title row's menu: the applied revision lands on disk.
     app.press("id:title-settings").expect("open the menu");
@@ -653,7 +653,7 @@ fn decisions_write_at_once_and_undo_restores_the_exact_text() {
         .expect("written again");
     app.wait_for("text:1 of 2 decided").expect("one decided");
     app.press_key("ctrl+enter").expect("Done");
-    app.wait_for("text:Approved changes applied to the buffer.")
+    app.wait_for("text:/^Approved changes applied to the document/")
         .expect("Done keeps the accepted change");
     app.wait_for("text:1 not applied")
         .expect("Done reports the undecided hunk as not applied");
@@ -707,7 +707,7 @@ fn rejecting_every_hunk_then_done_keeps_the_exact_bytes() {
     );
 
     app.press_key("ctrl+enter").expect("Done");
-    app.wait_for("text:No changes approved.")
+    app.wait_for("text:/^No changes were approved/")
         .expect("Done with nothing approved");
     assert!(
         app.shows(&bytes) && app.shows("Dirty: false"),
@@ -772,7 +772,7 @@ fn an_edit_between_decisions_refuses_the_undo_it_would_corrupt() {
     // Undo the first: the user edited it since, so the undo is refused with
     // a message and nothing is written over the edit.
     app.press_key("ctrl+z").expect("undo the edited accept");
-    app.wait_for("text:Can't undo — this part was edited after it was accepted.")
+    app.wait_for("text:Can't undo — this section was edited after the change was accepted.")
         .expect("the refusal says why");
     assert!(
         buffer_shows(&app, "Re-vised\nUnchanged\n") && app.shows("1 of 2 decided"),
@@ -793,6 +793,10 @@ fn copy_exports_only_the_approved_result_and_saves_nothing() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let source = "Original\nUnchanged\n";
     let (mut app, document, _directory, _config) = start_field_over_buffer(source);
+    // The footer's actions lead with `Done`: a phone-width window would clip
+    // the trailing ones, so the whole row is judged at a desktop size.
+    app.set_viewport(nsh_core::Size::new(px(1440.0), px(900.0)))
+        .expect("wide viewport");
 
     // One button, found by its id and named for a screen reader.
     assert_eq!(
@@ -861,7 +865,7 @@ fn an_edit_over_every_hunk_keeps_accept_disabled_and_done_writes_nothing() {
         .expect("type over the document");
     app.wait_for(&format!("text:Buffer: {REPLACEMENT}"))
         .expect("the user's text is in the buffer");
-    app.wait_for("text:Can't apply — this part changed")
+    app.wait_for("text:Can't apply — this section was edited since the review.")
         .expect("the docked hunk says it can't apply");
     assert!(
         app.screen()
@@ -879,7 +883,7 @@ fn an_edit_over_every_hunk_keeps_accept_disabled_and_done_writes_nothing() {
     app.settle();
     assert!(
         app.shows("0 of 2 decided")
-            && app.shows("Can't apply — this part changed")
+            && app.shows("Can't apply — this section was edited since the review.")
             && app
                 .screen()
                 .matches("id:revision-accept")
@@ -893,7 +897,7 @@ fn an_edit_over_every_hunk_keeps_accept_disabled_and_done_writes_nothing() {
     );
 
     app.press_key("ctrl+enter").expect("Done");
-    app.wait_for("text:No changes approved.")
+    app.wait_for("text:/^No changes were approved/")
         .expect("Done with nothing approved");
     assert!(
         buffer_shows(&app, REPLACEMENT),
