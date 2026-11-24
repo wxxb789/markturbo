@@ -102,8 +102,14 @@ These override any conflicting text in the motion direction below.
    amendment 2's cases.
 5. **Order after Goal 22.**
    - Goal 21 starts after Goal 22, because Goal 22 replaces the dot rail with a persistent file sidebar.
+   - Before any lane starts, the owner picks one of three distinct interactive HTML motion prototypes (owner rule,
+     2026-11-24). The chosen direction refines the motion spec below.
    - Fixes 4 and 11 and lane 21-C's rail widen and collapse apply to the sidebar's collapse and expand.
    - The frame scenario "rail widen and collapse" becomes "sidebar collapse and expand".
+   - If a scenario is instant in the baseline, it has no animation-window frames to compare. Two measures replace the
+     p95 comparison for it:
+     - **Toggle latency:** from input to the first presented frame of the new state. After p95 ≤ before p95 + 1 ms.
+     - **Absolute bound:** no frame above 33 ms inside the after build's animation window.
 
 ---
 

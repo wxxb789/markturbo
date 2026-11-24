@@ -149,6 +149,14 @@ These override any conflicting text in the advisor body below.
       `KeyUp` events (`nsh-platform-windows` `keyboard.rs`) wherever the focus is.
     - The silence timer (`KEY_ALIVE_MS`) may still end a hold whose release went unobserved. It never authorizes.
     - Test: press at 0 ms, an auto-repeat at 500 ms, a `KeyUp` at 550 ms. Nothing is sent at 900 ms or later.
+    - `KeyUp` reaches only a focused custom view, while `Ctrl+Enter` is focus-independent: a native text input can hold
+      the focus.
+      - So at the authorization moment, confirm through a platform key-state query that `Enter` and the modifier are
+        still physically down. On Windows, `GetAsyncKeyState` for `VK_RETURN` and `VK_CONTROL`.
+      - Unconfirmed means no send. Where no reliable query exists (the non-Windows compatibility targets), keyboard
+        holds never authorize, and the pointer hold remains.
+    - Test through an injectable key-state source: a key reported up at 900 ms with the text input focused sends
+      nothing; a key reported down sends exactly once.
 12. **Undo commit boundary (amends Done when 4 and amendment 2).**
     - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
       pending slot. When the slot is taken, the older action's Undo ends at the same moment.
