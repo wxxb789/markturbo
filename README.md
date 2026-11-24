@@ -118,9 +118,9 @@ an upgrade path.
    struck through until you decide it.
    **Copy** puts the approved text on the clipboard. **Done** (`Ctrl+Enter`)
    keeps the decisions as written and reports undecided changes as **not
-   applied**. Nothing is saved; save with **⚙ → Save**. Every write of an
-   accepted or undone change first returns the tab to **Restricted** Web
-   scripts.
+   applied**. Nothing is saved automatically; press `Ctrl+S` or choose **⚙ →
+   Save**. Every write of an accepted or undone change first returns the tab
+   to **Restricted** Web scripts.
 
 If you edit the document after sending, the result is marked **Stale — edited
 after review** and offers **Review again**.
@@ -448,6 +448,7 @@ link-open check is
 |---|---|---|
 | Anywhere | mod+`Enter` | Review (not while a review is running, a card is open, or a revision is pending) |
 | Anywhere | mod+`O` / mod+`N` | Open folder / new file |
+| Anywhere | mod+`S` | Save |
 | Anywhere | mod+`Shift+S` | Save As |
 | Anywhere | mod+`P` / mod+`Shift+F` | Find a file / search files |
 | Anywhere | mod+`W` | Close the tab |
@@ -460,8 +461,8 @@ link-open check is
 | Close guard | `Left` / `Right` / `Tab`, `Enter`, `Esc` | Move, choose, cancel |
 | Compare | `J` / `K`, `Esc` | Next / previous difference, close |
 
-There is no `Ctrl+S`; save from the ⚙ menu. The source editor
-provides native undo/redo, clipboard, and IME.
+`Ctrl+S` saves the active document; the ⚙ menu also carries Save As… and
+Quit. The source editor provides native undo/redo, clipboard, and IME.
 
 The table describes the bindings in the code, not accepted behavior: native
 keyboard and screen-reader acceptance is still pending.

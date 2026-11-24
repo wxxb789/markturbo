@@ -85,10 +85,10 @@ fn a_missing_recent_is_marked_disabled_and_opens_nothing() {
     );
     assert!(
         app.screen()
-            .count("id:welcome-recent >> text:Missing")
+            .count("id:welcome-recent-row >> text:Missing \u{00B7} Remove")
             .expect("selector")
             == 1,
-        "the missing row reads Missing on screen: {texts}"
+        "the missing row offers Missing \u{00B7} Remove on screen: {texts}"
     );
     assert!(
         !app.screen()
@@ -114,6 +114,21 @@ fn a_missing_recent_is_marked_disabled_and_opens_nothing() {
     );
     app.wait_for("id:welcome-open-folder")
         .expect("the welcome stays");
+
+    // The missing row's badge is one press to forget the entry.
+    app.press("id:welcome-recent-remove-0")
+        .expect("remove the missing target");
+    app.wait_until("the missing row to go", Duration::from_secs(5), |screen| {
+        screen.count("id:welcome-recent").unwrap_or(0) == 1
+    })
+    .expect("the missing row is removed");
+    support::wait_for_file(
+        &mut app,
+        &config.path().join("settings.toml"),
+        |text| !text.contains("gone.md"),
+        "the removal never reached settings.toml",
+        Duration::from_secs(10),
+    );
 
     // The present row reopens its document.
     app.press("role:button[File present.md]")
@@ -212,4 +227,42 @@ fn reopened_first(settings: &str) -> bool {
         (settings.find("note-03.md"), settings.find("note-00.md")),
         (Some(reopened), Some(first)) if reopened < first
     )
+}
+
+/// Two recents with the same file name carry their parent folders, so the
+/// rows tell the files apart.
+#[test]
+fn shared_recent_filenames_carry_their_parent_folders() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let config = tempfile::tempdir().expect("config dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let drafts = workspace.path().join("drafts");
+    let archive = workspace.path().join("archive");
+    std::fs::create_dir(&drafts).expect("drafts dir");
+    std::fs::create_dir(&archive).expect("archive dir");
+    let first = drafts.join("plan.md");
+    let second = archive.join("plan.md");
+    std::fs::write(&first, "# Drafts plan\n").expect("write first");
+    std::fs::write(&second, "# Archive plan\n").expect("write second");
+    std::fs::write(
+        config.path().join("settings.toml"),
+        format!("{}{}", recent(&first), recent(&second)),
+    )
+    .expect("write the settings");
+
+    let mut app = start(config.path());
+    app.wait_for("id:welcome-recents")
+        .expect("the recent targets");
+    assert!(
+        app.shows("drafts/plan.md"),
+        "the drafts plan is named by its folder: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        app.shows("archive/plan.md"),
+        "the archive plan is named by its folder: {:?}",
+        app.screen().texts()
+    );
 }

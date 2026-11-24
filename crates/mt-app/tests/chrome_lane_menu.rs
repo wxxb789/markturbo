@@ -32,6 +32,15 @@ fn the_menu_starts_a_new_file_and_a_pasted_document() {
         .expect("New file in the menu");
     app.wait_for("id:title-menu-paste")
         .expect("Paste as new document in the menu");
+    app.wait_for("id:title-menu-open-sample")
+        .expect("Open sample in the menu");
+    assert_eq!(
+        app.screen()
+            .count("id:title-menu-context")
+            .expect("selector"),
+        0,
+        "Context is hidden on an empty welcome"
+    );
     app.wait_for("text:New file").expect("its copy");
     app.wait_for("text:Paste as new document")
         .expect("its copy");
@@ -47,6 +56,16 @@ fn the_menu_starts_a_new_file_and_a_pasted_document() {
         1,
         "the new document is the one tab"
     );
+
+    // With a document open, the same menu offers Context and the sample.
+    app.press("id:title-settings")
+        .expect("reopen the glyph's menu");
+    app.wait_for("id:title-menu-context")
+        .expect("Context with a document open");
+    app.wait_for("id:title-menu-open-sample")
+        .expect("the sample stays reachable from a workspace");
+    app.press("id:title-settings")
+        .expect("close the glyph's menu");
 
     // The key reaches it too, with a document already open.
     app.press_key("mod+n").expect("Ctrl+N");

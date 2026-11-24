@@ -28,7 +28,7 @@ fn welcome_has_one_next_action_and_no_document_toolbar() {
     // The state's one next action, and the quiet choices under it.
     app.wait_for("id:welcome-open-folder")
         .expect("the welcome's next action");
-    app.wait_for("text:Open folder")
+    app.wait_for("text:Open folder\u{2026}")
         .expect("the next action's copy");
     for choice in [
         "id:welcome-new-file",

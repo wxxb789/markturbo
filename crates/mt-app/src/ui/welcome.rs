@@ -25,7 +25,7 @@ use nsh_core::{Color, file_dialog::OpenDialog, prelude::*};
 use crate::{
     app_paths,
     i18n::{self, Key},
-    state::{AppState, Entry, StatusMessage},
+    state::{AppState, Entry},
     ui::{
         prims,
         tokens::{
@@ -189,7 +189,7 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
             view().pt(px(SPACE_6)).child(
                 view()
                     .test_id("workspace-home-find")
-                    .child(prims::faint(s(S::FindAFile, language))),
+                    .child(prims::faint(find_a_file(language))),
             ),
         )
 }
@@ -270,78 +270,113 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                     .collect::<Vec<_>>()
             },
             |target: &RecentTarget| target.path.clone(),
-            move |target: ReadSignal<RecentTarget>, _| {
+            move |target: ReadSignal<RecentTarget>, index: ReadSignal<usize>| {
                 let target = target.get();
+                let index = index.get();
                 let state = state.clone();
                 let kind = match target.kind {
                     RecentTargetKind::Workspace => i18n::t(language, Key::Workspace),
                     RecentTargetKind::File => i18n::t(language, Key::File),
                 };
-                // A target that is gone stays listed, marked and disabled: the
-                // row says what happened rather than failing on a press.
+                let name = recent_name(&target, &state.settings.get().recent_targets);
+                // A target that is gone stays listed, marked and disabled:
+                // the row says what happened rather than failing on a press,
+                // and its badge offers one press to forget the entry.
                 let missing = !target_exists(&target);
                 let label = if missing {
-                    format!(
-                        "{kind} {} \u{2014} {}",
-                        target.display_name,
-                        s(S::Missing, language)
-                    )
+                    format!("{kind} {name} \u{2014} {}", s(S::Missing, language))
                 } else {
-                    format!("{kind} {}", target.display_name)
+                    format!("{kind} {name}")
                 };
                 let target_for_open = target.clone();
-                prims::press_feedback(
-                    view()
-                        .test_id("welcome-recent")
-                        .role(AccessibilityRole::Button)
-                        .optional_label(Some(SharedString::from(label)))
-                        .disabled(missing)
-                        .flex_row()
-                        .items_center()
-                        .gap(px(SPACE_2))
-                        .pl(px(SPACE_3))
-                        .py(px(SPACE_1))
-                        .when(!missing, |row| {
-                            row.cursor_pointer()
-                                .hover(|s| s.text_color(|| tokens::palette().ink))
-                                .focus_visible(|s| {
-                                    s.text_color(|| tokens::palette().ink).underline()
+                view()
+                    .test_id("welcome-recent-row")
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        prims::press_feedback(
+                            view()
+                                .test_id("welcome-recent")
+                                .role(AccessibilityRole::Button)
+                                .optional_label(Some(SharedString::from(label)))
+                                .disabled(missing)
+                                .flex_row()
+                                .items_center()
+                                .gap(px(SPACE_2))
+                                .pl(px(SPACE_3))
+                                .py(px(SPACE_1))
+                                .when(!missing, |row| {
+                                    row.cursor_pointer()
+                                        .hover(|s| s.text_color(|| tokens::palette().ink))
+                                        .focus_visible(|s| {
+                                            s.text_color(|| tokens::palette().ink).underline()
+                                        })
                                 })
-                        })
-                        .on_press(move || {
-                            // Checked again at the press: the target may have gone
-                            // since the row was drawn.
-                            if target_exists(&target_for_open) {
-                                state.open_recent(&target_for_open);
-                            }
-                        }),
-                )
-                .child(
-                    text(kind)
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || tokens::palette().ink_caption),
-                )
-                .child(
-                    text(target.display_name.clone())
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || {
-                            if missing {
-                                tokens::palette().ink_caption
-                            } else {
-                                tokens::palette().ink_rest
-                            }
-                        })
-                        .truncate(),
-                )
-                .when(missing, |row| {
-                    row.child(prims::faint(s(S::Missing, language)))
-                })
+                                .on_press({
+                                    let open_state = state.clone();
+                                    move || {
+                                        // Checked again at the press: the target may
+                                        // have gone since the row was drawn.
+                                        if target_exists(&target_for_open) {
+                                            open_state.open_recent(&target_for_open);
+                                        }
+                                    }
+                                }),
+                        )
+                        .child(
+                            text(kind)
+                                .font_family(FONT_UI)
+                                .text_size(px(TYPE_UI))
+                                .line_height(px(TYPE_UI_LINE))
+                                .text_color(move || tokens::palette().ink_caption),
+                        )
+                        .child(
+                            text(name)
+                                .font_family(FONT_UI)
+                                .text_size(px(TYPE_UI))
+                                .line_height(px(TYPE_UI_LINE))
+                                .text_color(move || {
+                                    if missing {
+                                        tokens::palette().ink_caption
+                                    } else {
+                                        tokens::palette().ink_rest
+                                    }
+                                })
+                                .truncate(),
+                        ),
+                    )
+                    .when(missing, {
+                        let remove_state = state.clone();
+                        let remove_target = target.clone();
+                        let remove_id = format!("welcome-recent-remove-{index}");
+                        move |row| {
+                            row.child(
+                                prims::quiet_action(
+                                    &remove_id,
+                                    s(S::MissingRemove, language),
+                                    move || remove_state.remove_recent_target(&remove_target.path),
+                                )
+                                .pr(px(SPACE_3)),
+                            )
+                        }
+                    })
             },
         ))
+}
+
+/// The name a recent row shows: plain, unless two entries share it, in which
+/// case each carries its parent folder (`drafts/plan.md`).
+fn recent_name(target: &RecentTarget, entries: &[RecentTarget]) -> String {
+    let shared = entries
+        .iter()
+        .filter(|other| other.display_name == target.display_name)
+        .count();
+    if shared > 1
+        && let Some(folder) = target.path.parent().and_then(|parent| parent.file_name())
+    {
+        return format!("{}/{}", folder.to_string_lossy(), target.display_name);
+    }
+    target.display_name.clone()
 }
 
 /// Whether a recent target is still there, as the kind it was recorded as.
@@ -355,6 +390,7 @@ fn target_exists(target: &RecentTarget) -> bool {
 /// Shows the system's folder picker and opens what the user picks; a cancel
 /// opens nothing. The chrome lane's title menu shares this flow.
 pub(crate) fn choose_folder(state: AppState) {
+    let language = state.settings.get().language;
     let picked = pick_paths(OpenDialog::folders().multiple(false));
     spawn(async move {
         match picked.await {
@@ -364,11 +400,26 @@ pub(crate) fn choose_folder(state: AppState) {
                 }
             }
             Ok(None) => {}
-            Err(why) => state
-                .status
-                .set(StatusMessage::plain(format!("Folder picker failed: {why}"))),
+            Err(why) => state.notify_error(picker_failed(language, &why)),
         }
     });
+}
+
+/// `{mod+P} finds any file in this folder.`, with the platform's modifier.
+fn find_a_file(language: Language) -> String {
+    let key = crate::ui::titlebar::shortcut(false, "P");
+    match language {
+        Language::English => format!("{key} finds any file in this folder."),
+        Language::Chinese => format!("按 {key} 查找此文件夹中的任意文件。"),
+    }
+}
+
+/// `Could not open the folder dialog: {why}. Try again.`
+fn picker_failed(language: Language, why: &dyn std::fmt::Display) -> String {
+    match language {
+        Language::English => format!("Could not open the folder dialog: {why}. Try again."),
+        Language::Chinese => format!("无法打开文件夹对话框：{why}。请重试。"),
+    }
 }
 
 /// The welcome's copy. New strings live here rather than in `i18n.rs` (a merge
@@ -382,31 +433,31 @@ enum S {
     OpenSample,
     StaysOnThisDevice,
     Missing,
+    MissingRemove,
     NoFiles,
-    FindAFile,
 }
 
 fn s(key: S, language: Language) -> &'static str {
     match language {
         Language::English => match key {
-            S::OpenFolder => "Open folder",
+            S::OpenFolder => "Open folder\u{2026}",
             S::NewFile => "New file",
-            S::Paste => "Paste",
+            S::Paste => "Paste as new document",
             S::OpenSample => "Open sample",
             S::StaysOnThisDevice => "Opening, editing and search stay on this device.",
             S::Missing => "Missing",
+            S::MissingRemove => "Missing \u{00B7} Remove",
             S::NoFiles => "No files in this folder yet.",
-            S::FindAFile => "Ctrl+P finds any file in this folder.",
         },
         Language::Chinese => match key {
-            S::OpenFolder => "打开文件夹",
+            S::OpenFolder => "打开文件夹\u{2026}",
             S::NewFile => "新建文件",
-            S::Paste => "粘贴",
+            S::Paste => "粘贴为新文档",
             S::OpenSample => "打开示例",
             S::StaysOnThisDevice => "打开、编辑与搜索都在这台设备上完成。",
             S::Missing => "已不存在",
+            S::MissingRemove => "已不存在 \u{00B7} 移除",
             S::NoFiles => "这个文件夹里还没有文件。",
-            S::FindAFile => "按 Ctrl+P 查找这个文件夹中的任意文件。",
         },
     }
 }

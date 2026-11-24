@@ -39,9 +39,13 @@ use crate::{
 /// The column's content for the active document, by pane. Empty while no
 /// document is open (the shell shows [`crate::ui::welcome::welcome`] then).
 pub fn column(state: AppState, language: Language) -> impl IntoElement {
+    let reference = element_ref();
+    state.attach_document_view(reference);
     let state_for_tabs = state.clone();
     view()
         .test_id("document")
+        .focusable(true)
+        .element_ref(&reference)
         .flex_1()
         .h(relative(1.0))
         // The document starts 40px below the column's top edge, as the

@@ -28,16 +28,26 @@ mod cjk_font_download;
 mod conflict;
 #[path = "conflict_compare.rs"]
 mod conflict_compare;
+#[path = "conflict_compare_missing.rs"]
+mod conflict_compare_missing;
 #[path = "ctrl_enter_editor.rs"]
 mod ctrl_enter_editor;
+#[path = "duplicate_guard_names.rs"]
+mod duplicate_guard_names;
+#[path = "folder_open_token.rs"]
+mod folder_open_token;
 #[path = "goal17_settings.rs"]
 mod goal17_settings;
+#[path = "guard_untitled_cancel.rs"]
+mod guard_untitled_cancel;
 #[path = "hierarchy_layouts.rs"]
 mod hierarchy_layouts;
 #[path = "hierarchy_welcome.rs"]
 mod hierarchy_welcome;
 #[path = "language_switch.rs"]
 mod language_switch;
+#[path = "palette_folder.rs"]
+mod palette_folder;
 #[path = "paste_document.rs"]
 mod paste_document;
 #[path = "quit_guard.rs"]
@@ -46,6 +56,8 @@ mod quit_guard;
 mod quit_untitled;
 #[path = "recovery_restore.rs"]
 mod recovery_restore;
+#[path = "recovery_undo.rs"]
+mod recovery_undo;
 #[path = "refine_keys_shortcuts.rs"]
 mod refine_keys_shortcuts;
 #[path = "refine_state_pane.rs"]
@@ -84,6 +96,8 @@ mod theme;
 mod translation_flow;
 #[path = "untitled_discard.rs"]
 mod untitled_discard;
+#[path = "untitled_numbers.rs"]
+mod untitled_numbers;
 #[path = "untitled_recovery.rs"]
 mod untitled_recovery;
 #[path = "untitled_save.rs"]

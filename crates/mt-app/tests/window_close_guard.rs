@@ -153,7 +153,7 @@ fn the_window_close_button_is_guarded_like_quit() {
         app.wait_for("id:guard-save").expect("the guard");
         app.press("id:guard-card >> label:Save")
             .expect("try to save");
-        app.wait_for("text:Still open: a document could not be saved.")
+        app.wait_for("text:Could not save this document, so it stays open. Check file permissions or try Save As….")
             .expect("the guard says the save failed");
         app.settle();
         assert!(visible(&mut app), "a failed save keeps the window open");
@@ -182,7 +182,7 @@ fn the_window_close_button_is_guarded_like_quit() {
         app.wait_for("id:guard-save").expect("the guard");
         app.press("id:guard-card >> label:Save")
             .expect("save through the picker");
-        app.wait_for("text:Still open: a document could not be saved.")
+        app.wait_for("text:Save cancelled — the document stays open.")
             .expect("a cancelled picker leaves the guard up");
         assert!(visible(&mut app), "a cancelled picker keeps the window");
         assert!(!destination.exists());

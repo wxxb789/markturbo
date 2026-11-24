@@ -16,6 +16,7 @@ use nsh_core::{
 };
 
 use crate::{
+    app_paths,
     i18n::{self, Key},
     state::{AppState, Pane},
     ui::{
@@ -217,7 +218,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             },
             {
                 let state = state.clone();
-                move || file_name(state.clone()).into_element()
+                move || file_name(state.clone(), language).into_element()
             },
         ))
         .child(view().flex_1())
@@ -291,7 +292,7 @@ fn mod_enter(state: &AppState) {
 /// of one name are told apart, and a mark while the document is not saved.
 /// Pressing it opens (and closes) Context: the path the name stands for is
 /// the order Codex applies its instructions in.
-fn file_name(state: AppState) -> impl IntoElement {
+fn file_name(state: AppState, language: Language) -> impl IntoElement {
     let folder_state = state.clone();
     let name_state = state.clone();
     let label_state = state.clone();
@@ -301,7 +302,11 @@ fn file_name(state: AppState) -> impl IntoElement {
         view()
             .test_id("title-file")
             .role(AccessibilityRole::Button)
-            .optional_label(move || label_state.active_tab().map(|tab| tab.title.clone()))
+            .optional_label(move || {
+                label_state
+                    .active_tab()
+                    .map(|tab| SharedString::from(show_context_label(language, &tab.title)))
+            })
             .window_drag(false)
             .cursor_pointer()
             .bg(Color::TRANSPARENT)
@@ -363,6 +368,7 @@ fn file_name(state: AppState) -> impl IntoElement {
 
 fn review_action(state: AppState, language: Language) -> impl IntoElement {
     let enabled_state = state.clone();
+    let blocked_state = state.clone();
     let enabled = move || {
         enabled_state.active.get().is_some() && enabled_state.revision_hunks.get().is_empty()
     };
@@ -381,6 +387,10 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
             }
         },
     )
+    .optional_accessibility_description(move || {
+        (!blocked_state.revision_hunks.get().is_empty())
+            .then(|| SharedString::from(review_blocked_label(language)))
+    })
 }
 
 /// `Settings`, the word that opens the row's menu: quieter than `Review`,
@@ -475,6 +485,23 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 },
             )
         })
+        .child(when(app_paths::bundled_sample_available, {
+            let sample_state = state.clone();
+            move || {
+                let press_state = sample_state.clone();
+                menu_row(
+                    menu,
+                    "title-menu-open-sample",
+                    s(S::OpenSample, language),
+                    None,
+                    move || {
+                        menu.close();
+                        press_state.open_bundled_sample();
+                    },
+                )
+                .into_element()
+            }
+        }))
         .child(
             view()
                 .px(px(SPACE_3))
@@ -548,12 +575,24 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                     .into_element()
             }
         }))
-        .child(menu_item(
-            &state,
-            menu,
-            "title-menu-context",
-            s(S::Context, language),
-            |state| state.toggle_context(),
+        .child(when(
+            {
+                let gate_state = state.clone();
+                move || gate_state.root.get().is_some() || document_rows.get()
+            },
+            {
+                let context_state = state.clone();
+                move || {
+                    menu_item(
+                        &context_state,
+                        menu,
+                        "title-menu-context",
+                        s(S::Context, language),
+                        |state| state.toggle_context(),
+                    )
+                    .into_element()
+                }
+            },
         ))
         .child(
             view()
@@ -653,7 +692,7 @@ fn pane_row(
 
 /// A shortcut as the menu names it: `Ctrl+S`, `Ctrl+Shift+S`; `⌘S`, `⇧⌘S`
 /// where `mod` is Command.
-fn shortcut(shift: bool, key: &str) -> SharedString {
+pub(crate) fn shortcut(shift: bool, key: &str) -> SharedString {
     SharedString::from(match (apple_keys(), shift) {
         (true, false) => format!("\u{2318}{key}"),
         (true, true) => format!("\u{21E7}\u{2318}{key}"),
@@ -814,6 +853,7 @@ enum S {
     OpenFolder,
     NewFile,
     PasteAsNew,
+    OpenSample,
     SaveAs,
     Split,
     WebPreview,
@@ -828,10 +868,11 @@ fn s(key: S, language: Language) -> &'static str {
             S::OpenFolder => "Open folder\u{2026}",
             S::NewFile => "New file",
             S::PasteAsNew => "Paste as new document",
+            S::OpenSample => "Open sample",
             S::SaveAs => "Save As\u{2026}",
             S::Split => "Split",
-            S::WebPreview => "Web preview",
-            S::SplitWeb => "Split \u{00B7} Web",
+            S::WebPreview => "Compatibility preview",
+            S::SplitWeb => "Split \u{00B7} Compatibility",
             S::Context => "Context",
             S::ReviewSelection => "Review selection",
         },
@@ -839,13 +880,30 @@ fn s(key: S, language: Language) -> &'static str {
             S::OpenFolder => "打开文件夹\u{2026}",
             S::NewFile => "新建文件",
             S::PasteAsNew => "粘贴为新文档",
+            S::OpenSample => "打开示例",
             S::SaveAs => "另存为\u{2026}",
             S::Split => "分栏",
-            S::WebPreview => "Web 预览",
-            S::SplitWeb => "分栏 \u{00B7} Web",
+            S::WebPreview => "兼容预览",
+            S::SplitWeb => "分栏 \u{00B7} 兼容预览",
             S::Context => "上下文",
             S::ReviewSelection => "审查选区",
         },
+    }
+}
+
+/// The titlebar name's accessible label: what pressing it does.
+fn show_context_label(language: Language, name: &str) -> String {
+    match language {
+        Language::English => format!("Show agent context for {name}"),
+        Language::Chinese => format!("显示 {name} 的智能体上下文"),
+    }
+}
+
+/// Why `Review` is dimmed while a Revision is docked.
+fn review_blocked_label(language: Language) -> &'static str {
+    match language {
+        Language::English => "Finish or close the current revision before running Review.",
+        Language::Chinese => "请先完成或关闭当前修订，再运行审查。",
     }
 }
 
@@ -986,6 +1044,7 @@ mod tests {
             "title-menu-open-folder",
             "title-menu-new-file",
             "title-menu-paste",
+            "title-menu-open-sample",
             "title-menu-save",
             "title-menu-save-as",
             "title-menu-edit",
@@ -1078,7 +1137,7 @@ mod tests {
                 .expect("the hovered title Settings text")
                 .color,
             app.screen()
-                .span_style("id:title-menu-open-folder >> text:Open folder")
+                .span_style("id:title-menu-open-folder >> text:Open folder\u{2026}")
                 .expect("the hovered menu row text")
                 .color,
         );
@@ -1095,7 +1154,7 @@ mod tests {
                 .expect("the hovered title Settings text")
                 .color,
             app.screen()
-                .span_style("id:title-menu-open-folder >> text:Open folder")
+                .span_style("id:title-menu-open-folder >> text:Open folder\u{2026}")
                 .expect("the hovered menu row text")
                 .color,
         );

@@ -130,7 +130,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     // Quit: the in-app guard takes the decision, and it must await it.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-quit").expect("request quit");
-    app.wait_for("text:Close without saving?")
+    app.wait_for("text:Quit without saving?")
         .expect("Quit must await a decision");
 
     release_response.send(()).expect("release translation");
