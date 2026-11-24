@@ -158,11 +158,20 @@ These override any conflicting text in the advisor body below.
     - Test through an injectable key-state source: a key reported up at 900 ms with the text input focused sends
       nothing; a key reported down sends exactly once.
     - Continuity, not just the end state:
-      - While a keyboard hold charges, sample the platform key state every frame (at most 16 ms apart) for the hold's
-        900 ms only. This is bounded to an active hold; it is not background polling.
-      - Any sample with `Enter` or the modifier up cancels the hold to zero, and so does a non-repeat press of either
-        key.
-      - Test: Ctrl released at 550 ms and pressed again at 800 ms while Enter stays down. Nothing is sent.
+      - Sampling cannot see a release and re-press between two samples. So observe every transition instead:
+        - On Windows, install a thread keyboard hook only while a keyboard hold charges:
+          `SetWindowsHookExW(WH_KEYBOARD, …, 0, GetCurrentThreadId())` on the UI thread.
+        - The hook sees `WM_KEYUP`/`WM_KEYDOWN` for the thread wherever the focus is, native text inputs included. It is
+          removed when the hold ends.
+      - Any up transition of `Enter` or the modifier cancels the hold to zero, and so does any non-repeat down
+        transition of either key.
+      - If the hook cannot be installed, keyboard holds do not authorize. On platforms without such a hook, the same
+        applies, and the pointer hold remains.
+      - Tests, through an injectable transition source:
+        - Ctrl released at 548 ms and pressed again at 556 ms while Enter stays down, with the text input focused.
+          Nothing is sent.
+        - A hook that fails to install sends nothing.
+      - The end-state query above stays as a final check.
 12. **Undo commit boundary (amends Done when 4 and amendment 2).**
     - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
       pending slot. When the slot is taken, the older action's Undo ends at the same moment.
