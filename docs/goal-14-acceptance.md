@@ -105,8 +105,8 @@ lockfile's source URLs were not changed.
 | `cargo tree -d -p mt-app` | Exit 0; no duplicate nsh crate. |
 | `uv run --locked --project scripts scripts/mt.py check ci` | Exit 0 on the final run: 233 tooling tests passed; 1,041 Rust tests passed (227 mt-app), 0 failed, 7 existing ignores. Optimized Clippy reported 0 mt-app warnings and 2 existing mt-core warnings. |
 | PR-head CI | Pending: this stage has no published PR head. |
-| Native acceptance and visual matrix | Pending. Native acceptance was deferred by the owner on 2026-11-22 and was not run. The Windows 11 session could open the input desktop, but `GetForegroundWindow` returned no foreground HWND. No native PASS or capture is claimed. |
-| Native keyboard focus | Pending: on Windows 11, with Review not configured, focus the editor, click Review, and verify typing does not edit the document until the editor is refocused. Also verify the existing focus requests on the welcome screen, Settings menu and Review Again and Prepare transitions listed above. In Settings, verify that focus lands on Store securely after successfully removing a key. |
+| Native acceptance and visual matrix | Not a pass. Deferred by the owner on 2026-11-22; partly run 2026-11-24 (see [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)): goals 02, 03 and 06 passed, goal-07 failed, and the visual matrix captured 20 of 22 cells. No native PASS is claimed. The 2026-11-22 session could open the input desktop, but `GetForegroundWindow` returned no foreground HWND. |
+| Native keyboard focus | Partly done 2026-11-24 (see [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)): with Review not configured, focusing the editor and then clicking Review left typing out of the document until the editor was refocused, observed as expected. Still pending: the existing focus requests on the welcome screen, Settings menu, Review Again, Prepare, and Store securely after successfully removing a key. |
 
 The first CI run exited 1 on the consent regression above. After the fix,
 the next full run exited 1 on the unchanged mt-core recovery test
@@ -137,3 +137,38 @@ owner's active, unlocked RDP desktop (Windows 11 x64, harness process session
 Clause 6 therefore stays pending: the goal set did not pass, and the visual
 matrix and the native keyboard-focus check above have not run. This run is not
 a pass.
+
+## Desktop acceptance 2026-11-24
+
+One `mt.py accept all` run on `main` `cc4cf0a` (release executable SHA-256
+`4b5a0747dff742eb5749dce3fdc58b13b6893a954cdc9191751287d9f744fb36`) on the
+owner's active, unlocked RDP desktop (Windows 11 x64). The first attempt,
+2026-11-23, ran with four concurrent cargo builds holding the CPU at 100%:
+goal-06 PASS, goal-02 FAIL (`EXTERNAL_MODIFICATION_UIA_NAME_QUERY_FAILED`),
+goal-07 FAIL (`PROCESS_JOB_QUIESCENCE_TIMEOUT`), goal-03 not run
+(`SKIPPED_AFTER_CLEANUP_FAILURE`). A second attempt BLOCKED with
+`SESSION_NOT_ACTIVE` (the RDP session had disconnected); nothing ran. The one
+retry after the environment correction (no builds running), 2026-11-24:
+goal-02 PASS, goal-03 PASS, goal-06 PASS (`ALL_REQUIRED_CASES`), goal-07 FAIL
+(`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`) — the same result as the
+`c3aab06` run, so the first run's failures were load-induced. goal-07 still
+waits for the first nsh release containing
+[longbridge/nsh#2423](https://github.com/longbridge/nsh/pull/2423).
+
+The visual matrix ran on `main` `32f324d` (release executable SHA-256
+`d9dc951ffe19fb1a3e3fe64456658f00f9e40d6398437f5b80673b8c2c6d77bd`) with
+`--languages en-us --viewports default --modes light,dark`: 20 of 22 cells
+captured. Both `web-compatibility-preview` cells failed with
+`WEB_COMPATIBILITY_PREVIEW_WEB_VIEW_MISSING_UIA_CONTRACT_MISMATCH`: the harness
+looks for the WebView through UIA, and nsh 0.6.1 hosts WebView2 in a
+composition controller with no automation provider. This is a harness
+observation-channel gap, not a product failure, and it is not a pass.
+
+The native keyboard-focus check was partly exercised on the `32f324d`
+executable on 2026-11-24: with Review not configured, focusing the editor and
+then clicking Review left typing out of the document until the editor was
+refocused, observed as expected. The remaining focus requests were not
+checked.
+
+Clause 6 stays pending: goal-07 fails and two matrix cells are uncaptured.
+This run is not a pass.

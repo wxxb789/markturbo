@@ -45,9 +45,18 @@ optical-sizing capture is recorded below; no native pass is claimed.
 
 - Run native acceptance against the final release executable and its expected
   SHA-256, as described in [verification.md](verification.md).
+  Run 2026-11-24 on `cc4cf0a`: goals 02, 03 and 06 passed and goal-07 failed;
+  the run exercises none of this goal's items (see
+  [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Run the visual matrix on the same executable. Capture before and after
   Settings, Review, and light-mode cooled model text. Check Settings at a
   900px window height, including the last section after scrolling.
+  **Partly done 2026-11-24:** before captures on `1159142` covered 8 of 8 cells
+  for `clean-profile-welcome, review-loading, review-result-questions,
+  settings`; the after set is the `32f324d` matrix (20 of 22 cells; both
+  `web-compatibility-preview` cells failed on the harness's UIA
+  observation-channel gap, not a product failure). Settings' last section
+  after scrolling was not captured.
 - The mixed CJK/Latin optical-variant capture ran on 2026-11-23, light theme
   only (the recipe forces light), against markturbo.exe SHA-256
   `a6ef8cfb758e6934f1a7b17713f240ad9ea4255f753d5ff160a07193580b567b`. The
@@ -74,3 +83,27 @@ longer pending: the light-theme capture (the recipe does not support the dark
 theme) ran on 2026-11-23 against the same hash-verified executable, and the
 owner picked +1px with the next companion weight, now the production default
 (recorded above). This is not a pass.
+
+## Desktop acceptance 2026-11-24
+
+One `mt.py accept all` run on `main` `cc4cf0a` (release executable SHA-256
+`4b5a0747dff742eb5749dce3fdc58b13b6893a954cdc9191751287d9f744fb36`), retry
+after the environment correction on 2026-11-24: goal-02 PASS, goal-03 PASS,
+goal-06 PASS (`ALL_REQUIRED_CASES`), goal-07 FAIL
+(`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`). It covers goals 02, 03, 06 and
+07 only and exercises none of this goal's items.
+
+Before captures ran with the same harness options and states
+(`clean-profile-welcome, review-loading, review-result-questions, settings`)
+on `1159142` (Goal 17 before, release executable SHA-256
+`dd09671496cfdeba125d754b5604d94fba23687e345f76dcc644883ddef10c5f`): 8 of 8
+cells captured. The after set is the `32f324d` visual matrix: with
+`--languages en-us --viewports default --modes light,dark`, 20 of 22 cells
+captured, and both `web-compatibility-preview` cells failed with
+`WEB_COMPATIBILITY_PREVIEW_WEB_VIEW_MISSING_UIA_CONTRACT_MISMATCH` — the
+harness's UIA observation-channel gap, not a product failure, recorded in
+[TODO.md](TODO.md). Settings' last section after scrolling was not captured.
+Captures stay under `.scratch/` and are not committed.
+
+Pending: the Settings last-section capture and the two
+`web-compatibility-preview` cells. This is not a pass.
