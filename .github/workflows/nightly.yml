@@ -117,12 +117,12 @@ jobs:
       - name: Test the app in the release profile
         # The shipped codegen (thin LTO, one codegen unit) re-optimizes the
         # whole app in every test binary it links, so this step links the
-        # unit tests and one `release_suite` binary holding every
+        # unit tests and one `suite` binary holding every
         # `tests/*.rs` file instead of one binary per file. On windows-2022
         # (run 44453412872) building 38 binaries took 120m28s of the 122-minute
         # step and the tests under two minutes; the build time grew with the
         # binary count (60m24s for 21 in run 44077710691). nextest gives each
         # test its own process, which those tests need, and runs them in
-        # parallel; mt-app has no doctests (`doctest = false`) and the main
-        # binary has no unit tests.
-        run: cargo nextest run --locked --cargo-profile release -p mt-app --lib --test release_suite
+        # parallel; mt-app has no doctests (`doctest = false`), and the
+        # workspace step above already covers the main binary.
+        run: cargo nextest run --locked --cargo-profile release -p mt-app --lib --test suite

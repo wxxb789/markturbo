@@ -116,44 +116,6 @@
   inventory (`scripts/markturbo_tools/release.py:281-285,771`). Either stage it
   with the payload so the inventory covers every installed file, or document the
   exclusion in the release-notes template; decide before the next candidate.
-- [ ] **Merge the mt-app integration test binaries** — `crates/mt-app/tests/`
-  holds roughly twenty one- or two-test files, and each links the whole app, so
-  link time and per-process startup dominate the suite rather than the
-  assertions (measured 2026-11-15: the warm `--profile ci -p mt-app` run takes
-  about a minute locally, and the Windows per-PR job spends most of its time in
-  compilation and linking). Consolidating them behind one `tests/all.rs` with
-  `autotests = false`, or adopting `cargo nextest` for cross-binary parallelism,
-  would cut both costs. Treat it as its own small goal inside the upcoming UI
-  iteration, and keep `cargo test` as the local command either way. The PR app
-  suites already use nextest, and the nightly release-profile run already links
-  the files once through `tests/release_suite.rs`; what remains is the
-  per-file binaries under `cargo test`, most of which set process environment
-  variables and so need their own process.
-- [ ] **Dead-code candidate: multi-chain loopback provider** — Goal 07 now runs
-  one Review→Revision chain, but `LoopbackRevisionServer` in
-  `scripts/markturbo_tools/native/goal07_provider.py` still supports repeated
-  `begin_chain` cycles and keeps a cumulative `_request_count` beside the
-  per-chain `requests`, and `scripts/tests/test_native_goal07_provider.py`
-  still runs a three-chain test (`request_count == 6`). Revalidate that no
-  caller needs more than one chain, then drop the extra state and test.
-- [ ] **Dead-code candidate: old WebView profile resolver** — Repository
-  search finds no caller of `mt_core::runtime_paths::webview_data_dir`;
-  its helper in `crates/mt-core/src/runtime_paths.rs` is referenced only
-  by that function and a path unit test. The nsh Windows backend computes
-  its own profile in `native/web.rs`. Check for external callers before
-  removing the public function or its helper.
-- [ ] **Dead-code candidate: `ui::prims::model_voice`** —
-  `rg -n 'model_voice\(' crates/mt-app/src -g '*.rs'` and
-  `git grep -n 'model_voice(' -- crates/mt-app/src` return only the definition
-  at `crates/mt-app/src/ui/prims.rs:101` (the file header also links it as a
-  doc symbol, but there are no call sites); the active review path is
-  `ui::review::voice`. Revalidate that no downstream consumer uses this
-  public helper before removing or consolidating it.
-- [ ] **Dead-code candidate: `Key::WebPreviewRetry`** —
-  `rg -n 'Key::WebPreviewRetry' crates/mt-app/src` finds its English and
-  Chinese table entries plus the exhaustive key list;
-  `git grep WebPreviewRetry -- crates/mt-app/src` also finds the enum declaration, but
-  no call site. Revalidate before removing the translations or key.
 - [ ] **Upgrade nsh for the Goal 15 WebView2 popup fix** — the 2026-11-23
   native run failed goal-07 (`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, case
   `revision_session`): the fixture's `window.open` leaves a visible WebView2

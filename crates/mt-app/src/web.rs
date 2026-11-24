@@ -974,16 +974,12 @@ fn collect_markdown_flow_scripts(
         return;
     };
     let value = &html.value;
-    let mut remaining = value.trim_start_matches([' ', '\t']);
-    let Some(mut content) = opening_tag_end(remaining, "script") else {
-        scan_flow_scope(remaining, scope);
+    let mut indentation = 0;
+    let Some((_, mut remaining, mut content)) =
+        next_flow_script(value.trim_start_matches([' ', '\t']), scope)
+    else {
         return;
     };
-    if *scope != RawTextScope::None {
-        scan_flow_scope(remaining, scope);
-        return;
-    }
-    let mut indentation = 0;
     let mut line_ends = value
         .split_inclusive(['\r', '\n'])
         .zip(source[position.start.offset..position.end.offset].split_inclusive(['\r', '\n']))
@@ -1028,15 +1024,6 @@ fn collect_markdown_flow_scripts(
             .map_or(0, str::len);
         remaining = next;
         content = next_content;
-    }
-}
-
-fn scan_flow_scope(mut remaining: &str, scope: &mut RawTextScope) {
-    while let Some((_, _, content)) = next_flow_script(remaining, scope) {
-        let Some(tail) = raw_text_end_tail(content, "script") else {
-            return;
-        };
-        remaining = tail;
     }
 }
 
@@ -2732,6 +2719,70 @@ mod tests {
         );
         let elapsed = started.elapsed();
         assert!(ranges.is_empty(), "{} scripts were collected", ranges.len());
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn raw_text_scope_closed_in_a_flow_script_block_restores_later_scripts() {
+        let suppressed = "<script>void 0;</script>";
+        let restored = "<script>evil()</script>";
+        let source = format!("A <textarea>\n\n{suppressed} </textarea> {restored}\n");
+        let html = page(&md(&source), &registry(), false);
+        let rendered = body(&html);
+        assert!(!rendered.contains(suppressed), "{rendered}");
+        assert!(
+            rendered.contains("&lt;script>void 0;&lt;/script>"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(restored), "{rendered}");
+    }
+
+    #[test]
+    fn raw_text_scope_closed_in_a_later_flow_block_restores_the_script_after_it() {
+        let script = "<script>void 1;</script>";
+        let source = format!("A <textarea>\n\n</textarea>\n{script}\n");
+        let html = page(&md(&source), &registry(), false);
+        let rendered = body(&html);
+        assert!(rendered.contains(script), "{rendered}");
+        assert!(!rendered.contains("&lt;script"), "{rendered}");
+    }
+
+    #[test]
+    fn flow_block_without_a_script_start_restores_the_script_after_other_html() {
+        let script = "<script>void 1;</script>";
+        let source = format!("<div>\n<!-- x -->\n{script}\n");
+        let html = page(&md(&source), &registry(), false);
+        let rendered = body(&html);
+        assert!(rendered.contains("<div>"), "{rendered}");
+        assert!(rendered.contains(script), "{rendered}");
+    }
+
+    #[test]
+    fn cross_block_raw_text_scope_scanning_stays_linear() {
+        let script = "<script>void 0;</script>";
+        let unit = format!("A <textarea>\n\nB </textarea> {script}\n\n");
+        let count = 20_000;
+        let source = unit.repeat(count);
+        let ast = markdown::to_mdast(&source, &markdown::ParseOptions::default()).unwrap();
+        let mut ranges = Vec::new();
+        let started = std::time::Instant::now();
+        collect_inline_script_ranges(
+            &ast,
+            &source,
+            &mut ranges,
+            &mut Vec::new(),
+            &ScriptContext::default(),
+            &mut RawTextScope::None,
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            ranges.len() == count && ranges.iter().all(|range| range.script == script),
+            "{} scripts were collected",
+            ranges.len()
+        );
         assert!(
             elapsed < std::time::Duration::from_millis(500),
             "{elapsed:?}"
