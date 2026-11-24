@@ -78,9 +78,15 @@ executable or receipts were generated in this implementation stage.
 
 - Run the native acceptance suite on the final release executable with its
   expected SHA-256 using the command in [verification.md](verification.md).
+  Run 2026-11-24 on `cc4cf0a`: goals 02, 03 and 06 passed and goal-07 failed;
+  the run exercises none of this goal's items (see
+  [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Reveal a recovery or conflict banner with Animation effects on. Verify that
   the banner grows from zero height while fading in and that the document
   below moves continuously with it, without a jump.
+  **Done 2026-11-24:** the conflict banner revealed with its animation and moved
+  the content below without a jump (see
+  [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Dismiss a recovery or conflict banner with Animation effects on. Around the
   midpoint of the exit, verify the content below is between its start and end
   positions while the banner is still fading. With Animation effects off,
@@ -88,9 +94,17 @@ executable or receipts were generated in this implementation stage.
 - Open **Compare** on a conflict banner and choose **Use disk version**.
   Confirm the reload and verify that the comparison remains intact while
   the banner fades and collapses with the document reflow.
+  **Partly done 2026-11-24:** **Compare** → **Use disk version** dismissed the
+  banner with the comparison intact; the reload confirmation and the banner's
+  exit motion (fade and collapse with the document reflow) were not recorded
+  (see [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - With two tabs open, edit the active tab, close it and choose **Don't save**.
   Verify that its rail row and editor disappear immediately while the guard
   fades, and that the remaining editor accepts input during the fade.
+  **Partly done 2026-11-24:** the rail row and editor were removed while the
+  guard faded, and the other editor accepted input; the removal immediacy and
+  whether the other editor accepted input during the fade were not recorded
+  (see [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Close and reopen the guard or consent before its fade ends. Verify that
   opacity, scale and vertical position do not jump on the first frame back,
   and that the fading surface does not intercept pointer or keyboard input.
@@ -98,10 +112,19 @@ executable or receipts were generated in this implementation stage.
   separate from the historical Goal 09 captures. Use the existing harness with
   `--languages en-us --viewports default --modes light,dark` for eleven states
   in both appearances, and a fresh `--out .scratch/goal-16-visual`.
+  **Partly done 2026-11-24:** 20 of 22 cells captured on `32f324d`; both
+  `web-compatibility-preview` cells failed on the harness's UIA
+  observation-channel gap
+  (`WEB_COMPATIBILITY_PREVIEW_WEB_VIEW_MISSING_UIA_CONTRACT_MISMATCH`), not a
+  product failure; recorded in [TODO.md](TODO.md).
 - Retain before/after Settings, consent, and title menu captures under
   `.scratch/`, using `dede9c6` for the before build and the same release profile,
   viewport, language, and appearance for both builds. Neither the matrix nor
   captures have been attempted here.
+  **Partly done 2026-11-24:** before captures on `dede9c6` covered 8 of 8 cells
+  for `clean-profile-welcome, review-loading, review-result-questions, settings`;
+  the after set is the `32f324d` matrix above. The consent card and title menu
+  were not captured because no matrix state reaches them.
 
 ## Native acceptance 2026-11-23
 
@@ -114,3 +137,36 @@ goal-03 PASS, goal-06 PASS (`ALL_REQUIRED_CASES`), goal-07 FAIL
 (`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`). It exercises none of this goal's
 desktop acceptance items; the visual matrix, the before/after captures and the
 banner, card and menu checks listed above remain pending. This is not a pass.
+
+## Desktop acceptance 2026-11-24
+
+Owner manual checks on the `32f324d` executable (release executable SHA-256
+`d9dc951ffe19fb1a3e3fe64456658f00f9e40d6398437f5b80673b8c2c6d77bd`) on
+2026-11-24, all observed as expected: after an unsaved edit and an on-disk
+change, saving raised the conflict banner, which revealed with its animation
+and moved the content below without a jump; **Compare** → **Use disk version**
+dismissed the banner with the comparison intact; and closing an edited tab
+with **Don't save** removed its rail row and editor while the guard faded, and
+the other editor accepted input. Not recorded: the reload after **Use disk
+version**, the banner's exit motion, the close-tab removal immediacy and
+whether the other editor accepted input during its guard fade. Not checked:
+Animation effects off, and reopening a guard or consent before its fade ends.
+
+Before captures ran with the same harness options and states
+(`clean-profile-welcome, review-loading, review-result-questions, settings`)
+on `dede9c6` (Goal 16 before, release executable SHA-256
+`cb736a67076d24978aac9652c81c87467dc20dad083da5b8d035ea8b165a7636`): 8 of 8
+cells captured. The after set is the `32f324d` matrix below. The consent card
+and the title menu were not captured because no matrix state reaches them.
+Captures stay under `.scratch/` and are not committed.
+
+The 22-state visual matrix ran on the `32f324d` executable with
+`--languages en-us --viewports default --modes light,dark`: 20 of 22 cells
+captured. Both `web-compatibility-preview` cells failed with
+`WEB_COMPATIBILITY_PREVIEW_WEB_VIEW_MISSING_UIA_CONTRACT_MISMATCH` — the
+harness's UIA observation-channel gap, not a product failure; it is recorded
+in [TODO.md](TODO.md).
+
+This is not a pass: the reload confirmation, the banner-exit checks, the
+close-tab removal immediacy and input during its guard fade, the guard or
+consent reopen, and the two `web-compatibility-preview` cells stay pending.
