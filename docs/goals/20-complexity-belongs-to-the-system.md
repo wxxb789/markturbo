@@ -172,6 +172,16 @@ These override any conflicting text in the advisor body below.
           Nothing is sent.
         - A hook that fails to install sends nothing.
       - The end-state query above stays as a final check.
+      - **Queued input is never skipped.** A transition can be queued while the hook has not yet seen it, for example
+        when the UI thread was busy and nsh's posted wake ran first.
+        - Authorize only when all three hold at that moment:
+          1. `GetQueueStatus(QS_KEY | QS_RAWINPUT)` reports no pending keyboard input;
+          2. the hook has seen no transition;
+          3. `GetAsyncKeyState` reports both keys down.
+        - Otherwise defer the decision. Let the message loop deliver the queued input, and decide again at the next
+          turn. A transition delivered then cancels the hold.
+        - Test through injectable queue-status, key-state and transition sources: a release and re-press queued at
+          886/894 ms, while the hook has not yet seen them at 900 ms, sends nothing.
 12. **Undo commit boundary (amends Done when 4 and amendment 2).**
     - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
       pending slot. When the slot is taken, the older action's Undo ends at the same moment.
