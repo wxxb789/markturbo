@@ -144,6 +144,65 @@ fn a_missing_recent_is_marked_disabled_and_opens_nothing() {
 /// first), and a restarted app reads those ten back. The welcome lists the
 /// five most recent of them.
 #[test]
+fn a_recent_that_vanishes_after_render_flips_to_missing() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let config = tempfile::tempdir().expect("config dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let vanish = workspace.path().join("vanish.md");
+    std::fs::write(&vanish, "# Vanish\n").expect("write the target");
+    std::fs::write(config.path().join("settings.toml"), recent(&vanish))
+        .expect("write the settings");
+
+    let mut app = start(config.path());
+    app.wait_for("id:welcome-recents")
+        .expect("the recent target");
+    // The row is drawn as openable; the file goes missing behind it.
+    std::fs::remove_file(&vanish).expect("remove the target after the render");
+    app.press("role:button[File vanish.md]")
+        .expect("press the stale row");
+    app.wait_until(
+        "the stale row to flip to missing",
+        Duration::from_secs(5),
+        |screen| {
+            screen
+                .count("role:button[File vanish.md — Missing]")
+                .unwrap_or(0)
+                == 1
+        },
+    )
+    .expect("a press on a vanished recent says so");
+    assert_eq!(
+        app.screen()
+            .count("id:welcome-recent-row >> text:Missing \u{00B7} Remove")
+            .expect("selector"),
+        1,
+        "the flipped row offers Missing \u{00B7} Remove: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        !app.screen()
+            .enabled("role:button[File vanish.md — Missing]")
+            .expect("selector"),
+        "the flipped row is no longer pressable"
+    );
+    assert_eq!(
+        app.screen().count("id:rail-file-row").expect("selector"),
+        0,
+        "the vanished target opened no document"
+    );
+
+    // The badge still forgets the entry.
+    app.press("id:welcome-recent-remove-0")
+        .expect("remove the vanished target");
+    app.wait_until("the row to go", Duration::from_secs(5), |screen| {
+        screen.count("id:welcome-recent").unwrap_or(0) == 0
+    })
+    .expect("the vanished row is removed");
+}
+
+#[test]
 fn the_recent_history_holds_ten_targets_across_a_restart() {
     let _guard = TEST_LOCK
         .lock()

@@ -41,8 +41,7 @@ struct MenuMotion {
 }
 
 impl MenuMotion {
-    fn new() -> Self {
-        let open = signal(false);
+    fn new(open: Signal<bool>) -> Self {
         let visible = signal(false);
         let opacity = animated_value(0.0);
         let reduced = motion::reduced_motion();
@@ -152,7 +151,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     let review_state = state.clone();
     effect(move || bind_mod_enter(&review_state));
 
-    let menu = MenuMotion::new();
+    let menu = MenuMotion::new(state.title_menu_open);
 
     // The menu's document commands, reachable without it.
     let open_state = state.clone();
@@ -171,8 +170,9 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             save_as_state.save_as_active();
         }
     });
-    // Escape closes the menu from anywhere. The binding passes the key on, so
-    // it takes nothing from the surfaces that bind Escape themselves.
+    // Every Escape binding runs the same fixed-order decision, so the
+    // newest one cannot pick a layer the contract puts lower.
+    let escape_state = state.clone();
     on_key_with(
         "escape",
         KeyOptions {
@@ -181,9 +181,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             ..KeyOptions::default()
         },
         move |_: &str| {
-            if menu.is_open() {
-                menu.close();
-            }
+            escape_state.escape_top_layer();
         },
     );
 
@@ -891,7 +889,6 @@ fn s(key: S, language: Language) -> &'static str {
     }
 }
 
-/// The titlebar name's accessible label: what pressing it does.
 fn show_context_label(language: Language, name: &str) -> String {
     match language {
         Language::English => format!("Show agent context for {name}"),
@@ -899,7 +896,6 @@ fn show_context_label(language: Language, name: &str) -> String {
     }
 }
 
-/// Why `Review` is dimmed while a Revision is docked.
 fn review_blocked_label(language: Language) -> &'static str {
     match language {
         Language::English => "Finish or close the current revision before running Review.",
@@ -968,7 +964,7 @@ mod tests {
     }
 
     fn menu_motion_contents(samples: Sender<(f32, f32)>) -> impl IntoElement {
-        let menu = MenuMotion::new();
+        let menu = MenuMotion::new(signal(false));
         let read_task = Cell::new(None::<Spawned<()>>);
 
         view()

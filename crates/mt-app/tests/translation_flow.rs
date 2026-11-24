@@ -127,22 +127,51 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("the translation target is the active tab");
     app.wait_for("id:source-editor >> text:/你好/")
         .expect("the active editor holds the translation target's text");
-    // Quit: the in-app guard takes the decision, and it must await it.
+
+    // A dirty untitled draft is what makes Quit's Save wait on a Save As
+    // picker; the test holds that picker open while the translation
+    // returns, so the tab turns dirty after the save began.
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-new-file").expect("new draft");
+    app.wait_for("label:Markdown source")
+        .expect("the draft editor");
+    app.type_text("label:Markdown source", "Quit draft")
+        .expect("edit the draft");
+    app.wait_for("id:title-dirty")
+        .expect("the draft's dirty mark");
+    app.press("label:plan.md")
+        .expect("return to the translation target");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("plan.md is active again");
+
+    let draft_destination = dir.path().join("quit-draft.md");
+    let save_gate = dir.path().join("release-save");
+    // SAFETY: this binary has one test.
+    unsafe {
+        std::env::set_var("MARKTURBO_TEST_SAVE_GATE", &save_gate);
+    }
+    app.on_pick_save_path(Some(draft_destination.clone()))
+        .expect("register the draft's destination");
+
+    // Quit: the in-app guard takes the decision, its Save saves the named
+    // tab and then parks on the draft's Save As, and it must await it.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-quit").expect("request quit");
     app.wait_for("text:Quit without saving?")
         .expect("Quit must await a decision");
+    app.press("id:guard-save")
+        .expect("start saving the dirty tabs");
 
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:# 你好，再见", Duration::from_secs(20))
-        .expect("second translation applies while Quit is pending");
+        .expect("the translation applies while the Save As waits");
     assert!(
         app.screen()
             .matches("id:guard-card")
             .expect("guard selector"),
-        "Quit must still be pending"
+        "Quit must still be pending while the Save As picker waits"
     );
-    app.press("id:guard-save").expect("save all and quit");
+    std::fs::write(&save_gate, "go").expect("release the Save As picker");
 
     support::wait_for_file(
         &mut app,
@@ -156,6 +185,15 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         &other,
         |text| text.contains("Unsaved edit."),
         "Quit saves the other dirty tab",
+        Duration::from_secs(20),
+    );
+    // The tab that turned dirty during the Save As is guarded and saved too
+    // (contract amendment 13).
+    support::wait_for_file(
+        &mut app,
+        &draft_destination,
+        |text| text == "Quit draft",
+        "Quit saves the draft whose Save As was pending",
         Duration::from_secs(20),
     );
 }

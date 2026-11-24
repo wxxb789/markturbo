@@ -611,6 +611,17 @@ mod tests {
         }
     }
 
+    /// What the app's own last focus move handed the keyboard to, as text a
+    /// test can read: one signal per app, so parallel lib tests never share
+    /// a focus record.
+    fn focus_trace_text(state: &AppState) -> impl IntoElement {
+        let state = state.clone();
+        text(move || match state.focus_last.get() {
+            Some(target) => format!("focus: {target:?}"),
+            None => "focus: none".to_owned(),
+        })
+    }
+
     /// The shell at `layout` with the fixture open, under controls that open
     /// and close the review and pick the pane. The pane is chosen by the
     /// test, never left to the default.
@@ -624,6 +635,7 @@ mod tests {
             .w_full()
             .h(relative(1.0))
             .flex_col()
+            .child(focus_trace_text(&state))
             .child(
                 view()
                     .flex_row()
@@ -740,6 +752,7 @@ mod tests {
             .child(control("probe-close-other-tab", &state, move |state| {
                 state.request_close_tab(other);
             }))
+            .child(focus_trace_text(&state))
             .child(shell(state, Language::English, Layout::Wide))
     }
 
@@ -1325,8 +1338,6 @@ mod tests {
     /// the pane never changes (contract amendment 5).
     #[test]
     fn a_close_hands_focus_to_the_layer_left_open_or_the_document() {
-        use crate::state::focus_trace::{Target, take, watch};
-
         let mut app = start(Root::of::<WideProbe>(), 1440.0);
 
         // Preview: the palette closes onto the document view, not the editor.
@@ -1334,35 +1345,51 @@ mod tests {
         app.wait_for("id:preview-column").expect("the preview");
         app.press_key("mod+p").expect("open the palette");
         app.wait_for("id:palette-input").expect("the palette");
-        watch();
         app.press_key("escape").expect("close the palette");
         app.wait_for_gone("id:palette", std::time::Duration::from_secs(5))
             .expect("the palette closes");
-        assert_eq!(take().last(), Some(&Target::Document));
+        app.wait_for("text:focus: Document")
+            .expect("the document view took the keyboard");
         assert!(
             app.screen().matches("id:preview-column").expect("selector"),
             "the pane never switched to Source"
         );
 
-        // The palette sits over the guard: its close hands the guard back.
+        // The contract's Escape order puts the guard above the palette even
+        // though the palette's binding registered last: the first Escape
+        // cancels the guard and hands the keyboard to the palette, the
+        // second closes the palette.
         press(&mut app, "probe-source");
         press(&mut app, "probe-dirty");
         press(&mut app, "probe-guard");
         app.wait_for("id:guard-card").expect("the guard");
         app.press_key("mod+p").expect("open the palette");
         app.wait_for("id:palette-input").expect("the palette");
-        watch();
+        app.press_key("escape").expect("cancel the guard first");
+        app.wait_for_gone("id:guard-card", std::time::Duration::from_secs(5))
+            .expect("the guard closes");
+        app.wait_for("text:focus: Palette")
+            .expect("the palette under the guard took the keyboard");
+        assert!(
+            app.screen().matches("id:palette-input").expect("selector"),
+            "the palette under the guard stays open"
+        );
         app.press_key("escape").expect("close the palette");
         app.wait_for_gone("id:palette", std::time::Duration::from_secs(5))
             .expect("the palette closes");
-        assert_eq!(take().last(), Some(&Target::Guard));
-        assert!(
-            app.screen().matches("id:guard-card").expect("selector"),
-            "the guard below stays open"
-        );
-        app.press_key("escape").expect("cancel the guard");
-        app.wait_for_gone("id:guard-card", std::time::Duration::from_secs(5))
-            .expect("the guard closes");
+        app.wait_for("text:focus: Editor")
+            .expect("the editor took the keyboard");
+
+        // Escape closes the title menu and returns the keyboard where the
+        // next key lands: in the source editor.
+        press(&mut app, "title-settings");
+        app.wait_for("id:title-menu").expect("the title menu");
+        app.press_key("escape").expect("close the title menu");
+        app.wait_for_gone("id:title-menu", std::time::Duration::from_secs(5))
+            .expect("the menu closes");
+        app.press_key("z").expect("type after the menu closed");
+        app.wait_for("id:source-editor >> text:/z/")
+            .expect("the keystroke landed in the editor");
 
         // The palette over the comparison: its close hands Compare back.
         let mut app = conflict_probe();
@@ -1371,11 +1398,11 @@ mod tests {
             .expect("the comparison");
         app.press_key("mod+p").expect("open the palette");
         app.wait_for("id:palette-input").expect("the palette");
-        watch();
         app.press_key("escape").expect("close the palette");
         app.wait_for_gone("id:palette", std::time::Duration::from_secs(5))
             .expect("the palette closes");
-        assert_eq!(take().last(), Some(&Target::Compare));
+        app.wait_for("text:focus: Compare")
+            .expect("the comparison took the keyboard");
         assert!(
             app.screen()
                 .matches("id:conflict-previous")

@@ -43,8 +43,8 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         highlighted: signal(None),
         submitted: signal(String::new()),
     };
-    // Escape closes the palette while it is open; the binding belongs to the
-    // palette's own window in the layer order.
+    // Every Escape binding runs the same fixed-order decision, so the
+    // palette cannot be closed out of turn while a guard or menu is up.
     effect({
         let escape_state = state.clone();
         move || {
@@ -56,7 +56,11 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
                         when: When::Always,
                         ..KeyOptions::default()
                     },
-                    move |_| palette.close(&press_state),
+                    move |_| {
+                        if !press_state.escape_top_layer() {
+                            palette.close(&press_state);
+                        }
+                    },
                 );
             }
         }
@@ -412,18 +416,8 @@ impl Palette {
         self.open.set(true);
     }
 
-    /// Closes it and drops what the search found: the results are the line's,
-    /// and nothing else shows them. The keyboard returns to the editor, as
-    /// after every overlay close.
     fn close(&self, state: &AppState) {
-        self.open.set(false);
-        self.filter.set(String::new());
-        self.highlighted.set(None);
-        self.submitted.set(String::new());
-        state.clear_search();
-        if state.active.get().is_some() {
-            state.focus_editor();
-        }
+        state.close_palette();
     }
 
     /// What the input holds: the filter while listing files, the query while

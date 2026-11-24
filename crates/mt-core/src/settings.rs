@@ -112,7 +112,6 @@ impl Language {
     }
 }
 
-/// Which panes a document shows, as the settings persist the last choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum DocumentPane {
@@ -291,8 +290,6 @@ pub struct SettingsData {
     pub skills_group_by: GroupBy,
     /// Whether a no-argument launch begins in the welcome state.
     pub show_welcome_on_startup: bool,
-    /// The document pane the last choice picked: a document opened in a later
-    /// session starts in it.
     pub document_pane: DocumentPane,
     /// Explicit consent to local, content-free usage counters. Never enables
     /// an upload; export remains a separate deliberate user action.

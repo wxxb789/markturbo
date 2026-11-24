@@ -30,16 +30,22 @@ mod conflict;
 mod conflict_compare;
 #[path = "conflict_compare_missing.rs"]
 mod conflict_compare_missing;
+#[path = "context_new_root.rs"]
+mod context_new_root;
 #[path = "ctrl_enter_editor.rs"]
 mod ctrl_enter_editor;
 #[path = "duplicate_guard_names.rs"]
 mod duplicate_guard_names;
+#[path = "focus_after_close.rs"]
+mod focus_after_close;
 #[path = "folder_open_token.rs"]
 mod folder_open_token;
 #[path = "goal17_settings.rs"]
 mod goal17_settings;
 #[path = "guard_untitled_cancel.rs"]
 mod guard_untitled_cancel;
+#[path = "guard_untitled_save.rs"]
+mod guard_untitled_save;
 #[path = "hierarchy_layouts.rs"]
 mod hierarchy_layouts;
 #[path = "hierarchy_welcome.rs"]
@@ -64,6 +70,8 @@ mod refine_keys_shortcuts;
 mod refine_state_pane;
 #[path = "refine_state_status.rs"]
 mod refine_state_status;
+#[path = "reload_edit_race.rs"]
+mod reload_edit_race;
 #[path = "review_partial.rs"]
 mod review_partial;
 #[path = "review_selection.rs"]

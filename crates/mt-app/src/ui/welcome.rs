@@ -279,15 +279,11 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                     RecentTargetKind::File => i18n::t(language, Key::File),
                 };
                 let name = recent_name(&target, &state.settings.get().recent_targets);
-                // A target that is gone stays listed, marked and disabled:
-                // the row says what happened rather than failing on a press,
-                // and its badge offers one press to forget the entry.
-                let missing = !target_exists(&target);
-                let label = if missing {
-                    format!("{kind} {name} \u{2014} {}", s(S::Missing, language))
-                } else {
-                    format!("{kind} {name}")
-                };
+                let label = format!("{kind} {name}");
+                let missing_label = format!("{label} \u{2014} {}", s(S::Missing, language));
+                // A target that vanished after the row was drawn flips to
+                // missing on the press instead of doing nothing.
+                let missing = signal(!target_exists(&target));
                 let target_for_open = target.clone();
                 view()
                     .test_id("welcome-recent-row")
@@ -298,27 +294,31 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                             view()
                                 .test_id("welcome-recent")
                                 .role(AccessibilityRole::Button)
-                                .optional_label(Some(SharedString::from(label)))
-                                .disabled(missing)
+                                .optional_label(move || {
+                                    Some(SharedString::from(if missing.get() {
+                                        missing_label.clone()
+                                    } else {
+                                        label.clone()
+                                    }))
+                                })
+                                .disabled(move || missing.get())
                                 .flex_row()
                                 .items_center()
                                 .gap(px(SPACE_2))
                                 .pl(px(SPACE_3))
                                 .py(px(SPACE_1))
-                                .when(!missing, |row| {
-                                    row.cursor_pointer()
-                                        .hover(|s| s.text_color(|| tokens::palette().ink))
-                                        .focus_visible(|s| {
-                                            s.text_color(|| tokens::palette().ink).underline()
-                                        })
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(|| tokens::palette().ink))
+                                .focus_visible(|s| {
+                                    s.text_color(|| tokens::palette().ink).underline()
                                 })
                                 .on_press({
                                     let open_state = state.clone();
                                     move || {
-                                        // Checked again at the press: the target may
-                                        // have gone since the row was drawn.
                                         if target_exists(&target_for_open) {
                                             open_state.open_recent(&target_for_open);
+                                        } else {
+                                            missing.set(true);
                                         }
                                     }
                                 }),
@@ -336,7 +336,7 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                                 .text_size(px(TYPE_UI))
                                 .line_height(px(TYPE_UI_LINE))
                                 .text_color(move || {
-                                    if missing {
+                                    if missing.get() {
                                         tokens::palette().ink_caption
                                     } else {
                                         tokens::palette().ink_rest
@@ -345,27 +345,36 @@ fn recents(state: AppState, language: Language) -> impl IntoElement {
                                 .truncate(),
                         ),
                     )
-                    .when(missing, {
+                    .child(dynamic({
                         let remove_state = state.clone();
                         let remove_target = target.clone();
                         let remove_id = format!("welcome-recent-remove-{index}");
-                        move |row| {
-                            row.child(
-                                prims::quiet_action(
-                                    &remove_id,
-                                    s(S::MissingRemove, language),
-                                    move || remove_state.remove_recent_target(&remove_target.path),
-                                )
-                                .pr(px(SPACE_3)),
-                            )
+                        move || {
+                            if missing.get() {
+                                view()
+                                    .pr(px(SPACE_3))
+                                    .child(prims::quiet_action(
+                                        &remove_id,
+                                        s(S::MissingRemove, language),
+                                        {
+                                            let remove_state = remove_state.clone();
+                                            let remove_target = remove_target.clone();
+                                            move || {
+                                                remove_state
+                                                    .remove_recent_target(&remove_target.path)
+                                            }
+                                        },
+                                    ))
+                                    .into_element()
+                            } else {
+                                view().into_element()
+                            }
                         }
-                    })
+                    }))
             },
         ))
 }
 
-/// The name a recent row shows: plain, unless two entries share it, in which
-/// case each carries its parent folder (`drafts/plan.md`).
 fn recent_name(target: &RecentTarget, entries: &[RecentTarget]) -> String {
     let shared = entries
         .iter()
@@ -405,7 +414,6 @@ pub(crate) fn choose_folder(state: AppState) {
     });
 }
 
-/// `{mod+P} finds any file in this folder.`, with the platform's modifier.
 fn find_a_file(language: Language) -> String {
     let key = crate::ui::titlebar::shortcut(false, "P");
     match language {
@@ -414,7 +422,6 @@ fn find_a_file(language: Language) -> String {
     }
 }
 
-/// `Could not open the folder dialog: {why}. Try again.`
 fn picker_failed(language: Language, why: &dyn std::fmt::Display) -> String {
     match language {
         Language::English => format!("Could not open the folder dialog: {why}. Try again."),

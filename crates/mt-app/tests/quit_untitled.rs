@@ -45,7 +45,7 @@ fn quit_save_all_saves_an_untitled_draft() {
     // Each control's id names the control itself — the element a press
     // reaches and UI Automation exposes as its AutomationId.
     for (id, label) in [
-        ("guard-save", "Save"),
+        ("guard-save", "Save all"),
         ("guard-dont-save", "Don't save"),
         ("guard-cancel", "Cancel"),
     ] {
@@ -62,7 +62,7 @@ fn quit_save_all_saves_an_untitled_draft() {
             "`{id}` is the {label} control"
         );
     }
-    app.press("id:guard-card >> label:Save")
+    app.press("id:guard-card >> label:Save all")
         .expect("save before quitting");
 
     // Quit saves the draft through Save As from a task: pump the app's frames

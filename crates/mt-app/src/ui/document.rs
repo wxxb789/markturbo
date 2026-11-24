@@ -42,10 +42,18 @@ pub fn column(state: AppState, language: Language) -> impl IntoElement {
     let reference = element_ref();
     state.attach_document_view(reference);
     let state_for_tabs = state.clone();
+    #[cfg(test)]
+    let focus_state = state.clone();
     view()
         .test_id("document")
         .focusable(true)
         .element_ref(&reference)
+        .on_focus(move || {
+            #[cfg(test)]
+            focus_state
+                .focus_last
+                .set(Some(crate::state::FocusTarget::Document));
+        })
         .flex_1()
         .h(relative(1.0))
         // The document starts 40px below the column's top edge, as the
@@ -206,7 +214,15 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     // one headless `--lib` run in four). The later of the two wins.
     let focuses = signal(0u64);
     let editor_box = element_ref();
-    editor_box.on_focus_in(move || focuses.update(|count| *count += 1));
+    #[cfg(test)]
+    let box_focus_state = state.clone();
+    editor_box.on_focus_in(move || {
+        focuses.update(|count| *count += 1);
+        #[cfg(test)]
+        box_focus_state
+            .focus_last
+            .set(Some(crate::state::FocusTarget::Editor));
+    });
     let keys_state = state.clone();
     effect(move || {
         focuses.get();
@@ -293,7 +309,17 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                         })
                         .w_full()
                         .flex_1()
-                        .on_focus(move || focuses.update(|count| *count += 1))
+                        .on_focus({
+                            #[cfg(test)]
+                            let focus_state = state.clone();
+                            move || {
+                                focuses.update(|count| *count += 1);
+                                #[cfg(test)]
+                                focus_state
+                                    .focus_last
+                                    .set(Some(crate::state::FocusTarget::Editor));
+                            }
+                        })
                         .on_change(move |value: &SharedString| {
                             // nsh reports the bound value once on mount. A document is
                             // dirty only after the buffer differs from what the editor

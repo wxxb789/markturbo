@@ -86,8 +86,10 @@ pub enum Pane {
 }
 
 impl Pane {
-    /// The stored form of the pane, and back: settings persist the last
-    /// choice by this mapping.
+    fn mounts_source(self) -> bool {
+        matches!(self, Pane::Source | Pane::Split | Pane::SplitWeb)
+    }
+
     pub(crate) fn of(stored: mt_core::settings::DocumentPane) -> Self {
         match stored {
             mt_core::settings::DocumentPane::Source => Pane::Source,
@@ -158,11 +160,8 @@ pub(crate) enum StatusKind {
     Error,
 }
 
-/// What pressing a status line's action does, if it offers one.
 pub(crate) type StatusAction = Rc<dyn Fn()>;
 
-/// A status line's content: the message, the changing count it names, and the
-/// reversible action it offers (`Undo`) while it holds.
 #[derive(Clone, Default)]
 pub struct StatusMessage {
     pub(crate) text: SharedString,
@@ -223,10 +222,10 @@ pub struct AppState {
     pub search_ran: Signal<bool>,
     pub search_truncated: Signal<bool>,
     pub search_busy: Signal<bool>,
-    /// Whether the rail's `Ctrl+P` / `Ctrl+Shift+F` palette is open: the
-    /// shell's Escape order treats it as a layer above the conflict
-    /// comparison.
     pub(crate) palette_open: Signal<bool>,
+    /// Whether the titlebar menu is open: the first layer of the fixed
+    /// Escape order.
+    pub title_menu_open: Signal<bool>,
     pub settings: Signal<SettingsData>,
     pub settings_open: Signal<bool>,
     pub settings_credential: Signal<String>,
@@ -328,26 +327,19 @@ pub struct AppState {
     revision_ledger: Rc<RefCell<Option<RevisionLedger>>>,
     recovery: Option<Rc<RecoveryStore>>,
     recovery_tracks: Rc<RefCell<HashMap<u64, RecoveryTrack>>>,
-    /// The Tier-2 soft-delete a Discard is holding: its records left
-    /// `recovery_records` in memory and only leave the store when the Undo
-    /// window (`motion::UNDO_HOLD_MS`) closes.
     undo_hold: Rc<RefCell<Option<UndoHold>>>,
     undo_generation: Rc<Cell<u64>>,
     quit_discarded: Rc<Cell<bool>>,
-    /// The pane the user chose last: a document opened after the choice
-    /// starts in it, and the choice is persisted in the settings.
     chosen_pane: Rc<Cell<Pane>>,
-    /// The mounted document view (`ui::document`): the focus floor when the
-    /// active pane does not mount the source editor.
     document_view: Rc<Cell<Option<ElementRef>>>,
-    /// The mounted card or panel of each layer a close may leave open
-    /// (`ui::notices`, `ui::rail`): focus lands on the layer, never past it.
     guard_view: Rc<Cell<Option<ElementRef>>>,
     compare_view: Rc<Cell<Option<ElementRef>>>,
     palette_view: Rc<Cell<Option<ElementRef>>>,
     /// The latest folder open's request token: a slower earlier scan must
     /// not commit its root, files, context, recents or status.
     folder_request: Rc<Cell<u64>>,
+    #[cfg(test)]
+    pub(crate) focus_last: Signal<Option<FocusTarget>>,
     next_id: Rc<Cell<u64>>,
 }
 
@@ -357,10 +349,6 @@ struct RecoveryTrack {
     last_checkpoint: Option<Instant>,
 }
 
-/// A Tier-2 soft-delete in progress: the recovered records a Discard took
-/// out of the banner, its deadline task, and the generation of the status
-/// message that currently carries its Undo (a newer message re-attaches it
-/// until the hold ends).
 struct UndoHold {
     records: Vec<RecoveredRecord>,
     generation: u64,
@@ -391,11 +379,7 @@ pub struct RevisionHunkView {
 /// One destructive decision the guard is asking about (`ui::notices`).
 #[derive(Clone, PartialEq)]
 pub struct GuardRequest {
-    /// What the guard covers: a tab's close, the app's quit, or one of the
-    /// disk decisions that replaced the platform's native alerts.
     pub kind: GuardKind,
-    /// Which control the keyboard is on (`ui::notices`); the kinds with two
-    /// choices start on Cancel, the last control.
     pub choice: Signal<usize>,
     /// A save is going on: the guard's controls wait for it.
     pub busy: Signal<bool>,
@@ -403,22 +387,15 @@ pub struct GuardRequest {
     pub notice: Signal<Option<SharedString>>,
 }
 
-/// What the destructive guard covers (`ui::notices`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GuardKind {
-    /// Closing one tab that holds unsaved edits.
     CloseTab(u64),
-    /// Quitting with dirty tabs.
     QuitApp,
-    /// Discarding this tab's buffer and reloading the file from disk.
     ReloadFromDisk(u64),
-    /// Saving over a file that changed on disk since it was opened.
     OverwriteDisk(u64),
 }
 
 impl GuardKind {
-    /// How many controls the card draws: three for the save decisions, two
-    /// (the destructive one and Cancel) for the disk decisions.
     pub fn choices(self) -> usize {
         match self {
             GuardKind::CloseTab(_) | GuardKind::QuitApp => GUARD_CHOICES,
@@ -433,13 +410,11 @@ impl GuardKind {
     }
 }
 
-/// How a Save As ended: its caller decides whether a guard closes, stays
-/// with the cancellation notice, or reports a failure.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum SaveAsOutcome {
-    Saved,
+    Saved(u64),
     Cancelled,
-    Failed,
+    Failed(SharedString),
 }
 
 /// The guard's controls, in the order its card draws them (`ui::notices`).
@@ -766,6 +741,7 @@ impl AppState {
             search_truncated: signal(false),
             search_busy: signal(false),
             palette_open: signal(false),
+            title_menu_open: signal(false),
             settings: signal(settings),
             settings_open: signal(false),
             settings_credential: signal(String::new()),
@@ -830,6 +806,8 @@ impl AppState {
             compare_view: Rc::new(Cell::new(None)),
             palette_view: Rc::new(Cell::new(None)),
             folder_request: Rc::new(Cell::new(0)),
+            #[cfg(test)]
+            focus_last: signal(None),
             next_id: Rc::new(Cell::new(1)),
         };
         state.record_first_launch();
@@ -1095,11 +1073,8 @@ impl AppState {
         }
     }
 
-    /// Reads `path` as the workspace root and lists it. The walk runs off the
-    /// UI thread — a large repository must not freeze the window — and the
-    /// status line says `Opening folder…` while it runs. The filesystem stays
-    /// the source of truth: nothing here caches file contents. Each open
-    /// carries a request token; only the latest may commit.
+    /// The walk runs off the UI thread; each open carries a request token,
+    /// and only the latest may commit.
     pub fn open_folder(&self, path: PathBuf) {
         let request = self.folder_request.get().wrapping_add(1);
         self.folder_request.set(request);
@@ -1110,7 +1085,11 @@ impl AppState {
         self.spawn_task(async move {
             let scanned = blocking({
                 let path = path.clone();
-                move || tree::read_dir_deep(&path, 4)
+                move || {
+                    #[cfg(any(test, feature = "test-vault"))]
+                    crate::test_vault::wait_for_read(&path);
+                    tree::read_dir_deep(&path, 4)
+                }
             })
             .await;
             if state.folder_request.get() != request {
@@ -1123,6 +1102,9 @@ impl AppState {
                     state.root.set(Some(path.clone()));
                     state.entries.set(entries);
                     state.reset_context();
+                    if state.context_open.get() {
+                        state.refresh_context();
+                    }
                     state.record_recent(&path, RecentTargetKind::Workspace);
                     state.notify_named(crate::i18n::Key::Opened, &path);
                 }
@@ -1231,9 +1213,8 @@ impl AppState {
         self.owner.run(move || state.add_untitled_inner(text));
     }
 
-    /// The smallest positive number no other open untitled tab holds, with
-    /// the title that names it. The human-facing number is the smallest free
-    /// one, never the internal tab id (contract note, decision 22).
+    /// The smallest free number, never the internal tab id (contract note,
+    /// decision 22).
     fn next_untitled(&self, language: Language, exclude: Option<u64>) -> (u64, SharedString) {
         let used: HashSet<u64> = self
             .tabs
@@ -1294,11 +1275,11 @@ impl AppState {
         self.set_active(id);
     }
 
-    fn add_tab(&self, loaded: LoadedFile) {
-        self.add_tab_with(loaded, false);
+    fn add_tab(&self, loaded: LoadedFile) -> u64 {
+        self.add_tab_with(loaded, false)
     }
 
-    fn add_tab_with(&self, loaded: LoadedFile, dirty: bool) {
+    fn add_tab_with(&self, loaded: LoadedFile, dirty: bool) -> u64 {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
 
@@ -1331,6 +1312,7 @@ impl AppState {
             });
         });
         self.set_active(id);
+        id
     }
 
     /// Run app-owned async work with the window's lifetime. A `spawn` from a
@@ -1696,9 +1678,6 @@ impl AppState {
         self.record_usage(UsageEvent::RecoveryRestored);
     }
 
-    /// A Tier-2 delete of recovered drafts: the rows leave the banner at
-    /// once and the store only lets go after `motion::UNDO_HOLD_MS`, with
-    /// `Undo` on the status line restoring them until then.
     pub fn discard_recovered(&self, record: &RecoveredRecord) {
         self.begin_undo(vec![record.clone()]);
     }
@@ -1713,7 +1692,6 @@ impl AppState {
         self.begin_undo(self.recovery_records.get());
     }
 
-    /// Hold `records` out of the banner and start their commit deadline.
     /// There is one pending slot: a second Tier-2 action commits the older
     /// hold at once, then starts its own.
     fn begin_undo(&self, records: Vec<RecoveredRecord>) {
@@ -1757,8 +1735,8 @@ impl AppState {
         );
     }
 
-    /// Take the held records back into the banner. The deadline task was
-    /// already cancelled; its later fire is a no-op on a taken hold.
+    /// The deadline task was already cancelled; its later fire on a taken
+    /// hold is a no-op.
     fn undo_pending(&self, generation: u64) {
         let Some(hold) = self.undo_hold.borrow_mut().take() else {
             return;
@@ -1782,7 +1760,6 @@ impl AppState {
         self.end_undo_action(hold.status_generation);
     }
 
-    /// The hold is over: delete what the Undo window was keeping.
     fn commit_undo(&self, generation: u64) {
         let Some(hold) = self.undo_hold.borrow_mut().take() else {
             return;
@@ -1805,17 +1782,26 @@ impl AppState {
         self.status_generation.update(|generation| *generation += 1);
     }
 
-    /// Delete held records from the recovery store at the commit boundary.
+    /// Only the commit bound to the draft it captured may delete: a newer
+    /// checkpoint under the same key means the path was reopened and edited.
     fn delete_recovered(&self, records: &[RecoveredRecord]) {
-        if let Some(store) = &self.recovery {
-            for record in records {
+        let Some(store) = &self.recovery else {
+            return;
+        };
+        let Ok(scan) = store.recover() else {
+            return;
+        };
+        for record in records {
+            let replaced = scan.records.iter().any(|current| {
+                current.record.key == record.record.key
+                    && current.record.checkpointed_at != record.record.checkpointed_at
+            });
+            if !replaced {
                 let _ = store.invalidate_and_delete(&record.record.key);
             }
         }
     }
 
-    /// Drop a recent target the user asked to forget (a missing row's
-    /// `Missing · Remove`), persisting the shortened history.
     pub fn remove_recent_target(&self, path: &Path) {
         let mut settings = self.settings.get();
         if settings.remove_recent_target(path) {
@@ -1914,7 +1900,6 @@ impl AppState {
         self.open_guard(GuardKind::CloseTab(id));
     }
 
-    /// Show the destructive guard for `kind` (`ui::notices`).
     fn open_guard(&self, kind: GuardKind) {
         // The guard outlives the control that asked for it (the card replaces
         // the tab's own row), so its signals are the app's.
@@ -1930,9 +1915,8 @@ impl AppState {
         }));
     }
 
-    /// Read `tab`'s file for the conflict comparison (`ui::notices`),
-    /// replacing any earlier text for it. A failed read reports why and leaves
-    /// the comparison closed, so Compare cannot be a silent no-op.
+    /// A failed read reports why and leaves the comparison closed, so
+    /// Compare cannot be a silent no-op.
     pub fn refresh_conflict_disk(&self, tab: &Tab) -> Result<(), std::io::Error> {
         let loaded = io::load(&tab.path)?;
         let id = tab.id;
@@ -1964,7 +1948,6 @@ impl AppState {
         self.owner.run(f)
     }
 
-    /// The guard's selection: `delta` steps of the kind's controls, wrapping.
     pub fn guard_move(&self, delta: isize) {
         let Some(request) = self.guard.get() else {
             return;
@@ -2004,10 +1987,6 @@ impl AppState {
         }
     }
 
-    /// The guard's Save: save every document it covers, then finish the
-    /// close. A save that cannot finish leaves the guard up with its notice;
-    /// an untitled draft's Save As picker keeps it open too, until the picker
-    /// answers.
     pub fn guard_save(&self) {
         let Some(request) = self.guard.get() else {
             return;
@@ -2026,8 +2005,6 @@ impl AppState {
                     .find(|tab| tab.id == id)
                     .is_some_and(|tab| tab.untitled);
                 if untitled {
-                    // The picker is the next decision: the card waits for it,
-                    // and keeps its place when the picker is cancelled.
                     request.busy.set(true);
                     request.notice.set(None);
                     let state = self.clone();
@@ -2035,7 +2012,9 @@ impl AppState {
                         let outcome =
                             match state.tabs.get().iter().find(|tab| tab.id == id).cloned() {
                                 Some(tab) => state.save_as_tab(tab).await,
-                                None => SaveAsOutcome::Failed,
+                                None => SaveAsOutcome::Failed(SharedString::from(
+                                    s::guard_save_failed(language),
+                                )),
                             };
                         let Some(request) = state.guard.get() else {
                             return;
@@ -2045,16 +2024,15 @@ impl AppState {
                         }
                         request.busy.set(false);
                         match outcome {
-                            SaveAsOutcome::Saved => {
+                            SaveAsOutcome::Saved(new_id) => {
                                 state.guard.set(None);
+                                state.close_tab_now(new_id);
                                 state.focus_editor();
                             }
                             SaveAsOutcome::Cancelled => request
                                 .notice
                                 .set(Some(SharedString::from(s::save_cancelled(language)))),
-                            SaveAsOutcome::Failed => request
-                                .notice
-                                .set(Some(SharedString::from(s::guard_save_failed(language)))),
+                            SaveAsOutcome::Failed(reason) => request.notice.set(Some(reason)),
                         }
                     });
                     return;
@@ -2093,20 +2071,25 @@ impl AppState {
                         let outcome = if tab.untitled {
                             state.save_as_tab(tab).await
                         } else if state.save_tab(tab.id) {
-                            SaveAsOutcome::Saved
+                            SaveAsOutcome::Saved(tab.id)
                         } else {
-                            SaveAsOutcome::Failed
+                            SaveAsOutcome::Failed(SharedString::from(s::guard_save_failed(
+                                language,
+                            )))
                         };
-                        if outcome != SaveAsOutcome::Saved {
+                        if !matches!(outcome, SaveAsOutcome::Saved(_)) {
                             if let Some(request) = state.guard.get() {
                                 request.busy.set(false);
                                 let notice = match outcome {
-                                    SaveAsOutcome::Cancelled => s::save_cancelled(language),
-                                    SaveAsOutcome::Failed | SaveAsOutcome::Saved => {
-                                        s::guard_save_failed(language)
+                                    SaveAsOutcome::Cancelled => {
+                                        SharedString::from(s::save_cancelled(language))
+                                    }
+                                    SaveAsOutcome::Failed(reason) => reason,
+                                    SaveAsOutcome::Saved(_) => {
+                                        SharedString::from(s::guard_save_failed(language))
                                     }
                                 };
-                                request.notice.set(Some(SharedString::from(notice)));
+                                request.notice.set(Some(notice));
                             }
                             state.notify_error(s::quit_save_failed(language));
                             return;
@@ -2152,8 +2135,6 @@ impl AppState {
         }
     }
 
-    /// The guard's Cancel: nothing changes, the guard goes, and a document on
-    /// screen gets the keyboard back.
     pub fn guard_cancel(&self) {
         if self.guard.get().is_some() {
             self.guard.set(None);
@@ -2163,17 +2144,27 @@ impl AppState {
         }
     }
 
-    /// The reload guard's decision: discard the buffer and load the file
-    /// again.
     pub(crate) fn guard_reload(&self, id: u64) {
         self.guard.set(None);
         let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() else {
             return;
         };
+        // The confirmation was for this revision: an edit made while the
+        // disk was read refuses it, keeping the buffer and its recovery.
+        let confirmed_revision = tab.revision.get();
         let state = self.clone();
         self.spawn_task(async move {
             let path = tab.path.clone();
-            let loaded = match blocking(move || io::load(&path)).await {
+            let loaded = match blocking({
+                let path = path.clone();
+                move || {
+                    #[cfg(any(test, feature = "test-vault"))]
+                    crate::test_vault::wait_for_read(&path);
+                    io::load(&path)
+                }
+            })
+            .await
+            {
                 Ok(Ok(loaded)) => loaded,
                 Ok(Err(error)) => {
                     state.notify_failure(crate::i18n::Key::ReloadFailed, &error);
@@ -2184,14 +2175,26 @@ impl AppState {
                     return;
                 }
             };
-            state.adopt_disk_version(&tab, loaded);
-            state.notify_named(crate::i18n::Key::Reloaded, &tab.path);
+            let Some(current) = state
+                .tabs
+                .get()
+                .iter()
+                .find(|current| current.id == id)
+                .cloned()
+            else {
+                return;
+            };
+            if current.revision.get() != confirmed_revision {
+                state.note_conflict(&current);
+                state.focus_editor();
+                return;
+            }
+            state.adopt_disk_version(&current, loaded);
+            state.notify_named(crate::i18n::Key::Reloaded, &current.path);
             state.focus_editor();
         });
     }
 
-    /// The overwrite guard's decision: write the buffer over the file that
-    /// changed on disk.
     pub(crate) fn guard_overwrite(&self, id: u64) {
         self.guard.set(None);
         let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() else {
@@ -2238,9 +2241,6 @@ impl AppState {
         }
     }
 
-    /// Ask through the in-app guard before discarding the buffer and loading
-    /// the file again (decision 3): the same card as a close, never a native
-    /// alert.
     pub fn reload_active(&self) {
         let Some(tab) = self.active_tab() else {
             return;
@@ -2272,8 +2272,6 @@ impl AppState {
         self.note_edit(tab.id);
     }
 
-    /// Ask through the in-app guard before overwriting a file that changed on
-    /// disk (decision 3): the same card as a close, never a native alert.
     pub fn overwrite_active(&self) {
         let Some(tab) = self.active_tab() else {
             return;
@@ -2284,10 +2282,8 @@ impl AppState {
         self.open_guard(GuardKind::OverwriteDisk(tab.id));
     }
 
-    /// Save the active buffer to a new path. The native save dialog asks
-    /// before an existing file is chosen, so a picked existing destination is
-    /// replaced (atomically, as Save does) — unless another tab has it open,
-    /// which is refused so two tabs never edit one file.
+    /// A picked destination another tab has open is refused: two tabs never
+    /// edit one file.
     pub fn save_as_active(&self) {
         let Some(tab) = self.active_tab() else {
             return;
@@ -2299,6 +2295,9 @@ impl AppState {
     }
 
     async fn save_as_tab(&self, tab: Tab) -> SaveAsOutcome {
+        let language = self.settings.get().language;
+        #[cfg(any(test, feature = "test-vault"))]
+        let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         let picked = pick_save_path(
             SaveDialog::new()
                 .title(crate::i18n::t(
@@ -2316,9 +2315,9 @@ impl AppState {
                 if !tab.untitled && path == tab.path {
                     // Its own file: a plain Save, with its conflict check.
                     return if self.save_tab(tab.id) {
-                        SaveAsOutcome::Saved
+                        SaveAsOutcome::Saved(tab.id)
                     } else {
-                        SaveAsOutcome::Failed
+                        SaveAsOutcome::Failed(SharedString::from(s::guard_save_failed(language)))
                     };
                 }
                 if self
@@ -2329,11 +2328,10 @@ impl AppState {
                 {
                     // The file's name, not the folder it sits in.
                     let name = crate::i18n::file_name(&path);
-                    self.notify_held(crate::i18n::save_as_path_already_open_message(
-                        self.settings.get().language,
-                        Path::new(&name),
-                    ));
-                    return SaveAsOutcome::Failed;
+                    let reason =
+                        crate::i18n::save_as_path_already_open_message(language, Path::new(&name));
+                    self.notify_held(reason.clone());
+                    return SaveAsOutcome::Failed(SharedString::from(reason));
                 }
                 let text = tab.text.get().to_string();
                 let (newline, had_bom) = {
@@ -2351,29 +2349,25 @@ impl AppState {
                 match saved {
                     Ok(loaded) => {
                         self.close_tab_now(tab.id);
-                        self.add_tab(loaded);
+                        let new_id = self.add_tab(loaded);
                         self.record_usage(UsageEvent::ArtifactSaved);
-                        SaveAsOutcome::Saved
+                        SaveAsOutcome::Saved(new_id)
                     }
                     Err(error) => {
                         self.notify_failure(crate::i18n::Key::SaveAsFailed, &error);
-                        SaveAsOutcome::Failed
+                        SaveAsOutcome::Failed(SharedString::from(s::guard_save_failed(language)))
                     }
                 }
             }
             Ok(None) => SaveAsOutcome::Cancelled,
             Err(error) => {
-                self.notify_error(s::save_as_picker_failed(
-                    self.settings.get().language,
-                    &error,
-                ));
-                SaveAsOutcome::Failed
+                let reason = s::save_as_picker_failed(language, &error);
+                self.notify_error(reason.clone());
+                SaveAsOutcome::Failed(SharedString::from(reason))
             }
         }
     }
 
-    /// Show `pane` for tab `id`, remember it for the documents opened after
-    /// it, and persist it so the next session opens in the same pane.
     pub fn set_pane(&self, id: u64, pane: Pane) {
         if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
             tab.pane.set(pane);
@@ -2606,14 +2600,10 @@ impl AppState {
         self.source_editor.set(Some((tab, editor)));
     }
 
-    /// Record the mounted document view (`ui::document`): where a close
-    /// returns focus when the pane does not mount the source editor.
     pub fn attach_document_view(&self, view: ElementRef) {
         self.document_view.set(Some(view));
     }
 
-    /// Record the mounted guard card, comparison panel and palette input:
-    /// the layer a close leaves open takes the keyboard.
     pub fn attach_guard_view(&self, view: ElementRef) {
         self.guard_view.set(Some(view));
     }
@@ -2626,10 +2616,8 @@ impl AppState {
         self.palette_view.set(Some(view));
     }
 
-    /// Return a local action's keyboard focus without moving the caret: the
-    /// topmost layer still open when one is up, else the source editor when
-    /// the active pane mounts it, else the document view. Never switches
-    /// panes.
+    /// The topmost open layer, else the active pane's editor or document
+    /// view; the pane never switches. The caret never moves.
     pub fn focus_editor(&self) {
         let Some(active) = self.active.get() else {
             return;
@@ -2637,30 +2625,44 @@ impl AppState {
         if self.focus_open_layer() {
             return;
         }
-        if self.focus_mounted_editor(active) || self.focus_document_view() {
+        if self
+            .active_tab()
+            .is_some_and(|tab| tab.pane.get().mounts_source())
+        {
+            // The new tab's editor mounts in a later commit: focus it when
+            // it is there, never the container it replaced.
+            self.retry_editor_focus(active, Self::FOCUS_RETRY_FRAMES);
+        } else {
+            self.focus_document_view();
+        }
+    }
+
+    /// Frames a pending editor focus waits for a tab switch to mount it.
+    const FOCUS_RETRY_FRAMES: u8 = 6;
+
+    fn retry_editor_focus(&self, active: u64, frames_left: u8) {
+        if self.focus_mounted_editor(active) {
             return;
         }
-        // A tab switch can replace the editor in the next commit.
+        if frames_left == 0 {
+            self.focus_document_view();
+            return;
+        }
         let state = self.clone();
         request_animation_frame(move |_| {
             if state.active.get() != Some(active) || state.focus_open_layer() {
                 return;
             }
-            if !state.focus_mounted_editor(active) {
-                state.focus_document_view();
-            }
+            state.retry_editor_focus(active, frames_left - 1);
         });
     }
 
-    /// Give the keyboard to the topmost layer still open, if any: focus
-    /// never falls through a card or panel into the document. Returns
-    /// whether a layer is open.
     fn focus_open_layer(&self) -> bool {
         if self.guard.get().is_some() {
             if let Some(view) = self.guard_view.get() {
                 view.focus();
                 #[cfg(test)]
-                focus_trace::record(focus_trace::Target::Guard);
+                self.focus_last.set(Some(FocusTarget::Guard));
             }
             return true;
         }
@@ -2671,7 +2673,7 @@ impl AppState {
             if let Some(view) = self.palette_view.get() {
                 view.focus();
                 #[cfg(test)]
-                focus_trace::record(focus_trace::Target::Palette);
+                self.focus_last.set(Some(FocusTarget::Palette));
             }
             return true;
         }
@@ -2682,7 +2684,7 @@ impl AppState {
             if let Some(view) = self.compare_view.get() {
                 view.focus();
                 #[cfg(test)]
-                focus_trace::record(focus_trace::Target::Compare);
+                self.focus_last.set(Some(FocusTarget::Compare));
             }
             return true;
         }
@@ -2695,7 +2697,7 @@ impl AppState {
         };
         view.focus();
         #[cfg(test)]
-        focus_trace::record(focus_trace::Target::Document);
+        self.focus_last.set(Some(FocusTarget::Document));
         true
     }
 
@@ -2710,7 +2712,7 @@ impl AppState {
         };
         api.focus();
         #[cfg(test)]
-        focus_trace::record(focus_trace::Target::Editor);
+        self.focus_last.set(Some(FocusTarget::Editor));
         true
     }
 
@@ -3798,11 +3800,66 @@ impl AppState {
     pub fn open_settings(&self) {
         self.refresh_usage_counts();
         self.settings_open.set(true);
+        self.carry_undo_to(StatusSurface::Settings);
+    }
+
+    /// Move a live Undo with the surface the user is on: opening Settings
+    /// unmounts the editor's status line, and the hold's deadline must stay
+    /// reachable until it fires.
+    fn carry_undo_to(&self, surface: StatusSurface) {
+        if self.undo_hold.borrow().is_some() && self.status.get_untracked().action.is_some() {
+            self.status_surface.set(surface);
+        }
     }
 
     pub fn close_settings(&self) {
         if self.persist_settings(StatusSurface::Editor) {
             self.settings_open.set(false);
+        }
+    }
+
+    /// Escape closes at most one layer, in the contract's fixed order — the
+    /// title menu, the guard or consent card, then the palette. Every Escape
+    /// binding runs this, so which layer closes never depends on which
+    /// binding the keymap offered the key to. Returns whether one closed.
+    pub fn escape_top_layer(&self) -> bool {
+        if self.title_menu_open.get() {
+            self.close_title_menu();
+            return true;
+        }
+        if self.guard.get().is_some() {
+            self.guard_cancel();
+            return true;
+        }
+        if self.review_consent.get().is_some() {
+            self.cancel_review();
+            self.focus_editor();
+            return true;
+        }
+        if self.revision_consent.get().is_some() {
+            crate::ui::review::cancel_revision(self);
+            self.focus_editor();
+            return true;
+        }
+        if self.palette_open.get() {
+            self.close_palette();
+            return true;
+        }
+        false
+    }
+
+    pub fn close_title_menu(&self) {
+        self.title_menu_open.set(false);
+        if self.active.get().is_some() {
+            self.focus_editor();
+        }
+    }
+
+    pub fn close_palette(&self) {
+        self.palette_open.set(false);
+        self.clear_search();
+        if self.active.get().is_some() {
+            self.focus_editor();
         }
     }
 
@@ -4181,7 +4238,6 @@ impl Default for AppState {
     }
 }
 
-/// The number in an `Untitled {n}` title, when it carries one.
 fn untitled_number(title: &str) -> Option<u64> {
     title.rsplit(' ').next()?.parse().ok()
 }
@@ -4365,49 +4421,16 @@ fn recovered_loaded(record: &RecoveredRecord) -> LoadedFile {
     }
 }
 
-/// What `focus_editor` last handed the keyboard to, for the lib tests. The
-/// app dispatches keys on its own thread and the tests run in parallel, so
-/// the trace is global and records only between `watch` and `take`.
+/// What the last local focus move handed the keyboard to, for the lib tests:
+/// one per app, so parallel tests cannot see each other's focus.
 #[cfg(test)]
-pub(crate) mod focus_trace {
-    use std::sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    };
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Target {
-        Editor,
-        Document,
-        Guard,
-        Palette,
-        Compare,
-    }
-
-    static ACTIVE: AtomicBool = AtomicBool::new(false);
-
-    fn trace() -> &'static Mutex<Vec<Target>> {
-        static TRACE: OnceLock<Mutex<Vec<Target>>> = OnceLock::new();
-        TRACE.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
-    pub(crate) fn record(target: Target) {
-        if ACTIVE.load(Ordering::SeqCst) {
-            trace().lock().expect("the focus trace").push(target);
-        }
-    }
-
-    /// Start watching, clearing anything recorded before.
-    pub(crate) fn watch() {
-        trace().lock().expect("the focus trace").clear();
-        ACTIVE.store(true, Ordering::SeqCst);
-    }
-
-    /// Stop watching and return what was recorded.
-    pub(crate) fn take() -> Vec<Target> {
-        ACTIVE.store(false, Ordering::SeqCst);
-        std::mem::take(&mut *trace().lock().expect("the focus trace"))
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FocusTarget {
+    Editor,
+    Document,
+    Guard,
+    Palette,
+    Compare,
 }
 
 #[cfg(test)]

@@ -53,10 +53,29 @@ fn a_second_conflict_reads_the_disk_again() {
     app.wait_for("id:conflict-banner")
         .expect("the conflict banner");
 
-    // Compare reads the file: the first disk version is on screen.
+    // Compare reads the file: the first disk version is on screen, and the
+    // control shows its open state with the selected underline.
+    let closed_style = app
+        .screen()
+        .span_style("id:conflict-compare >> text:Compare")
+        .expect("the closed Compare label");
+    assert!(
+        closed_style.decoration.is_none(),
+        "the closed Compare is not underlined"
+    );
     app.press("label:Compare").expect("compare");
     app.wait_for("id:conflict-compare")
         .expect("the compare panel");
+    app.wait_for("text:Hide comparison")
+        .expect("the control names its open state");
+    let open_style = app
+        .screen()
+        .span_style("id:conflict-compare >> text:Hide comparison")
+        .expect("the open Compare label");
+    assert!(
+        open_style.decoration.underline,
+        "the open Compare shows its selected underline"
+    );
     assert!(
         shows_anywhere(&app, "Alpha"),
         "the first disk version shows: {:?}",

@@ -104,6 +104,114 @@ fn tier_two_discard_holds_and_commit_boundaries() {
     discard_all_stays_reversible_until_the_hold_expires();
     a_second_discard_commits_the_first_hold_and_takes_its_slot();
     a_newer_notice_does_not_hide_the_pending_undo();
+    a_live_undo_stays_reachable_on_settings();
+    an_expired_discard_keeps_a_newer_checkpoint_for_the_same_path();
+}
+
+/// Opening Settings unmounts the editor's status line: a live Undo has to
+/// travel to the visible surface and still restore its rows there.
+fn a_live_undo_stays_reachable_on_settings() {
+    let mut seeded = two_recovered();
+    let keys = seeded.keys.clone();
+    let app = &mut seeded.app;
+    app.press("id:recovery-discard-all").expect("discard all");
+    app.wait_for("id:status-action").expect("the Undo");
+    assert_eq!(
+        checkpoint_files(&keys),
+        2,
+        "nothing commits inside the hold"
+    );
+
+    app.press("id:title-settings").expect("open the title menu");
+    app.wait_for("id:title-menu").expect("the menu");
+    app.press("id:title-menu-settings").expect("open Settings");
+    app.wait_for("id:settings-page").expect("the settings page");
+    app.wait_for("id:status-action")
+        .expect("the Undo follows the user to Settings");
+
+    app.press("id:status-action")
+        .expect("undo on the settings surface");
+    app.wait_for_gone("id:status-action", Duration::from_secs(5))
+        .expect("the Undo is spent");
+    assert_eq!(
+        checkpoint_files(&keys),
+        2,
+        "the returned rows keep their store entries"
+    );
+
+    app.press("id:settings-close").expect("close Settings");
+    app.wait_for("id:recovery-banner")
+        .expect("the rows are back in the banner");
+}
+
+/// For the file a rejoined path's checkpoint is named by.
+fn record_path(key: &RecoveryKey) -> std::path::PathBuf {
+    mt_core::runtime_paths::recovery_dir()
+        .expect("the recovery directory")
+        .join(format!("{}.mtrecovery", key.as_str()))
+}
+
+/// The discard's commit is bound to the draft it captured: a checkpoint the
+/// same path wrote inside the hold is a newer draft and survives.
+fn an_expired_discard_keeps_a_newer_checkpoint_for_the_same_path() {
+    let mut seeded = two_recovered();
+    let keys = seeded.keys.clone();
+    let app = &mut seeded.app;
+    app.wait_for("id:recovery-discard-all")
+        .expect("Discard all with two rows");
+    app.press("id:recovery-discard-all").expect("discard all");
+    app.wait_until("the rows to go", Duration::from_secs(5), |screen| {
+        screen.count("id:recovery-banner").unwrap_or(1) == 0
+    })
+    .expect("the banner leaves");
+
+    // Reopen the same path and edit it: a fresh checkpoint lands under the
+    // same key while the old discard is still holding.
+    app.on_pick_paths(vec![seeded._dir.path().to_path_buf()])
+        .expect("answer the folder picker");
+    app.press("id:welcome-open-folder")
+        .expect("open the workspace");
+    app.wait_for("id:workspace-home").expect("the workspace");
+    app.press_key("mod+p").expect("open the palette");
+    app.wait_for("id:palette-input").expect("the palette input");
+    app.type_text("id:palette-input", "first")
+        .expect("filter to first.md");
+    app.submit("id:palette-input").expect("open first.md");
+    app.wait_for("label:Markdown source")
+        .expect("the source editor");
+    app.type_text("label:Markdown source", "\nA newer draft.")
+        .expect("edit the reopened file");
+    app.wait(Duration::from_millis(3_500))
+        .expect("advance to the fresh checkpoint");
+    let first = record_path(&keys[0]);
+    let second = record_path(&keys[1]);
+    assert!(first.exists(), "the newer first.md checkpoint is written");
+    let refreshed = std::fs::metadata(&first)
+        .and_then(|metadata| metadata.modified())
+        .expect("the fresh checkpoint's stamp");
+    assert!(second.exists(), "the second hold is still waiting");
+
+    // Let the old discard expire: its commit may only delete the drafts it
+    // captured, never the checkpoint that replaced one of them.
+    app.wait_for_gone("id:status-action", Duration::from_secs(5))
+        .expect("the hold commits");
+    app.wait(Duration::from_millis(500))
+        .expect("advance past the commit");
+    assert!(
+        first.exists(),
+        "the expired discard deleted the newer checkpoint for the same path"
+    );
+    assert_eq!(
+        std::fs::metadata(&first)
+            .and_then(|metadata| metadata.modified())
+            .expect("the surviving checkpoint's stamp"),
+        refreshed,
+        "the newer checkpoint was rewritten by the commit"
+    );
+    assert!(
+        !second.exists(),
+        "the captured second.md draft is still deleted"
+    );
 }
 
 fn discard_all_stays_reversible_until_the_hold_expires() {

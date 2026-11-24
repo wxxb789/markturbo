@@ -125,7 +125,7 @@ fn the_window_close_button_is_guarded_like_quit() {
         let (mut app, path) = dirty_file(dir.path(), config.path(), "save.md");
         app.press_window_close("main").expect("press close");
         app.wait_for("id:guard-save").expect("the guard");
-        app.press("id:guard-card >> label:Save")
+        app.press("id:guard-card >> label:Save all")
             .expect("save and close");
         support::wait_for_file(
             &mut app,
@@ -151,7 +151,7 @@ fn the_window_close_button_is_guarded_like_quit() {
         std::fs::write(&path, "# Changed elsewhere\n").expect("external edit");
         app.press_window_close("main").expect("press close");
         app.wait_for("id:guard-save").expect("the guard");
-        app.press("id:guard-card >> label:Save")
+        app.press("id:guard-card >> label:Save all")
             .expect("try to save");
         app.wait_for("text:Could not save this document, so it stays open. Check file permissions or try Save As….")
             .expect("the guard says the save failed");
@@ -180,7 +180,7 @@ fn the_window_close_button_is_guarded_like_quit() {
         app.on_pick_save_path(None).expect("cancel the picker");
         app.press_window_close("main").expect("press close");
         app.wait_for("id:guard-save").expect("the guard");
-        app.press("id:guard-card >> label:Save")
+        app.press("id:guard-card >> label:Save all")
             .expect("save through the picker");
         app.wait_for("text:Save cancelled — the document stays open.")
             .expect("a cancelled picker leaves the guard up");
@@ -196,7 +196,7 @@ fn the_window_close_button_is_guarded_like_quit() {
             .expect("register save path");
         app.press_window_close("main").expect("press close again");
         app.wait_for("id:guard-save").expect("the guard again");
-        app.press("id:guard-card >> label:Save")
+        app.press("id:guard-card >> label:Save all")
             .expect("save through the picker");
         support::wait_for_file(
             &mut app,
