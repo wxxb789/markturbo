@@ -5,10 +5,6 @@
 - [ ] **Keyboard press feedback on Win32**: nsh 0.6.1 dispatches only `Press`
   for keyboard activation, so pressables show no press-down visual for keyboard
   use. Revisit when nsh exposes keyboard press-down and release events.
-- [ ] **Keep consent charge full during the Sent fade**: In
-  `crates/mt-app/src/ui/consent.rs`, `rebuild(None, 0)` clears the charge bar
-  before checking `spent`, so the bar is empty during the 150 ms fade. Keep it
-  full until the card unmounts.
 - [ ] **First-time-user and screen-reader evidence for the shipped UI** — Goal
   09 was accepted on 2026-11-13 without the five first-time-target-user sessions
   and the Windows 11 x64 keyboard/screen-reader smoke its completion evidence
@@ -39,19 +35,6 @@
   40-node flow 638 µs vs 436 µs) with larger SVG output. Revisit with a
   benchmark against `mermaid-svg` on representative documents, a measured
   improvement threshold, and no new JS/script-execution requirement.
-- [ ] **Retired native acceptance adapters** — `mt.py accept goal-02`,
-  `goal-03`, `goal-06`, `goal-07` and their `scripts/markturbo_tools/native/*`
-  modules still drive the retired GPUI shell (`crates/mt-app/src/views/` no
-  longer exists; `docs/goal-09-acceptance.md` states the selectors are retired
-  and that rebuilding them for nsh is not part of that gate). They cannot
-  produce acceptance for the current nsh app; `check native` still compiles and
-  unit-tests them. Decide per adapter whether to rebuild on the nsh UIA surface
-  or delete the adapter, its module, and its `ACCEPTANCE_GOALS` entry, so the
-  CLI stops advertising an acceptance path that cannot pass. Revalidate the
-  candidate before removing anything. This entry also owns the stale pending
-  native items in [dependency-review.md](dependency-review.md): the GPUI/Kit
-  artifact's native acceptance and its focused Windows CJK/IME, selection/undo,
-  clipboard, save-dialog and WebView-focus acceptance can no longer be produced.
 - [ ] **Release renewal after the archived Goal 10/11 sequence** — On
   2026-11-14 the owner archived Goals 10 and 11 as execution deferred, not
   accepted: the product is not considered ready, no target users are available

@@ -42,7 +42,7 @@ Upstream references:
 | `dirs` | 6.0.0 | 7.0.0 | Major migration. Validate Windows/macOS/Linux config/data paths; a changed directory must not make settings or recovery appear lost. |
 | Workspace `sha2` | 0.10.9 | 0.11.0, already transitive | Breaking 0.x version step. Evaluate API migration and exact digest fixtures separately; transitive 0.10 users may still prevent deduplication. |
 | Workspace `windows` | 0.61.3 | 0.62.2, already transitive | Coordinate native API and handle-type interoperability; requires Windows compilation and affected native smoke. |
-| GPUI + component/base/assets/wry | Kit family 0.6.6 + gpui-pre 0.3.6 | Coordinated registry migration | Migrated in the separate Kit change; native acceptance remains pending. Do not chase Zed HEAD. |
+| GPUI + component/base/assets/wry | Kit family 0.6.6 + gpui-pre 0.3.6 | Coordinated registry migration | Migrated in the separate Kit change; the native acceptance against that artifact is superseded by the nsh migration ([2026-11-23 native run](goal-15-acceptance.md#native-acceptance-2026-11-23)). Do not chase Zed HEAD. |
 | RaTeX family | 0.1.14 | 0.1.14 | Keep the vendored parser allocation clamp until a verified upstream release includes it. |
 
 Registry checks also found no newer stable release for the directly used
@@ -100,20 +100,22 @@ Implemented migration boundary:
   click New, check welcome dismissal and a single buffer, then type through
   the focused input. No second harness or desktop session is required.
 - The migration is separately reviewable from development-process changes.
-  All three platform compile/test gates are required before merge. Focused
+  All three platform compile/test gates are required before merge. The focused
   Windows CJK/IME, selection/undo, clipboard, save-dialog and WebView-focus
-  acceptance remains pending against the upgraded artifact. Headless passing
-  does not resolve historical Goal 03 native evidence.
+  acceptance against the GPUI/Kit artifact is superseded by the nsh migration
+  ([2026-11-23 native run](goal-15-acceptance.md#native-acceptance-2026-11-23)).
+  Headless passing does not resolve historical Goal 03 native evidence.
 
 See `docs/development.md` for the targeted command and testing boundary. No
 application performance or production binary-size improvement is claimed.
 
-The GPUI shell and its acceptance adapters are retired (see the Goal 09
-acceptance record), so the native items this section still records as pending —
-the Kit native acceptance and the focused Windows CJK/IME, selection/undo,
-clipboard, save-dialog and WebView-focus acceptance against that artifact — can
-no longer be produced. They are carried by the retired-native-acceptance-adapter
-entry in [TODO.md](TODO.md) instead of staying open here.
+The GPUI shell is retired (see the Goal 09 acceptance record), so the native
+items this section recorded as pending — the Kit native acceptance and the
+focused Windows CJK/IME, selection/undo, clipboard, save-dialog and
+WebView-focus acceptance against that artifact — are superseded by the nsh
+migration
+([2026-11-23 native run](goal-15-acceptance.md#native-acceptance-2026-11-23))
+and are never counted as passed.
 
 Sources: [published Kit 0.6.6](https://docs.rs/crate/gpui-kit/0.6.6),
 [registry metadata](https://crates.io/api/v1/crates/gpui-kit),
