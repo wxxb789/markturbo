@@ -101,9 +101,10 @@ executable or receipts were generated in this implementation stage.
 - With two tabs open, edit the active tab, close it and choose **Don't save**.
   Verify that its rail row and editor disappear immediately while the guard
   fades, and that the remaining editor accepts input during the fade.
-  **Done 2026-11-24:** the rail row and editor were removed while the guard
-  faded, and the other editor accepted input (see
-  [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
+  **Partly done 2026-11-24:** the rail row and editor were removed while the
+  guard faded, and the other editor accepted input; the removal immediacy and
+  whether the other editor accepted input during the fade were not recorded
+  (see [Desktop acceptance 2026-11-24](#desktop-acceptance-2026-11-24)).
 - Close and reopen the guard or consent before its fade ends. Verify that
   opacity, scale and vertical position do not jump on the first frame back,
   and that the fading surface does not intercept pointer or keyboard input.
@@ -147,8 +148,9 @@ and moved the content below without a jump; **Compare** → **Use disk version**
 dismissed the banner with the comparison intact; and closing an edited tab
 with **Don't save** removed its rail row and editor while the guard faded, and
 the other editor accepted input. Not recorded: the reload after **Use disk
-version**, and the banner's exit motion. Not checked: Animation effects off,
-and reopening a guard or consent before its fade ends.
+version**, the banner's exit motion, the close-tab removal immediacy and
+whether the other editor accepted input during its guard fade. Not checked:
+Animation effects off, and reopening a guard or consent before its fade ends.
 
 Before captures ran with the same harness options and states
 (`clean-profile-welcome, review-loading, review-result-questions, settings`)
@@ -166,5 +168,5 @@ harness's UIA observation-channel gap, not a product failure; it is recorded
 in [TODO.md](TODO.md).
 
 This is not a pass: the reload confirmation, the banner-exit checks, the
-guard or consent reopen, and the two `web-compatibility-preview` cells stay
-pending.
+close-tab removal immediacy and input during its guard fade, the guard or
+consent reopen, and the two `web-compatibility-preview` cells stay pending.
