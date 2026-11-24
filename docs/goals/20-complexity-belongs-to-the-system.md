@@ -141,6 +141,28 @@ These override any conflicting text in the advisor body below.
     - Each must have a localized outer message with a next step.
     - An embedded `{why}` / `{error}` may stay the operating system's text (Windows localizes it). It must never contain
       document text, secrets or credential material.
+    - This exception amends Done when 3: OS-provided detail may appear in the OS language. Detail the app itself
+      produces, such as `TranslationError::InvalidTranslationResponse` or provider and parser messages, is not OS text.
+      It gets a localized mapping, or it is omitted.
+11. **Keyboard release ends the hold (amends 1).**
+    - A keyboard hold ends on the actual release of `Enter` or of the modifier. Observe it with nsh 0.6.1's view
+      `KeyUp` events (`nsh-platform-windows` `keyboard.rs`) wherever the focus is.
+    - The silence timer (`KEY_ALIVE_MS`) may still end a hold whose release went unobserved. It never authorizes.
+    - Test: press at 0 ms, an auto-repeat at 500 ms, a `KeyUp` at 550 ms. Nothing is sent at 900 ms or later.
+12. **Undo commit boundary (amends Done when 4 and amendment 2).**
+    - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
+      pending slot. When the slot is taken, the older action's Undo ends at the same moment.
+    - Test both paths.
+13. **Quit re-checks dirty tabs (amends 3).**
+    - After each Save As and before closing the window, Quit reads the current set of dirty tabs, not a list taken when
+      the quit started.
+    - A tab that became dirty during the guard is guarded too, for example when a translation returns.
+    - Test that interleaving.
+14. **Restored Review recomputes stale (amends 4).**
+    - Cancel restores the results, answers and Revision state from the snapshot.
+    - Stale is recomputed against the document's current revision, so a result the document has moved past shows as
+      stale.
+    - Test: an edit or a translation write while the new consent card is open.
 
 ## Contract notes (conductor, 2026-11-24)
 

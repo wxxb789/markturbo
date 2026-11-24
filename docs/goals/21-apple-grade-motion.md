@@ -67,7 +67,8 @@ UX behaviour changes (Goal 20), except where a motion fix needs a reserved slot.
 - **21-C Pointer and keyboard motion:** `ui/prims.rs`, `ui/titlebar.rs`, `ui/rail.rs` (widen/collapse), and the
   revision scroll. Fixes 3, 4, 9.
 - **21-D Editor retention:** `ui/shell.rs`, `app.rs`, `ui/document.rs`. The owner decision above.
-- **21-E Measurement:** the frame-time probe and the acceptance numbers (Done-when 6). Runs after 21-A to 21-D merge.
+- **21-E Measurement:** the frame-time probe and the acceptance numbers (Done-when 6). The probe lands first, then the
+  baseline is recorded. The after numbers are recorded once 21-A to 21-D merge.
 
 ## Mergeable alone
 
@@ -93,6 +94,16 @@ These override any conflicting text in the motion direction below.
    - **Instrument:** lane 21-E adds the smallest content-free probe. Examples: an env-gated frame-time log, or
      PresentMon if it is available on the machine. Document the probe in `docs/verification.md`.
    - **Missing data is never a pass:** without numbers, Done when 6 stays pending.
+   - **Baseline:** lane 21-E's probe lands first. `before` is measured on the commit that adds the probe, before any
+     motion lane. `after` is measured on the integrated head, with the same probe, machine and fixture.
+   - **Per scenario:** each scenario passes on its own. Pooling the scenarios is not a pass.
+4. **Cooling below `EMBER`.** When focus leaves while heat is below `EMBER` (for example 0.10, 9 ms into ignition),
+   cooling ends at that value and never rises to `EMBER`. The target is `min(current, EMBER)`. Test that case alongside
+   amendment 2's cases.
+5. **Order after Goal 22.**
+   - Goal 21 starts after Goal 22, because Goal 22 replaces the dot rail with a persistent file sidebar.
+   - Fixes 4 and 11 and lane 21-C's rail widen and collapse apply to the sidebar's collapse and expand.
+   - The frame scenario "rail widen and collapse" becomes "sidebar collapse and expand".
 
 ---
 
