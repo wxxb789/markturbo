@@ -1333,7 +1333,9 @@ fn revision_keys_are_inert_under_a_translation_card() {
 
 // The per-tab store must never hand back a session older than the screen: a
 // decision made before a later Review was prepared survives its cancel, and
-// Undo still takes its text back.
+// the panel's Undo still takes its text back. Closing the card also returns
+// the keyboard to the source editor: a typed character lands in the buffer
+// and decides nothing.
 #[test]
 fn a_decision_survives_the_cancel_of_a_later_review() {
     let _guard = TEST_LOCK
@@ -1394,19 +1396,340 @@ fn a_decision_survives_the_cancel_of_a_later_review() {
     app.wait_for_gone("id:consent-card", Duration::from_secs(2))
         .expect("the disclosure closed");
 
-    // The decision is still the screen's, and Undo takes its text back.
+    // The decision is still the screen's, and the card's close returned the
+    // keyboard to the source editor: `a` is a character in the buffer, not a
+    // decision for the docked hunk below it.
     app.wait_for("text:1 of 2 decided")
         .expect("the decision survived the cancel");
-    app.press_key("ctrl+z").expect("undo the decision");
+    app.press_key("a").expect("type in the editor");
+    app.wait(Duration::from_millis(200))
+        .expect("a decision would land by now");
+    assert!(
+        app.shows("1 of 2 decided"),
+        "`a` decided a hunk: {:?}",
+        app.screen().texts()
+    );
+    let typed = app
+        .screen()
+        .input_text("label:Markdown source")
+        .expect("read the buffer")
+        .map(str::to_owned)
+        .expect("the editor contains text");
+    assert!(
+        typed.contains('a') && typed != "Revised\nUnchanged\n",
+        "the character never reached the source editor: {typed:?}"
+    );
+
+    // The decision history is independently the panel's: its Undo button
+    // takes the pre-cancel accept back, not a decision `a` never made.
+    app.press("id:revision-undo")
+        .expect("press the panel's Undo");
     app.wait_for("text:0 of 2 decided")
         .expect("Undo took the decision back");
     assert_eq!(
         app.screen()
             .input_text("label:Markdown source")
             .expect("read the buffer"),
-        Some(source),
-        "Undo restored the exact text"
+        Some(typed.replacen("Revised", "Original", 1).as_str()),
+        "Undo restored the pre-cancel text and kept the typed character"
     );
+}
+
+// A Review answer for one tab cancels only that tab's Revision work: another
+// tab's waiting Revision consent card survives the answer, and sending from
+// that card still lands its hunks.
+#[test]
+fn a_background_reviews_answer_leaves_another_tabs_revision_card() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let (review_output, revision_output) = two_change_outputs(source);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (release_answer, answer_waits) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let mut reviews = 0;
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let body = read_http_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            if request["stream"].as_bool().unwrap_or(false) {
+                write_sse(&mut stream, &revision_output);
+            } else {
+                reviews += 1;
+                if reviews == 3 {
+                    let _ = answer_waits.recv();
+                }
+                write_review_json(&mut stream, &review_output);
+            }
+        }
+    });
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    let other = directory.path().join("other.md");
+    std::fs::write(&document, source).expect("write document");
+    std::fs::write(&other, source).expect("write other document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    // Both tabs get a Review result to build a Revision from.
+    app.press("id:title-review").expect("prepare A's Review");
+    app.wait_for("id:consent-card").expect("A's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("A's result");
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    app.press("id:title-review").expect("prepare B's Review");
+    app.wait_for("id:consent-card").expect("B's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("B's result");
+
+    // A's next Review is waiting: switch to B and open B's Revision consent
+    // card while the answer is still out.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter back to plan.md");
+    app.press("id:palette-row").expect("back to A");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("A's tab");
+    app.press("id:title-review")
+        .expect("prepare A's next Review");
+    app.wait_for("id:consent-card").expect("the new disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("A's request is out");
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    app.press("label:Prepare revision")
+        .expect("prepare B's Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("B's Revision card");
+
+    // A's answer arrives while B's card waits: the card belongs to B and
+    // stays open. The generation-check hook reports the answer's arrival.
+    let (checked_tx, checked_rx) = std::sync::mpsc::channel::<()>();
+    mt_app::test_vault::on_review_generation_checked(move || {
+        let _ = checked_tx.send(());
+    });
+    release_answer.send(()).expect("release A's answer");
+    checked_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("A's answer reached the app");
+    app.wait(Duration::from_millis(200))
+        .expect("the answer lands");
+    app.catch_up();
+    assert!(
+        app.shows("Ask for a revision?"),
+        "A's answer closed B's Revision card: {:?}",
+        app.screen().texts()
+    );
+
+    // Sending from B's surviving card still lands B's Revision.
+    support::hold_send(&mut app);
+    app.wait_for_within("id:revision-accept", Duration::from_secs(20))
+        .expect("B's Revision answer still lands");
+    app.wait_for("text:0 of 2 decided")
+        .expect("B's hunks arrived");
+    let _ = server.join();
+    assert_eq!(
+        std::fs::read_to_string(&document).unwrap(),
+        source,
+        "A's document is untouched"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other).unwrap(),
+        source,
+        "B's document is untouched too"
+    );
+}
+
+// An answer for one tab never cancels another tab's sent Revision: the
+// transport stays live while the answer lands, and its hunks still arrive.
+#[test]
+fn a_background_reviews_answer_leaves_a_sent_revisions_result_alone() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let (review_output, revision_output) = two_change_outputs(source);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (release_answer, answer_waits) = std::sync::mpsc::channel::<()>();
+    let (release_revision, revision_waits) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let mut reviews = 0;
+        for _ in 0..4 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let body = read_http_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            if request["stream"].as_bool().unwrap_or(false) {
+                let _ = revision_waits.recv();
+                write_sse(&mut stream, &revision_output);
+            } else {
+                reviews += 1;
+                if reviews == 3 {
+                    let _ = answer_waits.recv();
+                }
+                write_review_json(&mut stream, &review_output);
+            }
+        }
+    });
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    let other = directory.path().join("other.md");
+    std::fs::write(&document, source).expect("write document");
+    std::fs::write(&other, source).expect("write other document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    // Both tabs get a Review result to build a Revision from.
+    app.press("id:title-review").expect("prepare A's Review");
+    app.wait_for("id:consent-card").expect("A's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("A's result");
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    app.press("id:title-review").expect("prepare B's Review");
+    app.wait_for("id:consent-card").expect("B's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("B's result");
+
+    // A's next Review waits; B's Revision is prepared and sent while it is
+    // still out, so A's answer lands mid-transport.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter back to plan.md");
+    app.press("id:palette-row").expect("back to A");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("A's tab");
+    app.press("id:title-review")
+        .expect("prepare A's next Review");
+    app.wait_for("id:consent-card").expect("the new disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("A's request is out");
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    app.press("label:Prepare revision")
+        .expect("prepare B's Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("B's Revision card");
+    support::hold_send(&mut app);
+    app.wait_for("id:revision-busy")
+        .expect("B's Revision is in flight");
+
+    // A's answer arrives: the sent Revision must not be cancelled with it.
+    let (checked_tx, checked_rx) = std::sync::mpsc::channel::<()>();
+    mt_app::test_vault::on_review_generation_checked(move || {
+        let _ = checked_tx.send(());
+    });
+    release_answer.send(()).expect("release A's answer");
+    checked_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("A's answer reached the app");
+    app.wait(Duration::from_millis(200))
+        .expect("the answer lands");
+    app.catch_up();
+    assert!(
+        app.screen()
+            .matches("id:revision-busy")
+            .expect("the busy state"),
+        "A's answer cancelled B's sent Revision: {:?}",
+        app.screen().texts()
+    );
+
+    // The transport still delivers: releasing the answer lands the hunks.
+    release_revision
+        .send(())
+        .expect("release the Revision answer");
+    app.wait_for_within("id:revision-accept", Duration::from_secs(20))
+        .expect("B's Revision answer still lands");
+    app.wait_for("text:0 of 2 decided")
+        .expect("B's hunks arrived");
+    let _ = server.join();
 }
 
 /// Whether the buffer line reads `text` exactly (`shows` trims the final

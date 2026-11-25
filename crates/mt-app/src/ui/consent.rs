@@ -1100,6 +1100,7 @@ fn cancel(state: &AppState, kind: ConsentKind) {
         ConsentKind::Review => state.cancel_review(),
         ConsentKind::Translation => state.cancel_translation(),
     }
+    state.focus_editor();
 }
 
 // The card's Escape, for a surface whose own Escape binding fired instead of

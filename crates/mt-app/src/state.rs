@@ -155,6 +155,8 @@ impl StatusMessage {
     }
 }
 
+type InFlightRevision = (u64, Arc<AtomicBool>);
+
 /// The shell's state.
 #[derive(Clone)]
 pub struct AppState {
@@ -303,7 +305,7 @@ pub struct AppState {
     /// answer sent under an older generation belongs to no live proposal and
     /// is dropped unread.
     revision_generation: Rc<Cell<u64>>,
-    revision_cancellation: Rc<RefCell<Option<Arc<AtomicBool>>>>,
+    revision_cancellation: Rc<RefCell<Option<InFlightRevision>>>,
     /// Bumped by every context resolution and reset: only the latest
     /// resolution lands, so a slower one for the document that was active
     /// before cannot replace the chain of the one active now.
@@ -3463,9 +3465,7 @@ impl AppState {
                 ..RevisionSession::default()
             },
         );
-        self.cancel_revision();
-        self.revision_consent.set(None);
-        self.revision_manifest.set(None);
+        self.cancel_revision_for(origin.tab_id);
     }
 
     fn reset_revision(&self) {
@@ -3589,7 +3589,7 @@ impl AppState {
     pub fn cancel_revision(&self) {
         self.revision_generation
             .set(self.revision_generation.get().wrapping_add(1));
-        if let Some(cancelled) = self.revision_cancellation.borrow_mut().take() {
+        if let Some((_, cancelled)) = self.revision_cancellation.borrow_mut().take() {
             cancelled.store(true, Ordering::Release);
             if self.status_surface.get_untracked() == StatusSurface::Review {
                 self.status.set(StatusMessage::default());
@@ -3598,6 +3598,36 @@ impl AppState {
         *self.pending_revision.borrow_mut() = None;
         self.revision_consent.set(None);
         self.revision_manifest.set(None);
+        self.revision_busy.set(false);
+    }
+
+    fn cancel_revision_for(&self, tab_id: u64) {
+        let pending = self
+            .pending_revision
+            .borrow()
+            .as_ref()
+            .is_some_and(|(id, _)| *id == tab_id);
+        if pending {
+            *self.pending_revision.borrow_mut() = None;
+            self.revision_consent.set(None);
+            self.revision_manifest.set(None);
+        }
+        let in_flight = self
+            .revision_cancellation
+            .borrow()
+            .as_ref()
+            .is_some_and(|(id, _)| *id == tab_id);
+        if !in_flight {
+            return;
+        }
+        self.revision_generation
+            .set(self.revision_generation.get().wrapping_add(1));
+        if let Some((_, cancelled)) = self.revision_cancellation.borrow_mut().take() {
+            cancelled.store(true, Ordering::Release);
+            if self.status_surface.get_untracked() == StatusSurface::Review {
+                self.status.set(StatusMessage::default());
+            }
+        }
         self.revision_busy.set(false);
     }
 
@@ -3625,7 +3655,7 @@ impl AppState {
         self.revision_manifest.set(None);
         self.revision_busy.set(true);
         let cancelled = Arc::new(AtomicBool::new(false));
-        *self.revision_cancellation.borrow_mut() = Some(Arc::clone(&cancelled));
+        *self.revision_cancellation.borrow_mut() = Some((tab_id, Arc::clone(&cancelled)));
         for answer in bound.answers().as_slice() {
             if matches!(answer, RevisionAnswer::Answered(_)) {
                 self.record_usage(UsageEvent::ClarificationAnswered);
