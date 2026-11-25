@@ -63,4 +63,15 @@ fn documents_open_in_source_then_in_the_pane_last_chosen() {
         .expect("the second document opens in the pane last chosen");
     app.wait_for("label:Markdown source")
         .expect("Split keeps the editor");
+
+    // A new session reads the pane back: the same document opens in Split.
+    drop(app);
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("restart the app");
+    app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+        .expect("wide viewport");
+    app.wait_for("id:preview-field >> text:First heading")
+        .expect("the restarted app opens in the pane last chosen");
+    app.wait_for("label:Markdown source")
+        .expect("Split keeps the editor after a restart");
 }

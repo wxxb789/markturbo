@@ -136,7 +136,10 @@ fn blur_and_refocus_editor(app: &mut Headless) {
     app.press_key("mod+p").expect("open the palette");
     app.type_text("id:palette-input", "")
         .expect("the focus moves to the palette's line");
-    app.press_key("escape").expect("close the palette");
+    // Escape belongs to the consent card's layer first (contract order), so
+    // submit the listed file: it closes the palette without the card.
+    app.submit("id:palette-input")
+        .expect("close the palette by opening the file");
     app.wait_for_gone("id:palette", Duration::from_secs(2))
         .expect("the palette closed");
     focus_editor(app);

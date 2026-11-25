@@ -790,7 +790,9 @@ fn keyboard(state: AppState, is_revision: bool, hold: Hold) {
         }
         on_key_with("escape", KeyOptions::default(), {
             let state = state.clone();
-            move |_| cancel(&state, is_revision)
+            move |_| {
+                state.escape_top_layer();
+            }
         });
         for (key, unmodified) in [
             ("enter", true),

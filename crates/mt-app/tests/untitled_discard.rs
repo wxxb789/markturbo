@@ -33,7 +33,8 @@ fn discarding_an_untitled_draft_records_no_recent() {
     app.wait_for("id:welcome-paste").expect("paste choice");
 
     app.set_clipboard(Some("# Pasted draft\n".to_owned()));
-    app.press("label:Paste").expect("paste into a new document");
+    app.press("label:Paste as new document")
+        .expect("paste into a new document");
     app.wait_for("label:Markdown source")
         .expect("the pasted draft's editor");
 

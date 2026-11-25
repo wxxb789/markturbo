@@ -11,8 +11,10 @@ fn switching_tabs_swaps_the_document_surface() {
     let config = tempfile::tempdir().expect("config dir");
     let first = dir.path().join("first.md");
     let second = dir.path().join("second.md");
+    let third = dir.path().join("third.md");
     std::fs::write(&first, "# First heading\n").expect("write first");
     std::fs::write(&second, "# Second heading\n").expect("write second");
+    std::fs::write(&third, "# Third heading\n").expect("write third");
 
     // SAFETY: this test binary has one test, so no other test reads the
     // environment concurrently.
@@ -37,7 +39,7 @@ fn switching_tabs_swaps_the_document_surface() {
         .expect("first source editor");
 
     // The folder's second file opens from the palette (Ctrl+P), the way the
-    // rail's file list opens it: one plain press takes the preview slot.
+    // rail's file list opens it: a normal tab beside the first.
     app.press_key("mod+p").expect("open the palette");
     app.wait_for("id:palette-input")
         .expect("the palette's line");
@@ -54,6 +56,21 @@ fn switching_tabs_swaps_the_document_surface() {
         "both open files hold a rail dot"
     );
 
+    // Every open is a normal tab: a third file from the palette keeps all
+    // three open (no hidden replacement slot).
+    app.press_key("mod+p").expect("open the palette");
+    app.wait_for("id:palette-input").expect("the palette");
+    app.type_text("id:palette-input", "third")
+        .expect("filter to third.md");
+    app.submit("id:palette-input").expect("open third.md");
+    app.wait_for("text:# Third heading")
+        .expect("third document");
+    assert_eq!(
+        app.screen().count("id:rail-file-row").expect("selector"),
+        3,
+        "the third file opens beside the others"
+    );
+
     // The title row is mounted once, so the pane commands in its menu must
     // resolve the active tab when pressed rather than capture the startup
     // `None`.
@@ -65,6 +82,6 @@ fn switching_tabs_swaps_the_document_surface() {
         .expect("the preview takes the column");
     app.wait_for_gone("label:Markdown source", Duration::from_secs(5))
         .expect("source editor hidden by the active tab's pane change");
-    app.wait_for("text:Second heading")
+    app.wait_for("text:Third heading")
         .expect("the active tab's preview");
 }

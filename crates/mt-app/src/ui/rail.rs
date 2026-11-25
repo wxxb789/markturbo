@@ -8,8 +8,7 @@
 //!
 //! The rail also carries the app's file lists: `Ctrl+P` opens the workspace's
 //! files and `Ctrl+Shift+F` opens a content search as one input line at the
-//! top of the field. A single press opens in the preview slot — the tab the
-//! next single press replaces — and a double press pins it.
+//! top of the field. Every open creates or focuses a normal tab.
 
 use std::path::PathBuf;
 
@@ -38,12 +37,34 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
     let hovered = signal(false);
     let names_opacity = animated_value(0.0);
     let palette = Palette {
-        open: signal(false),
+        open: state.palette_open,
         mode: signal(PaletteMode::Files),
         filter: signal(String::new()),
         highlighted: signal(None),
         submitted: signal(String::new()),
     };
+    // Every Escape binding runs the same fixed-order decision, so the
+    // palette cannot be closed out of turn while a guard or menu is up.
+    effect({
+        let escape_state = state.clone();
+        move || {
+            if palette.open.get() {
+                let press_state = escape_state.clone();
+                on_key_with(
+                    "escape",
+                    KeyOptions {
+                        when: When::Always,
+                        ..KeyOptions::default()
+                    },
+                    move |_| {
+                        if !press_state.escape_top_layer() {
+                            palette.close(&press_state);
+                        }
+                    },
+                );
+            }
+        }
+    });
 
     // Ctrl+P and Ctrl+Shift+F: the same line, opened on the files and on the
     // search. They are not keys a text input uses, so the default `when`
@@ -211,11 +232,8 @@ fn dots(state: AppState, palette: Palette) -> impl IntoElement {
                     .border(px(HAIRLINE))
                     .border_color(Color::TRANSPARENT)
                     .focus_visible(|s| s.border_color(|| tokens::palette().ink))
-                    .on_press(move |event: &PressEvent| {
+                    .on_press(move |_event: &PressEvent| {
                         press_state.set_active(id);
-                        if event.clicks >= 2 {
-                            press_state.pin_tab(id);
-                        }
                         palette.close(&press_state);
                         press_state.focus_editor();
                     })
@@ -310,11 +328,8 @@ fn names(
                             .flex_row()
                             .items_center()
                             .cursor_pointer()
-                            .on_press(move |event: &PressEvent| {
+                            .on_press(move |_event: &PressEvent| {
                                 press_state.set_active(id);
-                                if event.clicks >= 2 {
-                                    press_state.pin_tab(id);
-                                }
                                 palette.close(&press_state);
                                 press_state.focus_editor();
                             })
@@ -401,14 +416,8 @@ impl Palette {
         self.open.set(true);
     }
 
-    /// Closes it and drops what the search found: the results are the line's,
-    /// and nothing else shows them.
     fn close(&self, state: &AppState) {
-        self.open.set(false);
-        self.filter.set(String::new());
-        self.highlighted.set(None);
-        self.submitted.set(String::new());
-        state.clear_search();
+        state.close_palette();
     }
 
     /// What the input holds: the filter while listing files, the query while
@@ -612,17 +621,19 @@ fn palette_input(state: AppState, language: Language, palette: Palette) -> impl 
     let change_state = state.clone();
     let submit_state = state.clone();
     let key_state = state.clone();
+    // The input is the palette's focus: a close of one above hands the
+    // keyboard back to it.
+    let reference = element_ref();
+    state.attach_palette_view(reference);
     view()
         .flex_col()
         .child(
             input()
                 .test_id("palette-input")
-                .label(SharedString::from(i18n::t(language, Key::SearchFiles)))
+                .element_ref(&reference)
+                .label(SharedString::from(s(S::FindFile, language)))
                 .value(move || palette.text(&value_state))
-                .placeholder(move || match palette.mode.get() {
-                    PaletteMode::Files => s(S::FindFile, language).to_owned(),
-                    PaletteMode::Search => i18n::t(language, Key::SearchFiles).to_owned(),
-                })
+                .placeholder(move || s(S::FindFile, language).to_owned())
                 .font_family(FONT_INPUT)
                 .text_size(px(TYPE_UI))
                 .bg(Color::TRANSPARENT)
@@ -670,16 +681,9 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
                         .py(px(SPACE_1))
                         .cursor_pointer()
                         .hover(|s| s.text_color(|| tokens::palette().ink))
-                        .on_press(move |event: &PressEvent| {
+                        .on_press(move |_event: &PressEvent| {
                             palette.close(&open_state);
-                            // Shift keeps the tab: the plain press opens in
-                            // the preview slot, which the next plain press
-                            // replaces.
-                            if event.modifiers.shift {
-                                open_state.open_file(path.clone());
-                            } else {
-                                open_state.open_preview(path.clone());
-                            }
+                            open_state.open_file(path.clone());
                         })
                         .child(
                             text(row.label.clone())
@@ -711,6 +715,11 @@ fn palette_rows(state: AppState, language: Language, palette: Palette) -> impl I
 /// What the line says under its rows when it is not simply listing them: the
 /// search at work, and a query that found nothing.
 fn notice(state: &AppState, palette: &Palette, language: Language) -> Option<SharedString> {
+    // With no folder and nothing open, every list is empty for a reason the
+    // line can name, instead of reading as a search that found nothing.
+    if state.root.get().is_none() && state.tabs.get().is_empty() {
+        return Some(SharedString::from(s(S::NoFolder, language)));
+    }
     match palette.mode.get() {
         PaletteMode::Files => {
             let typed = palette.text(state);
@@ -744,7 +753,7 @@ fn submit(state: &AppState, palette: Palette) {
     };
     let path = row.path.clone();
     palette.close(state);
-    state.open_preview(path);
+    state.open_file(path);
 }
 
 /// The rail's copy. New strings live here rather than in `i18n.rs` (a merge
@@ -754,6 +763,7 @@ fn submit(state: &AppState, palette: Palette) {
 enum S {
     FindFile,
     Close,
+    NoFolder,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -761,10 +771,12 @@ fn s(key: S, language: Language) -> &'static str {
         Language::English => match key {
             S::FindFile => "Find a file",
             S::Close => "Close",
+            S::NoFolder => "Open a folder first to search its files.",
         },
         Language::Chinese => match key {
             S::FindFile => "查找文件",
             S::Close => "关闭",
+            S::NoFolder => "请先打开文件夹以搜索其中的文件。",
         },
     }
 }

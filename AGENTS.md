@@ -53,7 +53,7 @@ Use `uv run --locked --project scripts scripts/mt.py check <tier>`:
 | --- | --- |
 | `fast` | Docs/tooling: whitespace and non-desktop Python tests |
 | `doc` | Headless core changes: fast, formatting and optimized mt-core tests |
-| `ci` | Settled Rust changes: fast, formatting, optimized Clippy/workspace tests |
+| `ci` | Settled Rust changes: fast, formatting, optimized Clippy and nextest suites |
 | `native` | Native acceptance harness code only: parallel harness unit tests; not acceptance |
 | `full` | Release artifacts: production-profile checks, build and privacy scan |
 

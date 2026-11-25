@@ -96,7 +96,7 @@ fn the_title_row_holds_the_name_review_and_settings() {
         app.screen().texts()
     );
     for control in [
-        format!("id:title-row >> role:button[{NAME}]"),
+        format!("id:title-row >> role:button[Show agent context for {NAME}]"),
         "id:title-row >> role:button[Review]".to_owned(),
         "id:title-row >> role:button[Settings]".to_owned(),
     ] {
@@ -204,6 +204,6 @@ fn the_title_row_holds_the_name_review_and_settings() {
         "Save As from the menu",
         Duration::from_secs(10),
     );
-    app.wait_for("id:title-row >> role:button[copy.md]")
+    app.wait_for("id:title-row >> role:button[Show agent context for copy.md]")
         .expect("the row names the saved copy");
 }

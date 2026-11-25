@@ -1386,7 +1386,7 @@ mod tests {
     fn ContextProbe() -> impl IntoElement {
         let state = AppState::new();
         let root = PathBuf::from(std::env::var_os("MT_CONTEXT_FIXTURE").expect("fixture root"));
-        state.open_folder(root.clone());
+        state.root.set(Some(root.clone()));
         state.open_file(root.join("docs").join("plan.md"));
         state.toggle_context();
         view().flex_col().child(crate::ui::shell::shell(
@@ -1403,7 +1403,7 @@ mod tests {
     fn FieldProbe() -> impl IntoElement {
         let state = AppState::new();
         let root = PathBuf::from(std::env::var_os("MT_CONTEXT_FIXTURE").expect("fixture root"));
-        state.open_folder(root.clone());
+        state.root.set(Some(root.clone()));
         state.open_file(root.join("docs").join("plan.md"));
         state.toggle_context();
         let field_state = state.clone();

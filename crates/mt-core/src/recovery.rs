@@ -313,6 +313,22 @@ pub enum RecoveryIssue {
     CleanupPending { path: PathBuf },
 }
 
+impl RecoveryIssue {
+    /// The record this issue names, when its file name carries a valid key.
+    /// A caller holding a captured [`RecoveryKey`] can then tell whether an
+    /// unreadable record may be the one it captured.
+    pub fn key(&self) -> Option<RecoveryKey> {
+        let path = match self {
+            Self::Malformed { path }
+            | Self::Oversized { path, .. }
+            | Self::Expired { path }
+            | Self::Unreadable { path }
+            | Self::CleanupPending { path } => path,
+        };
+        record_key_from_path(path)
+    }
+}
+
 /// Results of a non-mutating recovery scan.
 #[derive(Debug, Default)]
 pub struct RecoveryScan {

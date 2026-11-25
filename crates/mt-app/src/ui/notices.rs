@@ -42,8 +42,8 @@ use nsh_core::{
 use crate::{
     i18n::{self, Key},
     state::{
-        AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardRequest,
-        StatusMessage, Tab,
+        AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardKind,
+        GuardRequest, StatusMessage, Tab,
     },
     ui::{
         motion::{self, reduced_motion},
@@ -93,6 +93,31 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
         .w_full()
         .flex_col()
         .pt(px(SPACE_4))
+        .child(when(move || rows.get().len() > 1, {
+            let restore_all_state = state.clone();
+            let discard_all_state = state.clone();
+            move || {
+                let restore = restore_all_state.clone();
+                let discard = discard_all_state.clone();
+                view()
+                    .test_id("recovery-actions")
+                    .w_full()
+                    .flex_row()
+                    .gap(px(SPACE_3))
+                    .pb(px(SPACE_3))
+                    .child(prims::primary_action(
+                        "recovery-restore-all",
+                        s(S::RestoreAll, language),
+                        move || restore.restore_all_recovered(),
+                    ))
+                    .child(prims::quiet_action(
+                        "recovery-discard-all",
+                        s(S::DiscardAll, language),
+                        move || discard.discard_all_recovered(),
+                    ))
+                    .into_element()
+            }
+        }))
         .child(each(
             move || rows.get(),
             |record: &RecoveredRecord| record.record.key.clone(),
@@ -287,7 +312,6 @@ pub fn has_conflict(state: &AppState) -> bool {
 /// write your text to a new file (`save_as_active`, the way the status copy
 /// promises).
 pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement {
-    let compare_state = state.clone();
     let keep_state = state.clone();
     let disk_state = state.clone();
     let save_as_state = state.clone();
@@ -311,7 +335,16 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
             // comparison intact until its parent banner finishes fading.
         }
     });
-    let disabled = move || !has_conflict(&state);
+    let disabled_state = state.clone();
+    let disabled = move || !has_conflict(&disabled_state);
+    effect({
+        let keys_state = state.clone();
+        move || {
+            if compare_open(&keys_state).is_some() {
+                bind_compare_keys(&keys_state);
+            }
+        }
+    });
     view()
         .test_id("conflict-banner")
         .w_full()
@@ -328,12 +361,7 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
                         .flex_1()
                         .child(prims::ink(s(S::ChangedOnDisk, language))),
                 )
-                .child(
-                    prims::primary_action("conflict-compare", s(S::Compare, language), move || {
-                        toggle_compare(&compare_state)
-                    })
-                    .disabled(disabled.clone()),
-                )
+                .child(compare_action(&state, language, disabled.clone()))
                 .child(
                     prims::quiet_action(
                         "conflict-keep-mine",
@@ -383,7 +411,54 @@ pub fn compare_is_open(state: &AppState) -> bool {
     compare_open(state).is_some()
 }
 
-/// Fold the comparison open (at its first difference), or away.
+fn compare_action(
+    state: &AppState,
+    language: Language,
+    disabled: impl Fn() -> bool + Clone + 'static,
+) -> impl IntoElement {
+    let label_state = state.clone();
+    let press_state = state.clone();
+    let bound_state = state.clone();
+    prims::press_feedback(view())
+        .test_id("conflict-compare")
+        .role(AccessibilityRole::Button)
+        .optional_label(move || Some(SharedString::from(compare_label(&label_state, language))))
+        .window_drag(false)
+        .disabled(disabled)
+        .px(px(tokens::SPACE_3))
+        .py(px(tokens::SPACE_2))
+        .border(px(HAIRLINE))
+        .border_color(move || tokens::palette().ink_caption)
+        .hover(|s| s.border_color(|| tokens::palette().ink))
+        .focus_visible(|s| s.border_color(|| tokens::palette().ink))
+        .cursor_pointer()
+        .on_press(move || toggle_compare(&press_state))
+        .child({
+            dynamic(move || {
+                let line = text(SharedString::from(compare_label(&bound_state, language)))
+                    .font_family(tokens::FONT_UI)
+                    .text_size(px(tokens::TYPE_UI))
+                    .line_height(px(tokens::TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink);
+                if compare_open(&bound_state).is_some() {
+                    line.underline().into_element()
+                } else {
+                    line.into_element()
+                }
+            })
+        })
+}
+
+fn compare_label(state: &AppState, language: Language) -> String {
+    if compare_open(state).is_some() {
+        s(S::HideComparison, language).to_owned()
+    } else {
+        s(S::Compare, language).to_owned()
+    }
+}
+
+/// A disk read that fails reports why and leaves the panel closed: Compare
+/// is never a silent no-op (decision 10).
 fn toggle_compare(state: &AppState) {
     let Some(tab) = state.active_tab() else {
         return;
@@ -392,14 +467,19 @@ fn toggle_compare(state: &AppState) {
     // again the marker may still name this tab (from the conflict before), and
     // pressing Compare must open the comparison, not close nothing.
     if compare_open(state).is_some() {
-        state.conflict_compare.set(None);
-    } else {
-        // Read the file as it is now: the conflict was noticed earlier.
-        state.refresh_conflict_disk(&tab);
-        state.conflict_difference.set(0);
-        state.conflict_compare.set(Some(tab.id));
-        focus_line(state, &tab);
+        close_compare(state);
+        return;
     }
+    if let Err(error) = state.refresh_conflict_disk(&tab) {
+        state.notify_failure(crate::i18n::Key::ReloadFailed, &error);
+        return;
+    }
+    // The comparison is the surface now on top: the editor gives the
+    // keyboard up until it closes, so Escape reaches the comparison.
+    state.blur_source_editor();
+    state.conflict_difference.set(0);
+    state.conflict_compare.set(Some(tab.id));
+    focus_line(state, &tab);
 }
 
 /// Level the column on the comparison's current difference, the way a review
@@ -420,9 +500,9 @@ fn disk_text(state: &AppState, tab: &Tab) -> Option<String> {
         .map(|(_, text)| text)
 }
 
-/// Close the comparison, keeping the banner's decisions on screen.
 fn close_compare(state: &AppState) {
     state.conflict_compare.set(None);
+    state.focus_editor();
 }
 
 /// Walk to the next (`delta` +1) or previous (−1) difference, wrapping.
@@ -449,21 +529,20 @@ fn compare_panel(
     comparison: Signal<Option<Rc<Comparison>>>,
     language: Language,
 ) -> impl IntoElement {
-    let keys_state = state.clone();
-    let active_state = state.clone();
     let back_state = state.clone();
     let forward_state = state.clone();
+    // The panel is a layer: a close of one above hands the keyboard to it.
+    let reference = element_ref();
+    state.attach_compare_view(reference);
     let hidden = move || comparison.get().map_or(0, |content| content.hidden);
     view()
         .test_id("conflict-compare")
+        .focusable(true)
+        .element_ref(&reference)
         .w_full()
         .flex_col()
         .gap(px(SPACE_2))
         .pt(px(SPACE_4))
-        .child(when(
-            move || has_conflict(&active_state),
-            move || bind_compare_keys(&keys_state),
-        ))
         .child(
             view()
                 .w_full()
@@ -938,10 +1017,7 @@ pub fn guard_is_open(state: &AppState) -> bool {
     state.guard.get().is_some()
 }
 
-/// The guard card, in the overlay layer: 'Close without saving?' with Save,
-/// Don't save and Cancel. Cancel starts selected — the designed ring shows
-/// which control the keyboard is on — and Left/Right (or Tab/Shift+Tab) move
-/// the ring, so every decision is keyboard-reachable without moving focus.
+/// The destructive decision card, in the shell's overlay layer.
 pub fn guard(state: AppState, language: Language) -> impl IntoElement {
     let request = signal(state.guard.get_untracked());
     effect({
@@ -952,14 +1028,23 @@ pub fn guard(state: AppState, language: Language) -> impl IntoElement {
             }
         }
     });
+    // The card is the layer's focus handle: a layer above it closing hands
+    // the keyboard back here; the Cancel control takes it on the open.
+    let card = element_ref();
+    state.attach_guard_view(card);
     dynamic(move || {
         request
             .get()
-            .map(|request| guard_card(state.clone(), request, language))
+            .map(|request| guard_card(state.clone(), request, language, card))
     })
 }
 
-fn guard_card(state: AppState, request: GuardRequest, language: Language) -> AnyElement {
+fn guard_card(
+    state: AppState,
+    request: GuardRequest,
+    language: Language,
+    card: ElementRef,
+) -> AnyElement {
     // The card owns its keys: the source editor gives up the focus.
     state.blur_source_editor();
     effect({
@@ -974,13 +1059,128 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
     let save_state = state.clone();
     let discard_state = state.clone();
     let cancel_state = state.clone();
-    let disabled = move || !guard_is_open(&state);
+    let reload_state = state.clone();
+    let overwrite_state = state.clone();
+    let disabled_state = state.clone();
+    let disabled = move || !guard_is_open(&disabled_state);
     let choice = request.choice;
     let busy = request.busy;
     let notice = request.notice;
+    let kind = request.kind;
     let names = RefCell::new(String::new());
+    let headline = match kind {
+        GuardKind::CloseTab(_) => s(S::CloseWithoutSaving, language),
+        GuardKind::QuitApp => s(S::QuitWithoutSaving, language),
+        GuardKind::ReloadFromDisk(_) => s(S::ReloadTitle, language),
+        GuardKind::OverwriteDisk(_) => s(S::OverwriteTitle, language),
+    };
+    let cancel_ref = element_ref();
+    effect({
+        let focus_state = state.clone();
+        move || {
+            if guard_is_open(&focus_state) {
+                cancel_ref.focus();
+            }
+        }
+    });
+    let save_label = match kind {
+        GuardKind::QuitApp => s(S::SaveAll, language),
+        _ => s(S::Save, language),
+    };
+    let controls: Vec<AnyElement> = match kind {
+        GuardKind::CloseTab(_) | GuardKind::QuitApp => vec![
+            card_action(
+                "guard-save",
+                save_label,
+                false,
+                move || choice.get() == GUARD_SAVE_CHOICE,
+                disabled.clone(),
+                None,
+                move || {
+                    if !busy.get() {
+                        save_state.guard_save();
+                    }
+                },
+            )
+            .into_element(),
+            card_action(
+                "guard-dont-save",
+                s(S::DontSave, language),
+                true,
+                move || choice.get() == GUARD_DISCARD_CHOICE,
+                disabled.clone(),
+                None,
+                move || {
+                    if !busy.get() {
+                        discard_state.guard_discard();
+                    }
+                },
+            )
+            .into_element(),
+            card_action(
+                "guard-cancel",
+                s(S::Cancel, language),
+                false,
+                move || choice.get() == GUARD_CANCEL_CHOICE,
+                disabled.clone(),
+                Some(&cancel_ref),
+                move || {
+                    if !busy.get() {
+                        cancel_state.guard_cancel();
+                    }
+                },
+            )
+            .into_element(),
+        ],
+        GuardKind::ReloadFromDisk(id) => vec![
+            card_action(
+                "guard-reload",
+                s(S::ReloadAction, language),
+                false,
+                move || choice.get() == 0,
+                disabled.clone(),
+                None,
+                move || reload_state.guard_reload(id),
+            )
+            .into_element(),
+            card_action(
+                "guard-cancel",
+                s(S::Cancel, language),
+                false,
+                move || choice.get() == 1,
+                disabled.clone(),
+                Some(&cancel_ref),
+                move || cancel_state.guard_cancel(),
+            )
+            .into_element(),
+        ],
+        GuardKind::OverwriteDisk(id) => vec![
+            card_action(
+                "guard-overwrite",
+                s(S::OverwriteAction, language),
+                true,
+                move || choice.get() == 0,
+                disabled.clone(),
+                None,
+                move || overwrite_state.guard_overwrite(id),
+            )
+            .into_element(),
+            card_action(
+                "guard-cancel",
+                s(S::Cancel, language),
+                false,
+                move || choice.get() == 1,
+                disabled.clone(),
+                Some(&cancel_ref),
+                move || cancel_state.guard_cancel(),
+            )
+            .into_element(),
+        ],
+    };
     view()
         .test_id("guard-card")
+        .focusable(true)
+        .element_ref(&card)
         .w(px(GUARD_CARD_W))
         .flex_col()
         .gap(px(SPACE_4))
@@ -988,11 +1188,16 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
         .bg(move || tokens::palette().column_ground)
         .border(px(HAIRLINE))
         .border_color(move || tokens::palette().hairline)
-        .child(prims::ink(s(S::CloseWithoutSaving, language)))
+        .child(prims::ink(headline))
         .child(
             text(move || {
                 if guard_is_open(&names_state) {
-                    names.replace(documents_line(&names_state, request.tab, language));
+                    names.replace(match kind {
+                        GuardKind::CloseTab(id) => documents_line(&names_state, Some(id), language),
+                        GuardKind::QuitApp => documents_line(&names_state, None, language),
+                        GuardKind::ReloadFromDisk(_) => s(S::ReloadBody, language).to_owned(),
+                        GuardKind::OverwriteDisk(_) => s(S::OverwriteBody, language).to_owned(),
+                    });
                 }
                 names.borrow().clone()
             })
@@ -1016,42 +1221,7 @@ fn guard_card(state: AppState, request: GuardRequest, language: Language) -> Any
                 .w_full()
                 .flex_row()
                 .gap(px(SPACE_2))
-                .child(card_action(
-                    "guard-save",
-                    s(S::Save, language),
-                    false,
-                    move || choice.get() == GUARD_SAVE_CHOICE,
-                    disabled.clone(),
-                    move || {
-                        if !busy.get() {
-                            save_state.guard_save();
-                        }
-                    },
-                ))
-                .child(card_action(
-                    "guard-dont-save",
-                    s(S::DontSave, language),
-                    true,
-                    move || choice.get() == GUARD_DISCARD_CHOICE,
-                    disabled.clone(),
-                    move || {
-                        if !busy.get() {
-                            discard_state.guard_discard();
-                        }
-                    },
-                ))
-                .child(card_action(
-                    "guard-cancel",
-                    s(S::Cancel, language),
-                    false,
-                    move || choice.get() == GUARD_CANCEL_CHOICE,
-                    disabled,
-                    move || {
-                        if !busy.get() {
-                            cancel_state.guard_cancel();
-                        }
-                    },
-                )),
+                .children(controls),
         )
         .into_element()
 }
@@ -1064,7 +1234,9 @@ fn bind_guard_keys(state: &AppState) {
             when: When::Always,
             ..KeyOptions::default()
         },
-        move |_| escape.guard_cancel(),
+        move |_| {
+            escape.escape_top_layer();
+        },
     );
     for (key, activate) in [
         ("enter", true),
@@ -1106,25 +1278,35 @@ fn bind_guard_keys(state: &AppState) {
     }
 }
 
-/// The documents a guard covers, as one quiet line: their names, at most two
-/// of them, then how many more there are.
+/// A name two listed tabs share carries its parent folder (`drafts/plan.md`,
+/// `archive/plan.md`).
 fn documents_line(state: &AppState, tab: Option<u64>, language: Language) -> String {
     let tabs = state.tabs.get();
-    let names: Vec<String> = match tab {
-        Some(id) => tabs
-            .iter()
-            .find(|tab| tab.id == id)
-            .map(|tab| vec![tab.title.to_string()])
-            .unwrap_or_default(),
+    let listed: Vec<&Tab> = match tab {
+        Some(id) => tabs.iter().filter(|tab| tab.id == id).collect(),
         // Quitting covers whatever is dirty when the decision is made, so
         // the card lists exactly that, as it changes.
-        None => tabs
-            .iter()
-            .filter(|tab| tab.dirty.get())
-            .map(|tab| tab.title.to_string())
-            .collect(),
+        None => tabs.iter().filter(|tab| tab.dirty.get()).collect(),
     };
+    let names: Vec<String> = listed.iter().map(|tab| listed_name(tab, &listed)).collect();
     names_line(&names, language)
+}
+
+fn listed_name(tab: &Tab, listed: &[&Tab]) -> String {
+    let name = tab.title.to_string();
+    if tab.untitled {
+        return name;
+    }
+    let shared = listed
+        .iter()
+        .filter(|other| other.title == tab.title)
+        .count();
+    if shared > 1
+        && let Some(folder) = tab.path.parent().and_then(|parent| parent.file_name())
+    {
+        return format!("{}/{name}", folder.to_string_lossy());
+    }
+    name
 }
 
 /// [`documents_line`]'s shape for a list of names.
@@ -1150,9 +1332,43 @@ fn card_action(
     danger: bool,
     selected: impl IntoReactive<bool> + 'static,
     disabled: impl IntoReactive<bool> + 'static,
+    reference: Option<&ElementRef>,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     let selected = selected.into_reactive();
+    let control = prims::press_feedback(
+        view()
+            .test_id(test_id)
+            .role(AccessibilityRole::Button)
+            .disabled(disabled)
+            .optional_label(Some(SharedString::from(label)))
+            .w_full()
+            .h_full()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .bg(Color::TRANSPARENT)
+            .cursor_pointer()
+            .rounded(px(0.0))
+            .on_press(on_press)
+            .child(
+                text(label)
+                    .font_family(tokens::FONT_UI)
+                    .text_size(px(tokens::TYPE_UI))
+                    .line_height(px(tokens::TYPE_UI_LINE))
+                    .text_color(move || {
+                        if danger {
+                            tokens::palette().danger
+                        } else {
+                            tokens::palette().ink
+                        }
+                    }),
+            ),
+    );
+    let control = match reference {
+        Some(reference) => control.element_ref(reference),
+        None => control,
+    };
     view()
         .p(px(FOCUS_RING_OFFSET))
         .border(px(FOCUS_RING))
@@ -1182,35 +1398,7 @@ fn card_action(
                         tokens::palette().ink_caption
                     }
                 })
-                .child(prims::press_feedback(
-                    view()
-                        .test_id(test_id)
-                        .role(AccessibilityRole::Button)
-                        .disabled(disabled)
-                        .optional_label(Some(SharedString::from(label)))
-                        .w_full()
-                        .h_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .bg(Color::TRANSPARENT)
-                        .cursor_pointer()
-                        .rounded(px(0.0))
-                        .on_press(on_press)
-                        .child(
-                            text(label)
-                                .font_family(tokens::FONT_UI)
-                                .text_size(px(tokens::TYPE_UI))
-                                .line_height(px(tokens::TYPE_UI_LINE))
-                                .text_color(move || {
-                                    if danger {
-                                        tokens::palette().danger
-                                    } else {
-                                        tokens::palette().ink
-                                    }
-                                }),
-                        ),
-                )),
+                .child(control),
         )
 }
 
@@ -1339,6 +1527,7 @@ fn status_undo(state: AppState) -> impl IntoElement {
                         .map(|action| action.label)
                         .unwrap_or_default()
                 })
+                .test_id("status-action")
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
@@ -1488,7 +1677,11 @@ fn bind_compare_keys(state: &AppState) {
             when: When::Always,
             ..KeyOptions::default()
         },
-        move |_| close_compare(&escape),
+        move |_| {
+            if !escape.escape_top_layer() {
+                close_compare(&escape);
+            }
+        },
     );
 }
 
@@ -1501,15 +1694,26 @@ fn bind_compare_keys(state: &AppState) {
 enum S {
     UntitledDraft,
     Restore,
+    RestoreAll,
     Discard,
+    DiscardAll,
     ChangedOnDisk,
     Compare,
+    HideComparison,
     KeepMine,
     UseDiskVersion,
     Previous,
     Next,
     CloseWithoutSaving,
+    QuitWithoutSaving,
+    ReloadTitle,
+    ReloadBody,
+    ReloadAction,
+    OverwriteTitle,
+    OverwriteBody,
+    OverwriteAction,
     Save,
+    SaveAll,
     DontSave,
     Cancel,
 }
@@ -1519,30 +1723,56 @@ fn s(key: S, language: Language) -> &'static str {
         Language::English => match key {
             S::UntitledDraft => "Untitled draft",
             S::Restore => "Restore",
+            S::RestoreAll => "Restore all",
             S::Discard => "Discard",
+            S::DiscardAll => "Discard all",
             S::ChangedOnDisk => "Changed on disk",
             S::Compare => "Compare",
+            S::HideComparison => "Hide comparison",
             S::KeepMine => "Keep mine",
             S::UseDiskVersion => "Use disk version",
             S::Previous => "Previous",
             S::Next => "Next",
             S::CloseWithoutSaving => "Close without saving?",
+            S::QuitWithoutSaving => "Quit without saving?",
+            S::ReloadTitle => "Discard your edits and reload from disk?",
+            S::ReloadBody => {
+                "Your unsaved changes in this tab will be replaced by the file on disk."
+            }
+            S::ReloadAction => "Reload",
+            S::OverwriteTitle => "Overwrite external changes on disk?",
+            S::OverwriteBody => {
+                "The file on disk changed since you opened it. Saving will replace those disk changes with your version."
+            }
+            S::OverwriteAction => "Overwrite",
             S::Save => "Save",
+            S::SaveAll => "Save all",
             S::DontSave => "Don't save",
             S::Cancel => "Cancel",
         },
         Language::Chinese => match key {
             S::UntitledDraft => "未命名草稿",
             S::Restore => "恢复",
+            S::RestoreAll => "全部恢复",
             S::Discard => "丢弃",
+            S::DiscardAll => "全部丢弃",
             S::ChangedOnDisk => "磁盘上的文件已更改",
             S::Compare => "比较",
-            S::KeepMine => "保留我的",
-            S::UseDiskVersion => "使用磁盘版本",
+            S::HideComparison => "收起比较",
+            S::KeepMine => "保留我的版本",
+            S::UseDiskVersion => "采用磁盘版本",
             S::Previous => "上一个",
             S::Next => "下一个",
             S::CloseWithoutSaving => "不保存就关闭？",
+            S::QuitWithoutSaving => "不保存就退出？",
+            S::ReloadTitle => "放弃当前修改并从磁盘重新加载？",
+            S::ReloadBody => "此标签页中未保存的更改将被磁盘上的文件替换。",
+            S::ReloadAction => "重新加载",
+            S::OverwriteTitle => "覆盖磁盘上的外部更改？",
+            S::OverwriteBody => "文件在打开后已被外部修改。保存将用你的版本覆盖磁盘上的更改。",
+            S::OverwriteAction => "覆盖",
             S::Save => "保存",
+            S::SaveAll => "全部保存",
             S::DontSave => "不保存",
             S::Cancel => "取消",
         },

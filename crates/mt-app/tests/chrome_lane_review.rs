@@ -1,10 +1,11 @@
-//! The preview slot must not replace a tab the model's answer belongs to,
-//! whichever tab is on screen when the next file opens.
+//! A tab the model's answer belongs to must keep it, whichever tab is on
+//! screen when the next file opens.
 //!
 //! The answer travels with its tab, so switching to another file first (here
 //! `b.md`, from the palette, which only activates the tab it names) must not
-//! make the slot's `a.md` look free: opening `c.md` afterwards leaves it in
-//! place, and its Review is still the one the field offers to continue.
+//! make the reviewed `a.md` look replaceable: opening `c.md` afterwards
+//! leaves it in place, and its Review is still the one the field offers to
+//! continue.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -85,7 +86,7 @@ fn the_slot_keeps_a_reviewed_tab_that_is_not_on_screen() {
     .expect("wide viewport");
     app.wait_for("text:# B").expect("the startup document");
 
-    // `a.md` opens from the palette: one plain press takes the preview slot.
+    // `a.md` opens from the palette as a normal tab.
     open_from_palette(&mut app, "a.md");
     app.wait_for("text:# A").expect("the reviewed document");
 
@@ -97,18 +98,18 @@ fn the_slot_keeps_a_reviewed_tab_that_is_not_on_screen() {
     app.wait_for("text:keep the document intent")
         .expect("the model's stated goal");
 
-    // Another file comes to the screen; the slot keeps holding `a.md`.
+    // Another file comes to the screen; every tab stays open.
     open_from_palette(&mut app, "b.md");
     app.wait_for("text:# B")
         .expect("the startup document active again");
     assert_eq!(
         app.screen().count("id:rail-file-row").expect("selector"),
         2,
-        "both files are open before the slot is asked for another"
+        "both files are open before another opens"
     );
 
-    // The next file needs the slot: the reviewed tab is not on screen, but it
-    // is the one holding the answer.
+    // A third file opens beside them: the reviewed tab is not on screen, but
+    // it is the one holding the answer.
     open_from_palette(&mut app, "c.md");
     app.wait_for("text:# C").expect("the new file opens");
     assert_eq!(
@@ -128,8 +129,8 @@ fn the_slot_keeps_a_reviewed_tab_that_is_not_on_screen() {
         .expect("the answer is still the one on screen");
 }
 
-/// `Ctrl+P`, the file's name, Return: the palette opens one plain press's
-/// file, taking the preview slot (or activating the tab already holding it).
+/// `Ctrl+P`, the file's name, Return: the palette opens the file in a normal
+/// tab (or activates the tab already holding it).
 fn open_from_palette(app: &mut Headless, name: &str) {
     app.press_key("mod+p").expect("open the palette");
     app.wait_for("id:palette-input")
