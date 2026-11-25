@@ -190,7 +190,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     // menu is the topmost layer: while it is open, Escape closes it alone.
     let translation_state = state.clone();
     effect(move || {
-        if !translation_state.translation_busy.get() {
+        if !translation_state.translation_busy.get() || consent::is_open(&translation_state) {
             return;
         }
         let keys_state = translation_state.clone();
@@ -201,6 +201,9 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
                 ..KeyOptions::default()
             },
             move |_| {
+                if consent::cancel_open(&keys_state) {
+                    return;
+                }
                 if !escape_closes_menu(&keys_state) {
                     keys_state.cancel_translation_in_flight();
                 }
@@ -208,25 +211,38 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         );
     });
 
-    // The menu's document commands, reachable without it.
+    // The menu's document commands, reachable without it. While a consent
+    // card is open it is modal: these shortcuts do nothing (the keymap still
+    // consumes the key, so the card's own keys are the only ones that act).
     let open_state = state.clone();
     on_key("mod+o", move |_: &str| {
-        welcome::choose_folder(open_state.clone())
+        if !consent::is_open(&open_state) {
+            welcome::choose_folder(open_state.clone());
+        }
     });
     let new_state = state.clone();
-    on_key("mod+n", move |_: &str| new_state.new_document());
+    on_key("mod+n", move |_: &str| {
+        if !consent::is_open(&new_state) {
+            new_state.new_document();
+        }
+    });
     // Save; an untitled document goes to Save As. The source editor binds no
     // `mod+s`, so the default `when` fires it from the editor too.
     let save_state = state.clone();
-    on_key("mod+s", move |_: &str| save_state.save_active());
+    on_key("mod+s", move |_: &str| {
+        if !consent::is_open(&save_state) {
+            save_state.save_active();
+        }
+    });
     let save_as_state = state.clone();
     on_key("shift+mod+s", move |_: &str| {
-        if save_as_state.active.get().is_some() {
+        if save_as_state.active.get().is_some() && !consent::is_open(&save_as_state) {
             save_as_state.save_as_active();
         }
     });
     // Escape closes the menu from anywhere. The binding passes the key on, so
-    // it takes nothing from the surfaces that bind Escape themselves.
+    // it takes nothing from the surfaces that bind Escape themselves; a
+    // consent card owns Escape whatever binding fires first.
     let menu_escape_state = state.clone();
     on_key_with(
         "escape",
@@ -236,6 +252,9 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             ..KeyOptions::default()
         },
         move |_: &str| {
+            if consent::cancel_open(&menu_escape_state) {
+                return;
+            }
             escape_closes_menu(&menu_escape_state);
         },
     );

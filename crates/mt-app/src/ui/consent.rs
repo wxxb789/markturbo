@@ -67,6 +67,7 @@ use mt_core::{
     },
     settings::Language,
 };
+use nsh_core::element::desktop::window_state;
 use nsh_core::keymap::Keystroke;
 use nsh_core::platform::Lifecycle;
 use nsh_core::{Color, TransformKind, element::AnimatedValue, prelude::*};
@@ -97,22 +98,30 @@ const TERM_W: f32 = 96.0;
 enum KeyRole {
     Enter,
     Space,
-    /// The control key itself: a fresh press cancels the charge, and its
-    /// release ends a `Ctrl+Enter` hold.
-    Control,
+    /// A modifier the hold watches: a fresh press cancels the charge, and
+    /// its release ends a `Ctrl+Enter` hold.
+    Modifier,
     Other,
 }
 
 /// The watched key of a raw event's logical key. Windows reports Space as
 /// `" "` and the modifier as `Control`; other backends spell
-/// `"Space"`/`"ControlLeft"`.
+/// `"Space"`/`"ControlLeft"`. macOS reports Command's press and its release
+/// as `Meta`/`MetaLeft`/`MetaRight` (nsh-platform-macos-0.6.1
+/// `src/keyboard.rs`), so releasing Command ends the hold as releasing
+/// Control does.
 fn role_of(key: &str) -> KeyRole {
     if key == "Enter" || key == "NumpadEnter" {
         KeyRole::Enter
     } else if key == " " || key == "Space" {
         KeyRole::Space
-    } else if key == "Control" || key.starts_with("Control") {
-        KeyRole::Control
+    } else if key == "Control"
+        || key.starts_with("Control")
+        || key == "Meta"
+        || key.starts_with("Meta")
+        || key.starts_with("Super")
+    {
+        KeyRole::Modifier
     } else {
         KeyRole::Other
     }
@@ -131,7 +140,15 @@ pub(crate) fn key_capture() -> KeyCapture {
             strokes.push(stroke);
         }
     };
-    for keys in ["enter", "shift+enter", "space", "shift+space", "mod+enter"] {
+    for keys in [
+        "enter",
+        "shift+enter",
+        "space",
+        "shift+space",
+        "mod+enter",
+        "tab",
+        "shift+tab",
+    ] {
         bind(keys);
     }
     if apple {
@@ -223,6 +240,104 @@ fn card_focus_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RingStop {
+    Card,
+    ScopeSelection,
+    ScopeDocument,
+    ScopeContext,
+    Cancel,
+    Send,
+}
+
+impl RingStop {
+    fn index(self) -> Option<usize> {
+        match self {
+            RingStop::Card => None,
+            RingStop::ScopeSelection => Some(0),
+            RingStop::ScopeDocument => Some(1),
+            RingStop::ScopeContext => Some(2),
+            RingStop::Cancel => Some(3),
+            RingStop::Send => Some(4),
+        }
+    }
+}
+
+// The card's Tab ring while it is modal: the card itself plus the controls
+// of the body built now. `tab`/`shift+tab` are captured by `key_capture` and
+// move the focus here, so the platforms' own traversal — the whole window
+// when no native modal is presented — never leaves the card. A stop with no
+// node (a scope the manifest does not offer) is skipped, and Tab from the
+// card reaches the first built control.
+struct CardFocus {
+    card: ElementRef,
+    scope_selection: ElementRef,
+    scope_document: ElementRef,
+    scope_context: ElementRef,
+    cancel: ElementRef,
+    send: ElementRef,
+    landed: Cell<Option<usize>>,
+}
+
+impl CardFocus {
+    const RING: [RingStop; 5] = [
+        RingStop::ScopeSelection,
+        RingStop::ScopeDocument,
+        RingStop::ScopeContext,
+        RingStop::Cancel,
+        RingStop::Send,
+    ];
+
+    fn new() -> Self {
+        Self {
+            card: element_ref(),
+            scope_selection: element_ref(),
+            scope_document: element_ref(),
+            scope_context: element_ref(),
+            cancel: element_ref(),
+            send: element_ref(),
+            landed: Cell::new(None),
+        }
+    }
+
+    fn at(&self, stop: RingStop) -> &ElementRef {
+        match stop {
+            RingStop::Card => &self.card,
+            RingStop::ScopeSelection => &self.scope_selection,
+            RingStop::ScopeDocument => &self.scope_document,
+            RingStop::ScopeContext => &self.scope_context,
+            RingStop::Cancel => &self.cancel,
+            RingStop::Send => &self.send,
+        }
+    }
+
+    fn land(&self, stop: RingStop) {
+        self.landed.set(stop.index());
+    }
+
+    // The next built control after the one that landed last, wrapping both
+    // ways and skipping stops with no node; from the card, forward reaches
+    // the first built control and back the last.
+    fn step(&self, back: bool) {
+        let len = Self::RING.len();
+        let here = self.landed.get().filter(|index| *index < len);
+        for offset in 1..=len {
+            let index = match (here, back) {
+                (None, false) => offset - 1,
+                (None, true) => len - offset,
+                (Some(here), false) => (here + offset) % len,
+                (Some(here), true) => (here + len - offset) % len,
+            };
+            let stop = Self::RING[index];
+            if self.at(stop).node().is_some() {
+                self.at(stop).focus();
+                self.land(stop);
+                return;
+            }
+        }
+    }
+}
+
 /// The consent card.
 pub fn card(state: AppState, language: Language) -> impl IntoElement {
     // The card owns Enter, Escape and the hold: the source editor gives up
@@ -241,16 +356,20 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
         let hold = hold.clone();
         move || hold.cancel_hold()
     });
-    // The window leaving the foreground cancels any hold: neither a stuck
-    // key nor a pointer already down may matter once the room is not ours.
+    // The window leaving the foreground, or losing the keyboard focus to a
+    // native sheet (the pickers open one; nsh reports it in
+    // `WindowState::focused`), cancels any hold: neither a stuck key nor a
+    // pointer already down may matter once the room is not ours.
     effect({
         let hold = hold.clone();
         move || {
-            if lifecycle() != Lifecycle::Active {
+            let window_focused = window_state().is_none_or(|state| state.focused);
+            if lifecycle() != Lifecycle::Active || !window_focused {
                 hold.release();
             }
         }
     });
+    let ring = Rc::new(CardFocus::new());
     let body_state = state.clone();
     let body_hold = hold.clone();
     let presented = signal_with(None, SignalEquals::Never);
@@ -268,7 +387,7 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     let down = hold.clone();
     let up = hold.clone();
     let blur = hold.clone();
-    let focus = element_ref();
+    let focus = ring.card;
     // The card takes the keyboard focus when it opens: Cancel stays the
     // first control Tab reaches, but the card itself owns the keys until
     // then, so `Ctrl+Enter` from before it opened can never charge it. The
@@ -288,15 +407,28 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
         .p(px(tokens::SPACE_5))
         .focusable(true)
         .element_ref(&focus)
-        .on_focus(|| {
-            #[cfg(test)]
-            tests::record_focus(tests::FocusStop::Card);
+        .on_focus({
+            let ring = ring.clone();
+            move || {
+                ring.land(RingStop::Card);
+                #[cfg(test)]
+                tests::record_focus(tests::FocusStop::Card);
+            }
         })
         // The card takes the keyboard focus when it opens; these handlers
         // see the keys wherever inside the card the focus is, because the
         // events bubble to the card.
         .capture_keys(key_capture())
-        .on_key_down(move |event: &KeyEvent| down.key_down(event))
+        .on_key_down({
+            let ring = ring.clone();
+            move |event: &KeyEvent| {
+                if event.key == "Tab" && !event.repeat {
+                    ring.step(event.modifiers.shift);
+                    return;
+                }
+                down.key_down(event);
+            }
+        })
         .on_key_up(move |event: &KeyEvent| up.key_up(event))
         .on_blur(move || blur.release())
         // In dark mode the card's ground is lifted a hair off the room and a
@@ -332,13 +464,19 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             presented.with(|waiting| {
                 waiting
                     .as_ref()
-                    .map(|waiting| card_body(&body_state, language, &body_hold, waiting))
+                    .map(|waiting| card_body(&body_state, language, &body_hold, waiting, &ring))
             })
         }))
 }
 
 /// The disclosure and hold use the same manifest binding.
-fn card_body(state: &AppState, language: Language, hold: &Hold, waiting: &Waiting) -> AnyElement {
+fn card_body(
+    state: &AppState,
+    language: Language,
+    hold: &Hold,
+    waiting: &Waiting,
+    ring: &Rc<CardFocus>,
+) -> AnyElement {
     let rows = waiting
         .consent
         .as_ref()
@@ -356,6 +494,7 @@ fn card_body(state: &AppState, language: Language, hold: &Hold, waiting: &Waitin
                 waiting,
                 consent,
                 rows.as_ref().expect("a manifest has its rows"),
+                ring,
             ))
             .child(buttons(
                 state.clone(),
@@ -363,6 +502,7 @@ fn card_body(state: &AppState, language: Language, hold: &Hold, waiting: &Waitin
                 language,
                 hold.clone(),
                 total,
+                ring.clone(),
             ))
             .into_element(),
         None => text(waiting.fallback.clone())
@@ -383,6 +523,7 @@ fn disclosure_body(
     waiting: &Waiting,
     consent: &OutboundConsent,
     rows: &Rows,
+    ring: &Rc<CardFocus>,
 ) -> impl IntoElement {
     let loopback =
         consent.disclosure.endpoint().transport().encryption() == TransportEncryption::Unencrypted;
@@ -398,7 +539,7 @@ fn disclosure_body(
                 .flex_col()
                 .gap(px(tokens::SPACE_1))
                 .child(destination_list(language, consent.disclosure.endpoint()))
-                .child(scope_row(scope_state, language, hold, waiting)),
+                .child(scope_row(scope_state, language, hold, waiting, ring)),
         )
         .child(
             // Every row is on the card: a long manifest scrolls in place, so
@@ -478,6 +619,7 @@ fn scope_row(
     language: Language,
     hold: &Hold,
     waiting: &Waiting,
+    ring: &Rc<CardFocus>,
 ) -> impl IntoElement {
     let kind = waiting
         .consent
@@ -499,21 +641,31 @@ fn scope_row(
     } else {
         ReviewScopeChoice::Document
     };
-    let option = |choice: ReviewScopeChoice, test_id: &'static str, label: S, offered: bool| {
+    let option = |choice: ReviewScopeChoice,
+                  stop: RingStop,
+                  test_id: &'static str,
+                  label: S,
+                  offered: bool| {
         let label = label.text(language);
         if current == choice {
             return Some(scope_word(test_id, label));
         }
         let state = state.clone();
+        let ring = ring.clone();
         offered.then(|| {
             let enabled = state.clone();
             let blur = hold.clone();
             let action = prims::quiet_action(test_id, label, move || {
                 state.set_review_consent_scope(choice)
             })
+            .element_ref(ring.at(stop))
             .on_blur(move || blur.release());
-            #[cfg(test)]
-            let action = action.on_focus(|| tests::record_focus(tests::FocusStop::Scope));
+            let ring = ring.clone();
+            let action = action.on_focus(move || {
+                ring.land(stop);
+                #[cfg(test)]
+                tests::record_focus(tests::FocusStop::Scope);
+            });
             view()
                 .child(action.disabled(move || !is_open(&enabled)))
                 .into_element()
@@ -522,18 +674,21 @@ fn scope_row(
     let options: Vec<AnyElement> = [
         option(
             ReviewScopeChoice::Selection,
+            RingStop::ScopeSelection,
             "consent-scope-selection",
             S::ScopeSelection,
             waiting.offers_selection,
         ),
         option(
             ReviewScopeChoice::Document,
+            RingStop::ScopeDocument,
             "consent-scope-document",
             S::ScopeDocument,
             waiting.kind != ConsentKind::Revision,
         ),
         option(
             ReviewScopeChoice::DocumentWithContext,
+            RingStop::ScopeContext,
             "consent-scope-context",
             S::ScopeContext,
             waiting.offers_context,
@@ -723,14 +878,21 @@ fn buttons(
     language: Language,
     hold: Hold,
     total: u64,
+    ring: Rc<CardFocus>,
 ) -> impl IntoElement {
     view()
         .test_id("consent-buttons")
         .flex_row()
         .items_center()
         .gap(px(tokens::SPACE_3))
-        .child(cancel_button(state, kind, language, hold.clone()))
-        .child(send_button(hold, language, total))
+        .child(cancel_button(
+            state,
+            kind,
+            language,
+            hold.clone(),
+            ring.clone(),
+        ))
+        .child(send_button(hold, language, total, ring))
         // The keyboard route that needs no focus anywhere: the card holds
         // the focus, and this hold works from anywhere inside it.
         .child(
@@ -751,6 +913,7 @@ fn cancel_button(
     kind: ConsentKind,
     language: Language,
     hold: Hold,
+    ring: Rc<CardFocus>,
 ) -> impl IntoElement {
     let enabled = state.clone();
     let blur = hold.clone();
@@ -759,6 +922,7 @@ fn cancel_button(
         move || cancel(&state, kind),
         move || blur.release(),
         move || !is_open(&enabled),
+        ring,
     ))
 }
 
@@ -772,8 +936,10 @@ fn cancel_action(
     on_press: impl Fn() + 'static,
     on_blur: impl Fn() + 'static,
     disabled: impl Fn() -> bool + 'static,
+    ring: Rc<CardFocus>,
 ) -> AnyElement {
     let duration = prims::press_color_duration();
+    let focused = ring.clone();
     let control = view()
         .test_id("consent-cancel-button")
         .flex_row()
@@ -785,12 +951,16 @@ fn cancel_action(
         .group()
         .focusable(true)
         .disabled(disabled)
+        .element_ref(ring.at(RingStop::Cancel))
         .role(AccessibilityRole::Button)
         .label(SharedString::from(label))
         .on_press(move |_: &PressEvent| on_press())
-        .on_blur(on_blur);
-    #[cfg(test)]
-    let control = control.on_focus(|| tests::record_focus(tests::FocusStop::Cancel));
+        .on_blur(on_blur)
+        .on_focus(move || {
+            focused.land(RingStop::Cancel);
+            #[cfg(test)]
+            tests::record_focus(tests::FocusStop::Cancel);
+        });
     prims::press_feedback_with_duration(
         control.child(
             text(label)
@@ -811,10 +981,16 @@ fn cancel_action(
 
 /// Hold to send: a full [`motion::FILAMENT_CHARGE_MS`] of charge authorizes;
 /// anything shorter authorizes nothing.
-fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
+fn send_button(
+    hold: Hold,
+    language: Language,
+    total: u64,
+    ring: Rc<CardFocus>,
+) -> impl IntoElement {
     let heat = hold.heat;
     let blur = hold.clone();
     let focused = hold.clone();
+    let ring_landing = ring.clone();
     let down = hold.clone();
     let up = hold.clone();
     let tap = hold.clone();
@@ -836,8 +1012,10 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
             .focusable(true)
             .disabled(move || !is_open(&enabled))
             .label(SharedString::from(hold_accessibility(language, total)))
+            .element_ref(ring.at(RingStop::Send))
             .on_focus(move || {
                 focused.focused.set(true);
+                ring_landing.land(RingStop::Send);
                 #[cfg(test)]
                 tests::record_focus(tests::FocusStop::Hold);
             })
@@ -922,6 +1100,20 @@ fn cancel(state: &AppState, kind: ConsentKind) {
         ConsentKind::Review => state.cancel_review(),
         ConsentKind::Translation => state.cancel_translation(),
     }
+}
+
+// The card's Escape, for a surface whose own Escape binding fired instead of
+// the card's because it mounted later (a Review or Revision field). A waiting
+// menu keeps its Escape first, as it does in `keyboard`. Returns whether a
+// card was waiting.
+pub(crate) fn cancel_open(state: &AppState) -> bool {
+    let Some(kind) = kind_of(state) else {
+        return false;
+    };
+    if !titlebar::escape_closes_menu(state) {
+        cancel(state, kind);
+    }
+    true
 }
 
 // ─── the manifest's rows ──────────────────────────────────────────────────
@@ -1423,7 +1615,7 @@ impl Hold {
     }
 
     /// One raw `KeyDown` on the focused card. A watched key (Enter, Space or
-    /// the modifier) is the card's; an auto-repeat neither charges nor
+    /// a modifier) is the card's; an auto-repeat neither charges nor
     /// cancels. A fresh press of Enter/Space on the focused Send control
     /// begins from zero; anywhere else in the card it cancels the card, as
     /// the focused default (Cancel) does. A fresh modifier press cancels the
@@ -1438,7 +1630,7 @@ impl Hold {
             return;
         }
         match role {
-            KeyRole::Control => self.release(),
+            KeyRole::Modifier => self.release(),
             KeyRole::Enter => {
                 if event.modifiers.ctrl || event.modifiers.cmd {
                     self.begin(HoldPath::CtrlEnter);
@@ -2982,6 +3174,29 @@ mod tests {
         }
     }
 
+    fn cmd_enter() -> Modifiers {
+        Modifiers {
+            cmd: true,
+            ..Modifiers::default()
+        }
+    }
+
+    // One raw `Blur` on the card, as the platform sends it when the focus
+    // leaves it for somewhere the card does not own.
+    fn dispatch_blur(app: &mut Headless) {
+        let id = app.screen().id("id:consent-card").expect("the card");
+        let engine = app.engine().control();
+        engine.dispatch_event(id, EventKind::Blur, EventPayload::None);
+        let (sent, received) = std::sync::mpsc::channel();
+        engine.flush(move |_| {
+            let _ = sent.send(());
+        });
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the blur flushed");
+        app.catch_up();
+    }
+
     fn key_down(app: &mut Headless, key: &str, modifiers: Modifiers) {
         dispatch_key(app, key, true, modifiers, false);
     }
@@ -3110,11 +3325,96 @@ mod tests {
         let mut app = start_keyboard_harness();
         key_down(&mut app, "Enter", ctrl_enter());
         app.run_for(Duration::from_millis(400)).expect("held");
-        // Tab leaves the card: the focus it had is gone, and with it the hold.
-        app.press_key("tab").expect("leave the card");
+        // The focus leaves the card (a platform's own move, a window event):
+        // the hold it had is gone.
+        dispatch_blur(&mut app);
         app.run_for(Duration::from_millis(600))
             .expect("past 900 ms");
         assert_eq!(send_count(&app), 0, "a blurred card sends nothing");
+    }
+
+    #[test]
+    fn releasing_command_mid_hold_sends_nothing() {
+        // macOS reports Command's press and release as `Meta`: the hold must
+        // end with the modifier, as it does with Control.
+        let mut app = start_keyboard_harness();
+        key_down(&mut app, "Enter", cmd_enter());
+        app.run_for(Duration::from_millis(400)).expect("held");
+        key_up(&mut app, "MetaLeft", Modifiers::default());
+        app.run_for(Duration::from_millis(600))
+            .expect("past 900 ms");
+        assert_eq!(
+            send_count(&app),
+            0,
+            "releasing Command ended the hold; Enter alone sends nothing"
+        );
+        // A fresh unbroken hold still sends.
+        key_up(&mut app, "Enter", cmd_enter());
+        key_down(&mut app, "Enter", cmd_enter());
+        app.run_for(Duration::from_millis(1_000)).expect("again");
+        assert_eq!(send_count(&app), 1, "a fresh hold sends once");
+    }
+
+    #[test]
+    fn window_key_focus_loss_mid_hold_sends_nothing() {
+        let mut app = start_keyboard_harness();
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(300)).expect("held");
+        app.set_environment("the window lost the keyboard focus", |env| {
+            let mut state = env.window_state.take().unwrap_or_default();
+            state.focused = false;
+            env.window_state = Some(state);
+        })
+        .expect("the key focus loss");
+        app.run_for(Duration::from_millis(700))
+            .expect("past 900 ms");
+        assert_eq!(
+            send_count(&app),
+            0,
+            "a window without the key focus sends nothing"
+        );
+        // Back with the key focus, a fresh hold still works.
+        app.set_environment("the window has the keyboard focus again", |env| {
+            if let Some(state) = env.window_state.as_mut() {
+                state.focused = true;
+            }
+        })
+        .expect("the key focus back");
+        key_up(&mut app, "Enter", ctrl_enter());
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(1_000))
+            .expect("the fresh hold");
+        assert_eq!(send_count(&app), 1, "the card works again with the focus");
+    }
+
+    #[test]
+    fn tab_cycles_the_focus_inside_the_card() {
+        let mut app = start_keyboard_harness();
+        // From the card, forward reaches the first built control; the
+        // platform's window-wide traversal never runs.
+        app.press_key("tab").expect("tab");
+        app.wait_until("the scope switch", Duration::from_secs(5), |screen| {
+            screen.matches("text:focus order: [Card, Scope]") == Ok(true)
+        })
+        .expect("Tab reached the scope switch, not the window");
+        for _ in 0..2 {
+            app.press_key("tab").expect("tab");
+        }
+        app.wait_until("Send", Duration::from_secs(5), |screen| {
+            screen.matches("text:focus order: [Scope, Cancel, Hold]") == Ok(true)
+        })
+        .expect("Tab reached Send");
+        // From Send it wraps to a control of the card, never out of it.
+        app.press_key("tab").expect("tab from Send");
+        app.wait_until("a wrapped card control", Duration::from_secs(5), |screen| {
+            screen.matches("text:focus order: [Cancel, Hold, Scope]") == Ok(true)
+        })
+        .expect("Tab wrapped inside the card");
+        // Ctrl+Enter still reaches the card from a focused control, and a
+        // full hold sends.
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(1_000)).expect("the hold");
+        assert_eq!(send_count(&app), 1, "the card still owns Ctrl+Enter");
     }
 
     #[test]

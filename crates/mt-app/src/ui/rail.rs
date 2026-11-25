@@ -21,6 +21,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Tab},
     ui::{
+        consent,
         motion::{EASE_OUT, RAIL_WIDEN_MS, reduced_motion},
         prims, shell,
         tokens::{
@@ -47,17 +48,26 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
 
     // Ctrl+P and Ctrl+Shift+F: the same line, opened on the files and on the
     // search. They are not keys a text input uses, so the default `when`
-    // fires them from the editor too.
-    let key_state = state.clone();
+    // fires them from the editor too. While a consent card is open it is
+    // modal: the shortcuts do nothing (the keymap still consumes the key).
+    let palette_state = state.clone();
     on_key("mod+p", move |_: &str| {
-        palette.show(PaletteMode::Files, String::new())
+        if !consent::is_open(&palette_state) {
+            palette.show(PaletteMode::Files, String::new());
+        }
     });
+    let filter_state = state.clone();
     on_key("shift+mod+f", move |_: &str| {
-        palette.show(PaletteMode::Search, key_state.search_query.get())
+        if !consent::is_open(&filter_state) {
+            palette.show(PaletteMode::Search, filter_state.search_query.get());
+        }
     });
     // The tab's own close, and the active tab's from the keyboard.
     let close_state = state.clone();
     on_key("mod+w", move |_: &str| {
+        if consent::is_open(&close_state) {
+            return;
+        }
         if let Some(tab) = close_state.active_tab() {
             close_state.request_close_tab(tab.id);
         }

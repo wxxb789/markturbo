@@ -38,7 +38,7 @@ use crate::{
         ReviewView, Tab,
     },
     ui::{
-        glow,
+        consent, glow,
         motion::{EASE_IN_OUT, Heat, IGNITE_MS, LINEAR, REDUCED_CROSSFADE_MS, reduced_motion},
         prims, titlebar,
         tokens::{
@@ -312,6 +312,9 @@ fn keys(state: &AppState, session: Signal<Session>) {
         {
             let state = state.clone();
             move |_| {
+                if consent::cancel_open(&state) {
+                    return;
+                }
                 if titlebar::escape_closes_menu(&state) {
                     return;
                 }
@@ -3080,6 +3083,54 @@ mod tests {
             answer.is_empty(),
             "the question did not take the character: {answer:?}"
         );
+    }
+
+    // The room during the reported sequence: a Revision is busy, a Review
+    // consent card waits, and then the Revision's answer arrives, so the
+    // Review field mounts after the card with a newer Escape binding.
+    #[component]
+    fn EscapeAfterTheCardProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let tab = state.active_tab().expect("the tab");
+        state.review_view.set(Some(ReviewView {
+            status: "kept".to_owned(),
+            tab_id: Some(tab.id),
+            ..ReviewView::default()
+        }));
+        state.review_open.set(true);
+        state.revision_busy.set(true);
+        state
+            .review_consent
+            .set(Some(SharedString::from("disclosure text")));
+        let arrive = state.clone();
+        effect(move || {
+            let arrive = arrive.clone();
+            let _timer = set_timeout(Duration::from_millis(50), move || {
+                arrive.revision_busy.set(false);
+            });
+        });
+        crate::ui::shell::shell(state, Language::English, crate::ui::tokens::Layout::Wide)
+    }
+
+    #[test]
+    fn escape_cancels_the_card_after_the_review_field_mounts() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<EscapeAfterTheCardProbe>()))
+            .expect("start the shell");
+        app.set_viewport(Size {
+            width: Points(1440.0),
+            height: Points(900.0),
+        })
+        .expect("a 1440x900 window");
+        app.first_render().expect("first render");
+        app.wait_for("id:consent-card").expect("the card");
+        // The Revision's answer arrives and the tab shows no proposal: the
+        // Review field mounts after the card, its Escape binding newer.
+        app.wait_for("id:review-field")
+            .expect("the Review field mounted over the waiting card");
+        app.press_key("escape").expect("escape");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("the card's cancel ran");
     }
 
     /// The whole room over a document; a result with no questions arrives the

@@ -308,7 +308,7 @@ pub struct AppState {
     /// resolution lands, so a slower one for the document that was active
     /// before cannot replace the chain of the one active now.
     context_generation: Rc<Cell<u64>>,
-    pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
+    pending_revision: Rc<RefCell<Option<(u64, PreparedRevisionRequest)>>>,
     pending_translation: Rc<RefCell<Option<PendingTranslation>>>,
     /// Where the live proposal's hunks sit in its tab's text: the one
     /// authority that writes an accepted change, or takes one back.
@@ -529,13 +529,14 @@ struct ReviewSessionSnapshot {
 
 /// One tab's Revision session: what its Review produced and everything that
 /// followed — the frozen output, the answers, the live proposal and its
-/// status. The shown signals are the active tab's copy; a tab switch swaps it,
-/// and a background tab's answer writes the store without touching what is on
-/// screen.
+/// status, and the decision stack with the reading position. The shown
+/// signals are the active tab's copy; a tab switch swaps it, and a background
+/// tab's answer writes the store without touching what is on screen.
 #[derive(Clone, Default)]
 struct RevisionSession {
     context: Option<RevisionContext>,
     ledger: Option<RevisionLedger>,
+    session: crate::ui::revision::Session,
     not_applied: usize,
     questions: Vec<RevisionQuestionView>,
     hunks: Vec<RevisionHunkView>,
@@ -1344,6 +1345,7 @@ impl AppState {
         RevisionSession {
             context: self.revision_context.borrow().clone(),
             ledger: self.revision_ledger.borrow().clone(),
+            session: crate::ui::revision::shown_session(),
             not_applied: self.revision_not_applied.get_untracked(),
             questions: self.revision_questions.get_untracked(),
             hunks: self.revision_hunks.get_untracked(),
@@ -1356,6 +1358,7 @@ impl AppState {
     fn show_revision_session(&self, session: &RevisionSession) {
         *self.revision_context.borrow_mut() = session.context.clone();
         *self.revision_ledger.borrow_mut() = session.ledger.clone();
+        crate::ui::revision::show_session(session.session.clone());
         self.revision_not_applied.set(session.not_applied);
         self.revision_questions.set(session.questions.clone());
         self.revision_hunks.set(session.hunks.clone());
@@ -1368,6 +1371,7 @@ impl AppState {
     fn write_revision_session(&self, tab_id: u64, session: RevisionSession) {
         if session.context.is_none()
             && session.ledger.is_none()
+            && session.session == crate::ui::revision::Session::default()
             && session.questions.is_empty()
             && session.hunks.is_empty()
             && session.status.is_none()
@@ -2501,11 +2505,7 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_translation_failure(&error);
-                self.notify_error(flow_copy::failed(
-                    flow_copy::S::TranslationUnavailable,
-                    language,
-                    &error,
-                ));
+                self.notify_error(flow_copy::translation_unavailable(language));
                 return;
             }
         };
@@ -3367,7 +3367,10 @@ impl AppState {
             .unwrap_or_else(|| signal(0));
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
-            if state.review_generation.get_untracked() != generation {
+            let stale = state.review_generation.get_untracked() != generation;
+            #[cfg(any(test, feature = "test-vault"))]
+            crate::test_vault::review_generation_checked();
+            if stale {
                 // Withdrawn (or replaced) while the request was out: its
                 // answer is not this surface's to show, and it must not touch
                 // the view, the revision context or the busy flag.
@@ -3551,14 +3554,7 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
-                self.set_revision_status(
-                    flow_copy::failed(
-                        flow_copy::S::RevisionModelUnavailable,
-                        settings.language,
-                        &error,
-                    ),
-                    true,
-                );
+                self.set_revision_status(flow_copy::revision_unavailable(settings.language), true);
                 return;
             }
         };
@@ -3582,7 +3578,7 @@ impl AppState {
         )));
         let manifest = self.revision_manifest_of(&bound, tab_id);
         self.revision_manifest.set(Some(manifest));
-        *self.pending_revision.borrow_mut() = Some(bound);
+        *self.pending_revision.borrow_mut() = Some((tab_id, bound));
     }
 
     pub fn cancel_revision(&self) {
@@ -3603,21 +3599,7 @@ impl AppState {
     /// Send the prepared Revision after one-shot consent, then expose the
     /// validated hunks for explicit per-change approval.
     pub fn send_revision(&self) {
-        let Some(bound) = self.pending_revision.borrow_mut().take() else {
-            return;
-        };
-        // The answer belongs to the document this Review read, and only for
-        // as long as this context lives.
-        let Some(tab_id) = self
-            .revision_context
-            .borrow()
-            .as_ref()
-            .map(|context| context.tab_id)
-        else {
-            self.set_revision_status(
-                flow_copy::S::RevisionUnavailable.text(self.settings.get().language),
-                true,
-            );
+        let Some((tab_id, bound)) = self.pending_revision.borrow_mut().take() else {
             return;
         };
         let language = self.settings.get().language;
@@ -5002,7 +4984,7 @@ mod tests {
         let (output_a, answer_is_a, disclosed) = {
             let bound = state.pending_revision.borrow();
             match bound.as_ref() {
-                Some(bound) => {
+                Some((_, bound)) => {
                     let answer_is_a = bound.answers().as_slice().first().is_some_and(|answer| {
                         matches!(answer, RevisionAnswer::Answered(text) if text == "A answer")
                     });

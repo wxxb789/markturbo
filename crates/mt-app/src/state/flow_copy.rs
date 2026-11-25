@@ -11,7 +11,6 @@ pub(crate) enum S {
     RevisionReady,
     RevisionUnavailable,
     RevisionAnswersRejected,
-    RevisionModelUnavailable,
     RevisionRequestRejected,
     RevisionConsentRejected,
     RevisionFailed,
@@ -57,8 +56,6 @@ impl S {
             (S::RevisionUnavailable, Language::Chinese) => "请先运行审查，再准备修订。",
             (S::RevisionAnswersRejected, Language::English) => "Answers rejected",
             (S::RevisionAnswersRejected, Language::Chinese) => "回答被拒绝",
-            (S::RevisionModelUnavailable, Language::English) => "Revision unavailable",
-            (S::RevisionModelUnavailable, Language::Chinese) => "修订不可用",
             (S::RevisionRequestRejected, Language::English) => "The revision request was rejected",
             (S::RevisionRequestRejected, Language::Chinese) => "修订请求被拒绝",
             (S::RevisionConsentRejected, Language::English) => "The revision consent was rejected",
@@ -124,6 +121,30 @@ pub(crate) fn failed(s: S, language: Language, error: &dyn std::fmt::Display) ->
     }
 }
 
+// A Revision that could not be prepared because the model or its credential
+// is not set up: the outcome and the next step, in both languages, with no
+// provider or platform detail.
+pub(crate) fn revision_unavailable(language: Language) -> String {
+    match language {
+        Language::English => {
+            "Revision is unavailable. Check the model and API key in Settings.".to_owned()
+        }
+        Language::Chinese => "修订不可用。请在设置中检查模型和 API 密钥。".to_owned(),
+    }
+}
+
+// A Translation that could not be prepared because the model or its
+// credential is not set up: the outcome and the next step, in both
+// languages, with no provider or platform detail.
+pub(crate) fn translation_unavailable(language: Language) -> String {
+    match language {
+        Language::English => {
+            "Translation is unavailable. Check the model and API key in Settings.".to_owned()
+        }
+        Language::Chinese => "翻译不可用。请在设置中检查模型和 API 密钥。".to_owned(),
+    }
+}
+
 pub(crate) fn revision_failed(language: Language, error: &dyn std::fmt::Display) -> String {
     let label = S::RevisionFailed.text(language);
     match language {
@@ -184,6 +205,35 @@ mod tests {
         model::{EndpointIdentity, Provider},
         translate::provider::TranslationError,
     };
+
+    #[test]
+    fn a_prepare_failure_says_the_next_step_in_both_languages() {
+        assert_eq!(
+            revision_unavailable(Language::English),
+            "Revision is unavailable. Check the model and API key in Settings."
+        );
+        assert_eq!(
+            revision_unavailable(Language::Chinese),
+            "修订不可用。请在设置中检查模型和 API 密钥。"
+        );
+        assert_eq!(
+            translation_unavailable(Language::English),
+            "Translation is unavailable. Check the model and API key in Settings."
+        );
+        assert_eq!(
+            translation_unavailable(Language::Chinese),
+            "翻译不可用。请在设置中检查模型和 API 密钥。"
+        );
+        for message in [
+            revision_unavailable(Language::Chinese),
+            translation_unavailable(Language::Chinese),
+        ] {
+            assert!(
+                !message.contains("OpenAI") && !message.contains("error"),
+                "no provider or platform detail in the Chinese line: {message}"
+            );
+        }
+    }
 
     #[test]
     fn a_chinese_translation_failure_omits_the_app_english() {

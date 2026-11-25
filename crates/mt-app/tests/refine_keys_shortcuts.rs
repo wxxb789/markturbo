@@ -242,6 +242,50 @@ fn the_consent_card_reads_question_destination_boundary_and_key() {
         .expect("Cancel closed the card");
 }
 
+// While a consent card is open it is modal: the room's own shortcuts are
+// inert, so no picker opens and no tab closes during a charge, and the
+// charge itself is one unbroken press.
+#[test]
+fn a_waiting_consent_card_keeps_the_room_shortcuts_inert() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _directory, _config) = open_card_with_ctrl_enter(Os::Linux);
+
+    // A deliberate hold is underway.
+    card_key(&mut app, "Enter", true, ctrl_enter(), false);
+    app.run_for(Duration::from_millis(300)).expect("held");
+
+    // The platform has file dialogs: a request would be recorded.
+    app.on_pick_paths(Vec::new()).expect("file dialogs");
+    app.press_key("ctrl+o").expect("the folder shortcut");
+    assert!(
+        app.screen().file_requests().is_empty(),
+        "the folder picker opened during the charge: {:?}",
+        app.screen().file_requests()
+    );
+    app.press_key("ctrl+w").expect("the tab-close shortcut");
+    assert_eq!(
+        app.screen().matches("id:title-file"),
+        Ok(true),
+        "the card's tab was closed: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        app.screen().matches("id:consent-card"),
+        Ok(true),
+        "the card stays while the hold runs"
+    );
+
+    // The hold was one unbroken press: the inert shortcuts changed nothing,
+    // and the charge completed at its own deadline.
+    app.run_for(Duration::from_millis(600))
+        .expect("the rest of the charge");
+    assert!(
+        sent(&app),
+        "the unbroken hold sent after the shortcuts did nothing: {:?}",
+        app.screen().texts()
+    );
+}
+
 #[test]
 fn ctrl_s_saves_from_the_focused_editor() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

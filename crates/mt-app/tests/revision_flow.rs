@@ -1113,6 +1113,117 @@ fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
     assert_eq!(std::fs::read_to_string(&other).unwrap(), other_source);
 }
 
+// A Revision prepared on A and sent from B goes out under A's id and its
+// answer lands in A's session, never B's: switching tabs between prepare and
+// send cannot redirect it.
+#[test]
+fn a_prepared_revision_lands_on_the_tab_that_prepared_it() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let other_source = "Original\nUnchanged\nMore\n";
+    let (review_output, revision_output) = two_change_outputs(source);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for _ in 0..3 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let body = read_http_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            if request["stream"].as_bool().unwrap_or(false) {
+                let _ = released.recv();
+                write_sse(&mut stream, &revision_output);
+            } else {
+                write_review_json(&mut stream, &review_output);
+            }
+        }
+    });
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    let other = directory.path().join("other.md");
+    std::fs::write(&document, source).expect("write document");
+    std::fs::write(&other, other_source).expect("write other document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_OTHER", &other);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionAcrossDocuments>()))
+        .expect("start the two-document controls");
+    app.wait_for("text:Tabs: 1").expect("document loaded");
+
+    // A reviews; B reviews too, so B has a Revision context of its own.
+    app.press("text:Review").expect("prepare A's Review");
+    app.press("text:Send Review").expect("send A's Review");
+    app.wait_for_within("text:Review ready", Duration::from_secs(20))
+        .expect("A ready");
+    app.press("text:Open other").expect("open B");
+    app.wait_for("text:Tabs: 2").expect("B open");
+    app.press("text:Review").expect("prepare B's Review");
+    app.press("text:Send Review").expect("send B's Review");
+    app.wait_for_within("text:Review ready", Duration::from_secs(20))
+        .expect("B ready");
+
+    // Back on A, prepare its Revision; the consent waits. Then switch to B
+    // and send it from there: B has a Revision context, A's is the one that
+    // must receive the answer.
+    app.press("text:Open first").expect("back to A");
+    app.press("text:Prepare Revision")
+        .expect("prepare A's Revision");
+    app.press("text:Open other").expect("switch to B");
+    app.wait_for("text:Tabs: 2").expect("B shown");
+    app.press("text:Send Revision")
+        .expect("send the prepared Revision");
+    release.send(()).expect("release the Revision answer");
+    app.wait_for_within("text:Busy: false", Duration::from_secs(20))
+        .expect("the Revision finished");
+    app.wait(Duration::from_millis(300))
+        .expect("the answer settles");
+
+    // B, the shown tab, has nothing of the answer.
+    assert!(
+        app.shows("Hunks: 0"),
+        "B took A's answer: {:?}",
+        app.screen().texts()
+    );
+    app.press("text:Open first").expect("back to A");
+    app.wait_for("text:Hunks: 2")
+        .expect("A's own Revision is live again");
+    // Neither document changed: nothing was decided.
+    let both = format!("[{source}][{other_source}]");
+    assert!(
+        app.screen()
+            .matches(&format!("text:{both}"))
+            .expect("the documents selector"),
+        "neither document changes: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), other_source);
+}
+
 /// Whether the buffer line reads `text` exactly (`shows` trims the final
 /// newline the buffer keeps).
 fn buffer_shows(app: &Headless, text: &str) -> bool {

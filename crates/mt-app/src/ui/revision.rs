@@ -41,14 +41,14 @@
 //! Both sides of the docked hunk are complete; a tall one scrolls in place.
 //! `Accept` cannot write hidden or mismatched text.
 //!
-//! The decision log and the reading position live here, in a module-local
-//! session keyed by the proposal ([`Session`]); a decision is recorded only
-//! once the state has written (or refused) its text, so a change's state
-//! signal is `true` exactly when the session's last decision on it is an
-//! accept. `Done` ([`AppState::finish_revision`]) writes nothing more: the
-//! accepted changes are already in, and the undecided ones are discarded —
-//! never written — with `n not applied`. Nothing in this file mutates the
-//! document except through the state.
+//! The decision log and the reading position live in the tab's session
+//! ([`Session`]), kept with the tab's hunks and ledger by the state; a
+//! decision is recorded only once the state has written (or refused) its
+//! text, so a change's state signal is `true` exactly when the session's last
+//! decision on it is an accept. `Done` ([`AppState::finish_revision`]) writes
+//! nothing more: the accepted changes are already in, and the undecided ones
+//! are discarded — never written — with `n not applied`. Nothing in this file
+//! mutates the document except through the state.
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -66,7 +66,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, RevisionHunkView, Tab},
     ui::{
-        glow,
+        consent, glow,
         motion::{self, EASE_IN_OUT, Heat, LINEAR},
         prims, review, titlebar,
         tokens::{self, SPACE_1, SPACE_2, SPACE_3},
@@ -167,7 +167,7 @@ struct Decision {
 /// belong to and which hunk holds the reading position. A proposal is its
 /// hunks' content, so a new or re-rolled one never inherits a decision.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Session {
+pub(crate) struct Session {
     proposal: u64,
     current: usize,
     decisions: Vec<Decision>,
@@ -273,9 +273,22 @@ impl Session {
 }
 
 /// The session signal: one per surface, made on first use, like the shell's
-/// width.
+/// width. It is the shown tab's copy; the per-tab store swaps it on a tab
+/// switch ([`crate::state::AppState`]).
 fn session() -> Signal<Session> {
     global::<Session>()
+}
+
+// The shown session, for the state's per-tab store: the decision stack and
+// reading position of the tab on screen.
+pub(crate) fn shown_session() -> Session {
+    session().get_untracked()
+}
+
+// Put `value` on screen: a tab switch shows that tab's own decisions and
+// reading position, and a background answer never replaces them.
+pub(crate) fn show_session(value: Session) {
+    session().set(value);
 }
 
 /// The identity of a proposal: its hunks' content.
@@ -1096,6 +1109,9 @@ fn bind_busy_escape(state: &AppState) {
                 ..KeyOptions::default()
             },
             move |_| {
+                if consent::cancel_open(&keys) {
+                    return;
+                }
                 if titlebar::escape_closes_menu(&keys) {
                     return;
                 }
@@ -1380,6 +1396,14 @@ mod tests {
     /// The probe document every two-change proposal reads.
     const PROBE_TEXT: &str = "compiles but no check\n";
 
+    // A second document and its own two-change proposal, for the cross-tab
+    // probes.
+    const OTHER_TEXT: &str = "draft but unchecked\n";
+    const OTHER_CHANGES: &[(&str, &str, &str)] = &[
+        ("Tighten the draft.", "draft but", "draft, but"),
+        ("Name the state.", "unchecked", "checked"),
+    ];
+
     /// `two_hunks` as a proposal over `PROBE_TEXT`: (reason, old, new).
     const TWO_CHANGES: &[(&str, &str, &str)] = &[
         ("Tighten the promise.", "compiles but", "compiles, but"),
@@ -1603,6 +1627,68 @@ mod tests {
         );
         app.press("id:revision-accept")
             .expect("the proposal accepts on its own document");
+    }
+
+    // A second document with its own proposal, finished (a status and no
+    // hunks), and the routing the shell gives the field: the decision stack
+    // follows the tab that made it.
+    #[component]
+    fn CrossTabDecisionsProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let a = state.active.get().expect("A");
+        open_probe_document(&state, OTHER_TEXT);
+        present(&state, OTHER_TEXT, OTHER_CHANGES);
+        state.finish_revision(2);
+        let b = state.active.get().expect("B");
+        state.set_active(a);
+        let open_b = state.clone();
+        let open_a = state.clone();
+        let field_state = state.clone();
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .test_id("probe-open-b")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_b.set_active(b))
+                    .child(prims::rest("Open B")),
+            )
+            .child(
+                view()
+                    .test_id("probe-open-a")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_a.set_active(a))
+                    .child(prims::rest("Open A")),
+            )
+            .child(field(field_state, Language::English))
+    }
+
+    #[test]
+    fn decisions_stay_with_the_tab_that_made_them() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<CrossTabDecisionsProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-field").expect("the field");
+        app.wait_for("text:0 of 2 decided").expect("A's hunks");
+        app.press_key("a").expect("accept the docked hunk on A");
+        app.wait_for("text:1 of 2 decided").expect("A decided one");
+        app.wait(Duration::from_millis(150))
+            .expect("the advance settles");
+
+        // B finished its revision: it shows a status and no proposal, as it
+        // does after Done. Showing it must not take A's decisions with it.
+        app.press("id:probe-open-b").expect("B");
+        app.wait_for("text:No changes were approved — the document is unchanged.")
+            .expect("B's finished revision is shown");
+        app.press("id:probe-open-a").expect("back to A");
+        app.wait_for("text:1 of 2 decided")
+            .expect("A's decision survived B");
+        app.press_key("ctrl+z").expect("undo on A");
+        app.wait_for("text:0 of 2 decided")
+            .expect("Undo took A's decision back");
     }
 
     #[test]
