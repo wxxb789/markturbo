@@ -107,8 +107,12 @@ fn daily_schema_aggregates_events_lenses_durations_and_hunk_counts() {
 
     let bytes = std::fs::read(directory.path().join("usage.json")).unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json.as_object().unwrap().len(), 2);
+    assert_eq!(json.as_object().unwrap().len(), 3);
     assert_eq!(json["schema_version"], 1);
+    assert_eq!(
+        json["generation"], 19,
+        "every save takes the next write generation"
+    );
     assert_eq!(json["days"].as_object().unwrap().len(), 2);
     assert_eq!(json["days"]["200"]["events"].as_object().unwrap().len(), 16);
     assert_eq!(json["days"]["200"]["events"]["artifact_opened"], 2);
@@ -248,6 +252,55 @@ fn clear_deletes_the_store_without_resurrecting_old_counts_or_deleting_exports()
     assert_eq!(
         counts.days()[&200].events[&UsageEventKind::RecoveryRestored],
         1
+    );
+}
+
+#[test]
+fn a_second_commit_of_a_fully_cleared_snapshot_keeps_events_recorded_since() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = enabled_store(directory.path());
+    let second = enabled_store(directory.path());
+    first
+        .record(UsageEvent::ArtifactOpened, at_day(200))
+        .unwrap();
+    let from_first = first.inspect(at_day(200)).unwrap();
+    let from_second = second.inspect(at_day(200)).unwrap();
+    first.clear_keeping(&from_first).unwrap();
+    first
+        .record(UsageEvent::ArtifactOpened, at_day(200))
+        .unwrap();
+    second.clear_keeping(&from_second).unwrap();
+    let counts = first.inspect(at_day(200)).unwrap();
+    assert_eq!(
+        counts.days()[&200].events[&UsageEventKind::ArtifactOpened],
+        1,
+        "the second instance subtracted the cleared snapshot from the new event"
+    );
+}
+
+#[test]
+fn a_second_commit_of_a_partially_cleared_snapshot_keeps_events_recorded_since() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = enabled_store(directory.path());
+    let second = enabled_store(directory.path());
+    first
+        .record(UsageEvent::ArtifactOpened, at_day(200))
+        .unwrap();
+    let from_first = first.inspect(at_day(200)).unwrap();
+    let from_second = second.inspect(at_day(200)).unwrap();
+    first
+        .record(UsageEvent::ArtifactOpened, at_day(200))
+        .unwrap();
+    first.clear_keeping(&from_first).unwrap();
+    first
+        .record(UsageEvent::ArtifactOpened, at_day(200))
+        .unwrap();
+    second.clear_keeping(&from_second).unwrap();
+    let counts = first.inspect(at_day(200)).unwrap();
+    assert_eq!(
+        counts.days()[&200].events[&UsageEventKind::ArtifactOpened],
+        2,
+        "the second instance subtracted the cleared snapshot again"
     );
 }
 

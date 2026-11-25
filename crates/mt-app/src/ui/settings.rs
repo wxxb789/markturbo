@@ -533,7 +533,6 @@ fn credential_status_text(state: &AppState, language: Language) -> SharedString 
     }
 }
 
-/// The credential's actions: store (or replace) the typed key, use it for this
 fn credential_actions(
     store_state: AppState,
     session_state: AppState,
@@ -1238,9 +1237,6 @@ mod tests {
             })))
     }
 
-    /// A choice's test id names the pressable button itself — the element UI
-    /// Automation exposes with that AutomationId — and the button says it is
-    /// the current choice.
     #[component]
     fn MountedTransitionProbe() -> impl IntoElement {
         let shown = signal(false);

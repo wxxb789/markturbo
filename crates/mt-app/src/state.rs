@@ -969,12 +969,16 @@ impl AppState {
             .settings_for_persist(&settings)
             .try_save_usage_metrics_consent()
         {
-            Ok(settings) => {
-                self.remember_persisted_base_url(&settings);
+            Ok(saved) => {
+                self.remember_persisted_base_url(&saved);
                 self.usage
                     .borrow_mut()
-                    .set_enabled(settings.usage_metrics_enabled);
-                self.settings.set(settings);
+                    .set_enabled(saved.usage_metrics_enabled);
+                // The saved copy carries the fallback Base URL. What is on
+                // screen stays the user's edit with its validation error.
+                self.settings.update(|settings| {
+                    settings.usage_metrics_enabled = saved.usage_metrics_enabled;
+                });
                 self.usage_notice(crate::i18n::Key::UsageConsentSaved);
             }
             Err(_) => self.usage_notice(crate::i18n::Key::UsageConsentSaveFailed),
@@ -990,9 +994,17 @@ impl AppState {
 
     pub fn clear_usage(&self) {
         self.refresh_usage_counts();
+        let snapshot = match self.usage.borrow().inspect(SystemTime::now()) {
+            Ok(counts) => counts,
+            Err(_) => {
+                // A capture that failed holds nothing to undo: starting a
+                // hold would commit as a whole-store delete at its deadline.
+                self.usage_notice(crate::i18n::Key::UsageUnavailable);
+                return;
+            }
+        };
         self.commit_pending_undo();
-        *self.usage_clear_snapshot.borrow_mut() =
-            self.usage.borrow().inspect(SystemTime::now()).ok();
+        *self.usage_clear_snapshot.borrow_mut() = Some(snapshot);
         self.usage_counts.set(UsageAggregate::default());
         let language = self.settings.get().language;
         let state = self.clone();
@@ -1005,12 +1017,13 @@ impl AppState {
             }
         };
         let commit = move || {
-            let cleared = state.usage_clear_snapshot.borrow_mut().take();
-            let result = match cleared {
-                Some(cleared) => usage.borrow().clear_keeping(&cleared),
-                None => usage.borrow().clear(),
+            // The reverse already took the snapshot: there is nothing left to
+            // commit, and a store-wide delete would wipe events recorded
+            // after the capture.
+            let Some(cleared) = state.usage_clear_snapshot.borrow_mut().take() else {
+                return;
             };
-            if let Err(error) = result {
+            if let Err(error) = usage.borrow().clear_keeping(&cleared) {
                 log::warn!("cannot clear usage counts: {error}");
                 state.usage_notice(crate::i18n::Key::UsageUnavailable);
             }
@@ -3584,6 +3597,20 @@ impl AppState {
         self.review_view.set(None);
         self.review_unavailable.set(None);
         self.review_open.set(false);
+        self.reroute_status_from(StatusSurface::Review);
+    }
+
+    /// The status line shows on one surface at a time. When its surface goes
+    /// away, its message — a live Undo included — moves to the one on screen.
+    fn reroute_status_from(&self, surface: StatusSurface) {
+        if self.status_surface.get_untracked() == surface {
+            self.status_surface
+                .set(if self.settings_open.get_untracked() {
+                    StatusSurface::Settings
+                } else {
+                    StatusSurface::Editor
+                });
+        }
     }
 
     pub fn open_settings(&self) {
@@ -3801,12 +3828,14 @@ impl AppState {
     pub fn remove_credential(&self) -> Result<(), String> {
         let target = self.credential_target()?;
         let language = self.settings.get().language;
-        self.commit_pending_undo();
         let captured = self.vault.resolve(&target, None, false).map_err(|error| {
             log::warn!("cannot read the credential to remove: {error}");
             self.record_usage(UsageEvent::CredentialFailure);
             crate::i18n::t(language, crate::i18n::Key::CredentialReadFailed).to_owned()
         })?;
+        // A capture that failed keeps the previous Undo live; only a removal
+        // that starts commits the pending Tier 2 action.
+        self.commit_pending_undo();
         *self.credential_removal_pending.borrow_mut() = Some(PendingCredentialRemoval {
             target: target.clone(),
             captured,
@@ -4698,6 +4727,92 @@ mod tests {
         assert!(!undo, "a failed capture opened an Undo hold");
         assert!(!status_action, "a failed capture offered an Undo");
         assert!(notice.is_empty(), "a failed capture said {notice:?}");
+    }
+
+    static FAILED_CAPTURE_KEEPS_UNDO: std::sync::Mutex<Option<(bool, bool, bool, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn FailedCaptureKeepsUndoProbe() -> impl IntoElement {
+        let state =
+            AppState::with_vault(CredentialVault::with_test_store(Arc::new(FailingReadStore)));
+        configure_endpoint(&state);
+        state.clear_usage();
+        let before = state.pending_undo.borrow().is_some();
+        let error = state
+            .remove_credential()
+            .expect_err("the read failure refuses the removal");
+        let after = state.pending_undo.borrow().is_some();
+        let status_action = state.status.get_untracked().action.is_some();
+        *FAILED_CAPTURE_KEEPS_UNDO.lock().expect("the outcome") =
+            Some((before, !error.is_empty(), after, status_action));
+        view()
+    }
+
+    #[test]
+    fn a_capture_read_failure_keeps_the_previous_undo_live() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                FailedCaptureKeepsUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (before, failed, after, status_action) = FAILED_CAPTURE_KEEPS_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(before, "there was no pending Undo to keep");
+        assert!(failed, "the credential read did not fail");
+        assert!(after, "a failed capture committed the previous Undo");
+        assert!(
+            status_action,
+            "the status line lost the previous Undo's action"
+        );
+    }
+
+    static USAGE_CAPTURE_FAILURE: std::sync::Mutex<Option<(bool, String, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn UsageCaptureFailureProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        let directory = tempfile::tempdir().expect("a temp dir");
+        let data = directory.path().join("data");
+        // A directory named `usage.json`: every read of the store fails.
+        std::fs::create_dir_all(data.join("usage.json")).expect("the decoy store");
+        *state.usage.borrow_mut() =
+            UsageStore::open_in(&data, &directory.path().join("settings.toml"), true);
+        state.clear_usage();
+        let undo = state.pending_undo.borrow().is_some();
+        let notice = state.settings_notice.get_untracked().to_string();
+        let store_untouched = data.join("usage.json").is_dir();
+        *USAGE_CAPTURE_FAILURE.lock().expect("the outcome") = Some((undo, notice, store_untouched));
+        view()
+    }
+
+    #[test]
+    fn a_failed_usage_capture_reports_it_without_a_deletion_or_undo() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                UsageCaptureFailureProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (undo, notice, store_untouched) = USAGE_CAPTURE_FAILURE
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(!undo, "a failed capture opened an Undo hold");
+        assert_eq!(
+            notice,
+            "Local usage counts could not be read or written. Editing and Review remain available."
+        );
+        assert!(
+            store_untouched,
+            "a failed capture scheduled the whole store for deletion"
+        );
     }
 
     #[component]

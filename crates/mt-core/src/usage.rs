@@ -219,11 +219,21 @@ fn increment(count: &mut u64, amount: u64) {
     *count = count.saturating_add(amount);
 }
 
+/// The clear watermark beside `usage.json`; its extension replaces `json`.
+fn cleared_path(path: &Path) -> PathBuf {
+    path.with_extension("cleared")
+}
+
 /// The sole on-disk JSON document. Day keys are UTC Unix day indices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageAggregate {
     schema_version: u32,
+    /// The write this document came from; every save takes the next one. A
+    /// held Clear names the write it captured, so a commit that has already
+    /// happened can be told apart from the events recorded since.
+    #[serde(default)]
+    generation: u64,
     days: BTreeMap<u64, UsageDayCounts>,
 }
 
@@ -231,6 +241,7 @@ impl Default for UsageAggregate {
     fn default() -> Self {
         Self {
             schema_version: USAGE_SCHEMA_VERSION,
+            generation: 0,
             days: BTreeMap::new(),
         }
     }
@@ -247,6 +258,7 @@ impl UsageAggregate {
     pub fn without(&self, cleared: &UsageAggregate) -> UsageAggregate {
         UsageAggregate {
             schema_version: USAGE_SCHEMA_VERSION,
+            generation: self.generation,
             days: self
                 .days
                 .iter()
@@ -362,7 +374,7 @@ impl UsageStore {
         let today = day_bucket(now);
         aggregate.prune(today);
         aggregate.days.entry(today).or_default().record(event);
-        Self::save(path, &aggregate)
+        Self::save(path, &mut aggregate)
     }
 
     /// Inspect retained counts even when recording is disabled. A disabled
@@ -372,7 +384,7 @@ impl UsageStore {
         let path = self.path()?;
         let mut aggregate = Self::load(path)?;
         if aggregate.prune(day_bucket(now)) && self.enabled && self.persisted_consent() {
-            Self::save(path, &aggregate)?;
+            Self::save(path, &mut aggregate)?;
         }
         Ok(aggregate)
     }
@@ -416,6 +428,11 @@ impl UsageStore {
     pub fn clear(&self) -> Result<(), UsageError> {
         let _guard = self.lock_settings_writes()?;
         let path = self.path()?;
+        // Say that every write so far is gone: a held Clear captured before
+        // this call must not subtract from events recorded after it.
+        if let Ok(current) = Self::load(path) {
+            Self::record_clear(path, current.generation)?;
+        }
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -426,13 +443,19 @@ impl UsageStore {
 
     /// Commit a Clear that was held for undo: remove the counts `cleared`
     /// held, keep anything recorded since, and delete the file when nothing
-    /// is left — as [`clear`](Self::clear).
+    /// is left — as [`clear`](Self::clear). Each commit records the write it
+    /// cleared, so two instances holding the same capture remove it once: a
+    /// second commit of the same snapshot is a no-op.
     pub fn clear_keeping(&self, cleared: &UsageAggregate) -> Result<(), UsageError> {
         let _guard = self.lock_settings_writes()?;
         let path = self.path()?;
-        let kept = Self::load(path)?.without(cleared);
+        if cleared.generation != 0 && cleared.generation <= Self::cleared_through(path)? {
+            return Ok(());
+        }
+        let mut kept = Self::load(path)?.without(cleared);
+        Self::record_clear(path, cleared.generation)?;
         if !kept.days.is_empty() {
-            return Self::save(path, &kept);
+            return Self::save(path, &mut kept);
         }
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -440,6 +463,41 @@ impl UsageStore {
             Err(error) => return Err(error.into()),
         }
         Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)
+    }
+
+    /// Raise the clear watermark to `through` if it is newer: writes at or
+    /// below it are gone, and a commit holding one of them must not subtract
+    /// again. The watermark lives beside the store, so a deleted store still
+    /// remembers which writes are gone.
+    fn record_clear(path: &Path, through: u64) -> Result<(), UsageError> {
+        if through <= Self::cleared_through(path)? {
+            return Ok(());
+        }
+        let parent = path.parent().ok_or(UsageError::DataDirectoryUnavailable)?;
+        std::fs::create_dir_all(parent)?;
+        Self::clear_staging(parent)?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix(STAGING_PREFIX)
+            .suffix(STAGING_SUFFIX)
+            .tempfile_in(parent)?;
+        writeln!(temporary, "{through}")?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(cleared_path(path))
+            .map_err(|error| UsageError::from(error.error))?;
+        Ok(())
+    }
+
+    fn cleared_through(path: &Path) -> Result<u64, UsageError> {
+        let bytes = match std::fs::read(cleared_path(path)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .ok_or(UsageError::InvalidStore)
     }
 
     fn lock_settings_writes(&self) -> io::Result<crate::settings::SettingsWriteGuard> {
@@ -503,10 +561,14 @@ impl UsageStore {
         Ok(aggregate)
     }
 
-    fn save(path: &Path, aggregate: &UsageAggregate) -> Result<(), UsageError> {
+    fn save(path: &Path, aggregate: &mut UsageAggregate) -> Result<(), UsageError> {
         let parent = path.parent().ok_or(UsageError::DataDirectoryUnavailable)?;
         std::fs::create_dir_all(parent)?;
         Self::clear_staging(parent)?;
+        aggregate.generation = aggregate
+            .generation
+            .max(Self::cleared_through(path)?)
+            .wrapping_add(1);
         let mut temporary = tempfile::Builder::new()
             .prefix(STAGING_PREFIX)
             .suffix(STAGING_SUFFIX)

@@ -32,7 +32,7 @@ use std::{
 use mt_core::{recovery::RecoveredRecord, settings::Language};
 use nsh_base::editor::{EditorDecoration, EditorPosition, EditorRange};
 use nsh_core::{
-    Color, DecorationStyle, PropertyValue, StyleKey, TextDecoration,
+    Color, DecorationStyle, EllipsizeMode, PropertyValue, StyleKey, TextDecoration,
     element::AnimatedValue,
     element::{KeyOptions, Style, on_key_with, untracked},
     keymap::When,
@@ -1279,6 +1279,11 @@ pub(crate) fn status_line_at(
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
                 .number_of_lines(1)
+                // A long notice ellipsizes instead of pushing its Undo off
+                // the line: the action must stay reachable.
+                .flex_1()
+                .min_w(px(0.0))
+                .text_overflow(EllipsizeMode::Tail)
                 .text_color(move || {
                     if error.get() {
                         tokens::palette().danger

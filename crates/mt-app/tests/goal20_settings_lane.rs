@@ -14,6 +14,20 @@ const EDITOR: &str = "label:Markdown source";
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn start() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    start_with(None)
+}
+
+/// [`start`] with the app's clock under the test's control, so an Undo hold
+/// elapses only when the test runs the clock.
+fn start_with_manual_clock() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    start_with(Some(nsh_core::time::Clock::manual(
+        std::time::SystemTime::now(),
+    )))
+}
+
+fn start_with(
+    clock: Option<nsh_core::time::Clock>,
+) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let config = tempfile::tempdir().expect("config dir");
     let codex_home = tempfile::tempdir().expect("Codex home");
     let data_dir = config.path().join("data");
@@ -34,6 +48,9 @@ fn start() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     engine.environment.os = Os::Windows;
     engine.environment.idiom = Idiom::Desktop;
     engine.environment.color_scheme = ColorScheme::Light;
+    if let Some(clock) = clock {
+        engine.clock = clock;
+    }
     let mut app = Headless::start(engine).expect("start app");
     app.set_viewport(Size::new(Points(1280.0), Points(900.0)))
         .expect("900px viewport");
@@ -448,6 +465,16 @@ fn an_invalid_base_url_stays_out_of_settings_when_usage_is_toggled() {
         !settings.contains("secret"),
         "the invalid URL's userinfo reached the settings file"
     );
+    assert_eq!(
+        app.screen()
+            .input_text("id:settings-base-url")
+            .expect("read the field")
+            .unwrap_or_default(),
+        "https://user:secret@example.com/v1",
+        "the usage toggle replaced the edit on screen"
+    );
+    app.wait_for("text:The endpoint URL cannot contain user information.")
+        .expect("the usage toggle cleared the validation error");
 }
 
 #[test]
@@ -486,6 +513,56 @@ fn a_pending_removal_blocks_the_review_from_using_the_credential() {
     assert!(
         !app.screen().shows("Send for review?"),
         "the pending removal must not arm a credential request"
+    );
+}
+
+#[test]
+fn a_pending_undo_survives_closing_the_review_panel() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start_with_manual_clock();
+    app.press("id:welcome-new-file").expect("new document");
+    app.wait_for(EDITOR).expect("the source editor");
+    open_settings(&mut app);
+    app.press("text:OpenAI Chat Completions")
+        .expect("choose a wire format");
+    set_base_url(&mut app, "http://127.0.0.1:11450/v1");
+    app.type_text("id:api-key", "synthetic-key-review-undo")
+        .expect("type a key");
+    app.press("text:Store securely").expect("store the key");
+    app.wait_for("text:Credential stored securely for this endpoint")
+        .expect("the key is stored");
+    let target = openai_target("http://127.0.0.1:11450/v1");
+
+    app.press("text:Remove").expect("start the removal hold");
+    app.wait_for("text:No credential stored")
+        .expect("the removal is shown at once");
+    app.press("id:settings-close").expect("leave settings");
+    app.wait_for_gone("id:settings-page", Duration::from_secs(5))
+        .expect("settings closed");
+
+    app.press("id:title-review").expect("start a review");
+    app.wait_for_within("id:review-unavailable", Duration::from_secs(20))
+        .expect("the review says why it cannot run");
+    app.wait_for("text:No model set up")
+        .expect("the pending credential reads as missing");
+    app.wait_for_within("id:status-undo", Duration::from_secs(1))
+        .expect("the review status line carries the pending Undo");
+
+    app.press("id:review-close").expect("close the review");
+    app.wait_for_gone("id:review-unavailable", Duration::from_secs(5))
+        .expect("the review field closes");
+    app.wait_for_within("id:status-undo", Duration::from_secs(1))
+        .expect("the editor status line carries the pending Undo");
+
+    app.press("id:status-undo").expect("undo the removal");
+    app.run_for(Duration::from_millis(
+        mt_app::ui::motion::UNDO_HOLD_MS + 500,
+    ))
+    .expect("the hold would have elapsed");
+    assert_eq!(
+        mt_app::test_vault::stored(&target).as_deref(),
+        Some("synthetic-key-review-undo"),
+        "the undone removal committed after Review closed"
     );
 }
 
