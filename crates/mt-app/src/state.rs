@@ -880,6 +880,16 @@ impl AppState {
         );
     }
 
+    fn clear_usage_failure_notice(&self) {
+        let language = self.settings.get().language;
+        if self.settings_notice_error.get_untracked()
+            && self.settings_notice.get_untracked()
+                == crate::i18n::t(language, crate::i18n::Key::UsageUnavailable)
+        {
+            self.set_settings_notice("", false);
+        }
+    }
+
     pub(crate) fn set_settings_notice(&self, message: impl Into<SharedString>, error: bool) {
         self.settings_notice_error.set(error);
         self.settings_notice.set(message.into());
@@ -1081,12 +1091,8 @@ impl AppState {
         self.usage.borrow_mut().set_enabled(false);
         self.settings
             .update(|settings| settings.usage_metrics_enabled = false);
-        match self
-            .settings_for_persist(&settings)
-            .try_save_usage_metrics_consent()
-        {
+        match self.save_settings_with(&settings, SettingsData::try_save_usage_metrics_consent) {
             Ok(saved) => {
-                self.remember_persisted_base_url(&saved);
                 self.usage
                     .borrow_mut()
                     .set_enabled(saved.usage_metrics_enabled);
@@ -1125,9 +1131,12 @@ impl AppState {
             let usage = Rc::clone(&self.usage);
             move || {
                 let outcome = usage.borrow().restore(&captured, SystemTime::now());
-                if let Err(error) = &outcome {
-                    log::warn!("cannot restore usage counts: {error}");
-                    state.usage_notice(crate::i18n::Key::UsageUnavailable);
+                match &outcome {
+                    Ok(()) => state.clear_usage_failure_notice(),
+                    Err(error) => {
+                        log::warn!("cannot restore usage counts: {error}");
+                        state.usage_notice(crate::i18n::Key::UsageUnavailable);
+                    }
                 }
                 state.refresh_usage_counts();
                 outcome.map_err(|_| {
@@ -1919,7 +1928,7 @@ impl AppState {
         let mut settings = self.settings.get();
         if settings.remove_recent_target(path) {
             self.settings.set(settings);
-            let _ = self.settings.get().try_save_general();
+            let _ = self.save_settings_with(&self.settings.get(), SettingsData::try_save_general);
         }
     }
 
@@ -1932,12 +1941,7 @@ impl AppState {
         self.settings.update(|settings| {
             settings.record_recent_target(RecentTarget::new(path.to_path_buf(), kind, name));
         });
-        if let Ok(saved) = self
-            .settings_for_persist(&self.settings.get())
-            .try_save_general()
-        {
-            self.remember_persisted_base_url(&saved);
-        }
+        let _ = self.save_settings_with(&self.settings.get(), SettingsData::try_save_general);
     }
 
     /// Search the workspace's documents for `text`. Runs the walk and the
@@ -2511,7 +2515,8 @@ impl AppState {
             {
                 self.settings
                     .update(|settings| settings.document_pane = pane.stored());
-                let _ = self.settings.get().try_save_general();
+                let _ =
+                    self.save_settings_with(&self.settings.get(), SettingsData::try_save_general);
             }
         }
     }
@@ -3974,6 +3979,11 @@ impl AppState {
 
     pub fn close_settings(&self) {
         if self.persist_settings(StatusSurface::Editor) {
+            self.settings.update(|settings| {
+                if !model_base_url_valid(settings) {
+                    settings.model_base_url = self.settings_base_url_saved.borrow().clone();
+                }
+            });
             self.settings_open.set(false);
             self.sync_undo_surface();
             self.focus_editor();
@@ -4038,18 +4048,15 @@ impl AppState {
     }
 
     pub fn save_settings_quietly(&self) -> bool {
-        let settings = self.settings.get();
-        match self.settings_for_persist(&settings).try_save_general() {
-            Ok(saved) => {
-                self.remember_persisted_base_url(&saved);
-                true
-            }
+        let language = self.settings.get().language;
+        match self.save_settings_with(&self.settings.get(), SettingsData::try_save_general) {
+            Ok(_) => true,
             Err(error) => {
                 log::warn!("cannot save settings: {}", error.kind());
                 self.notify_at(
                     StatusSurface::Settings,
                     StatusKind::Error,
-                    crate::i18n::t(settings.language, crate::i18n::Key::SettingsSaveFailed),
+                    crate::i18n::t(language, crate::i18n::Key::SettingsSaveFailed),
                 );
                 false
             }
@@ -4058,24 +4065,34 @@ impl AppState {
 
     fn persist_settings(&self, success_surface: StatusSurface) -> bool {
         use crate::i18n::{Key, t};
-        let settings = self.settings.get();
-        let (key, kind, saved) = match self.settings_for_persist(&settings).try_save_general() {
-            Ok(saved) => {
-                self.remember_persisted_base_url(&saved);
-                (Key::SettingsSaved, StatusKind::Success, true)
-            }
-            Err(error) => {
-                log::warn!("cannot save settings: {}", error.kind());
-                (Key::SettingsSaveFailed, StatusKind::Error, false)
-            }
-        };
+        let language = self.settings.get().language;
+        let (key, kind, saved) =
+            match self.save_settings_with(&self.settings.get(), SettingsData::try_save_general) {
+                Ok(_) => (Key::SettingsSaved, StatusKind::Success, true),
+                Err(error) => {
+                    log::warn!("cannot save settings: {}", error.kind());
+                    (Key::SettingsSaveFailed, StatusKind::Error, false)
+                }
+            };
         let surface = if saved {
             success_surface
         } else {
             StatusSurface::Settings
         };
-        self.notify_at(surface, kind, t(settings.language, key));
+        self.notify_at(surface, kind, t(language, key));
         saved
+    }
+
+    // The one settings write: every caller persists the sanitized snapshot,
+    // so a rejected Base URL never reaches disk.
+    fn save_settings_with(
+        &self,
+        settings: &SettingsData,
+        save: impl FnOnce(&SettingsData) -> std::io::Result<SettingsData>,
+    ) -> std::io::Result<SettingsData> {
+        let saved = save(&self.settings_for_persist(settings))?;
+        self.remember_persisted_base_url(&saved);
+        Ok(saved)
     }
 
     fn settings_for_persist(&self, settings: &SettingsData) -> SettingsData {

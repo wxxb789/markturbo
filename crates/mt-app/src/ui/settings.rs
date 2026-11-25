@@ -60,7 +60,11 @@ pub(crate) fn page(
             when: When::Always,
             ..KeyOptions::default()
         },
-        move |_| escape_state.close_settings(),
+        move |_| {
+            if !escape_state.escape_top_layer() {
+                escape_state.close_settings();
+            }
+        },
     );
     let close_state = state.clone();
     view()

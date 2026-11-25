@@ -107,6 +107,30 @@ fn escape_closes_settings_and_the_editor_takes_typing_again() {
 }
 
 #[test]
+fn escape_closes_the_title_menu_before_settings() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start();
+    open_settings(&mut app);
+    app.press("id:title-settings").expect("open the title menu");
+    app.wait_for("id:title-menu")
+        .expect("the menu is disclosed");
+
+    app.press_key("escape").expect("first Escape");
+    app.wait_for_gone("id:title-menu", Duration::from_secs(5))
+        .expect("the title menu closes first");
+    assert!(
+        app.screen()
+            .matches("id:settings-page")
+            .expect("valid settings-page selector"),
+        "the first Escape closed Settings under the menu"
+    );
+
+    app.press_key("escape").expect("second Escape");
+    app.wait_for_gone("id:settings-page", Duration::from_secs(5))
+        .expect("the second Escape closes Settings");
+}
+
+#[test]
 fn the_shortcut_toggles_settings() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, _config, _codex_home) = start();
@@ -478,6 +502,46 @@ fn an_invalid_base_url_stays_out_of_settings_when_usage_is_toggled() {
 }
 
 #[test]
+fn a_rejected_base_url_cannot_reach_disk_after_settings_closes() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, config, _codex_home) = start();
+    app.press("id:welcome-new-file").expect("new document");
+    app.wait_for(EDITOR).expect("the source editor");
+    open_settings(&mut app);
+    app.press("text:OpenAI Chat Completions")
+        .expect("choose a wire format");
+    set_base_url(&mut app, "http://127.0.0.1:11451/v1");
+
+    app.clear("id:settings-base-url").expect("clear the field");
+    app.type_text(
+        "id:settings-base-url",
+        "https://user:secret@example.invalid:bad",
+    )
+    .expect("type a rejected URL");
+    app.press("id:settings-close").expect("close settings");
+    app.wait_for_gone("id:settings-page", Duration::from_secs(5))
+        .expect("settings closed");
+
+    app.press("id:title-settings").expect("open the title menu");
+    app.press("id:title-menu-preview")
+        .expect("switch the document view");
+    app.wait_for("id:preview-column")
+        .expect("the preview pane is current");
+
+    let settings =
+        std::fs::read_to_string(config.path().join("settings.toml")).expect("the settings file");
+    assert!(
+        !settings.contains("user") && !settings.contains("secret"),
+        "a rejected URL's userinfo reached the settings file: {settings}"
+    );
+    assert_eq!(
+        persisted(&config).model_base_url,
+        "http://127.0.0.1:11451/v1",
+        "the pane switch replaced the last valid base URL"
+    );
+}
+
+#[test]
 fn a_pending_removal_blocks_the_review_from_using_the_credential() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, _config, _codex_home) = start();
@@ -686,6 +750,12 @@ fn a_failed_undo_keeps_the_counts_for_a_retry() {
     std::fs::remove_dir(&store).expect("clear the decoy");
     app.press("id:status-undo").expect("retry the Undo");
     app.wait_for("text:Undone.").expect("the retry succeeded");
+    assert!(
+        !app.screen().shows(
+            "Local usage counts could not be read or written. Editing and Review remain available."
+        ),
+        "the retry left the failure notice up after restoring the counts"
+    );
     let json: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&store).expect("the restored store"))
             .expect("valid JSON");
