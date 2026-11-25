@@ -58,15 +58,18 @@ fn focus_lands_on_the_editor_the_next_tab_mounts() {
     };
     open(&mut app, "second", "text:# Second heading");
 
-    // Dirty the second tab, close it through the guard's Don't save, and
-    // type at once: the key can only land if the fallback tab's editor took
-    // the focus, not the document container it mounts inside.
+    // Dirty the second tab, close it through the guard's Don't save chosen
+    // with the keyboard (Left off Cancel, Enter), and type at once: the key
+    // can only land if the fallback tab's editor took the focus, not the
+    // document container it mounts inside. The guard closes on the Enter
+    // binding, whose owner dies with the card; the focus retry must outlive
+    // it.
     app.type_text("label:Markdown source", "\nDirty line")
         .expect("dirty the second tab");
     app.press_key("mod+w").expect("close the dirty tab");
     app.wait_for("id:guard-dont-save").expect("the close guard");
-    app.press("id:guard-card >> label:Don't save")
-        .expect("close without saving");
+    app.press_key("left").expect("select Don't save");
+    app.press_key("enter").expect("confirm with the keyboard");
     app.wait_for_gone("id:guard-card", TIMEOUT)
         .expect("the guard closes");
     app.wait_for("text:# First heading")

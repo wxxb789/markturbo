@@ -208,7 +208,10 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         .pr(move || Length::from(px(prims::caption_insets().right.0 + SPACE_3)))
         .bg(move || tokens::palette().room)
         .window_drag(true)
-        .child(when(move || menu.is_open(), move || menu_scrim(menu)))
+        .child(when(move || menu.is_open(), {
+            let state = state.clone();
+            move || menu_scrim(state.clone(), menu)
+        }))
         .child(when(
             {
                 let state = state.clone();
@@ -699,9 +702,11 @@ pub(crate) fn shortcut(shift: bool, key: &str) -> SharedString {
     })
 }
 
-/// The click-catcher under the menu: a press anywhere else closes it. It is
-/// the row's first child, so what the row holds stays pressable above it.
-fn menu_scrim(menu: MenuMotion) -> impl IntoElement {
+/// The click-catcher under the menu: a press anywhere else closes it through
+/// [`AppState::close_title_menu`], so the keyboard returns to the document.
+/// It is the row's first child, so what the row holds stays pressable above
+/// it.
+fn menu_scrim(state: AppState, menu: MenuMotion) -> impl IntoElement {
     view()
         .test_id("title-menu-scrim")
         // A backdrop closes a popover for the pointer; it is not a stop of
@@ -719,7 +724,7 @@ fn menu_scrim(menu: MenuMotion) -> impl IntoElement {
                 PointerEvents::None
             }
         })
-        .on_press(move || menu.close())
+        .on_press(move || state.close_title_menu())
 }
 
 /// Hover and focus styles belong on the label text so they reach its glyphs.

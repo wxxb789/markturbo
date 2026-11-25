@@ -84,28 +84,20 @@ fn a_slow_first_open_never_commits_over_a_fast_second() {
     app.wait_for("id:context-source-0 >> text:AGENTS.md")
         .expect("the fast root's instructions resolve");
 
-    // Release the slow scan: it completes now, after the fast commit.
+    // Release the slow scan and wait until it actually returns: a
+    // superseded open changes nothing on screen, so its token check is the
+    // only proof the stale scan ran at all (contract amendment 7).
     std::fs::write(&release, "go").expect("release the slow scan");
-    let committed = app
-        .wait_until(
-            "the superseded slow open to land",
-            Duration::from_secs(3),
-            |screen| {
-                screen
-                    .texts()
-                    .iter()
-                    .any(|text| text.contains(&slow_name) || *text == "slow.md")
-            },
-        )
-        .is_ok();
-    assert!(
-        !committed,
-        "the slow first open committed over the fast one: {:?}",
-        app.screen().texts()
-    );
+    app.wait_until(
+        "the superseded slow open to return",
+        Duration::from_secs(10),
+        |_| mt_app::test_vault::open_superseded(slow.path()),
+    )
+    .expect("the slow first open returned after its release");
 
-    // None of the stale result's surfaces moved: root and files, Context,
-    // Recents and status still name the fast folder.
+    // Now that it returned, none of the stale result's surfaces moved: root
+    // and files, Context, Recents and status still name the fast folder, and
+    // the stale answer wrote no error either.
     assert!(app.shows(&fast_name), "the fast root stays");
     assert!(
         !app.shows(&slow_name),
@@ -133,6 +125,11 @@ fn a_slow_first_open_never_commits_over_a_fast_second() {
     assert!(
         !app.shows(&format!("Opened {slow_name}")),
         "the stale open wrote no status: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        !app.shows("Open folder failed"),
+        "the stale open wrote an error the one-point check would have missed: {:?}",
         app.screen().texts()
     );
     let settings = std::fs::read_to_string(config.path().join("settings.toml")).unwrap_or_default();

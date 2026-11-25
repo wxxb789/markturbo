@@ -162,6 +162,21 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.press("id:guard-save")
         .expect("start saving the dirty tabs");
 
+    // The draft's Save As reached the platform and waits for its answer:
+    // the translation returns while the picker is open, after it was asked
+    // (contract amendment 13).
+    app.wait_until(
+        "the draft's Save As picker to be asked",
+        Duration::from_secs(10),
+        |screen| {
+            screen
+                .file_requests()
+                .iter()
+                .any(|request| matches!(request, nsh_core::file_dialog::FileRequest::SaveDialog(_)))
+        },
+    )
+    .expect("the Save As reached its picker before the translation returns");
+
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:# 你好，再见", Duration::from_secs(20))
         .expect("the translation applies while the Save As waits");

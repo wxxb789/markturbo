@@ -135,6 +135,9 @@ pub struct Tab {
     pub untitled: bool,
     pub recovery_key: RecoveryKey,
     pub loaded: Rc<RefCell<LoadedFile>>,
+    /// The latest Reload this tab asked for: an older request's answer that
+    /// comes back later writes nothing.
+    reload: Rc<Cell<u64>>,
 }
 
 impl PartialEq for Tab {
@@ -331,7 +334,9 @@ pub struct AppState {
     undo_generation: Rc<Cell<u64>>,
     quit_discarded: Rc<Cell<bool>>,
     chosen_pane: Rc<Cell<Pane>>,
-    document_view: Rc<Cell<Option<ElementRef>>>,
+    /// The document view mounted last and the tab it belongs to: a retry
+    /// waits for the tab it was asked to focus, never the ref it replaced.
+    document_view: Rc<Cell<Option<(u64, ElementRef)>>>,
     guard_view: Rc<Cell<Option<ElementRef>>>,
     compare_view: Rc<Cell<Option<ElementRef>>>,
     palette_view: Rc<Cell<Option<ElementRef>>>,
@@ -916,10 +921,16 @@ impl AppState {
         self.publish(surface, kind, StatusMessage::counted(text, count));
     }
 
-    fn publish(&self, surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
+    fn publish(&self, mut surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
         // A pending Undo stays on the line: a newer message carries it on
-        // until its deadline, when the slot is freed or taken.
+        // until its deadline, when the slot is freed or taken. The line is
+        // the one the user can see: with Settings open, the editor's status
+        // line is unmounted, so a background notice must not route the Undo
+        // there (contract amendment 2).
         let live_undo = self.undo_hold.borrow().as_ref().map(|hold| hold.generation);
+        if live_undo.is_some() && self.settings_open.get_untracked() {
+            surface = StatusSurface::Settings;
+        }
         if let Some(generation) = live_undo {
             let state = self.clone();
             let label = SharedString::from(s::undo(self.settings.get().language));
@@ -1093,6 +1104,10 @@ impl AppState {
             })
             .await;
             if state.folder_request.get() != request {
+                // A superseded open writes nothing; the test harness learns
+                // the stale scan returned this way.
+                #[cfg(any(test, feature = "test-vault"))]
+                crate::test_vault::note_superseded_open(&path);
                 return;
             }
             match scanned {
@@ -1267,6 +1282,7 @@ impl AppState {
                 untitled: true,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
+                reload: Rc::new(Cell::new(0)),
             });
         });
         if dirty {
@@ -1309,6 +1325,7 @@ impl AppState {
                 untitled: false,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
+                reload: Rc::new(Cell::new(0)),
             });
         });
         self.set_active(id);
@@ -1783,7 +1800,9 @@ impl AppState {
     }
 
     /// Only the commit bound to the draft it captured may delete: a newer
-    /// checkpoint under the same key means the path was reopened and edited.
+    /// checkpoint under the same key means the path was reopened and edited,
+    /// and a record the scan could not read cannot be confirmed as the
+    /// captured one.
     fn delete_recovered(&self, records: &[RecoveredRecord]) {
         let Some(store) = &self.recovery else {
             return;
@@ -1796,7 +1815,11 @@ impl AppState {
                 current.record.key == record.record.key
                     && current.record.checkpointed_at != record.record.checkpointed_at
             });
-            if !replaced {
+            let unconfirmed = scan
+                .issues
+                .iter()
+                .any(|issue| issue.key().is_some_and(|key| key == record.record.key));
+            if !replaced && !unconfirmed {
                 let _ = store.invalidate_and_delete(&record.record.key);
             }
         }
@@ -2152,6 +2175,8 @@ impl AppState {
         // The confirmation was for this revision: an edit made while the
         // disk was read refuses it, keeping the buffer and its recovery.
         let confirmed_revision = tab.revision.get();
+        let request = tab.reload.get().wrapping_add(1);
+        tab.reload.set(request);
         let state = self.clone();
         self.spawn_task(async move {
             let path = tab.path.clone();
@@ -2175,6 +2200,11 @@ impl AppState {
                     return;
                 }
             };
+            // A newer Reload took this tab's slot while the disk was read:
+            // the latest request's answer is the one the user asked for.
+            if tab.reload.get() != request {
+                return;
+            }
             let Some(current) = state
                 .tabs
                 .get()
@@ -2296,8 +2326,6 @@ impl AppState {
 
     async fn save_as_tab(&self, tab: Tab) -> SaveAsOutcome {
         let language = self.settings.get().language;
-        #[cfg(any(test, feature = "test-vault"))]
-        let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         let picked = pick_save_path(
             SaveDialog::new()
                 .title(crate::i18n::t(
@@ -2310,6 +2338,10 @@ impl AppState {
                     ["md", "markdown"],
                 )),
         );
+        // The picker is asked before this test-only stop: a test holds the
+        // answer while other work interleaves with the save.
+        #[cfg(any(test, feature = "test-vault"))]
+        let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         match picked.await {
             Ok(Some(path)) => {
                 if !tab.untitled && path == tab.path {
@@ -2354,8 +2386,11 @@ impl AppState {
                         SaveAsOutcome::Saved(new_id)
                     }
                     Err(error) => {
-                        self.notify_failure(crate::i18n::Key::SaveAsFailed, &error);
-                        SaveAsOutcome::Failed(SharedString::from(s::guard_save_failed(language)))
+                        // The real I/O reason is the failed save's answer: the
+                        // guard shows it, not a generic line.
+                        let reason = s::save_as_write_failed(language, &error);
+                        self.notify_error(reason.clone());
+                        SaveAsOutcome::Failed(SharedString::from(reason))
                     }
                 }
             }
@@ -2600,8 +2635,8 @@ impl AppState {
         self.source_editor.set(Some((tab, editor)));
     }
 
-    pub fn attach_document_view(&self, view: ElementRef) {
-        self.document_view.set(Some(view));
+    pub fn attach_document_view(&self, tab: u64, view: ElementRef) {
+        self.document_view.set(Some((tab, view)));
     }
 
     pub fn attach_guard_view(&self, view: ElementRef) {
@@ -2633,7 +2668,8 @@ impl AppState {
             // it is there, never the container it replaced.
             self.retry_editor_focus(active, Self::FOCUS_RETRY_FRAMES);
         } else {
-            self.focus_document_view();
+            // The Preview and Web panes mount their document the same way.
+            self.retry_document_focus(active, Self::FOCUS_RETRY_FRAMES);
         }
     }
 
@@ -2649,11 +2685,16 @@ impl AppState {
             return;
         }
         let state = self.clone();
-        request_animation_frame(move |_| {
-            if state.active.get() != Some(active) || state.focus_open_layer() {
-                return;
-            }
-            state.retry_editor_focus(active, frames_left - 1);
+        // The retry belongs to the app, not to the handler that asked for
+        // the focus: a key binding in a card that this action closes would
+        // take the pending frame down with it.
+        self.owner.run(|| {
+            request_animation_frame(move |_| {
+                if state.active.get() != Some(active) || state.focus_open_layer() {
+                    return;
+                }
+                state.retry_editor_focus(active, frames_left - 1);
+            });
         });
     }
 
@@ -2691,13 +2732,41 @@ impl AppState {
         false
     }
 
+    fn retry_document_focus(&self, active: u64, frames_left: u8) {
+        if self.focus_mounted_document(active) {
+            return;
+        }
+        if frames_left == 0 {
+            return;
+        }
+        let state = self.clone();
+        self.owner.run(|| {
+            request_animation_frame(move |_| {
+                if state.active.get() != Some(active) || state.focus_open_layer() {
+                    return;
+                }
+                state.retry_document_focus(active, frames_left - 1);
+            });
+        });
+    }
+
     fn focus_document_view(&self) -> bool {
-        let Some(view) = self.document_view.get() else {
+        let Some(active) = self.active.get_untracked() else {
+            return false;
+        };
+        self.focus_mounted_document(active)
+    }
+
+    /// Focus the document view only when it belongs to `active`: the
+    /// subtree is keyed by tab, so the ref a switch replaces must not take
+    /// the keyboard.
+    fn focus_mounted_document(&self, active: u64) -> bool {
+        let Some((_, view)) = self.document_view.get().filter(|(tab, _)| *tab == active) else {
             return false;
         };
         view.focus();
         #[cfg(test)]
-        self.focus_last.set(Some(FocusTarget::Document));
+        self.focus_last.set(Some(FocusTarget::Document(active)));
         true
     }
 
@@ -3815,6 +3884,7 @@ impl AppState {
     pub fn close_settings(&self) {
         if self.persist_settings(StatusSurface::Editor) {
             self.settings_open.set(false);
+            self.carry_undo_to(StatusSurface::Editor);
         }
     }
 
@@ -4336,6 +4406,22 @@ mod s {
         }
     }
 
+    /// `guard_save_failed` with the write's own reason embedded, in the
+    /// contract's `{error}` position (contract amendment 10).
+    pub(super) fn save_as_write_failed(
+        language: Language,
+        error: &dyn std::fmt::Display,
+    ) -> String {
+        match language {
+            Language::English => format!(
+                "Could not save this document ({error}), so it stays open. Check file permissions or try Save As…."
+            ),
+            Language::Chinese => {
+                format!("文档未能保存（{error}），已保持打开。请检查文件权限或尝试“另存为…”。")
+            }
+        }
+    }
+
     pub(super) fn guard_save_failed(language: Language) -> &'static str {
         match language {
             Language::English => {
@@ -4427,7 +4513,7 @@ fn recovered_loaded(record: &RecoveredRecord) -> LoadedFile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FocusTarget {
     Editor,
-    Document,
+    Document(u64),
     Guard,
     Palette,
     Compare,

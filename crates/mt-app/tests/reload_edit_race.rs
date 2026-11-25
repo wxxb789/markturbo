@@ -103,3 +103,98 @@ fn edits_during_the_reload_read_stay_in_the_buffer() {
         "the reload retired the recovery record of the kept edits"
     );
 }
+
+/// Two Reloads of one tab whose answers come back in reverse order: the
+/// later confirmation's disk version lands first, and the older request's
+/// answer must not mistake that sync for an edit and re-raise the conflict.
+#[test]
+fn a_stale_reload_answer_does_not_reconflict_a_synced_tab() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = dir.path().join("plan.md");
+    let first_release = dir.path().join("release-first");
+    let second_release = dir.path().join("release-second");
+    std::fs::write(&path, "# Original\n").expect("write fixture");
+
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &path);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+    }
+
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
+        .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    // An external write makes the save refuse, raising the conflict banner
+    // with its Use-disk choice.
+    std::fs::write(&path, "# External change\n").expect("replace the file");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save").expect("attempt save");
+    app.wait_for("id:conflict-use-disk")
+        .expect("the conflict banner's use-disk choice");
+
+    // Each of the two Reloads parks on its own release, so the second's
+    // answer is forced to land before the first's.
+    mt_app::test_vault::gate_reads(&path, [first_release.clone(), second_release.clone()]);
+    app.press("id:conflict-use-disk")
+        .expect("ask to reload from disk");
+    app.wait_for("id:guard-reload").expect("the reload guard");
+    app.press("id:guard-reload")
+        .expect("confirm the first reload");
+    app.wait_until(
+        "the first reload's read to reach its gate",
+        Duration::from_secs(5),
+        |_| mt_app::test_vault::gate_reads_started(&path) == 1,
+    )
+    .expect("the first reload waits on the disk");
+    app.press("id:conflict-use-disk")
+        .expect("ask to reload from disk again");
+    app.wait_for("id:guard-reload")
+        .expect("the second reload guard");
+    app.press("id:guard-reload")
+        .expect("confirm the second reload");
+    app.wait_until(
+        "the second reload's read to reach its gate",
+        Duration::from_secs(5),
+        |_| mt_app::test_vault::gate_reads_started(&path) == 2,
+    )
+    .expect("the second reload waits on the disk");
+
+    // The second request's answer arrives first and syncs the tab.
+    std::fs::write(&second_release, "go").expect("release the second reload");
+    app.wait_for_gone("id:conflict-banner", Duration::from_secs(20))
+        .expect("the disk version lands and the conflict clears");
+    assert!(
+        editor_text(&app).contains("External change"),
+        "the disk version is in the buffer: {:?}",
+        editor_text(&app)
+    );
+
+    // The first request's answer arrives last. It is stale: the tab is
+    // already synced, so no conflict may come back and the buffer stays.
+    std::fs::write(&first_release, "go").expect("release the first reload");
+    app.wait(Duration::from_millis(500))
+        .expect("let the stale answer land");
+    assert!(
+        !app.screen()
+            .matches("id:conflict-banner")
+            .expect("selector"),
+        "the stale reload re-conflicted the synced tab: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        editor_text(&app).contains("External change"),
+        "the stale answer wrote over the synced buffer: {:?}",
+        editor_text(&app)
+    );
+}

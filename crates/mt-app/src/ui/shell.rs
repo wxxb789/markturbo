@@ -663,6 +663,9 @@ mod tests {
                         if let Some(tab) = state.active_tab() {
                             state.request_close_tab(tab.id);
                         }
+                    }))
+                    .child(control("probe-forget-focus", &state, |state| {
+                        state.focus_last.set(None);
                     })),
             )
             .child(shell(state, Language::English, layout))
@@ -751,6 +754,25 @@ mod tests {
             }))
             .child(control("probe-close-other-tab", &state, move |state| {
                 state.request_close_tab(other);
+            }))
+            .child(control("probe-preview", &state, |state| {
+                if let Some(tab) = state.active_tab() {
+                    state.set_pane(tab.id, Pane::Preview);
+                }
+            }))
+            .child(control("probe-web", &state, |state| {
+                if let Some(tab) = state.active_tab() {
+                    state.set_pane(tab.id, Pane::Web);
+                }
+            }))
+            .child(control("probe-rail-switch", &state, move |state| {
+                let next = if state.active.get() == Some(other) {
+                    state.tabs.get().last().expect("file tab").id
+                } else {
+                    other
+                };
+                state.set_active(next);
+                state.focus_editor();
             }))
             .child(focus_trace_text(&state))
             .child(shell(state, Language::English, Layout::Wide))
@@ -1348,7 +1370,7 @@ mod tests {
         app.press_key("escape").expect("close the palette");
         app.wait_for_gone("id:palette", std::time::Duration::from_secs(5))
             .expect("the palette closes");
-        app.wait_for("text:focus: Document")
+        app.wait_for("text:/focus: Document/")
             .expect("the document view took the keyboard");
         assert!(
             app.screen().matches("id:preview-column").expect("selector"),
@@ -1391,6 +1413,20 @@ mod tests {
         app.wait_for("id:source-editor >> text:/z/")
             .expect("the keystroke landed in the editor");
 
+        // A press on the scrim outside the menu closes it through the same
+        // path as Escape, so the keyboard returns to the editor too.
+        press(&mut app, "probe-forget-focus");
+        press(&mut app, "title-settings");
+        app.wait_for("id:title-menu").expect("the title menu again");
+        press(&mut app, "title-menu-scrim");
+        app.wait_for_gone("id:title-menu", std::time::Duration::from_secs(5))
+            .expect("the outside press closes the menu");
+        app.wait_for("text:focus: Editor")
+            .expect("the click-away handed the keyboard back to the editor");
+        app.press_key("q").expect("type after the outside press");
+        app.wait_for("id:source-editor >> text:/q/")
+            .expect("the keystroke landed in the editor");
+
         // The palette over the comparison: its close hands Compare back.
         let mut app = conflict_probe();
         press_without_settling(&mut app, "conflict-compare");
@@ -1408,6 +1444,43 @@ mod tests {
                 .matches("id:conflict-previous")
                 .expect("selector"),
             "the comparison below stays open"
+        );
+    }
+
+    /// A rail switch to a tab whose pane is Preview or Web focuses that
+    /// tab's document view: the retry waits for the new subtree instead of
+    /// focusing the ref it replaces.
+    #[test]
+    fn a_tab_switch_focuses_the_new_tabs_document_view() {
+        let mut app = file_probe();
+        // The file tab (id 2) becomes Preview; the untitled tab (id 1)
+        // takes the keyboard; switching back must focus the file tab's
+        // document view, not the untitled one it replaces.
+        press(&mut app, "probe-preview");
+        app.wait_for("id:preview-column").expect("the preview");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Editor")
+            .expect("the untitled editor took the keyboard");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Document(2)")
+            .expect("the switched-to tab's document view took the keyboard");
+        assert!(
+            app.screen().matches("id:preview-column").expect("selector"),
+            "the pane stays Preview"
+        );
+
+        // The same for a Web pane.
+        press(&mut app, "probe-web");
+        app.wait_for("id:web-pane").expect("the web pane");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Editor")
+            .expect("the untitled editor took the keyboard");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Document(2)")
+            .expect("the web tab's document view took the keyboard");
+        assert!(
+            app.screen().matches("id:web-pane").expect("selector"),
+            "the pane stays Web"
         );
     }
 

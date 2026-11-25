@@ -139,10 +139,6 @@ fn a_missing_recent_is_marked_disabled_and_opens_nothing() {
         .expect("the welcome leaves");
 }
 
-/// Eleven recorded targets: the history keeps ten, a reopen writes exactly
-/// ten back to `settings.toml` (the oldest dropped, the reopened target
-/// first), and a restarted app reads those ten back. The welcome lists the
-/// five most recent of them.
 #[test]
 fn a_recent_that_vanishes_after_render_flips_to_missing() {
     let _guard = TEST_LOCK
@@ -202,6 +198,10 @@ fn a_recent_that_vanishes_after_render_flips_to_missing() {
     .expect("the vanished row is removed");
 }
 
+/// Eleven recorded targets: the history keeps ten, a reopen writes exactly
+/// ten back to `settings.toml` (the oldest dropped, the reopened target
+/// first), and a restarted app reads those ten back. The welcome lists the
+/// five most recent of them.
 #[test]
 fn the_recent_history_holds_ten_targets_across_a_restart() {
     let _guard = TEST_LOCK

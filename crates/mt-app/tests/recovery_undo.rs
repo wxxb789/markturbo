@@ -106,6 +106,8 @@ fn tier_two_discard_holds_and_commit_boundaries() {
     a_newer_notice_does_not_hide_the_pending_undo();
     a_live_undo_stays_reachable_on_settings();
     an_expired_discard_keeps_a_newer_checkpoint_for_the_same_path();
+    an_unreadable_record_survives_a_delayed_discard();
+    a_live_undo_stays_reachable_when_a_background_notice_arrives();
 }
 
 /// Opening Settings unmounts the editor's status line: a live Undo has to
@@ -142,6 +144,74 @@ fn a_live_undo_stays_reachable_on_settings() {
     app.press("id:settings-close").expect("close Settings");
     app.wait_for("id:recovery-banner")
         .expect("the rows are back in the banner");
+}
+
+/// A live Undo stays reachable while Settings is open even when a later
+/// background notice lands: the notice follows the Undo to the visible
+/// surface instead of routing it back to the unmounted editor line.
+fn a_live_undo_stays_reachable_when_a_background_notice_arrives() {
+    let mut seeded = two_recovered();
+    let keys = seeded.keys.clone();
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let workspace_name = workspace
+        .path()
+        .file_name()
+        .expect("a folder name")
+        .to_string_lossy()
+        .into_owned();
+    let release = workspace.path().join("release-scan");
+    let app = &mut seeded.app;
+
+    app.press("id:recovery-discard-all").expect("discard all");
+    app.wait_for("id:status-action").expect("the Undo");
+
+    // A slow folder open starts first; its completion posts the background
+    // notice while Settings is the visible surface.
+    mt_app::test_vault::gate_read(workspace.path(), &release);
+    app.on_pick_paths(vec![workspace.path().to_path_buf()])
+        .expect("answer the folder picker");
+    app.press("id:welcome-open-folder")
+        .expect("start the slow open");
+    app.wait_for("text:Opening folder…")
+        .expect("the open announces itself");
+
+    // Settings takes the surface and carries the Undo there.
+    app.press("id:title-settings").expect("open the title menu");
+    app.press("id:title-menu-settings").expect("open Settings");
+    app.wait_for("id:settings-page").expect("the settings page");
+    app.wait_for("id:settings-page >> id:status-action")
+        .expect("the Undo follows the user to Settings");
+
+    // The scan completes: `Opened …` must not hide the Undo. The commit's
+    // Recents write proves the notice landed while the checks run.
+    std::fs::write(&release, "go").expect("release the slow scan");
+    support::wait_for_file(
+        app,
+        &seeded._config.path().join("settings.toml"),
+        |text| text.contains(&workspace_name),
+        "the slow folder never committed its background notice",
+        Duration::from_secs(10),
+    );
+    assert!(
+        app.screen()
+            .matches("id:settings-page >> id:status-action")
+            .expect("selector"),
+        "the background notice hid the Undo: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        checkpoint_files(&keys),
+        2,
+        "nothing was deleted while the Undo had to stay reachable"
+    );
+
+    // The carried Undo still restores the rows.
+    app.press("id:settings-page >> id:status-action")
+        .expect("undo from the settings surface");
+    app.press("id:settings-close").expect("close Settings");
+    app.wait_for("id:recovery-banner")
+        .expect("the rows are back in the banner");
+    assert_eq!(checkpoint_files(&keys), 2, "nothing was deleted");
 }
 
 /// For the file a rejoined path's checkpoint is named by.
@@ -212,6 +282,38 @@ fn an_expired_discard_keeps_a_newer_checkpoint_for_the_same_path() {
         !second.exists(),
         "the captured second.md draft is still deleted"
     );
+}
+
+/// The commit may only delete the record it captured. When the file under
+/// the same key cannot be read, the scan lists it as an issue instead of a
+/// record: it cannot be confirmed, so the commit leaves it alone.
+fn an_unreadable_record_survives_a_delayed_discard() {
+    let mut seeded = two_recovered();
+    let keys = seeded.keys.clone();
+    let app = &mut seeded.app;
+    app.wait_for("id:recovery-discard-all")
+        .expect("Discard all with two rows");
+    app.press("id:recovery-discard-all").expect("discard all");
+    app.wait_until("the rows to go", Duration::from_secs(5), |screen| {
+        screen.count("id:recovery-banner").unwrap_or(1) == 0
+    })
+    .expect("the banner leaves");
+
+    // The first record becomes unreadable while the hold runs.
+    let first = record_path(&keys[0]);
+    let second = record_path(&keys[1]);
+    std::fs::write(&first, b"not a recovery record").expect("corrupt the checkpoint");
+
+    // The commit can only prove the second record: the first survives.
+    app.wait_for_gone("id:status-action", Duration::from_secs(5))
+        .expect("the hold commits");
+    app.wait(Duration::from_millis(500))
+        .expect("advance past the commit");
+    assert!(
+        first.exists(),
+        "the commit deleted a record it could not confirm"
+    );
+    assert!(!second.exists(), "the confirmed record is still deleted");
 }
 
 fn discard_all_stays_reversible_until_the_hold_expires() {

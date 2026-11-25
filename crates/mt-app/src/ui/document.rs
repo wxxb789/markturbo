@@ -40,7 +40,11 @@ use crate::{
 /// document is open (the shell shows [`crate::ui::welcome::welcome`] then).
 pub fn column(state: AppState, language: Language) -> impl IntoElement {
     let reference = element_ref();
-    state.attach_document_view(reference);
+    // The ref is keyed by the tab it draws: a close or a tab switch mounts
+    // the next tab's document in a later commit, and focusing this ref must
+    // not hand the keyboard to the view it replaces.
+    let document_tab = state.active.get_untracked().unwrap_or_default();
+    state.attach_document_view(document_tab, reference);
     let state_for_tabs = state.clone();
     #[cfg(test)]
     let focus_state = state.clone();
@@ -52,7 +56,7 @@ pub fn column(state: AppState, language: Language) -> impl IntoElement {
             #[cfg(test)]
             focus_state
                 .focus_last
-                .set(Some(crate::state::FocusTarget::Document));
+                .set(Some(crate::state::FocusTarget::Document(document_tab)));
         })
         .flex_1()
         .h(relative(1.0))

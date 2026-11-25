@@ -111,4 +111,19 @@ fn saving_an_untitled_close_guard_finishes_or_reports() {
         "# Open\n",
         "the failed Save As wrote nothing"
     );
+
+    // A write failure keeps the guard open with the I/O reason itself, not
+    // only a generic notice on the status line.
+    let missing = dir.path().join("missing-dir").join("draft.md");
+    app.on_pick_save_path(Some(missing.clone()))
+        .expect("register the unwritable destination");
+    app.press("id:guard-card >> label:Save")
+        .expect("save into a missing directory");
+    app.wait_for_within("id:guard-card >> text:/\\(os error \\d+\\)/", TIMEOUT)
+        .expect("the guard shows the write failure's real reason");
+    assert!(
+        app.screen().matches("id:guard-save").expect("selector"),
+        "a failed Save As keeps the guard open"
+    );
+    assert!(!missing.exists(), "the failed Save As wrote nothing");
 }

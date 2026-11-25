@@ -71,7 +71,8 @@ pub fn stored(target: &str) -> Option<String> {
 
 struct PathGate {
     path: PathBuf,
-    release: PathBuf,
+    releases: Vec<PathBuf>,
+    next: usize,
 }
 
 static PATH_GATES: LazyLock<Mutex<Vec<PathGate>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -79,13 +80,35 @@ static PATH_GATES: LazyLock<Mutex<Vec<PathGate>>> = LazyLock::new(|| Mutex::new(
 /// Hold every blocking read of `path` until `release` exists, so a test can
 /// order a scan or a load against the work the UI thread does meanwhile.
 pub fn gate_read(path: impl Into<PathBuf>, release: impl Into<PathBuf>) {
+    gate_reads(path, [release])
+}
+
+/// Hold the Nth blocking read of `path` until the Nth of `releases` exists,
+/// so a test can order two reads of one file; reads past the list wait for
+/// its last path, as [`gate_read`] holds every read.
+pub fn gate_reads(
+    path: impl Into<PathBuf>,
+    releases: impl IntoIterator<Item = impl Into<PathBuf>>,
+) {
     PATH_GATES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push(PathGate {
             path: path.into(),
-            release: release.into(),
+            releases: releases.into_iter().map(Into::into).collect(),
+            next: 0,
         });
+}
+
+/// How many blocking reads of `path` have taken a release slot: each of them
+/// has reached its gate.
+pub fn gate_reads_started(path: &Path) -> usize {
+    PATH_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|gate| gate.path == path)
+        .map_or(0, |gate| gate.next)
 }
 
 /// Hold the next Save As before its native picker until the path named by
@@ -101,15 +124,44 @@ pub(crate) fn wait_for_save_gate() {
     }
 }
 
-/// Wait on this path's gate, if a test set one. Runs inside the blocking
-/// read's thread, so the UI thread never waits.
-pub(crate) fn wait_for_read(path: &Path) {
-    let release = PATH_GATES
+static SUPERSEDED_OPENS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Whether the folder open for `path` returned after a newer request took
+/// its slot. A superseded open writes nothing, so only this tells a test
+/// that the stale scan actually came back.
+pub fn open_superseded(path: &Path) -> bool {
+    SUPERSEDED_OPENS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .find(|gate| gate.path == path)
-        .map(|gate| gate.release.clone());
+        .any(|seen| seen == path)
+}
+
+pub(crate) fn note_superseded_open(path: &Path) {
+    SUPERSEDED_OPENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(path.to_path_buf());
+}
+
+/// Wait on this path's gate, if a test set one. Runs inside the blocking
+/// read's thread, so the UI thread never waits.
+pub(crate) fn wait_for_read(path: &Path) {
+    let release = {
+        let mut gates = PATH_GATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(gate) = gates.iter_mut().find(|gate| gate.path == path) else {
+            return;
+        };
+        let release = gate
+            .releases
+            .get(gate.next)
+            .or_else(|| gate.releases.last())
+            .cloned();
+        gate.next += 1;
+        release
+    };
     if let Some(release) = release {
         while !release.exists() {
             std::thread::sleep(Duration::from_millis(5));
