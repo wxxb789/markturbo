@@ -126,4 +126,38 @@ fn saving_an_untitled_close_guard_finishes_or_reports() {
         "a failed Save As keeps the guard open"
     );
     assert!(!missing.exists(), "the failed Save As wrote nothing");
+
+    // The same write failure with the interface in Chinese: the guard shows
+    // the app's localized reason, never the library's `at path` wording or
+    // the destination path (contract amendment 10).
+    app.press("id:guard-cancel").expect("leave the guard");
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-settings").expect("open Settings");
+    app.wait_for("id:settings-page").expect("the settings page");
+    app.press("label:简体中文").expect("switch the language");
+    app.wait_for("text:设置")
+        .expect("the Chinese settings page");
+    app.press("id:settings-header >> label:关闭")
+        .expect("close Settings");
+    app.press_key("mod+w").expect("press Ctrl+W again");
+    app.wait_for("id:guard-save")
+        .expect("the Chinese close guard");
+
+    let missing_zh = dir.path().join("missing-zh").join("draft.md");
+    app.on_pick_save_path(Some(missing_zh.clone()))
+        .expect("register the unwritable destination");
+    app.press("id:guard-save")
+        .expect("save into a missing directory");
+    app.wait_for_within("id:guard-card >> text:/写入失败/", TIMEOUT)
+        .expect("the guard shows the localized write failure");
+    assert!(
+        !app.screen().texts().iter().any(|text| {
+            text.contains("at path")
+                || text.contains(".markturbo-")
+                || text.contains(&missing_zh.display().to_string())
+        }),
+        "the Chinese guard leaked the library's path wording: {:?}",
+        app.screen().texts()
+    );
+    assert!(!missing_zh.exists(), "the failed Save As wrote nothing");
 }

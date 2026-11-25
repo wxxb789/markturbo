@@ -183,8 +183,12 @@ fn a_stale_reload_answer_does_not_reconflict_a_synced_tab() {
     // The first request's answer arrives last. It is stale: the tab is
     // already synced, so no conflict may come back and the buffer stays.
     std::fs::write(&first_release, "go").expect("release the first reload");
-    app.wait(Duration::from_millis(500))
-        .expect("let the stale answer land");
+    app.wait_until(
+        "the stale reload answer to be handled",
+        Duration::from_secs(10),
+        |_| mt_app::test_vault::reload_superseded(&path),
+    )
+    .expect("the stale reload answer was handled");
     assert!(
         !app.screen()
             .matches("id:conflict-banner")

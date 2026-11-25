@@ -122,9 +122,9 @@ pub fn save_gate_reached() -> bool {
     SAVE_GATE_REACHED.load(Ordering::Acquire)
 }
 
-/// Hold the next Save As before its native picker until the path named by
-/// `MARKTURBO_TEST_SAVE_GATE` exists, so a test can dirty another tab while
-/// the save is pending.
+/// Hold the next Save As after its picker was asked and before its answer is
+/// read, until the path named by `MARKTURBO_TEST_SAVE_GATE` exists, so a test
+/// can dirty another tab while the save is pending.
 pub(crate) fn wait_for_save_gate() {
     let Some(release) = std::env::var_os("MARKTURBO_TEST_SAVE_GATE") else {
         return;

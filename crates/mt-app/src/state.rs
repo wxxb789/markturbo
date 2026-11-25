@@ -2353,11 +2353,6 @@ impl AppState {
 
     async fn save_as_tab(&self, tab: Tab) -> SaveAsOutcome {
         let language = self.settings.get().language;
-        // Test-only: the picker's answer does not exist yet. A test holds
-        // the save here while other work interleaves and proves the work
-        // landed before the answer, not merely before it was read.
-        #[cfg(any(test, feature = "test-vault"))]
-        let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         let picked = pick_save_path(
             SaveDialog::new()
                 .title(crate::i18n::t(
@@ -2370,6 +2365,10 @@ impl AppState {
                     ["md", "markdown"],
                 )),
         );
+        // Test-only: the picker was asked before this stop and the answer is
+        // not read until the test releases it.
+        #[cfg(any(test, feature = "test-vault"))]
+        let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         match picked.await {
             Ok(Some(path)) => {
                 if !tab.untitled && path == tab.path {
@@ -4445,13 +4444,17 @@ mod s {
     }
 
     /// Why the write failed, in the user's language. Only the OS's own I/O
-    /// text is passed through unchanged (contract amendment 10).
+    /// text is passed through unchanged (contract amendment 10): a wrapped
+    /// library error keeps neither its English nor the path it names.
     fn save_refusal(language: Language, error: &SaveError) -> String {
         if matches!(language, Language::English) {
             return error.to_string();
         }
         match error {
-            SaveError::Io(error) => error.to_string(),
+            SaveError::Io(error) => match error.raw_os_error() {
+                Some(code) => std::io::Error::from_raw_os_error(code).to_string(),
+                None => "写入失败".to_owned(),
+            },
             SaveError::Conflict => {
                 "文件在打开后已在磁盘上更改。请比较版本、保留你的版本、采用磁盘版本，或选择“另存为…”。"
                     .to_owned()
@@ -5032,14 +5035,43 @@ mod tests {
             "the Chinese guard does not name the conflict in Chinese: {refusal}"
         );
 
-        let os = SaveError::Io(std::io::Error::new(
+        let os = SaveError::Io(std::io::Error::from_raw_os_error(5));
+        let refusal = s::save_as_write_failed(Language::Chinese, &os);
+        assert!(
+            refusal.contains("os error 5"),
+            "the OS's own error text must be kept: {refusal}"
+        );
+
+        let custom = SaveError::Io(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Access is denied. (os error 5)",
         ));
-        let refusal = s::save_as_write_failed(Language::Chinese, &os);
+        let refusal = s::save_as_write_failed(Language::Chinese, &custom);
         assert!(
-            refusal.contains("Access is denied. (os error 5)"),
-            "the OS's own error text must be kept: {refusal}"
+            !refusal.contains("Access is denied"),
+            "a library message wrapped in an io::Error leaks: {refusal}"
+        );
+        assert!(
+            refusal.contains("写入失败"),
+            "a wrapped error falls back to the localized reason: {refusal}"
+        );
+
+        let missing = tempfile::tempdir()
+            .expect("temp dir")
+            .path()
+            .join("missing");
+        let staged = tempfile::Builder::new()
+            .prefix(".markturbo-")
+            .tempfile_in(&missing)
+            .expect_err("staging into a missing directory fails");
+        let refusal = s::save_as_write_failed(Language::Chinese, &SaveError::Io(staged));
+        assert!(
+            refusal.contains("写入失败"),
+            "the staged write falls back to the localized reason: {refusal}"
+        );
+        assert!(
+            !refusal.contains("at path") && !refusal.contains(&missing.display().to_string()),
+            "the staged write leaks the library's path wording: {refusal}"
         );
     }
 }

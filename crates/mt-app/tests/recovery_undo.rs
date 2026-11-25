@@ -257,6 +257,11 @@ fn a_live_undo_stays_reachable_when_a_background_notice_arrives() {
 /// 18).
 #[test]
 fn closing_the_review_panel_carries_the_live_undo_back_to_the_editor() {
+    if !cfg!(windows) {
+        // DPAPI is the production protector; non-Windows builds intentionally
+        // have no plaintext recovery fallback.
+        return;
+    }
     let mut seeded = two_recovered();
     let keys = seeded.keys.clone();
     let app = &mut seeded.app;
@@ -304,6 +309,11 @@ fn closing_the_review_panel_carries_the_live_undo_back_to_the_editor() {
 /// amendment 18).
 #[test]
 fn settings_opened_from_the_review_panel_keeps_the_live_undo() {
+    if !cfg!(windows) {
+        // DPAPI is the production protector; non-Windows builds intentionally
+        // have no plaintext recovery fallback.
+        return;
+    }
     let mut seeded = two_recovered();
     let keys = seeded.keys.clone();
     let app = &mut seeded.app;
