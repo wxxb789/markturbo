@@ -116,6 +116,60 @@ class ValidationBoundaryTests(unittest.TestCase):
         self.assertFalse(any("test" in command for command in calls))
 
 
+class RustCheckTests(unittest.TestCase):
+    def run_rust_checks(self, profile: str) -> list[tuple[str, ...]]:
+        calls: list[tuple[str, ...]] = []
+        with (
+            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
+            mock.patch.object(checks.shutil, "which", return_value="cargo-nextest"),
+            mock.patch.object(checks, "run", side_effect=calls.append),
+        ):
+            checks.rust_checks(profile)
+        return calls
+
+    def test_mt_app_runs_as_one_suite_binary_under_nextest(self) -> None:
+        commands = self.run_rust_checks("ci")
+
+        self.assertIn(
+            (
+                "cargo", "nextest", "run", "--locked", "--cargo-profile", "ci",
+                "-p", "mt-app", "--lib", "--bins", "--test", "suite",
+            ),
+            commands,
+        )
+
+    def test_mt_core_keeps_the_workspace_feature_set_under_nextest(self) -> None:
+        commands = self.run_rust_checks("ci")
+
+        self.assertIn(
+            (
+                "cargo", "nextest", "run", "--locked", "--cargo-profile", "ci",
+                "-p", "mt-core", "--features", "model-transport,test-support",
+            ),
+            commands,
+        )
+
+    def test_no_plain_cargo_test_covers_mt_app_integration_tests(self) -> None:
+        commands = self.run_rust_checks("ci")
+
+        cargo_tests = [command for command in commands if command[1] == "test"]
+        self.assertTrue(cargo_tests)
+        for command in cargo_tests:
+            self.assertIn("--doc", command)
+
+    def test_missing_nextest_fails_with_the_install_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing = Path(temporary) / "cargo-nextest.exe"
+            with (
+                mock.patch.object(checks.shutil, "which", return_value=None),
+                mock.patch.object(checks, "NEXTEST_FALLBACK", missing),
+            ):
+                with self.assertRaisesRegex(
+                    checks.CheckFailure, "cargo install cargo-nextest --locked"
+                ):
+                    checks.nextest("run")
+
+
 class ReleaseArtifactTests(unittest.TestCase):
     def test_missing_artifact_never_falls_back_to_a_stale_default_binary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

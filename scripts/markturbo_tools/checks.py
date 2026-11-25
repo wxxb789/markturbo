@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CARGO_FALLBACK = Path.home() / ".cargo" / "bin" / (
     "cargo.exe" if sys.platform == "win32" else "cargo"
 )
+NEXTEST_FALLBACK = Path.home() / ".cargo" / "bin" / (
+    "cargo-nextest.exe" if sys.platform == "win32" else "cargo-nextest"
+)
 
 
 class CheckFailure(RuntimeError):
@@ -82,6 +85,17 @@ def cargo(*args: str) -> tuple[str, ...]:
     if executable is None:
         raise CheckFailure("cargo was not found on PATH or under ~/.cargo/bin")
     return (executable, *args)
+
+
+def nextest(*args: str) -> tuple[str, ...]:
+    executable = shutil.which("cargo-nextest")
+    if executable is None and NEXTEST_FALLBACK.is_file():
+        executable = str(NEXTEST_FALLBACK)
+    if executable is None:
+        raise CheckFailure(
+            "cargo-nextest was not found; install it with: cargo install cargo-nextest --locked"
+        )
+    return cargo("nextest", *args)
 
 
 def test_shards(test_ids: list[str], workers: int) -> list[list[str]]:
@@ -201,7 +215,19 @@ def doc(*, base: str | None = None, head: str | None = None) -> None:
 def rust_checks(profile: str) -> None:
     run(cargo("fmt", "--all", "--", "--check"))
     run(cargo("clippy", "--profile", profile, "--workspace", "--all-targets", "--locked"))
-    run(cargo("test", "--profile", profile, "--workspace", "--locked"))
+    run(
+        nextest(
+            "run", "--locked", "--cargo-profile", profile,
+            "-p", "mt-core", "--features", "model-transport,test-support",
+        )
+    )
+    run(
+        nextest(
+            "run", "--locked", "--cargo-profile", profile,
+            "-p", "mt-app", "--lib", "--bins", "--test", "suite",
+        )
+    )
+    run(cargo("test", "--profile", profile, "--workspace", "--doc", "--locked"))
 
 
 def ci(*, base: str | None = None, head: str | None = None) -> None:

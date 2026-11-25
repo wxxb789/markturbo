@@ -35,7 +35,7 @@ desktop or an executable. Neither `check ci` nor `check full` launches a GUI.
 
 Per-PR CI runs one platform per tier instead of the workspace suite on every
 platform, and it splits `check ci` into parallel shards. Linux keeps the
-authoritative Rust gate, now as four jobs that run the same commands `check ci`
+authoritative Rust gate, now as four jobs that cover the same checks `check ci`
 runs locally: `preflight` (`check fast` plus `cargo fmt --all -- --check`),
 `clippy` (`cargo clippy --profile ci --workspace --all-targets --locked`),
 `mt-core tests` (`cargo test --profile ci -p mt-core --features
@@ -82,19 +82,21 @@ run the affected tier before pushing and let CI confirm it. Measured on the
 development desktop (Windows 11 x64, 16 cores, warm `target/ci`):
 
 ```sh
-cargo test --locked --profile ci -p mt-app        # ~1 min, app/UI behavior
-cargo nextest run --locked --cargo-profile ci -p mt-app   # ~22 s, same suite
-cargo test --locked --profile ci -p mt-core       # core behavior
-cargo test --locked --profile ci --workspace      # whole workspace, ~3.5 min
+cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite   # ~22 s, app/UI behavior
+cargo nextest run --locked --cargo-profile ci -p mt-core --features model-transport,test-support   # core behavior
+cargo test --locked --profile ci --doc --workspace   # doctests only; the workspace has none today
 uv run --locked --project scripts scripts/mt.py check ci   # the PR gate
 ```
 
-`cargo nextest` is the parallel runner CI uses for the app suites; install it
-once with `cargo install cargo-nextest --locked`. It runs the same tests ~2.5x
-faster here because the suite is dominated by per-process startup. `cargo test`
-stays valid for every command above; it is also the only one of the two that
-runs doctests, so keep using it for `--doc` (the workspace has none today, and
-the nightly `check ci` run covers them if that changes).
+`cargo nextest` is the parallel runner CI uses for both crates; install it once
+with `cargo install cargo-nextest --locked`. `--test suite` is the mt-app
+default: plain `cargo test` builds each of the ~45 `tests/*.rs` files as its own
+executable, so a library change relinks all of them and Windows Defender scans
+each new executable on first open. `suite` links the same files once while
+nextest still gives every test its own process, which those tests need.
+`cargo test` remains the only one of the two that runs doctests, so keep it for
+`--doc`; `check ci` includes that step, so adding the workspace's first doctest
+still fails the gate.
 
 For comparison, a code pull request spends roughly 15-18 minutes in CI and a
 documentation-only one about 2-3. `.githooks/pre-push` is an opt-in guard for the
@@ -112,7 +114,7 @@ Focused examples (replace the filter with the behavior being changed):
 ```sh
 cargo test --locked --profile ci -p mt-core review
 cargo test --locked --profile ci -p mt-core --features model-transport review::provider
-cargo test --locked --profile ci -p mt-app review
+cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite review
 uv run --locked --project scripts python -m unittest scripts.tests.test_checks
 ```
 
