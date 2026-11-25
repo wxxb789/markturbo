@@ -60,6 +60,7 @@ pub const MENU_SCALE: f32 = 0.97;
 pub const CARD_RISE_PX: f32 = 4.0;
 pub const CARD_RISE_MS: f32 = ENTER_MS;
 pub const STATUS_HOLD_MS: u64 = 3000;
+pub const UNDO_HOLD_MS: u64 = 5000;
 pub const CONSENT_NOTICE_MS: u64 = 1500;
 pub const RAIL_WIDEN_MS: f32 = 160.0;
 pub const CAMERA_MS: f32 = 360.0;

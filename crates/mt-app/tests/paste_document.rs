@@ -41,7 +41,8 @@ fn paste_creates_a_document() {
     app.set_clipboard(Some(PASTED.to_owned()));
     // The test id sits on the wrapper; the button inside hears the press, so
     // the press goes through the button's accessibility label.
-    app.press("label:Paste").expect("paste into a new document");
+    app.press("label:Paste as new document")
+        .expect("paste into a new document");
     app.wait_for("label:Markdown source")
         .expect("pasted editor");
     app.wait_for("text:# Pasted draft")

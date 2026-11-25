@@ -289,6 +289,9 @@ fn keys(state: &AppState, session: Signal<Session>) {
         {
             let state = state.clone();
             move |_| {
+                if state.escape_top_layer() {
+                    return;
+                }
                 if state.review_busy.get_untracked() {
                     session.update(|session| session.cancelled = true);
                     state.cancel_review_in_flight();

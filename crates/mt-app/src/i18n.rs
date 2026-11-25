@@ -711,7 +711,7 @@ fn english(key: Key) -> &'static str {
         Key::PreviewLoading => "Preparing preview…",
         Key::DiagramCouldNotRender => "could not render",
         Key::SaveConflictDetail => {
-            "Save refused: the file changed on disk. Reload, overwrite, or save as a new file."
+            "Save refused: the file changed on disk. Compare versions, keep yours, use the disk version, or choose Save As…."
         }
         Key::Opened => "Opened",
         Key::Reloaded => "Reloaded",
@@ -896,7 +896,7 @@ fn chinese(key: Key) -> &'static str {
         Key::PreviewLoading => "正在准备预览…",
         Key::DiagramCouldNotRender => "无法渲染",
         Key::SaveConflictDetail => {
-            "保存被拒绝：磁盘上的文件已更改。请重新加载、覆盖或另存为新文件。"
+            "保存被拒绝：磁盘上的文件已更改。请比较版本、保留你的版本、采用磁盘版本，或选择“另存为…”。"
         }
         Key::Opened => "已打开",
         Key::Reloaded => "已重新加载",
