@@ -59,6 +59,9 @@ pub const CARD_RISE_PX: f32 = 4.0;
 pub const CARD_RISE_MS: f32 = ENTER_MS;
 pub const STATUS_HOLD_MS: u64 = 3000;
 pub const CONSENT_NOTICE_MS: u64 = 1500;
+/// The Tier 2 undo hold: a destructive local action takes effect at once and
+/// commits after this long unless its status-line `Undo` is pressed first.
+pub const UNDO_HOLD_MS: u64 = 5000;
 pub const RAIL_WIDEN_MS: f32 = 160.0;
 pub const CAMERA_MS: f32 = 360.0;
 pub const CAMERA_TICK: std::time::Duration = std::time::Duration::from_micros(16_667);

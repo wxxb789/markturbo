@@ -38,9 +38,9 @@ use crate::{
         ReviewView, Tab, flow_copy,
     },
     ui::{
-        consent, glow,
+        glow,
         motion::{EASE_IN_OUT, Heat, IGNITE_MS, LINEAR, REDUCED_CROSSFADE_MS, reduced_motion},
-        prims, titlebar,
+        prims,
         tokens::{
             self, FOCUS_RING, FOCUS_RING_OFFSET, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
             SPACE_XL, TYPE_MODEL, TYPE_MODEL_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MODEL, with_alpha,
@@ -332,10 +332,7 @@ fn keys(state: &AppState, session: Signal<Session>) {
         {
             let state = state.clone();
             move |_| {
-                if consent::cancel_open(&state) {
-                    return;
-                }
-                if titlebar::escape_closes_menu(&state) {
+                if state.escape_top_layer() {
                     return;
                 }
                 if state.review_busy.get_untracked() {

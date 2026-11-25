@@ -367,15 +367,31 @@ impl Companion {
         match (self.status.get(), self.on_disk.get()) {
             (CompanionStatus::Downloading(_), _) => Some(CompanionAction::Cancel),
             (CompanionStatus::Applying | CompanionStatus::Removing, _) => None,
+            (CompanionStatus::Failed(_), _) => Some(CompanionAction::Retry),
             (_, true) => Some(CompanionAction::Remove),
-            (CompanionStatus::Failed(_), false) => Some(CompanionAction::Retry),
             (_, false) => Some(CompanionAction::Download),
+        }
+    }
+
+    pub(super) fn offers(&self, action: CompanionAction) -> bool {
+        let status = self.status.get();
+        let busy = matches!(
+            status,
+            CompanionStatus::Downloading(_) | CompanionStatus::Applying | CompanionStatus::Removing
+        );
+        match action {
+            CompanionAction::Download => {
+                !busy && !matches!(status, CompanionStatus::Failed(_)) && !self.on_disk.get()
+            }
+            CompanionAction::Retry => matches!(status, CompanionStatus::Failed(_)),
+            CompanionAction::Cancel => matches!(status, CompanionStatus::Downloading(_)),
+            CompanionAction::Remove => self.on_disk.get() && !busy,
         }
     }
 
     /// Deletes the file. The registered face stays until the app restarts.
     pub fn remove(&self) {
-        if self.action() != Some(CompanionAction::Remove) {
+        if !self.offers(CompanionAction::Remove) {
             return;
         }
         let Some(font) = self.font.clone() else {
@@ -611,43 +627,41 @@ mod tests {
     fn settings_font_actions_follow_busy_and_file_presence() {
         use CompanionStatus::*;
 
-        let selectors = [
-            "id:settings-cjk-font-download",
-            "id:settings-cjk-font-retry",
-            "id:settings-cjk-font-cancel",
-            REMOVE,
-        ];
+        let download = "id:settings-cjk-font-download";
+        let retry = "id:settings-cjk-font-retry";
+        let cancel = "id:settings-cjk-font-cancel";
+        let remove = REMOVE;
         for (status, absent, present) in [
-            (Downloading(0), Some(selectors[2]), Some(selectors[2])),
-            (Applying, None, None),
-            (Removing, None, None),
-            (Absent, Some(selectors[0]), Some(REMOVE)),
-            (Installed, Some(selectors[0]), Some(REMOVE)),
-            (Removed, Some(selectors[0]), Some(REMOVE)),
+            (Downloading(0), &[cancel][..], &[cancel][..]),
+            (Applying, &[][..], &[][..]),
+            (Removing, &[][..], &[][..]),
+            (Absent, &[download][..], &[remove][..]),
+            (Installed, &[download][..], &[remove][..]),
+            (Removed, &[download][..], &[remove][..]),
             (
                 Failed(CompanionFailure::Network),
-                Some(selectors[1]),
-                Some(REMOVE),
+                &[retry][..],
+                &[retry, remove][..],
             ),
             (
                 Failed(CompanionFailure::Verification),
-                Some(selectors[1]),
-                Some(REMOVE),
+                &[retry][..],
+                &[retry, remove][..],
             ),
             (
                 Failed(CompanionFailure::Disk),
-                Some(selectors[1]),
-                Some(REMOVE),
+                &[retry][..],
+                &[retry, remove][..],
             ),
             (
                 Failed(CompanionFailure::Registration),
-                Some(selectors[1]),
-                Some(REMOVE),
+                &[retry][..],
+                &[retry, remove][..],
             ),
             (
                 Failed(CompanionFailure::Removal),
-                Some(selectors[1]),
-                Some(REMOVE),
+                &[retry][..],
+                &[retry, remove][..],
             ),
         ] {
             for (on_disk, expected) in [(false, absent), (true, present)] {
@@ -658,10 +672,10 @@ mod tests {
                     cjk_font_section(companion, Language::English)
                 });
                 app.wait_for("id:settings-cjk-font-status").unwrap();
-                for selector in selectors {
+                for selector in [download, retry, cancel, remove] {
                     assert_eq!(
                         app.screen().matches(selector).unwrap(),
-                        expected == Some(selector),
+                        expected.contains(&selector),
                         "{status:?}, on_disk={on_disk}, {selector}"
                     );
                 }
@@ -686,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_is_offered_when_retry_fails_with_a_file_still_on_disk() {
+    fn retry_and_remove_are_offered_when_retry_fails_with_a_file_still_on_disk() {
         let data = tempfile::tempdir().unwrap();
         let font = font(data.path(), FONT);
         let mut app = start(font.clone(), Fetch::NetworkFailure);
@@ -699,10 +713,11 @@ mod tests {
         app.wait_for(REMOVE)
             .expect("the retry found the file on disk");
         app.wait_for(
-            "text:Download failed: the network request did not complete. Nothing was installed.",
+            "text:Download failed: could not reach the font server. Nothing was installed — check your connection and press Retry.",
         )
         .unwrap();
-        assert!(!app.screen().matches("id:settings-cjk-font-retry").unwrap());
+        app.wait_for("id:settings-cjk-font-retry")
+            .expect("retry stays offered with the file on disk");
         assert!(font.path().is_file());
         app.press(REMOVE).expect("remove the copy left on disk");
         app.wait_for(ABSENT).unwrap();

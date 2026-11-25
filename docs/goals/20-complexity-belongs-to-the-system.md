@@ -259,6 +259,59 @@ These override any conflicting text in the advisor body below.
     - Stale is recomputed against the document's current revision, so a result the document has moved past shows as
       stale.
     - Test: an edit or a translation write while the new consent card is open.
+17. **`Clear counts` commits at press; Undo adds the captured counts back (conductor, 2026-11-25; amends 2 and 12 for
+    this action only).**
+    - Usage counts are local statistics.
+      - With a deferred commit, each review round surfaced another multi-instance or crash race in a generation and
+        watermark scheme.
+      - That scheme also kept a counter that leaked past activity volume.
+    - `Clear counts` captures the current aggregate, then clears the store at once with the existing atomic clear.
+      - A corrupt or unsupported `usage.json` is deleted.
+      - A read failure deletes the file when it is a regular file, and otherwise reports the error.
+    - The Undo, live for `UNDO_HOLD_MS` in the shared single slot, **adds** the captured counts back into whatever the
+      store holds by then. Events recorded during the hold are kept either way.
+    - Remove the clear-generation and watermark state, and any persisted counter that survives a clear.
+    - Tests:
+      - clear, then record an event, then Undo restores old plus new;
+      - clear, then record an event, then expiry keeps only the new event;
+      - a corrupt file is cleared;
+      - nothing survives a clear except events recorded after it.
+18. **An Undo shows on the visible surface (conductor, 2026-11-25; replaces the routing in the contract notes
+    below).**
+    - The live Undo renders on exactly one status line: the one on the surface the user currently sees. Settings when
+      Settings is open; otherwise the Review status line when the Review panel is open; otherwise the editor's.
+    - This is computed from the current UI state on every change, so it never depends on where its notice was first
+      routed.
+    - Lane 20-A owns this resolver in the shared Undo API. Lane 20-C adopts it when it merges `main`.
+    - Tests: Review closed while an Undo is live; Settings opened from the Review panel while an Undo is live; a
+      background notice arriving while an Undo is live.
+
+17. **`Clear counts` commits at press; Undo adds the captured counts back (conductor, 2026-11-25; amends 2 and 12 for
+    this action only).**
+    - Usage counts are local statistics.
+      - With a deferred commit, each review round surfaced another multi-instance or crash race in a generation and
+        watermark scheme.
+      - That scheme also kept a counter that leaked past activity volume.
+    - `Clear counts` captures the current aggregate, then clears the store at once with the existing atomic clear.
+      - A corrupt or unsupported `usage.json` is deleted.
+      - A read failure deletes the file when it is a regular file, and otherwise reports the error.
+    - The Undo, live for `UNDO_HOLD_MS` in the shared single slot, **adds** the captured counts back into whatever the
+      store holds by then. Events recorded during the hold are kept either way.
+    - Remove the clear-generation and watermark state, and any persisted counter that survives a clear.
+    - Tests:
+      - clear, then record an event, then Undo restores old plus new;
+      - clear, then record an event, then expiry keeps only the new event;
+      - a corrupt file is cleared;
+      - nothing survives a clear except events recorded after it.
+18. **An Undo shows on the visible surface (conductor, 2026-11-25; replaces the routing in the contract notes
+    below).**
+    - The live Undo renders on exactly one status line: the one on the surface the user currently sees. Settings when
+      Settings is open; otherwise the Review status line when the Review panel is open; otherwise the editor's.
+    - This is computed from the current UI state on every change, so it never depends on where its notice was first
+      routed.
+    - Lane 20-A owns this resolver in the shared Undo API. Lane 20-C adopts it when it merges `main`.
+    - Tests: Review closed while an Undo is live; Settings opened from the Review panel while an Undo is live; a
+      background notice arriving while an Undo is live.
 
 ## Contract notes (conductor, 2026-11-24)
 

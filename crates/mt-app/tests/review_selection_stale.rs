@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use nsh_engine::{EngineConfig, Points, Root};
-use nsh_testing::{DialogAnswer, Headless};
+use nsh_testing::Headless;
 
 const DOCUMENT: &str = "# Plan\n\nIntro OUTSIDE-BEFORE-SENTINEL.\n\nSELECTED-SENTINEL keep the target words.\n\nAfter OUTSIDE-AFTER-SENTINEL.\n";
 const SELECTED: &str = "SELECTED-SENTINEL keep the target words.";
@@ -141,8 +141,9 @@ fn a_selection_the_editor_no_longer_shows_is_not_reviewed() {
     menu(&mut app, "title-menu-save");
     app.wait_for("id:conflict-use-disk")
         .expect("the conflict's use-disk choice");
-    app.on_dialog(|_| DialogAnswer::Press("Reload".to_owned()));
     app.press("label:Use disk version").expect("use the disk");
+    app.wait_for("id:guard-reload").expect("the reload guard");
+    app.press("id:guard-reload").expect("confirm the reload");
     app.wait_for("text:/INSERTED-LINE-SENTINEL/")
         .expect("the reloaded text");
     menu(&mut app, "title-menu-review-selection");

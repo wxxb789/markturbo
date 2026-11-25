@@ -57,6 +57,10 @@ jobs:
       - name: Install Linux build dependencies
         uses: ./.github/actions/install-linux-deps
 
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: nextest
+
       - name: Check
         run: uv run --locked --project scripts scripts/mt.py check ci
 

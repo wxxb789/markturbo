@@ -75,7 +75,7 @@ use nsh_core::{Color, TransformKind, element::AnimatedValue, prelude::*};
 use crate::{
     i18n::{self, Key},
     state::{AppState, OutboundConsent, OutboundItem, OutboundOrigin, ReviewScopeChoice},
-    ui::{motion, prims, review, titlebar, tokens},
+    ui::{motion, prims, review, tokens},
 };
 
 const FILAMENT_H: f32 = 2.0;
@@ -350,7 +350,7 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     let hold = Hold::new(state.clone(), kind, language);
     // Esc is a keymap binding; the hold's keys are the card's own raw
     // handlers below, so they measure only what the focused card hears.
-    keyboard(state.clone(), kind);
+    keyboard(state.clone());
     // A card that leaves drops its charge and its completion timer with it.
     cleanup({
         let hold = hold.clone();
@@ -1077,7 +1077,7 @@ fn send_button(
 /// `KeyDown`/`KeyUp` handlers ([`Hold::key_down`]), so only what the focused
 /// card hears moves the charge and the keymap can never measure a key the
 /// card did not receive.
-fn keyboard(state: AppState, kind: ConsentKind) {
+fn keyboard(state: AppState) {
     effect(move || {
         if !is_open(&state) {
             return;
@@ -1085,9 +1085,7 @@ fn keyboard(state: AppState, kind: ConsentKind) {
         on_key_with("escape", KeyOptions::default(), {
             let state = state.clone();
             move |_| {
-                if !titlebar::escape_closes_menu(&state) {
-                    cancel(&state, kind);
-                }
+                state.escape_top_layer();
             }
         });
     });
@@ -1101,20 +1099,6 @@ fn cancel(state: &AppState, kind: ConsentKind) {
         ConsentKind::Translation => state.cancel_translation(),
     }
     state.focus_editor();
-}
-
-// The card's Escape, for a surface whose own Escape binding fired instead of
-// the card's because it mounted later (a Review or Revision field). A waiting
-// menu keeps its Escape first, as it does in `keyboard`. Returns whether a
-// card was waiting.
-pub(crate) fn cancel_open(state: &AppState) -> bool {
-    let Some(kind) = kind_of(state) else {
-        return false;
-    };
-    if !titlebar::escape_closes_menu(state) {
-        cancel(state, kind);
-    }
-    true
 }
 
 // ─── the manifest's rows ──────────────────────────────────────────────────

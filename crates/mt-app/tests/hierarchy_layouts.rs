@@ -54,7 +54,7 @@ fn compatibility_layouts_are_progressively_disclosed() {
         .expect("the menu closes");
     // The web compatibility pane waits behind the glyph's menu too.
     assert!(
-        !app.shows("Web preview"),
+        !app.shows("Compatibility preview"),
         "advanced layout shown before disclosure"
     );
     assert_eq!(
@@ -68,7 +68,8 @@ fn compatibility_layouts_are_progressively_disclosed() {
     app.wait_for("id:title-menu").expect("menu disclosed");
     app.wait_for("id:title-menu-web")
         .expect("compatibility layout disclosed");
-    app.wait_for("text:Web preview").expect("its copy");
+    app.wait_for("text:Compatibility preview")
+        .expect("its copy");
 
     // Closing the disclosure hides the layout again: the menu carries it,
     // and nothing stays on the row.
@@ -76,7 +77,10 @@ fn compatibility_layouts_are_progressively_disclosed() {
         .expect("close the glyph's menu");
     app.wait_for_gone("id:title-menu-web", Duration::from_secs(5))
         .expect("the compatibility layout is hidden again");
-    assert!(!app.shows("Web preview"), "the disclosed layout stayed");
+    assert!(
+        !app.shows("Compatibility preview"),
+        "the disclosed layout stayed"
+    );
 
     app.press("id:title-settings")
         .expect("open the glyph's menu");

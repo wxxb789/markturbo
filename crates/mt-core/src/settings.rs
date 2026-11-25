@@ -112,6 +112,17 @@ impl Language {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DocumentPane {
+    #[default]
+    Source,
+    Preview,
+    Web,
+    Split,
+    SplitWeb,
+}
+
 /// How to group the Skills list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -279,6 +290,7 @@ pub struct SettingsData {
     pub skills_group_by: GroupBy,
     /// Whether a no-argument launch begins in the welcome state.
     pub show_welcome_on_startup: bool,
+    pub document_pane: DocumentPane,
     /// Explicit consent to local, content-free usage counters. Never enables
     /// an upload; export remains a separate deliberate user action.
     pub usage_metrics_enabled: bool,
@@ -310,6 +322,7 @@ impl Default for SettingsData {
             skills_include_internal: false,
             skills_group_by: GroupBy::default(),
             show_welcome_on_startup: true,
+            document_pane: DocumentPane::default(),
             usage_metrics_enabled: false,
             recent_targets: Vec::new(),
         }
@@ -800,7 +813,7 @@ mod tests {
         );
 
         drop(settings_guard);
-        assert_eq!(usage.clear(), Ok(()));
+        assert!(usage.clear().is_ok());
     }
 
     #[test]
@@ -1170,6 +1183,7 @@ mod tests {
             skills_group_by: GroupBy::Status,
             translate_to: "de".into(),
             show_welcome_on_startup: false,
+            document_pane: DocumentPane::Split,
             usage_metrics_enabled: true,
             recent_targets: vec![RecentTarget::new(
                 PathBuf::from("C:/work/notes.md"),

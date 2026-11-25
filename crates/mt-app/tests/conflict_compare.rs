@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use nsh_engine::{EngineConfig, Points, Root};
-use nsh_testing::{DialogAnswer, Headless};
+use nsh_testing::Headless;
 
 /// Whether any text on screen holds `needle` (the panel draws one span per
 /// word, so a phrase is not one text).
@@ -53,19 +53,76 @@ fn a_second_conflict_reads_the_disk_again() {
     app.wait_for("id:conflict-banner")
         .expect("the conflict banner");
 
-    // Compare reads the file: the first disk version is on screen.
+    // Compare reads the file: the first disk version is on screen, and the
+    // control shows its open state with the selected underline.
+    let closed_style = app
+        .screen()
+        .span_style("id:conflict-compare >> text:Compare")
+        .expect("the closed Compare label");
+    assert!(
+        closed_style.decoration.is_none(),
+        "the closed Compare is not underlined"
+    );
     app.press("label:Compare").expect("compare");
     app.wait_for("id:conflict-compare")
         .expect("the compare panel");
+    app.wait_for("text:Hide comparison")
+        .expect("the control names its open state");
+    let open_style = app
+        .screen()
+        .span_style("id:conflict-compare >> text:Hide comparison")
+        .expect("the open Compare label");
+    assert!(
+        open_style.decoration.underline,
+        "the open Compare shows its selected underline"
+    );
     assert!(
         shows_anywhere(&app, "Alpha"),
         "the first disk version shows: {:?}",
         app.screen().texts()
     );
 
-    // Keep mine resolves the conflict; the comparison's read is left behind.
-    app.on_dialog(|_| DialogAnswer::Press("Overwrite".to_owned()));
+    // Escape alone closes the comparison.
+    app.press_key("escape").expect("close the comparison");
+    app.wait_for_gone("id:conflict-previous", Duration::from_secs(5))
+        .expect("the comparison closes");
+    app.press("label:Compare").expect("reopen the comparison");
+    app.wait_for("id:conflict-previous")
+        .expect("the comparison is open again");
+
+    // Escape dismisses the topmost layer only: with the palette over the
+    // comparison, it closes the palette and leaves the comparison.
+    app.press_key("mod+p")
+        .expect("open the palette over the comparison");
+    app.wait_for("id:palette-input").expect("the palette");
+    app.press_key("escape").expect("close the palette");
+    app.wait_for_gone("id:palette", Duration::from_secs(5))
+        .expect("the palette closes");
+    app.settle();
+    assert!(
+        app.screen()
+            .matches("id:conflict-previous")
+            .expect("selector"),
+        "the comparison below stays open: {:?}",
+        app.screen().texts()
+    );
+
+    // Escape then closes the comparison and returns the keyboard to the
+    // editor: the next plain key types into the document.
+    app.press_key("escape").expect("close the comparison");
+    app.wait_for_gone("id:conflict-previous", Duration::from_secs(5))
+        .expect("the comparison closes");
+    app.press_key("x").expect("type without clicking");
+    app.wait_for(r"id:source-editor >> text:/Local edit\.x/")
+        .expect("the keystroke landed in the editor");
+
+    // Keep mine opens the in-app overwrite guard; the comparison's read is
+    // left behind.
     app.press("label:Keep mine").expect("keep mine");
+    app.wait_for("id:guard-overwrite")
+        .expect("the overwrite guard");
+    app.press("id:guard-overwrite")
+        .expect("confirm the overwrite");
     app.wait_for_gone("id:conflict-banner", Duration::from_secs(5))
         .expect("the conflict is resolved");
     assert!(

@@ -68,6 +68,53 @@ app must never lock files while picking up other editors' changes promptly, with
    - Before implementation, the owner picks one of three distinct interactive HTML prototypes. The prototypes include
      motion and interaction, dark/light themes, narrow/wide windows, and reduced motion. The chosen direction is
      recorded here.
+6. **Chosen direction: B, "Shoji" (sliding screens). Owner, 2026-11-24.**
+   - The reference prototype is [`docs/design/goal-22-shoji.html`](../design/goal-22-shoji.html). Open it in a browser.
+     Where it conflicts with this contract, the contract wins. The prototype's dev strip and legend are tooling, not
+     product.
+   - **Idea.** Every surface is a paper screen sliding on a track. Space is rearranged physically, never swapped.
+   - **Sidebar.** A slightly toned panel, a different paper tone from `ui::tokens` rather than a border.
+     - At 1040 px or wider it pushes the editor. Below that it slides over the editor.
+     - Collapsed (`Ctrl+B`), it leaves an edge strip of about 44 px, where each open document is a short vertical tick.
+       Hovering a tick shows the document's name; clicking it switches to that document.
+   - **One list.** This replaces decision 1's separate "open documents" section.
+     - The folder tree marks open files with a small ink dot. The active file has full ink.
+     - An "Outside folder" group appears at the top only when it has members: open files outside the workspace,
+       untitled buffers, or buffers whose file was deleted or moved on disk.
+   - **View control.**
+     - A small three-segment glyph that shows the split ratio, plus the current state's label.
+     - Cycling (`Ctrl+E`, or a click) slides the divider between the panes: Edit puts it at the right edge, Split in the
+       middle, Preview at the left edge.
+     - The divider can also be dragged, and it snaps to those three stops only. There is no free ratio.
+   - **Motion.**
+     - Spatial and continuous: ease-out with a slight settle, from `ui::motion` tokens. The divider uses the camera
+       duration; the sidebar uses the rail widen duration.
+     - Every movement can be interrupted. It retargets from its current value toward the new stop without a jump, and
+       it moves backwards only when the new stop is behind it.
+     - With reduced motion, movement becomes an opacity change.
+     - This goal owns the sidebar and divider motion. Goal 21 later tunes it, and does not redo it.
+   - **Every open tab stays one click away.** The titlebar tab strip remains and lists every open tab, expanded or
+     collapsed.
+     - Untitled buffers and buffers whose file was deleted or moved on disk appear in the "Outside folder" group, as
+       "Untitled N" or by their last name.
+   - **Easing.** "A slight settle" means the existing monotonic curves, `motion::camera_easing()` for the divider and
+     `motion::EASE_OUT` for the sidebar. There is no overshoot, and no new easing token.
+   - **Drop.** The nsh 0.6.1 `FileDragEvent` carries no position, and Windows only sends enter/leave when the hit target
+     changes. So:
+     - The screen always slides in from the right edge, the side away from the sidebar.
+     - It counts only items it can confirm it will open: supported document names, plus folders when the event
+       identifies them as folders. It shows "Open plan.md" for one, or "Open 3 files" for several.
+     - When nothing can be confirmed (no names, or only inferred types), it says "Drop to open". Skipped items are
+       reported after the drop, by decision 3's count notice.
+     - It says "Can't open this file type" only when every item is confirmed to be a file of an unsupported type. An
+       item that might be a folder, because the event carries only a name and an inferred MIME, is never treated as
+       unsupported.
+     - The prototype's "side being dragged over" is not required.
+     - The screen clears on leave or drop.
+   - **Clean reload.** The changed text slips about 6 px as the old text leaves and the new text arrives. It never
+     glows; only model output emits light.
+     - It plays only after a new disk snapshot has been adopted successfully. It never plays for a conflict or a
+       failed read.
 
 ## Done when
 
@@ -75,6 +122,19 @@ app must never lock files while picking up other editors' changes promptly, with
    for I/O:
    - the sidebar opens a file from the tree in one click; `Ctrl+B` persists; the narrow layout auto-collapses;
    - the view button cycles in order, and the shortcut cycles too;
+   - Shoji, decision 6 (lane 22-A):
+     - cycling moves the divider to the matching stop;
+     - dragging the divider snaps to the nearest of the three stops;
+     - pressing again mid-slide retargets from the current position without a jump, in both cases:
+       - the next stop is in the same direction (Edit to Split, pressed again mid-slide, continues toward Preview);
+       - it is the opposite direction (Split to Preview, pressed mid-slide, goes back to Edit);
+     - under reduced motion there is no translation, only opacity;
+     - with the sidebar expanded, every open tab, including untitled and deleted-on-disk buffers, can be switched to
+       in one click;
+   - drop and reload motion (lane 22-B):
+     - the drop screen text follows decision 6's confirmed, unknown and unsupported cases;
+     - the drop screen slides in from the right edge, and under reduced motion it fades in with no translation;
+     - the reload slip plays only after a successful adoption;
    - drops:
      - a drop event opens the files, a folder drop sets the workspace, and an unsupported drop shows the count notice;
      - coordinates are optional: Windows sends `FileDrop(uris)` with no position. Test that form as well as
@@ -113,14 +173,17 @@ app must never lock files while picking up other editors' changes promptly, with
 
 ## Out of scope
 
-The outline view; tab reordering by drag; motion polish (Goal 21 follows and covers the sidebar's motion).
+The outline view; tab reordering by drag; motion tuning beyond decision 6. Goal 21 follows and may tune durations
+and curves, but keeps decision 6's spatial behaviour.
 
 ## Delivery lanes (after Goal 20 lane 20-A merges)
 
 - **22-A Sidebar and view button:** `ui/rail.rs` (becomes the sidebar), `ui/shell.rs` layout, `ui/titlebar.rs` (the
-  view button, and removing the view items from the menu), plus the settings field for the sidebar state.
+  view button, and removing the view items from the menu), plus the settings field for the sidebar state. It also owns
+  decision 6's sidebar panel, edge strip, single list, divider with snapping, and their motion.
 - **22-B Files and events:** drag-and-drop handlers (the shell root and `state.rs` open paths), the watcher wiring in
-  `state.rs`, the `mt-core` watcher and `document/io.rs` share modes and retry, and the reload and conflict paths.
+  `state.rs`, the `mt-core` watcher and `document/io.rs` share modes and retry, and the reload and conflict paths. It
+  also owns decision 6's drop screen and reload slip.
 
 ## Mergeable alone
 

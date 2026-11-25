@@ -179,6 +179,32 @@ impl UsageDayCounts {
             _ => {}
         }
     }
+
+    /// Adds `other`'s counters back into these, per counter, saturating. Used
+    /// by Undo of a clear: the store already holds whatever was recorded
+    /// since the clear.
+    fn add(&mut self, other: &UsageDayCounts) {
+        for (kind, count) in &other.events {
+            increment(self.events.entry(*kind).or_default(), *count);
+        }
+        for (scope, lenses) in &other.review_started {
+            for (lens, count) in lenses {
+                increment(
+                    self.review_started
+                        .entry(*scope)
+                        .or_default()
+                        .entry(*lens)
+                        .or_default(),
+                    *count,
+                );
+            }
+        }
+        for (bucket, count) in &other.review_durations {
+            increment(self.review_durations.entry(*bucket).or_default(), *count);
+        }
+        increment(&mut self.accepted_hunks, other.accepted_hunks);
+        increment(&mut self.rejected_hunks, other.rejected_hunks);
+    }
 }
 
 fn increment(count: &mut u64, amount: u64) {
@@ -349,17 +375,56 @@ impl UsageStore {
         Ok(())
     }
 
-    /// Explicit Clear deletes the aggregate, including while recording is off.
-    /// It does not change consent or delete copies previously exported by users.
-    pub fn clear(&self) -> Result<(), UsageError> {
+    /// Explicit Clear deletes the aggregate at once, including while recording
+    /// is off, and returns the counts it held for a later Undo. A corrupt or
+    /// unsupported store is discarded; a read failure discards a regular file
+    /// and otherwise reports the error. It does not change consent or delete
+    /// copies previously exported by users.
+    pub fn clear(&self) -> Result<UsageAggregate, UsageError> {
         let _guard = self.lock_settings_writes()?;
         let path = self.path()?;
+        let captured = match Self::load(path) {
+            Ok(aggregate) => aggregate,
+            Err(UsageError::InvalidStore | UsageError::UnsupportedSchema) => {
+                UsageAggregate::default()
+            }
+            Err(error) => {
+                if !path.is_file() {
+                    return Err(error);
+                }
+                UsageAggregate::default()
+            }
+        };
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)
+        // Best effort: the store is already deleted, so a stale staging file
+        // this process cannot remove must not cost the caller the captured
+        // counts, and with them the Undo.
+        if let Some(parent) = path.parent() {
+            let _ = Self::clear_staging(parent);
+        }
+        Ok(captured)
+    }
+
+    /// Undo of [`clear`](Self::clear): add `captured`'s counters back into
+    /// whatever the store holds now, so an event recorded during the Undo hold
+    /// is kept alongside them. Counts outside the retention window are pruned
+    /// before saving, exactly as recording and inspection prune them.
+    pub fn restore(&self, captured: &UsageAggregate, now: SystemTime) -> Result<(), UsageError> {
+        if captured.days.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock_settings_writes()?;
+        let path = self.path()?;
+        let mut aggregate = Self::load(path)?;
+        for (day, counts) in &captured.days {
+            aggregate.days.entry(*day).or_default().add(counts);
+        }
+        aggregate.prune(day_bucket(now));
+        Self::save(path, &aggregate)
     }
 
     fn lock_settings_writes(&self) -> io::Result<crate::settings::SettingsWriteGuard> {

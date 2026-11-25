@@ -10,7 +10,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use nsh_engine::{EngineConfig, Points, Root};
-use nsh_testing::{DialogAnswer, Headless};
+use nsh_testing::Headless;
 
 #[test]
 fn external_change_shows_conflict_resolution() {
@@ -88,18 +88,18 @@ fn external_change_shows_conflict_resolution() {
         app.screen().texts()
     );
 
-    // 'Keep mine' still asks before the destructive overwrite (the button's
-    // accessibility label, so the press lands on the control that hears it).
-    let asked = path.clone();
-    app.on_dialog(move |_| {
-        assert_eq!(
-            std::fs::read_to_string(&asked).expect("read the file while asked"),
-            "# External change\n",
-            "nothing is written before the overwrite is confirmed"
-        );
-        DialogAnswer::Press("Overwrite".to_owned())
-    });
+    // 'Keep mine' opens the quiet in-app guard, not a native alert: nothing
+    // is written until its Overwrite is pressed.
     app.press("label:Keep mine").expect("choose keep mine");
+    app.wait_for("id:guard-overwrite")
+        .expect("the overwrite guard");
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read the file while asked"),
+        "# External change\n",
+        "nothing is written before the overwrite is confirmed"
+    );
+    app.press("id:guard-overwrite")
+        .expect("confirm the overwrite");
     app.wait_for_gone("id:conflict-banner", Duration::from_secs(5))
         .expect("conflict resolved");
     let saved = std::fs::read_to_string(&path).expect("read overwritten file");

@@ -621,6 +621,17 @@ mod tests {
         }
     }
 
+    /// What the app's own last focus move handed the keyboard to, as text a
+    /// test can read: one signal per app, so parallel lib tests never share
+    /// a focus record.
+    fn focus_trace_text(state: &AppState) -> impl IntoElement {
+        let state = state.clone();
+        text(move || match state.focus_last.get() {
+            Some(target) => format!("focus: {target:?}"),
+            None => "focus: none".to_owned(),
+        })
+    }
+
     /// The shell at `layout` with the fixture open, under controls that open
     /// and close the review and pick the pane. The pane is chosen by the
     /// test, never left to the default.
@@ -634,6 +645,7 @@ mod tests {
             .w_full()
             .h(relative(1.0))
             .flex_col()
+            .child(focus_trace_text(&state))
             .child(
                 view()
                     .flex_row()
@@ -648,6 +660,22 @@ mod tests {
                     }))
                     .child(control("probe-split", &state, |state| {
                         pane(state, Pane::Split)
+                    }))
+                    .child(control("probe-preview", &state, |state| {
+                        pane(state, Pane::Preview)
+                    }))
+                    .child(control("probe-dirty", &state, |state| {
+                        if let Some(tab) = state.active_tab() {
+                            tab.dirty.set(true);
+                        }
+                    }))
+                    .child(control("probe-guard", &state, |state| {
+                        if let Some(tab) = state.active_tab() {
+                            state.request_close_tab(tab.id);
+                        }
+                    }))
+                    .child(control("probe-forget-focus", &state, |state| {
+                        state.focus_last.set(None);
                     })),
             )
             .child(shell(state, Language::English, layout))
@@ -737,6 +765,26 @@ mod tests {
             .child(control("probe-close-other-tab", &state, move |state| {
                 state.request_close_tab(other);
             }))
+            .child(control("probe-preview", &state, |state| {
+                if let Some(tab) = state.active_tab() {
+                    state.set_pane(tab.id, Pane::Preview);
+                }
+            }))
+            .child(control("probe-web", &state, |state| {
+                if let Some(tab) = state.active_tab() {
+                    state.set_pane(tab.id, Pane::Web);
+                }
+            }))
+            .child(control("probe-rail-switch", &state, move |state| {
+                let next = if state.active.get() == Some(other) {
+                    state.tabs.get().last().expect("file tab").id
+                } else {
+                    other
+                };
+                state.set_active(next);
+                state.focus_editor();
+            }))
+            .child(focus_trace_text(&state))
             .child(shell(state, Language::English, Layout::Wide))
     }
 
@@ -898,8 +946,6 @@ mod tests {
 
     #[test]
     fn using_disk_version_keeps_compare_content_mounted_during_banner_exit() {
-        use nsh_core::{EventKind, EventPayload, PayloadValue, ROOT_ID};
-
         fn content(node: &LayoutNode) -> Option<&str> {
             node.text.as_ref().map(|text| text.text.text.as_str())
         }
@@ -920,21 +966,9 @@ mod tests {
             .collect();
         assert_eq!(watched.len(), 3, "Compare controls, counter and disk text");
         press_without_settling(&mut app, "conflict-use-disk");
+        app.wait_for("id:guard-reload").expect("the reload guard");
         // Answer without Headless's settle step, which would finish the fade.
-        let dialog = app.pending_dialog().expect("reload confirmation");
-        let reload = dialog
-            .buttons
-            .iter()
-            .position(|button| button.text == "Reload")
-            .expect("reload action");
-        app.engine().control().dispatch_event(
-            ROOT_ID,
-            EventKind::Dialog,
-            EventPayload::Map(vec![
-                ("id", PayloadValue::Number(f64::from(dialog.id))),
-                ("index", PayloadValue::Number(reload as f64)),
-            ]),
-        );
+        press_without_settling(&mut app, "guard-reload");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app
             .screen()
@@ -1193,7 +1227,7 @@ mod tests {
         app.wait_for("id:guard-save").expect("the close guard");
         press_without_settling(&mut app, "probe-break-save");
         press_without_settling(&mut app, "guard-save");
-        let error = "Still open: the document could not be saved.";
+        let error = "Could not save this document, so it stays open. Check file permissions or try Save As….";
         app.wait_for(&format!("text:{error}"))
             .expect("the failed-save notice");
 
@@ -1329,6 +1363,135 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         app.catch_up();
+    }
+
+    /// A layer close returns the keyboard to the layer still open, else to
+    /// the source editor when the pane mounts it, else to the document view;
+    /// the pane never changes (contract amendment 5).
+    #[test]
+    fn a_close_hands_focus_to_the_layer_left_open_or_the_document() {
+        let mut app = start(Root::of::<WideProbe>(), 1440.0);
+
+        // Preview: the palette closes onto the document view, not the editor.
+        press(&mut app, "probe-preview");
+        app.wait_for("id:preview-column").expect("the preview");
+        app.press_key("mod+p").expect("open the palette");
+        app.wait_for("id:palette-input").expect("the palette");
+        app.press_key("escape").expect("close the palette");
+        app.wait_for_gone("id:palette", std::time::Duration::from_secs(5))
+            .expect("the palette closes");
+        app.wait_for("text:/focus: Document/")
+            .expect("the document view took the keyboard");
+        assert!(
+            app.screen().matches("id:preview-column").expect("selector"),
+            "the pane never switched to Source"
+        );
+
+        // The contract's Escape order puts the guard above the palette even
+        // though the palette's binding registered last: the first Escape
+        // cancels the guard and hands the keyboard to the palette, the
+        // second closes the palette.
+        press(&mut app, "probe-source");
+        press(&mut app, "probe-dirty");
+        press(&mut app, "probe-guard");
+        app.wait_for("id:guard-card").expect("the guard");
+        app.press_key("mod+p").expect("open the palette");
+        app.wait_for("id:palette-input").expect("the palette");
+        app.press_key("escape").expect("cancel the guard first");
+        app.wait_for_gone("id:guard-card", std::time::Duration::from_secs(5))
+            .expect("the guard closes");
+        app.wait_for("text:focus: Palette")
+            .expect("the palette under the guard took the keyboard");
+        assert!(
+            app.screen().matches("id:palette-input").expect("selector"),
+            "the palette under the guard stays open"
+        );
+        app.press_key("escape").expect("close the palette");
+        app.wait_for_gone("id:palette", std::time::Duration::from_secs(5))
+            .expect("the palette closes");
+        app.wait_for("text:focus: Editor")
+            .expect("the editor took the keyboard");
+
+        // Escape closes the title menu and returns the keyboard where the
+        // next key lands: in the source editor.
+        press(&mut app, "title-settings");
+        app.wait_for("id:title-menu").expect("the title menu");
+        app.press_key("escape").expect("close the title menu");
+        app.wait_for_gone("id:title-menu", std::time::Duration::from_secs(5))
+            .expect("the menu closes");
+        app.press_key("z").expect("type after the menu closed");
+        app.wait_for("id:source-editor >> text:/z/")
+            .expect("the keystroke landed in the editor");
+
+        // A press on the scrim outside the menu closes it through the same
+        // path as Escape, so the keyboard returns to the editor too.
+        press(&mut app, "probe-forget-focus");
+        press(&mut app, "title-settings");
+        app.wait_for("id:title-menu").expect("the title menu again");
+        press(&mut app, "title-menu-scrim");
+        app.wait_for_gone("id:title-menu", std::time::Duration::from_secs(5))
+            .expect("the outside press closes the menu");
+        app.wait_for("text:focus: Editor")
+            .expect("the click-away handed the keyboard back to the editor");
+        app.press_key("q").expect("type after the outside press");
+        app.wait_for("id:source-editor >> text:/q/")
+            .expect("the keystroke landed in the editor");
+
+        // The palette over the comparison: its close hands Compare back.
+        let mut app = conflict_probe();
+        press_without_settling(&mut app, "conflict-compare");
+        app.wait_for("id:conflict-previous")
+            .expect("the comparison");
+        app.press_key("mod+p").expect("open the palette");
+        app.wait_for("id:palette-input").expect("the palette");
+        app.press_key("escape").expect("close the palette");
+        app.wait_for_gone("id:palette", std::time::Duration::from_secs(5))
+            .expect("the palette closes");
+        app.wait_for("text:focus: Compare")
+            .expect("the comparison took the keyboard");
+        assert!(
+            app.screen()
+                .matches("id:conflict-previous")
+                .expect("selector"),
+            "the comparison below stays open"
+        );
+    }
+
+    /// A rail switch to a tab whose pane is Preview or Web focuses that
+    /// tab's document view: the retry waits for the new subtree instead of
+    /// focusing the ref it replaces.
+    #[test]
+    fn a_tab_switch_focuses_the_new_tabs_document_view() {
+        let mut app = file_probe();
+        // The file tab (id 2) becomes Preview; the untitled tab (id 1)
+        // takes the keyboard; switching back must focus the file tab's
+        // document view, not the untitled one it replaces.
+        press(&mut app, "probe-preview");
+        app.wait_for("id:preview-column").expect("the preview");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Editor")
+            .expect("the untitled editor took the keyboard");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Document(2)")
+            .expect("the switched-to tab's document view took the keyboard");
+        assert!(
+            app.screen().matches("id:preview-column").expect("selector"),
+            "the pane stays Preview"
+        );
+
+        // The same for a Web pane.
+        press(&mut app, "probe-web");
+        app.wait_for("id:web-pane").expect("the web pane");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Editor")
+            .expect("the untitled editor took the keyboard");
+        press(&mut app, "probe-rail-switch");
+        app.wait_for("text:focus: Document(2)")
+            .expect("the web tab's document view took the keyboard");
+        assert!(
+            app.screen().matches("id:web-pane").expect("selector"),
+            "the pane stays Web"
+        );
     }
 
     fn binding_nodes(items: &[nsh_core::MountItem], id: nsh_core::NodeId) -> Vec<u32> {

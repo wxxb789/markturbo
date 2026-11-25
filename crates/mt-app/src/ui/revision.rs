@@ -66,7 +66,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, RevisionHunkView, Tab},
     ui::{
-        consent, glow,
+        glow,
         motion::{self, EASE_IN_OUT, Heat, LINEAR},
         prims, review, titlebar,
         tokens::{self, SPACE_1, SPACE_2, SPACE_3},
@@ -1110,10 +1110,7 @@ fn bind_busy_escape(state: &AppState) {
                 ..KeyOptions::default()
             },
             move |_| {
-                if consent::cancel_open(&keys) {
-                    return;
-                }
-                if titlebar::escape_closes_menu(&keys) {
+                if keys.escape_top_layer() {
                     return;
                 }
                 review::cancel_active_revision(&keys);

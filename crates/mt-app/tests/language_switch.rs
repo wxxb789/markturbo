@@ -22,7 +22,8 @@ fn switching_language_relocalizes_the_live_shell() {
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
     app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
         .expect("wide viewport");
-    app.wait_for("text:Open folder").expect("English shell");
+    app.wait_for("text:Open folder\u{2026}")
+        .expect("English shell");
 
     // Settings live behind the glyph's menu: Open it, then the page.
     app.press("id:title-settings")
@@ -48,9 +49,13 @@ fn switching_language_relocalizes_the_live_shell() {
     app.press("id:settings-header >> label:关闭")
         .expect("close the settings page");
     app.wait_for("id:welcome").expect("the welcome surface");
-    app.wait_for("text:打开文件夹").expect("Chinese shell");
+    app.wait_for("text:打开文件夹\u{2026}")
+        .expect("Chinese shell");
     app.wait_for("text:打开、编辑与搜索都在这台设备上完成。")
         .expect("Chinese welcome guidance");
-    assert!(!app.shows("Open folder"), "English shell copy remained");
+    assert!(
+        !app.shows("Open folder\u{2026}"),
+        "English shell copy remained"
+    );
     assert!(!app.shows("Settings"), "English shell copy remained");
 }

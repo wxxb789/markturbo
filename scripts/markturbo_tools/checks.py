@@ -84,6 +84,16 @@ def cargo(*args: str) -> tuple[str, ...]:
     return (executable, *args)
 
 
+def require_nextest() -> None:
+    try:
+        run(cargo("nextest", "--version"), capture_stdout=True)
+    except CheckFailure as error:
+        raise CheckFailure(
+            f"cargo nextest is not usable ({error}); "
+            "install it with: cargo install cargo-nextest --locked"
+        ) from None
+
+
 def test_shards(test_ids: list[str], workers: int) -> list[list[str]]:
     """Partition sorted IDs deterministically, one shard per worker."""
 
@@ -198,10 +208,25 @@ def doc(*, base: str | None = None, head: str | None = None) -> None:
     run(cargo("test", "--profile", "ci", "-p", "mt-core", "--locked"))
 
 
+def rust_commands(profile: str) -> tuple[tuple[str, ...], ...]:
+    return (
+        cargo("clippy", "--profile", profile, "--workspace", "--all-targets", "--locked"),
+        cargo(
+            "nextest", "run", "--locked", "--cargo-profile", profile,
+            "-p", "mt-core", "--features", "model-transport,test-support",
+        ),
+        cargo(
+            "nextest", "run", "--locked", "--cargo-profile", profile,
+            "-p", "mt-app", "--lib", "--bins", "--test", "suite",
+        ),
+    )
+
+
 def rust_checks(profile: str) -> None:
     run(cargo("fmt", "--all", "--", "--check"))
-    run(cargo("clippy", "--profile", profile, "--workspace", "--all-targets", "--locked"))
-    run(cargo("test", "--profile", profile, "--workspace", "--locked"))
+    require_nextest()
+    for command in rust_commands(profile):
+        run(command)
 
 
 def ci(*, base: str | None = None, head: str | None = None) -> None:

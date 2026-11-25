@@ -72,12 +72,13 @@ runs the Rust checks that its draft pushes skipped.
 The app suites run under `cargo nextest`, which gives every test its own
 process and runs them in parallel; the environment-variable tests need that
 isolation. nextest does not run
-doctests; the workspace has none today (the CI log shows no `Doc-tests` harness
-and `cargo test --doc --workspace` compiles a separate unit set for zero tests,
-measured 11m33s), so the nightly `check ci` run keeps the plain `cargo test` path
-as the backstop for any doctest added later instead of paying that compile in
-every pull request. The `mt-core` shard keeps plain `cargo test`, so mt-core
-doctests would still run per pull request if any were added.
+doctests; both libraries set `doctest = false` and `cargo test --doc --workspace`
+compiles a separate unit set for zero tests (measured 11m33s), so no gate pays
+for it today. `check fast` reads the workspace manifests and fails when a
+library enables doctests, so a new doctest has to arrive with the gate step that
+runs it; the nightly `cargo test --workspace` job stays the plain-`cargo test`
+backstop, and the `mt-core` shard would still run mt-core doctests per pull
+request.
 
 The three Linux Rust jobs are the pieces of `check ci`, split so the wall clock
 is the slowest shard instead of the sum: `check fast` and formatting in

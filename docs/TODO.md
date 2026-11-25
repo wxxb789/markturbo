@@ -122,3 +122,38 @@
   capture), and add consent-card and title-menu states if before/after
   captures of them are still wanted. See
   [goal-16-acceptance.md](goal-16-acceptance.md#desktop-acceptance-2026-11-24).
+
+- [ ] **nextest gate follow-ups (PR #75 review, P3)**:
+  - `.config/nextest.toml` is not in the PR workflow's `rust` path filter, so a PR that changes only the nextest
+    config skips the jobs that use it.
+  - The `serial` test group keeps the mt-core timing tests off each other, but they can still run beside other test
+    binaries. `crates/mt-core/tests/performance.rs` asserts wall-clock bounds, so give those tests the whole pool.
+  - The doctest guard in `scripts/tests/test_checks.py` checks only that `--doc` appears. If doctests are enabled
+    again, verify which crates the command actually covers.
+- [ ] **Goal 20 lane 20-A test hardening (PR #71 review P3s)**:
+  - The nightly runs plain `cargo test --workspace`, so `recovery_undo.rs`, `folder_open_token.rs` and
+    `reload_edit_race.rs` share one process. Cases in one binary race on `MARKTURBO_CONFIG_DIR`, `MARKTURBO_DATA_DIR`
+    and `MARKTURBO_OPEN`. Move the nightly to nextest, or give these fixtures per-test isolation.
+  - `nsh-testing` 0.6.1 `Headless::react()` answers a `SaveDialog` at once. The Quit test in `translation_flow.rs` can
+    gate only the app's read of the answer, not the platform's reply, so it does not prove the translation lands while
+    the picker is unanswered.
+  - The Chinese Save As guard formats a raw OS error through `io::Error::Display`, which appends the English
+    ` (os error N)`.
+  - `wait_until()` gates on test markers that schedule no UI batch (`folder_open_token.rs`, `reload_edit_race.rs`,
+    `translation_flow.rs`). Under the system clock they can time out after the condition already holds.
+- [ ] **Goal 20 lane 20-C follow-ups (PR #74 review)**:
+  - Accepted residual: on Windows, `delete_resolved()` (`crates/mt-core/src/credentials.rs`) compares the secret and
+    `LastWritten`, then calls `CredDeleteW` by target name. If the Credential Manager replaces the entry between the
+    compare and the delete, the newer credential is deleted.
+  - A staging temp file held open past the 5 s usage Undo window: `clear()` ignores the cleanup failure, but
+    `restore()` still needs the same file removed. The Undo can expire unrestored, and the staged counts can stay on
+    disk.
+  - The usage-failure notice is matched by its translated text. If the UI language changes between a failed and a
+    successful Undo, the red Settings notice stays. Match on a notice key instead of the text.
+- [ ] **Goal 20 lane 20-B wait-state polish (PR #72 review P3s)**:
+  - The disabled titlebar Review and the menu Review selection state their wait reason only in the accessible
+    description, so pointer users never see it. Show it visibly.
+  - The "waiting for another document" notice is a persistent Info status, and it stays after the other request
+    finishes. Clear it when the slot frees.
+  - While a Review is in flight elsewhere, "Review with context" in the Context panel closes the panel and opens no
+    card. Disable it with the same reason instead.
