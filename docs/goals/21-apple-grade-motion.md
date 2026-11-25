@@ -112,6 +112,16 @@ These override any conflicting text in the motion direction below.
        opacity or by width, whichever comes first. Button feedback and the animation's final frame do not count.
        After p95 ≤ before p95 + 1 ms.
      - **Absolute bound:** no frame above 33 ms inside the after build's animation window.
+6. **Keep Goal 22's Shoji behaviour (owner direction, 2026-11-24).**
+   - Goal 22 decision 6 spatial motion stays. Spec rows 6 and 15 and the "Stays instant" list do not override it.
+     - The divider slides to its stop when the view cycles.
+     - The sidebar pushes the editor in a wide window and slides over it in a narrow one.
+     - The drop screen slides in.
+     - The clean reload slips about 6 px.
+   - Goal 21 may tune only these motions' durations and curves, and their frame cost.
+   - Reduced motion still replaces translation with opacity.
+   - The rest of row 15 is unchanged: switching rooms, tabs, fields and theme stays at 0 ms. Switching panes means
+     the divider slide.
 
 ---
 
