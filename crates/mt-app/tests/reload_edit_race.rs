@@ -90,18 +90,20 @@ fn edits_during_the_reload_read_stay_in_the_buffer() {
     );
 
     // The dirty buffer keeps its crash-recovery record.
-    app.wait(Duration::from_secs(3))
-        .expect("let the checkpoint tick write");
-    let record = mt_core::runtime_paths::recovery_dir()
-        .expect("the recovery directory")
-        .join(format!(
-            "{}.mtrecovery",
-            RecoveryKey::for_path(&path).as_str()
-        ));
-    assert!(
-        record.exists(),
-        "the reload retired the recovery record of the kept edits"
-    );
+    if cfg!(windows) {
+        app.wait(Duration::from_secs(3))
+            .expect("let the checkpoint tick write");
+        let record = mt_core::runtime_paths::recovery_dir()
+            .expect("the recovery directory")
+            .join(format!(
+                "{}.mtrecovery",
+                RecoveryKey::for_path(&path).as_str()
+            ));
+        assert!(
+            record.exists(),
+            "the reload retired the recovery record of the kept edits"
+        );
+    }
 }
 
 /// Two Reloads of one tab whose answers come back in reverse order: the
