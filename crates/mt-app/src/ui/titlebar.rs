@@ -18,7 +18,7 @@ use nsh_core::{
 use crate::{
     app_paths,
     i18n::{self, Key},
-    state::{AppState, Pane},
+    state::{AppState, Pane, flow_copy},
     ui::{
         consent, motion, notices, prims, revision, shell,
         tokens::{
@@ -153,25 +153,65 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
 
     let menu = MenuMotion::new(state.title_menu_open);
 
-    // The menu's document commands, reachable without it.
+    // Escape stands a waiting Translation down, as it does a waiting Review:
+    // the late answer is discarded by generation and nothing is applied. The
+    // menu is the topmost layer: while it is open, Escape closes it alone.
+    let translation_state = state.clone();
+    effect(move || {
+        if !translation_state.translation_busy.get() || consent::is_open(&translation_state) {
+            return;
+        }
+        let keys_state = translation_state.clone();
+        on_key_with(
+            "escape",
+            KeyOptions {
+                when: When::Always,
+                ..KeyOptions::default()
+            },
+            move |_| {
+                if keys_state.escape_top_layer() {
+                    return;
+                }
+                keys_state.cancel_translation_in_flight();
+            },
+        );
+    });
+
+    // The menu's document commands, reachable without it. While a consent
+    // card is open it is modal: these shortcuts do nothing (the keymap still
+    // consumes the key, so the card's own keys are the only ones that act).
     let open_state = state.clone();
     on_key("mod+o", move |_: &str| {
-        welcome::choose_folder(open_state.clone())
+        if !consent::is_open(&open_state) {
+            welcome::choose_folder(open_state.clone());
+        }
     });
     let new_state = state.clone();
-    on_key("mod+n", move |_: &str| new_state.new_document());
+    on_key("mod+n", move |_: &str| {
+        if !consent::is_open(&new_state) {
+            new_state.new_document();
+        }
+    });
     // Save; an untitled document goes to Save As. The source editor binds no
     // `mod+s`, so the default `when` fires it from the editor too.
     let save_state = state.clone();
-    on_key("mod+s", move |_: &str| save_state.save_active());
+    on_key("mod+s", move |_: &str| {
+        if !consent::is_open(&save_state) {
+            save_state.save_active();
+        }
+    });
     let save_as_state = state.clone();
     on_key("shift+mod+s", move |_: &str| {
-        if save_as_state.active.get().is_some() {
+        if save_as_state.active.get().is_some() && !consent::is_open(&save_as_state) {
             save_as_state.save_as_active();
         }
     });
     let settings_state = state.clone();
-    on_key("mod+,", move |_: &str| settings_state.toggle_settings());
+    on_key("mod+,", move |_: &str| {
+        if !consent::is_open(&settings_state) {
+            settings_state.toggle_settings();
+        }
+    });
     // Every Escape binding runs the same fixed-order decision, so the
     // newest one cannot pick a layer the contract puts lower.
     let escape_state = state.clone();
@@ -231,19 +271,24 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
 
 /// Binds `Ctrl+Enter` (`mod+enter`; on an Apple keyboard `ctrl+enter` too, the
 /// key the hints name) to [`mod_enter`], the app's one handler for it. Call it
-/// inside an effect: the binding is dropped with the effect's run, and it
-/// reads whether a consent card is up and armed, whose hold takes the key's
-/// auto-repeats (anything else, an unarmed card included, fires once per
-/// press).
+/// inside an effect: the binding is dropped with the effect's run, and it is
+/// not made while a consent card is up, whose own focused handlers measure its
+/// hold.
 ///
 /// The keymap fires the newest binding of a keystroke, and the source editor
 /// binds its own `mod+enter` (insert a line below) every time it takes the
 /// focus. So besides the title row, the source editor binds this again on
 /// each of its `Focus` events (`document`), and the surfaces that
-/// claim the key (the consent card, the Revision field's `Done`) bind it as
-/// they come — every one of them the same binding.
+/// claim the key (the Revision field's `Done`) bind it as they come — every
+/// one of them the same binding.
 pub fn bind_mod_enter(state: &AppState) {
-    let held = consent::is_open(state) && consent::key_armed();
+    // The consent card has the keyboard focus while it is open: its own
+    // `KeyDown`/`KeyUp` handlers measure the hold, and a binding here would
+    // take `Ctrl+Enter` from them before they see it. Not binding also makes
+    // the effects that call this re-run when a card opens or closes.
+    if consent::is_open(state) {
+        return;
+    }
     let keys: &[&str] = if apple_keys() {
         &["mod+enter", "ctrl+enter"]
     } else {
@@ -257,7 +302,6 @@ pub fn bind_mod_enter(state: &AppState) {
                 // `enter` is a key a text input uses: the binding asks for
                 // the focus wherever it is.
                 when: When::Always,
-                repeat: held,
                 ..KeyOptions::default()
             },
             move |_: &str| mod_enter(&state),
@@ -265,16 +309,13 @@ pub fn bind_mod_enter(state: &AppState) {
     }
 }
 
-/// `Ctrl+Enter`: the consent card's hold while one is up, `Done` while a
-/// fresh proposal is docked, else `Review`.
+/// `Ctrl+Enter`: `Done` while a fresh proposal is docked, else `Review`.
+/// While a consent card is up the key belongs to the card's own handlers
+/// ([`consent::card`]), so a binding that fires anyway does nothing.
 fn mod_enter(state: &AppState) {
     if consent::is_open(state) {
-        consent::key_hold();
         return;
     }
-    // A card this press opens must not read the same key's repeats as a
-    // hold: it arms only once the key was let go.
-    consent::note_key_press();
     if revision::done_applies(state) {
         revision::done(state);
         return;
@@ -286,6 +327,7 @@ fn mod_enter(state: &AppState) {
         && state.revision_hunks.get().is_empty()
         && !notices::guard_is_open(state)
         && !state.review_busy.get()
+        && !state.reopen_review()
     {
         state.start_review();
     }
@@ -373,27 +415,58 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
     let enabled_state = state.clone();
     let blocked_state = state.clone();
     let enabled = move || {
-        enabled_state.active.get().is_some() && enabled_state.revision_hunks.get().is_empty()
+        enabled_state.active.get().is_some()
+            && enabled_state.revision_hunks.get().is_empty()
+            && !enabled_state.review_start_waiting()
     };
+    let press_enabled = enabled.clone();
+    let waiting_state = state.clone();
+    let hint_state = state.clone();
     let start = state;
-    row_action(
-        "title-review",
-        i18n::t(language, Key::Review),
-        true,
-        enabled,
-        move || {
-            if enabled() {
-                // A newly opened consent card keeps focus; focus_editor
-                // only restores it when Review did not open a modal.
-                start.start_review();
-                start.focus_editor();
-            }
-        },
-    )
-    .optional_accessibility_description(move || {
-        (!blocked_state.revision_hunks.get().is_empty())
-            .then(|| SharedString::from(review_blocked_label(language)))
-    })
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_2))
+        .child(
+            row_action(
+                "title-review",
+                i18n::t(language, Key::Review),
+                true,
+                enabled,
+                move || {
+                    if press_enabled() && !start.reopen_review() {
+                        // A newly opened consent card keeps focus; focus_editor
+                        // only restores it when Review did not open a modal.
+                        start.start_review();
+                        start.focus_editor();
+                    }
+                },
+            )
+            .optional_accessibility_description(move || {
+                if waiting_state.review_start_waiting() {
+                    Some(SharedString::from(
+                        flow_copy::S::ReviewWaitingElsewhere.text(language),
+                    ))
+                } else if !blocked_state.revision_hunks.get().is_empty() {
+                    Some(SharedString::from(review_blocked_label(language)))
+                } else {
+                    None
+                }
+            }),
+        )
+        .child(when(
+            move || hint_state.review_start_waiting(),
+            move || {
+                view()
+                    .test_id("title-review-wait")
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
+                    .child(
+                        prims::faint(move || flow_copy::S::ReviewWaitingElsewhere.text(language))
+                            .truncate(),
+                    )
+            },
+        ))
 }
 
 /// `Settings`, the word that opens the row's menu: quieter than `Review`,
@@ -453,6 +526,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 "title-menu-open-folder",
                 s(S::OpenFolder, language),
                 Some(shortcut(false, "O")),
+                || true,
                 move || {
                     menu.close();
                     welcome::choose_folder(open_state.clone());
@@ -469,6 +543,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 "title-menu-new-file",
                 s(S::NewFile, language),
                 Some(shortcut(false, "N")),
+                || true,
                 move || {
                     menu.close();
                     new_state.new_document();
@@ -482,6 +557,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 "title-menu-paste",
                 s(S::PasteAsNew, language),
                 None,
+                || true,
                 move || {
                     menu.close();
                     paste_state.new_from_clipboard();
@@ -497,6 +573,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                     "title-menu-open-sample",
                     s(S::OpenSample, language),
                     None,
+                    || true,
                     move || {
                         menu.close();
                         press_state.open_bundled_sample();
@@ -520,10 +597,17 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                            hint: Option<SharedString>,
                            run: fn(&AppState)| {
                     let state = state.clone();
-                    menu_row(menu, test_id, label, hint, move || {
-                        menu.close();
-                        run(&state);
-                    })
+                    menu_row(
+                        menu,
+                        test_id,
+                        label,
+                        hint,
+                        || true,
+                        move || {
+                            menu.close();
+                            run(&state);
+                        },
+                    )
                     .into_element()
                 };
                 let pane = |test_id: &'static str, label: &'static str, pane: Pane| {
@@ -569,12 +653,46 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                         None,
                         |state| state.translate_active(),
                     ))
-                    .child(row(
-                        "title-menu-review-selection",
-                        s(S::ReviewSelection, language),
-                        None,
-                        |state| state.start_review_selection(),
-                    ))
+                    .child({
+                        let enabled_state = state.clone();
+                        let waiting_state = state.clone();
+                        let review_state = state.clone();
+                        menu_row(
+                            menu,
+                            "title-menu-review-selection",
+                            s(S::ReviewSelection, language),
+                            None,
+                            move || !enabled_state.review_busy_elsewhere.get(),
+                            move || {
+                                menu.close();
+                                review_state.start_review_selection();
+                            },
+                        )
+                        .optional_accessibility_description(move || {
+                            waiting_state.review_busy_elsewhere.get().then(|| {
+                                SharedString::from(
+                                    flow_copy::S::ReviewWaitingElsewhere.text(language),
+                                )
+                            })
+                        })
+                        .into_element()
+                    })
+                    .child({
+                        let hint_state = state.clone();
+                        when(
+                            move || hint_state.review_busy_elsewhere.get(),
+                            move || {
+                                view()
+                                    .test_id("title-menu-review-wait")
+                                    .w_full()
+                                    .px(px(SPACE_3))
+                                    .pb(px(SPACE_2))
+                                    .child(prims::faint(move || {
+                                        flow_copy::S::ReviewWaitingElsewhere.text(language)
+                                    }))
+                            },
+                        )
+                    })
                     .into_element()
             }
         }))
@@ -653,10 +771,17 @@ fn menu_item(
     run: fn(&AppState),
 ) -> impl IntoElement {
     let state = state.clone();
-    menu_row(menu, test_id, label, None, move || {
-        menu.close();
-        run(&state);
-    })
+    menu_row(
+        menu,
+        test_id,
+        label,
+        None,
+        || true,
+        move || {
+            menu.close();
+            run(&state);
+        },
+    )
 }
 
 fn pane_row(
@@ -670,12 +795,19 @@ fn pane_row(
     let on_screen = move || pane_selection.get() == Some(pane);
     let current = on_screen;
     let state = state.clone();
-    menu_row(menu, test_id, label, None, move || {
-        menu.close();
-        if let Some(tab) = state.active_tab() {
-            state.set_pane(tab.id, pane);
-        }
-    })
+    menu_row(
+        menu,
+        test_id,
+        label,
+        None,
+        || true,
+        move || {
+            menu.close();
+            if let Some(tab) = state.active_tab() {
+                state.set_pane(tab.id, pane);
+            }
+        },
+    )
     .accessibility_state(move || AccessibilityState {
         current: current().then_some(AccessibilityCurrent::True),
         ..AccessibilityState::default()
@@ -735,9 +867,11 @@ fn menu_row(
     test_id: &'static str,
     label: &'static str,
     hint: Option<SharedString>,
+    enabled: impl Fn() -> bool + Clone + 'static,
     on_press: impl Fn() + 'static,
 ) -> View {
     let duration = prims::press_color_duration();
+    let label_opacity = enabled.clone();
     prims::press_feedback_with_duration(
         view()
             .test_id(test_id)
@@ -753,7 +887,7 @@ fn menu_row(
             .px(px(SPACE_3))
             .py(px(SPACE_2))
             .group()
-            .disabled(move || !menu.is_open())
+            .disabled(move || !menu.is_open() || !enabled())
             .focusable(move || menu.is_open())
             .on_press(on_press),
         duration,
@@ -763,7 +897,13 @@ fn menu_row(
             .font_family(tokens::FONT_UI)
             .text_size(px(TYPE_UI))
             .line_height(px(TYPE_UI_LINE))
-            .text_color(move || tokens::palette().ink_rest)
+            .text_color(move || {
+                if label_opacity() {
+                    tokens::palette().ink_rest
+                } else {
+                    tokens::with_alpha(tokens::palette().ink_rest, 0.45)
+                }
+            })
             .flex_1()
             .min_w(px(0.0))
             .truncate()
@@ -1390,5 +1530,142 @@ mod tests {
             mounted_mid_exit && !app.screen().matches("id:menu-motion-panel").unwrap(),
             "the menu panel must stay mounted during its exit and unmount after it"
         );
+    }
+
+    /// The row over a document view standing in for the source editor: the
+    /// menu is open and the focus is on another control, so the Escape
+    /// binding must close the menu and put the focus back on the document.
+    #[component]
+    fn MenuEscapeFocusProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let tab = state.active_tab().expect("the tab");
+        let target = element_ref();
+        state.attach_document_view(tab.id, target);
+        let menu_state = state.clone();
+        let other = element_ref();
+        let target_focused = signal(false);
+        let other_focused = signal(false);
+        view()
+            .flex_col()
+            .w(px(600.0))
+            .h(px(500.0))
+            .child(
+                view()
+                    .test_id("menu-focus-target")
+                    .element_ref(&target)
+                    .focusable(true)
+                    .on_focus(move || target_focused.set(true))
+                    .child(prims::ink("document")),
+            )
+            .child(
+                view()
+                    .test_id("menu-focus-other")
+                    .element_ref(&other)
+                    .focusable(true)
+                    .on_focus(move || other_focused.set(true))
+                    .child(prims::ink("other")),
+            )
+            .child(
+                view()
+                    .test_id("menu-open")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        other.focus();
+                        menu_state.title_menu_open.set(true);
+                    })
+                    .child(prims::ink("open the menu")),
+            )
+            .child(
+                text(move || {
+                    format!(
+                        "target: {} other: {}",
+                        target_focused.get(),
+                        other_focused.get()
+                    )
+                })
+                .test_id("menu-focus-state"),
+            )
+            .child(title_row(state, Language::English))
+    }
+
+    #[test]
+    fn escape_closes_the_menu_and_returns_focus_to_the_document() {
+        let mut config = EngineConfig::new(Root::of::<MenuEscapeFocusProbe>());
+        // A platform that gives ordinary views the keyboard focus, as the
+        // Windows host does.
+        config.environment.os = nsh_core::platform::Os::Linux;
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(600.0), Points(500.0)))
+            .expect("viewport");
+        app.wait_for("id:menu-open").expect("the probe renders");
+        app.press("id:menu-open").expect("open the menu");
+        app.wait_for("id:title-menu-open-folder")
+            .expect("the menu is open");
+        app.wait_for("text:target: false other: true")
+            .expect("the other control holds the focus");
+        app.press_key("escape").expect("close the menu");
+        app.wait_for_gone("id:title-menu-open-folder", Duration::from_secs(2))
+            .expect("the menu closed");
+        app.wait_for("text:target: true other: true")
+            .expect("the document view took the focus back");
+    }
+
+    /// The row over two documents with a Review in flight on the first: the
+    /// Review entry points wait and say why.
+    #[component]
+    fn ReviewWaitProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let first = state.active.get().expect("the first document");
+        state.arm_review_in_flight(first);
+        state.new_document();
+        title_row(state, Language::English)
+    }
+
+    #[test]
+    fn review_entry_points_wait_for_another_documents_review() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewWaitProbe>()))
+            .expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(600.0), Points(900.0)))
+            .expect("viewport");
+        app.wait_for("id:title-review").expect("the row");
+        assert!(
+            app.screen()
+                .accessibility_state("id:title-review")
+                .expect("Review's state")
+                .disabled,
+            "the Review action waits"
+        );
+        assert_eq!(
+            app.screen()
+                .accessibility_description("id:title-review")
+                .expect("Review's description")
+                .as_deref(),
+            Some("Waiting for Review on another document."),
+            "the Review action says why"
+        );
+        app.wait_for("id:title-review-wait >> text:Waiting for Review on another document.")
+            .expect("the Review action shows the reason visibly");
+        app.press("id:title-settings").expect("open the menu");
+        app.wait_for("id:title-menu-review-selection")
+            .expect("the menu's Review row");
+        assert!(
+            app.screen()
+                .accessibility_state("id:title-menu-review-selection")
+                .expect("Review selection's state")
+                .disabled,
+            "the menu's Review waits"
+        );
+        assert_eq!(
+            app.screen()
+                .accessibility_description("id:title-menu-review-selection")
+                .expect("Review selection's description")
+                .as_deref(),
+            Some("Waiting for Review on another document."),
+            "the menu's Review says why"
+        );
+        app.wait_for("id:title-menu-review-wait >> text:Waiting for Review on another document.")
+            .expect("the menu's Review shows the reason visibly");
     }
 }

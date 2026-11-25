@@ -41,14 +41,14 @@
 //! Both sides of the docked hunk are complete; a tall one scrolls in place.
 //! `Accept` cannot write hidden or mismatched text.
 //!
-//! The decision log and the reading position live here, in a module-local
-//! session keyed by the proposal ([`Session`]); a decision is recorded only
-//! once the state has written (or refused) its text, so a change's state
-//! signal is `true` exactly when the session's last decision on it is an
-//! accept. `Done` ([`AppState::finish_revision`]) writes nothing more: the
-//! accepted changes are already in, and the undecided ones are discarded —
-//! never written — with `n not applied`. Nothing in this file mutates the
-//! document except through the state.
+//! The decision log and the reading position live in the tab's session
+//! ([`Session`]), kept with the tab's hunks and ledger by the state; a
+//! decision is recorded only once the state has written (or refused) its
+//! text, so a change's state signal is `true` exactly when the session's last
+//! decision on it is an accept. `Done` ([`AppState::finish_revision`]) writes
+//! nothing more: the accepted changes are already in, and the undecided ones
+//! are discarded — never written — with `n not applied`. Nothing in this file
+//! mutates the document except through the state.
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -58,7 +58,9 @@ use std::{
 
 use mt_core::settings::Language;
 use nsh_base::editor::EditorDecoration;
-use nsh_core::{Color, PropertyValue, StyleKey, TextDecoration, element::Style, prelude::*};
+use nsh_core::{
+    Color, PropertyValue, StyleKey, TextDecoration, element::Style, keymap::When, prelude::*,
+};
 
 use crate::{
     i18n::{self, Key},
@@ -97,6 +99,9 @@ enum S {
     ReviewAgain,
     Move,
     Copy,
+    Copied,
+    Dismiss,
+    Hunk(usize),
     Proposed,
 }
 
@@ -112,11 +117,16 @@ impl S {
                 S::Done => "Done".to_owned(),
                 S::Decided(n, m) => format!("{n} of {m} decided"),
                 S::NotApplied(n) => format!("{n} not applied"),
-                S::CannotApply => "Can't apply — this part changed".to_owned(),
+                S::CannotApply => {
+                    "Can't apply — this section was edited since the review.".to_owned()
+                }
                 S::OtherDocument => "This Revision belongs to another document".to_owned(),
                 S::ReviewAgain => "Review again".to_owned(),
                 S::Move => "Move".to_owned(),
                 S::Copy => "Copy".to_owned(),
+                S::Copied => "Approved result copied to the clipboard.".to_owned(),
+                S::Dismiss => "Dismiss".to_owned(),
+                S::Hunk(n) => format!("Revision hunk {n}"),
                 S::Proposed => "Proposed text".to_owned(),
             },
             Language::Chinese => match self {
@@ -128,11 +138,14 @@ impl S {
                 S::Done => "完成".to_owned(),
                 S::Decided(n, m) => format!("已决定 {n} / {m}"),
                 S::NotApplied(n) => format!("{n} 项未应用"),
-                S::CannotApply => "无法应用——这部分已改动".to_owned(),
+                S::CannotApply => "无法应用——此段落自审查后已被修改。".to_owned(),
                 S::OtherDocument => "此修订属于另一个文档".to_owned(),
-                S::ReviewAgain => "重新审阅".to_owned(),
+                S::ReviewAgain => "重新审查".to_owned(),
                 S::Move => "切换".to_owned(),
                 S::Copy => "复制".to_owned(),
+                S::Copied => "已将批准后的文本复制到剪贴板。".to_owned(),
+                S::Dismiss => "关闭提示".to_owned(),
+                S::Hunk(n) => format!("修订片段 {n}"),
                 S::Proposed => "建议的文本".to_owned(),
             },
         }
@@ -154,7 +167,7 @@ struct Decision {
 /// belong to and which hunk holds the reading position. A proposal is its
 /// hunks' content, so a new or re-rolled one never inherits a decision.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Session {
+pub(crate) struct Session {
     proposal: u64,
     current: usize,
     decisions: Vec<Decision>,
@@ -260,9 +273,22 @@ impl Session {
 }
 
 /// The session signal: one per surface, made on first use, like the shell's
-/// width.
+/// width. It is the shown tab's copy; the per-tab store swaps it on a tab
+/// switch ([`crate::state::AppState`]).
 fn session() -> Signal<Session> {
     global::<Session>()
+}
+
+// The shown session, for the state's per-tab store: the decision stack and
+// reading position of the tab on screen.
+pub(crate) fn shown_session() -> Session {
+    session().get_untracked()
+}
+
+// Put `value` on screen: a tab switch shows that tab's own decisions and
+// reading position, and a background answer never replaces them.
+pub(crate) fn show_session(value: Session) {
+    session().set(value);
 }
 
 /// The identity of a proposal: its hunks' content.
@@ -374,6 +400,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
     // reads it.
     sync_session(&hunks.get_untracked(), now);
     bind_keys(&state, heat);
+    bind_busy_escape(&state);
     watch_proposal(hunks, now);
     watch_heat(hunks, now, heat);
 
@@ -426,6 +453,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
             move || {
                 let state = cancel_state.clone();
                 view()
+                    .test_id("revision-busy")
                     .flex_row()
                     .items_center()
                     .gap(px(SPACE_3))
@@ -433,8 +461,12 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                     .child(prims::quiet_action(
                         "revision-cancel",
                         i18n::t(language, Key::Cancel),
-                        move || review::cancel_revision(&state),
+                        move || {
+                            review::cancel_active_revision(&state);
+                            state.focus_editor();
+                        },
                     ))
+                    .child(prims::kbd("Esc"))
             },
         ))
         // The hunks, the current one docked in the reading position: the
@@ -518,14 +550,10 @@ fn outcome(state: AppState, language: Language) -> impl IntoElement {
             },
             move || {
                 let state = close_state.clone();
-                prims::quiet_action(
-                    "revision-dismiss",
-                    i18n::t(language, Key::Close),
-                    move || {
-                        dismiss(&state);
-                        state.focus_editor();
-                    },
-                )
+                prims::quiet_action("revision-dismiss", S::Dismiss.text(language), move || {
+                    dismiss(&state);
+                    state.focus_editor();
+                })
             },
         ))
 }
@@ -799,7 +827,7 @@ fn one_line(
 ) -> impl IntoElement {
     let word = move || hunk.with(|hunk| format!("{}", hunk.ordinal + 1));
     let label =
-        move || hunk.with(|hunk| SharedString::from(format!("Revision hunk {}", hunk.ordinal + 1)));
+        move || hunk.with(|hunk| SharedString::from(S::Hunk(hunk.ordinal + 1).text(language)));
     let digest_text = move || {
         let decided = hunk.with(|hunk| now.with(|now| now.decision(hunk.change_id)));
         let digest_line = hunk.with(|hunk| digest(&hunk.rationale, DIGEST_CHARS));
@@ -925,9 +953,10 @@ fn decisions(
             view()
                 .flex_row()
                 .items_center()
-                .justify_end()
+                .justify_start()
                 .w_full()
                 .gap(px(SPACE_3))
+                .child(done_action(done_state, language, hunks, now))
                 .child(copy_action(copy_state, language))
                 .child(prims::quiet_action(
                     "revision-close",
@@ -936,10 +965,7 @@ fn decisions(
                         close_state.close_review();
                         close_state.focus_editor();
                     },
-                ))
-                // `Done` is the one next action only once nothing is left to
-                // judge; while hunks wait it stays the quiet one.
-                .child(done_action(done_state, language, hunks, now)),
+                )),
         )
 }
 
@@ -959,7 +985,7 @@ fn copy_action(state: AppState, language: Language) -> impl IntoElement {
             .py(px(4.0))
             .hover(|s| s.text_color(|| tokens::palette().ink).underline())
             .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
-            .on_press(move || copy_approved(&state)),
+            .on_press(move || copy_approved(&state, language)),
     )
     .child(
         text(label)
@@ -1046,20 +1072,52 @@ fn key_hints(language: Language) -> impl IntoElement {
 
 /// `A` / `R` decide the current hunk, `J` / `K` move between them, and
 /// `Ctrl+Z` takes the last decision back — all while no text input has the
-/// keyboard focus, so the document stays fully editable. They do nothing
-/// without a proposal, so they may stay bound; `Done`'s own key has a side
-/// effect with none, and is bound by [`bind_done_key`] only where it applies.
+/// keyboard focus, so the document stays fully editable. The bindings exist
+/// only while a proposal is on screen and no consent card is modal: with no
+/// hunks there is nothing for them to do, and under a card the card's own
+/// keys are the only ones that act.
 fn bind_keys(state: &AppState, heat: Heat) {
-    let keys = state.clone();
-    on_key("a", move |_| decide(&keys, heat, true));
-    let keys = state.clone();
-    on_key("r", move |_| decide(&keys, heat, false));
-    let keys = state.clone();
-    on_key("j", move |_| move_by(&keys, 1));
-    let keys = state.clone();
-    on_key("k", move |_| move_by(&keys, -1));
-    let keys = state.clone();
-    on_key("ctrl+z", move |_| undo_decision(&keys));
+    let state = state.clone();
+    effect(move || {
+        if state.revision_hunks.get().is_empty() || state.consent_open() {
+            return;
+        }
+        let keys = state.clone();
+        on_key("a", move |_| decide(&keys, heat, true));
+        let keys = state.clone();
+        on_key("r", move |_| decide(&keys, heat, false));
+        let keys = state.clone();
+        on_key("j", move |_| move_by(&keys, 1));
+        let keys = state.clone();
+        on_key("k", move |_| move_by(&keys, -1));
+        let keys = state.clone();
+        on_key("ctrl+z", move |_| undo_decision(&keys));
+    });
+}
+
+/// `Esc` cancels a Revision in flight, wherever the focus is.
+fn bind_busy_escape(state: &AppState) {
+    let state = state.clone();
+    effect(move || {
+        if !state.revision_busy.get() {
+            return;
+        }
+        let keys = state.clone();
+        on_key_with(
+            "escape",
+            KeyOptions {
+                when: When::Always,
+                ..KeyOptions::default()
+            },
+            move |_| {
+                if keys.escape_top_layer() {
+                    return;
+                }
+                review::cancel_active_revision(&keys);
+                keys.focus_editor();
+            },
+        );
+    });
 }
 
 /// Whether `Ctrl+Enter` is `Done` (else it is `Review`,
@@ -1166,9 +1224,14 @@ pub(crate) fn done(state: &AppState) {
 
 /// `Copy`: the approved result on the clipboard. Nothing else changes — not
 /// the editor, not the dirty flag, not the file.
-fn copy_approved(state: &AppState) {
+fn copy_approved(state: &AppState, language: Language) {
     if let Some(text) = state.revision_approved_text() {
         set_clipboard(text.to_string());
+        state.notify_at(
+            crate::state::StatusSurface::Review,
+            crate::state::StatusKind::Success,
+            S::Copied.text(language),
+        );
     }
 }
 
@@ -1331,6 +1394,14 @@ mod tests {
     /// The probe document every two-change proposal reads.
     const PROBE_TEXT: &str = "compiles but no check\n";
 
+    // A second document and its own two-change proposal, for the cross-tab
+    // probes.
+    const OTHER_TEXT: &str = "draft but unchecked\n";
+    const OTHER_CHANGES: &[(&str, &str, &str)] = &[
+        ("Tighten the draft.", "draft but", "draft, but"),
+        ("Name the state.", "unchecked", "checked"),
+    ];
+
     /// `two_hunks` as a proposal over `PROBE_TEXT`: (reason, old, new).
     const TWO_CHANGES: &[(&str, &str, &str)] = &[
         ("Tighten the promise.", "compiles but", "compiles, but"),
@@ -1484,7 +1555,7 @@ mod tests {
             .expect("start the field");
         app.wait_for("id:revision-proposal-blocked")
             .expect("the edited hunk says it cannot apply");
-        assert!(app.shows("Can't apply — this part changed"));
+        assert!(app.shows(&S::CannotApply.text(Language::English)));
         assert!(
             app.screen()
                 .matches("id:revision-accept")
@@ -1504,41 +1575,191 @@ mod tests {
         app.press_key("j").expect("press J");
         app.wait_for("id:revision-accept")
             .expect("the untouched hunk can be accepted");
-        assert!(!app.shows("Can't apply — this part changed"));
+        assert!(!app.shows(&S::CannotApply.text(Language::English)));
     }
 
-    /// The two-change proposal, then another document comes on screen.
+    /// The two-change proposal, then another document comes on screen: the
+    /// proposal stays in its own tab's session, and returning shows it again.
     #[component]
     fn OtherDocumentProbe() -> impl IntoElement {
         let state = AppState::new();
         open_probe_document(&state, PROBE_TEXT);
+        let first = state.active.get().expect("the first tab");
         present(&state, PROBE_TEXT, TWO_CHANGES);
         open_probe_document(&state, PROBE_TEXT);
-        field(state, Language::English)
+        let other_empty = signal(state.revision_hunks.get_untracked().is_empty());
+        state.set_active(first);
+        let live_again = signal(!state.revision_hunks.get_untracked().is_empty());
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                text(move || {
+                    format!(
+                        "other empty: {} live again: {}",
+                        other_empty.get(),
+                        live_again.get()
+                    )
+                })
+                .test_id("revision-other-doc-state"),
+            )
+            .child(field(state, Language::English))
     }
 
     #[test]
-    fn a_proposal_for_another_document_says_so_and_disables_accept() {
+    fn a_proposal_stays_with_its_own_document() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<OtherDocumentProbe>()))
             .expect("start the field");
-        app.wait_for("id:revision-stale")
-            .expect("the field says the proposal is not this document's");
-        assert!(app.shows("This Revision belongs to another document"));
+        app.wait_for("text:other empty: true live again: true")
+            .expect("the proposal left the tab it does not belong to");
+        app.wait_for("id:revision-accept")
+            .expect("returning shows the proposal again");
+        assert!(
+            !app.shows(&S::OtherDocument.text(Language::English)),
+            "no cross-document proposal ever shows"
+        );
         assert!(
             !app.shows("Stale — edited after review"),
             "nothing was edited after the review"
         );
-        assert!(
-            app.screen()
-                .matches("id:revision-accept")
-                .expect("the selector"),
-            "Accept stays in the row: {:?}",
-            app.screen().texts()
-        );
-        assert!(
-            app.press("id:revision-accept").is_err(),
-            "the proposal cannot be accepted into another document"
-        );
+        app.press("id:revision-accept")
+            .expect("the proposal accepts on its own document");
+    }
+
+    // A second document with its own proposal, finished (a status and no
+    // hunks), and the routing the shell gives the field: the decision stack
+    // follows the tab that made it.
+    #[component]
+    fn CrossTabDecisionsProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let a = state.active.get().expect("A");
+        open_probe_document(&state, OTHER_TEXT);
+        present(&state, OTHER_TEXT, OTHER_CHANGES);
+        state.finish_revision(2);
+        let b = state.active.get().expect("B");
+        state.set_active(a);
+        let open_b = state.clone();
+        let open_a = state.clone();
+        let field_state = state.clone();
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .test_id("probe-open-b")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_b.set_active(b))
+                    .child(prims::rest("Open B")),
+            )
+            .child(
+                view()
+                    .test_id("probe-open-a")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_a.set_active(a))
+                    .child(prims::rest("Open A")),
+            )
+            .child(field(field_state, Language::English))
+    }
+
+    #[test]
+    fn decisions_stay_with_the_tab_that_made_them() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<CrossTabDecisionsProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-field").expect("the field");
+        app.wait_for("text:0 of 2 decided").expect("A's hunks");
+        app.press_key("a").expect("accept the docked hunk on A");
+        app.wait_for("text:1 of 2 decided").expect("A decided one");
+        app.wait(Duration::from_millis(150))
+            .expect("the advance settles");
+
+        // B finished its revision: it shows a status and no proposal, as it
+        // does after Done. Showing it must not take A's decisions with it.
+        app.press("id:probe-open-b").expect("B");
+        app.wait_for("text:No changes were approved — the document is unchanged.")
+            .expect("B's finished revision is shown");
+        app.press("id:probe-open-a").expect("back to A");
+        app.wait_for("text:1 of 2 decided")
+            .expect("A's decision survived B");
+        app.press_key("ctrl+z").expect("undo on A");
+        app.wait_for("text:0 of 2 decided")
+            .expect("Undo took A's decision back");
+    }
+
+    // A proposal with controls that open and clear a consent card: the
+    // Revision keys are inert while one waits, and come back when it goes.
+    #[component]
+    fn ConsentGatedKeysProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let open_state = state.clone();
+        let clear_state = state.clone();
+        let field_state = state.clone();
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .test_id("probe-waiting-consent")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        open_state
+                            .translation_consent
+                            .set(Some(SharedString::from("disclosure text")));
+                    })
+                    .child(prims::rest("Wait for consent")),
+            )
+            .child(
+                view()
+                    .test_id("probe-consent-gone")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| clear_state.translation_consent.set(None))
+                    .child(prims::rest("Drop consent")),
+            )
+            .child(field(field_state, Language::English))
+    }
+
+    #[test]
+    fn revision_keys_wait_for_a_consent_card_and_come_back() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ConsentGatedKeysProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-field").expect("the field");
+        app.wait_for("text:0 of 2 decided").expect("the hunks");
+
+        // A decision before the card: the keys are the field's.
+        app.press_key("a").expect("accept the docked hunk");
+        app.wait_for("text:1 of 2 decided").expect("one decided");
+        app.wait(Duration::from_millis(150))
+            .expect("the advance settles");
+
+        // While the card waits, the keys do nothing: `A` does not decide
+        // the second hunk, and Undo does not take the first decision back.
+        app.press("id:probe-waiting-consent")
+            .expect("wait for consent");
+        app.press_key("a").expect("A under the card");
+        app.wait(Duration::from_millis(200))
+            .expect("a decision would land by now");
+        app.wait_for("text:1 of 2 decided")
+            .expect("A decided under the card");
+        app.press_key("ctrl+z").expect("Undo under the card");
+        app.wait(Duration::from_millis(200))
+            .expect("an undo would land by now");
+        app.wait_for("text:1 of 2 decided")
+            .expect("Undo took a decision under the card");
+
+        // The card goes: the keys are the field's again.
+        app.press("id:probe-consent-gone")
+            .expect("drop the consent");
+        app.press_key("a").expect("accept with the card gone");
+        app.wait_for("text:2 of 2 decided")
+            .expect("the keys came back");
+        app.press_key("ctrl+z").expect("undo with the card gone");
+        app.wait_for("text:1 of 2 decided").expect("Undo came back");
     }
 
     #[test]
@@ -1710,10 +1931,116 @@ mod tests {
         // `Done` is reachable without the mouse: the key runs it, keeping
         // the accepted change and discarding the one still undecided.
         app.press_key("ctrl+enter").expect("press Ctrl+Enter");
-        app.wait_for("text:Approved changes applied to the buffer.")
+        app.wait_for("text:/^Approved changes applied to the document/")
             .expect("Done ran from the keyboard");
         app.wait_for("text:1 not applied")
             .expect("the undecided hunk was discarded, not written");
+    }
+
+    /// The field with the status line beside it, for `Copy`'s feedback.
+    #[component]
+    fn CopyStatusProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let status_state = state.clone();
+        view()
+            .flex_col()
+            .child(text(move || status_state.status.get().text.clone()).test_id("status-line"))
+            .child(field(state, Language::English))
+    }
+
+    #[test]
+    fn copy_reports_its_status() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<CopyStatusProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-copy").expect("the copy action");
+        app.press("id:revision-copy").expect("press Copy");
+        app.wait_for("text:Approved result copied to the clipboard.")
+            .expect("Copy reports its status");
+    }
+
+    /// A surface with nothing to decide: a Revision in flight, no hunks.
+    #[component]
+    fn BusyEscapeProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        let tab = state.active_tab().expect("the tab");
+        state.arm_revision_in_flight(tab.id);
+        let open_state = state.clone();
+        view()
+            .child(when(
+                move || is_open(&open_state),
+                move || field(state.clone(), Language::English),
+            ))
+            .child(text("probe-tail"))
+    }
+
+    #[test]
+    fn escape_cancels_a_busy_revision_and_its_row_shows_the_hint() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<BusyEscapeProbe>())).expect("start");
+        app.wait_for("id:revision-busy").expect("the busy row");
+        assert!(app.shows("Esc"), "the busy row carries the Esc hint");
+        app.press_key("escape").expect("press Esc");
+        app.wait_for_gone("id:revision-field", Duration::from_secs(2))
+            .expect("the cancelled revision left the field");
+        app.wait_for("text:probe-tail").expect("the probe's tail");
+    }
+
+    /// Two documents, one Revision out on the first: the busy row follows its
+    /// owner, and Escape on an idle tab never cancels the owner's request.
+    #[component]
+    fn RevisionBusyProjectionProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        let first = state.active.get().expect("A");
+        open_probe_document(&state, PROBE_TEXT);
+        let second = state.active.get().expect("B");
+        state.set_active(first);
+        state.arm_revision_in_flight(first);
+        let open_b = state.clone();
+        let open_a = state.clone();
+        let open_state = state.clone();
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .test_id("probe-open-b")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_b.set_active(second))
+                    .child(prims::rest("Open B")),
+            )
+            .child(
+                view()
+                    .test_id("probe-open-a")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_a.set_active(first))
+                    .child(prims::rest("Open A")),
+            )
+            .child(when(
+                move || is_open(&open_state),
+                move || field(state.clone(), Language::English),
+            ))
+    }
+
+    #[test]
+    fn a_busy_revision_shows_only_on_the_tab_that_owns_it() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionBusyProjectionProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-busy").expect("A's busy row");
+        app.press("id:probe-open-b").expect("switch to B");
+        app.wait_for_gone("id:revision-busy", Duration::from_secs(2))
+            .expect("B never shows A's busy row");
+        app.press_key("escape").expect("Esc on the idle tab");
+        app.press("id:probe-open-a").expect("back to A");
+        app.wait_for("id:revision-busy")
+            .expect("A's row is back, its request untouched by B's Esc");
+        app.press_key("escape").expect("Esc on the owning tab");
+        app.wait_for_gone("id:revision-busy", Duration::from_secs(2))
+            .expect("the owning tab's Esc cancels its own row");
     }
 
     /// A surface that routes on `is_open`, as the shell does.
@@ -1933,7 +2260,7 @@ mod tests {
         app.wait_for("text:Revision failed: Timed out after 60 s")
             .expect("the failure is on screen");
         app.wait_for("id:revision-dismiss").expect("a way out");
-        app.press("text:Close").expect("dismiss");
+        app.press("id:revision-dismiss").expect("dismiss");
         app.wait_for("text:probe-tail").expect("the probe's tail");
         assert!(
             !app.shows("Revision failed: Timed out after 60 s"),
@@ -1972,7 +2299,7 @@ mod tests {
             app.screen().texts()
         );
         assert!(
-            !app.shows("Run Review first to prepare a Revision."),
+            !app.shows(crate::state::flow_copy::S::RevisionUnavailable.text(Language::English)),
             "and `Done` did not claim the key: {:?}",
             app.screen().texts()
         );
@@ -2370,7 +2697,7 @@ mod tests {
         app.wait_for(&format!("text:{applied}"))
             .expect("the accepted hunk is in the buffer");
         app.press_key("ctrl+enter").expect("press Ctrl+Enter");
-        app.wait_for("text:Approved changes applied to the buffer.")
+        app.wait_for("text:/^Approved changes applied to the document/")
             .expect("Done ran");
         assert_eq!(
             app.screen()

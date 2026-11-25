@@ -56,23 +56,15 @@ use mt_core::{
         tree::{self, FileNode},
     },
 };
-use nsh_base::{
-    alert_dialog,
-    editor::{Editor, EditorApi},
-};
+use nsh_base::editor::{Editor, EditorApi};
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
 
+pub(crate) mod flow_copy;
 mod revision_ledger;
 
 use revision_ledger::{LedgerRefusal, RevisionLedger};
 
 static FIRST_LAUNCH_CHECKED: AtomicBool = AtomicBool::new(false);
-
-/// The status line while a proposal waits for decisions.
-const REVISION_READY: &str =
-    "Revision ready. Each accepted change enters the buffer at once; nothing is saved.";
-/// The status line when there is no proposal to decide or finish.
-const REVISION_UNAVAILABLE: &str = "Run Review first to prepare a Revision.";
 
 /// Which panes a document shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -217,6 +209,8 @@ impl StatusMessage {
     }
 }
 
+type InFlightRevision = (u64, Arc<AtomicBool>);
+
 struct PendingCredentialRemoval {
     target: String,
     captured: Option<ResolvedCredential>,
@@ -280,6 +274,16 @@ pub struct AppState {
     pub review_manifest: Signal<Option<OutboundConsent>>,
     pub review_view: Signal<Option<ReviewView>>,
     pub review_busy: Signal<bool>,
+    /// A Review is in flight on a tab other than the active one: the room's
+    /// Review entry points wait for it and say why.
+    pub review_busy_elsewhere: Signal<bool>,
+    // Whether the shown status line is the Review wait notice, so a freed
+    // Review slot clears exactly that notice and no newer one.
+    review_wait_notice: Rc<Cell<bool>>,
+    // The text a live Undo was published with: clearing a notice that
+    // overwrote it restores the text, so the Undo keeps a visible line until
+    // its deadline.
+    undo_text: Rc<RefCell<SharedString>>,
     /// The source column's camera ([`DocumentFocus`]): the line a docked
     /// surface wants levelled with it. Set it with
     /// [`AppState::focus_document_line`].
@@ -293,6 +297,15 @@ pub struct AppState {
     /// result.
     pub review_generation: Signal<u64>,
     pub translation_busy: Signal<bool>,
+    /// Which Translation an in-flight request belongs to: bumped when one is
+    /// withdrawn, so its late answer is discarded, never applied.
+    pub translation_generation: Signal<u64>,
+    pub translation_consent: Signal<Option<SharedString>>,
+    /// The waiting Translation consent's structured disclosure and manifest.
+    pub translation_manifest: Signal<Option<OutboundConsent>>,
+    /// Whether the mounted source editor holds the keyboard focus: background
+    /// results must not steal it ([`ReviewView`] arrival).
+    pub source_editor_focused: Signal<bool>,
     pub revision_questions: Signal<Vec<RevisionQuestionView>>,
     pub revision_consent: Signal<Option<SharedString>>,
     /// The waiting Revision consent's structured disclosure and manifest.
@@ -301,6 +314,9 @@ pub struct AppState {
     pub revision_status: Signal<Option<SharedString>>,
     pub(crate) revision_status_error: Signal<bool>,
     pub revision_busy: Signal<bool>,
+    /// A Revision is in flight on a tab other than the active one: another
+    /// tab's `Prepare revision` waits for it and says why.
+    pub revision_busy_elsewhere: Signal<bool>,
     /// How many hunks the last `Done` discarded undecided (never written);
     /// zero when there is nothing to report.
     pub revision_not_applied: Signal<usize>,
@@ -337,17 +353,38 @@ pub struct AppState {
     /// has read yet.
     review_in_flight: Rc<RefCell<Option<ReviewOrigin>>>,
     review_binding: Rc<RefCell<Option<ReviewOrigin>>>,
+    /// Finished Review results by tab: switching tabs shows the tab's own
+    /// result, and an answer that arrives for a background tab never replaces
+    /// the result another tab is showing.
+    review_views: Rc<RefCell<HashMap<u64, ReviewView>>>,
+    review_bindings: Rc<RefCell<HashMap<u64, ReviewOrigin>>>,
+    /// Whether each tab left its Review field open: switching to a tab
+    /// restores its own open state. The first activation never touches it — a
+    /// probe may have opened the field before the document landed.
+    review_open_tabs: Rc<RefCell<HashMap<u64, bool>>>,
+    /// The Review session a preparing Review parked: `cancel_review` puts it
+    /// back untouched, then recomputes stale against the document.
+    review_snapshot: Rc<RefCell<Option<ReviewSessionSnapshot>>>,
+    /// One Revision session per tab, keyed by tab id: the Review output, the
+    /// answers, the proposal and its status. The signals above are the active
+    /// tab's copy; a tab switch swaps it in, and a background tab's answer
+    /// writes here without touching what is on screen.
+    revision_sessions: Rc<RefCell<HashMap<u64, RevisionSession>>>,
+    /// Why each tab's last Review attempt could not be prepared (`None`
+    /// normally): a failure on one tab is not shown on another.
+    review_unavailable_tabs: Rc<RefCell<HashMap<u64, ReviewUnavailable>>>,
     revision_context: Rc<RefCell<Option<RevisionContext>>>,
     /// Bumped whenever the revision context is replaced or reset: a Revision
     /// answer sent under an older generation belongs to no live proposal and
     /// is dropped unread.
     revision_generation: Rc<Cell<u64>>,
-    revision_cancellation: Rc<RefCell<Option<Arc<AtomicBool>>>>,
+    revision_cancellation: Rc<RefCell<Option<InFlightRevision>>>,
     /// Bumped by every context resolution and reset: only the latest
     /// resolution lands, so a slower one for the document that was active
     /// before cannot replace the chain of the one active now.
     context_generation: Rc<Cell<u64>>,
-    pending_revision: Rc<RefCell<Option<PreparedRevisionRequest>>>,
+    pending_revision: Rc<RefCell<Option<(u64, PreparedRevisionRequest)>>>,
+    pending_translation: Rc<RefCell<Option<PendingTranslation>>>,
     /// Where the live proposal's hunks sit in its tab's text: the one
     /// authority that writes an accepted change, or takes one back.
     revision_ledger: Rc<RefCell<Option<RevisionLedger>>>,
@@ -567,6 +604,7 @@ fn line_bounds(text: &str, start: usize) -> (usize, Option<usize>) {
 }
 
 /// Immutable inputs retained after a successful Review for a later Revision.
+#[derive(Clone)]
 struct RevisionContext {
     tab_id: u64,
     /// The tab's source revision the Review read: once the text moves on,
@@ -582,6 +620,39 @@ struct RevisionContext {
 struct ReviewOrigin {
     tab_id: u64,
     snapshot: SourceSnapshot,
+}
+
+/// A Translation prepared and disclosed, waiting for its hold-to-send.
+struct PendingTranslation {
+    prepared: PreparedTranslationRequest,
+    origin: ReviewOrigin,
+    target: String,
+}
+
+/// Everything a preparing Review parks: the result on screen, the binding it
+/// was answered under, the selection scope it was prepared with, and the
+/// Revision built from it. [`AppState::cancel_review`] puts it all back.
+struct ReviewSessionSnapshot {
+    view: Option<ReviewView>,
+    binding: Option<ReviewOrigin>,
+    selection: Option<(usize, usize)>,
+}
+
+/// One tab's Revision session: what its Review produced and everything that
+/// followed — the frozen output, the answers, the live proposal and its
+/// status, and the decision stack with the reading position. The shown
+/// signals are the active tab's copy; a tab switch swaps it, and a background
+/// tab's answer writes the store without touching what is on screen.
+#[derive(Clone, Default)]
+struct RevisionSession {
+    context: Option<RevisionContext>,
+    ledger: Option<RevisionLedger>,
+    session: crate::ui::revision::Session,
+    not_applied: usize,
+    questions: Vec<RevisionQuestionView>,
+    hunks: Vec<RevisionHunkView>,
+    status: Option<SharedString>,
+    status_error: bool,
 }
 
 /// A Review result reduced to the strings the panel shows.
@@ -788,9 +859,16 @@ impl AppState {
             review_manifest: signal(None),
             review_view: signal(None),
             review_busy: signal(false),
+            review_busy_elsewhere: signal(false),
+            review_wait_notice: Rc::new(Cell::new(false)),
+            undo_text: Rc::new(RefCell::new(SharedString::default())),
             document_focus: signal(DocumentFocus::default()),
             review_unavailable: signal(None),
             translation_busy: signal(false),
+            translation_generation: signal(0),
+            translation_consent: signal(None),
+            translation_manifest: signal(None),
+            source_editor_focused: signal(false),
             revision_questions: signal(Vec::new()),
             revision_consent: signal(None),
             revision_manifest: signal(None),
@@ -798,6 +876,7 @@ impl AppState {
             revision_status: signal(None),
             revision_status_error: signal(false),
             revision_busy: signal(false),
+            revision_busy_elsewhere: signal(false),
             revision_not_applied: signal(0),
             vault,
             review_generation: signal(0),
@@ -811,19 +890,26 @@ impl AppState {
             review_origin: Rc::new(RefCell::new(None)),
             review_selection: Rc::new(Cell::new(None)),
             source_editor: Rc::new(Cell::new(None)),
+            document_view: Rc::new(Cell::new(None)),
             review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
+            review_views: Rc::new(RefCell::new(HashMap::new())),
+            review_bindings: Rc::new(RefCell::new(HashMap::new())),
+            review_open_tabs: Rc::new(RefCell::new(HashMap::new())),
+            revision_sessions: Rc::new(RefCell::new(HashMap::new())),
+            review_unavailable_tabs: Rc::new(RefCell::new(HashMap::new())),
             revision_context: Rc::new(RefCell::new(None)),
             revision_generation: Rc::new(Cell::new(0)),
             revision_cancellation: Rc::default(),
             context_generation: Rc::new(Cell::new(0)),
             pending_revision: Rc::new(RefCell::new(None)),
+            pending_translation: Rc::new(RefCell::new(None)),
+            review_snapshot: Rc::new(RefCell::new(None)),
             revision_ledger: Rc::new(RefCell::new(None)),
             recovery,
             recovery_tracks: Rc::new(RefCell::new(HashMap::new())),
             quit_discarded: Rc::new(Cell::new(false)),
             chosen_pane: Rc::new(Cell::new(chosen_pane)),
-            document_view: Rc::new(Cell::new(None)),
             guard_view: Rc::new(Cell::new(None)),
             compare_view: Rc::new(Cell::new(None)),
             palette_view: Rc::new(Cell::new(None)),
@@ -949,6 +1035,7 @@ impl AppState {
     }
 
     fn publish(&self, mut surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
+        self.review_wait_notice.set(false);
         // A pending Undo stays on the line: a newer message carries it on
         // until its deadline, when the slot is freed or taken. Its line is
         // the surface the user sees, computed from the UI state, never the
@@ -992,6 +1079,14 @@ impl AppState {
         }
     }
 
+    /// Clear the status line; a live Undo stays on it until its deadline.
+    pub(crate) fn clear_status(&self) {
+        if self.pending_undo.borrow().is_some() {
+            return;
+        }
+        self.status.set(StatusMessage::default());
+    }
+
     pub(crate) fn notify_undo(
         &self,
         surface: StatusSurface,
@@ -1002,6 +1097,8 @@ impl AppState {
         let generation = self.undo_generation.get().wrapping_add(1);
         self.undo_generation.set(generation);
         self.pending_undo.borrow_mut().replace(action.clone());
+        let text = text.into();
+        *self.undo_text.borrow_mut() = text.clone();
         self.publish(
             surface,
             StatusKind::Info,
@@ -1052,6 +1149,9 @@ impl AppState {
             self.status.update(|message| message.action = None);
             self.status_generation
                 .set(self.status_generation.get_untracked().wrapping_add(1));
+        }
+        if self.review_wait_notice.get() && !self.review_busy_elsewhere.get_untracked() {
+            self.clear_review_wait_notice();
         }
     }
 
@@ -1310,13 +1410,8 @@ impl AppState {
     /// does not move it, and replacing the tab would drop it.
     pub fn holds_live_model_output(&self, id: u64) -> bool {
         let owns = |origin: &Option<ReviewOrigin>| origin.is_some_and(|origin| origin.tab_id == id);
-        // The answer is the tab's while its result is the one on screen: a
-        // closed Review keeps its binding but holds nothing.
-        let shown = self
-            .review_view
-            .get()
-            .is_some_and(|view| view.tab_id == Some(id));
-        let binding = *self.review_binding.borrow();
+        let shown = self.review_views.borrow().contains_key(&id);
+        let binding = self.review_bindings.borrow().get(&id).copied();
         let answer = shown
             && binding.is_some_and(|binding| {
                 binding.tab_id == id
@@ -1329,17 +1424,14 @@ impl AppState {
                         .find(|tab| tab.id == id)
                         .is_some_and(|tab| tab.revision.get() == binding.snapshot.revision)
             });
-        let revision = self.revision_context.borrow();
-        let revision_work = match revision.as_ref() {
-            Some(context) => context.tab_id == id,
-            // Hunks and questions clear with the context; without one they
-            // are the tab on screen's (a Revision still coming back).
-            None => {
-                self.active.get() == Some(id)
-                    && (!self.revision_hunks.get().is_empty()
-                        || !self.revision_questions.get().is_empty())
-            }
-        };
+        let revision_work = self
+            .revision_sessions
+            .borrow()
+            .get(&id)
+            .is_some_and(|session| session.context.is_some())
+            || (self.active.get() == Some(id)
+                && (!self.revision_hunks.get().is_empty()
+                    || !self.revision_questions.get().is_empty()));
         owns(&self.review_origin.borrow())
             || owns(&self.review_in_flight.borrow())
             || answer
@@ -1498,14 +1590,243 @@ impl AppState {
     }
 
     pub fn set_active(&self, id: u64) {
-        let changed = self.active.get() != Some(id);
+        let previous = self.active.get();
+        let changed = previous != Some(id);
         if changed {
             self.reset_context();
         }
+        if changed && let Some(previous) = previous {
+            self.review_open_tabs
+                .borrow_mut()
+                .insert(previous, self.review_open.get_untracked());
+            if self.tabs.get().iter().any(|tab| tab.id == previous) {
+                self.store_shown_revision_session(previous);
+            }
+            self.store_shown_review_unavailable(previous);
+            let open = self
+                .review_open_tabs
+                .borrow()
+                .get(&id)
+                .copied()
+                .unwrap_or(false);
+            self.review_open.set(open);
+        }
         self.active.set(Some(id));
+        if changed {
+            self.load_review_result(id);
+            self.load_revision_session(id);
+            self.load_review_unavailable(id);
+            self.refresh_review_busy();
+            self.refresh_revision_busy();
+        }
         if changed && self.context_open.get() {
             self.refresh_context();
         }
+        self.sync_undo_surface();
+    }
+
+    /// The Revision state the shown signals hold now, as a session.
+    fn shown_revision_session(&self) -> RevisionSession {
+        RevisionSession {
+            context: self.revision_context.borrow().clone(),
+            ledger: self.revision_ledger.borrow().clone(),
+            session: crate::ui::revision::shown_session(),
+            not_applied: self.revision_not_applied.get_untracked(),
+            questions: self.revision_questions.get_untracked(),
+            hunks: self.revision_hunks.get_untracked(),
+            status: self.revision_status.get_untracked(),
+            status_error: self.revision_status_error.get_untracked(),
+        }
+    }
+
+    /// Put `session` on screen: the signals the Revision field reads.
+    fn show_revision_session(&self, session: &RevisionSession) {
+        *self.revision_context.borrow_mut() = session.context.clone();
+        *self.revision_ledger.borrow_mut() = session.ledger.clone();
+        crate::ui::revision::show_session(session.session.clone());
+        self.revision_not_applied.set(session.not_applied);
+        self.revision_questions.set(session.questions.clone());
+        self.revision_hunks.set(session.hunks.clone());
+        self.revision_status.set(session.status.clone());
+        self.revision_status_error.set(session.status_error);
+    }
+
+    /// Write `session` under `tab_id`; show it only while that tab is active,
+    /// so a background tab's answer never replaces the screen's.
+    fn write_revision_session(&self, tab_id: u64, session: RevisionSession) {
+        if session.context.is_none()
+            && session.ledger.is_none()
+            && session.session == crate::ui::revision::Session::default()
+            && session.questions.is_empty()
+            && session.hunks.is_empty()
+            && session.status.is_none()
+            && session.not_applied == 0
+        {
+            self.revision_sessions.borrow_mut().remove(&tab_id);
+        } else {
+            self.revision_sessions
+                .borrow_mut()
+                .insert(tab_id, session.clone());
+        }
+        if self.active.get_untracked() == Some(tab_id) {
+            self.show_revision_session(&session);
+        }
+    }
+
+    /// Save the shown Revision state under the tab it belongs to.
+    fn store_shown_revision_session(&self, tab_id: u64) {
+        self.write_revision_session(tab_id, self.shown_revision_session());
+    }
+
+    /// Load `tab_id`'s Revision session onto the screen; an unknown tab shows
+    /// nothing of the previous tab's.
+    fn load_revision_session(&self, tab_id: u64) {
+        let session = self
+            .revision_sessions
+            .borrow()
+            .get(&tab_id)
+            .cloned()
+            .unwrap_or_default();
+        self.show_revision_session(&session);
+    }
+
+    /// Save the shown Review-unavailable state under the tab it belongs to.
+    fn store_shown_review_unavailable(&self, tab_id: u64) {
+        match self.review_unavailable.get_untracked() {
+            Some(reason) => {
+                self.review_unavailable_tabs
+                    .borrow_mut()
+                    .insert(tab_id, reason);
+            }
+            None => {
+                self.review_unavailable_tabs.borrow_mut().remove(&tab_id);
+            }
+        }
+    }
+
+    /// Show `tab_id`'s Review-unavailable state; an unknown tab shows none.
+    fn load_review_unavailable(&self, tab_id: u64) {
+        let reason = self.review_unavailable_tabs.borrow().get(&tab_id).copied();
+        self.review_unavailable.set(reason);
+    }
+
+    /// Record why the active tab's Review could not be prepared.
+    fn set_review_unavailable(&self, reason: ReviewUnavailable) {
+        self.review_unavailable.set(Some(reason));
+        if let Some(tab_id) = self.active.get_untracked() {
+            self.review_unavailable_tabs
+                .borrow_mut()
+                .insert(tab_id, reason);
+        }
+    }
+
+    /// Clear the active tab's Review-unavailable state (what cancel and close
+    /// do).
+    fn clear_review_unavailable(&self) {
+        if let Some(tab_id) = self.active.get_untracked() {
+            self.clear_review_unavailable_for(tab_id);
+        } else {
+            self.review_unavailable.set(None);
+        }
+    }
+
+    /// Clear `tab_id`'s Review-unavailable state; the shown signal only when
+    /// that tab is the one on screen.
+    fn clear_review_unavailable_for(&self, tab_id: u64) {
+        self.review_unavailable_tabs.borrow_mut().remove(&tab_id);
+        if self.active.get_untracked() == Some(tab_id) {
+            self.review_unavailable.set(None);
+        }
+    }
+
+    /// Put a finished Review result where it belongs: under the tab it was
+    /// answered for, and on screen when that tab is the active one. A result
+    /// with no tab (a probe's) only replaces what is on screen; a background
+    /// tab's answer never touches this tab's display.
+    fn set_review_result(&self, view: ReviewView, binding: Option<ReviewOrigin>) {
+        if let Some(tab_id) = view.tab_id {
+            self.review_views.borrow_mut().insert(tab_id, view.clone());
+            match binding {
+                Some(binding) => {
+                    self.review_bindings.borrow_mut().insert(tab_id, binding);
+                }
+                None => {
+                    self.review_bindings.borrow_mut().remove(&tab_id);
+                }
+            }
+        }
+        if view
+            .tab_id
+            .is_none_or(|tab_id| self.active.get() == Some(tab_id))
+        {
+            self.review_view.set(Some(view));
+            if binding.is_some() {
+                *self.review_binding.borrow_mut() = binding;
+            }
+        }
+    }
+
+    fn refresh_review_busy(&self) {
+        let owner = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .map(|origin| origin.tab_id);
+        let active = self.active.get();
+        self.review_busy
+            .set(owner.is_some_and(|owner| active == Some(owner)));
+        self.review_busy_elsewhere
+            .set(owner.is_some_and(|owner| active != Some(owner)));
+        if owner.is_none() {
+            self.clear_review_wait_notice();
+        }
+    }
+
+    fn clear_review_wait_notice(&self) {
+        if !self.review_wait_notice.replace(false) {
+            return;
+        }
+        if self.pending_undo.borrow().is_some() {
+            let text = self.undo_text.borrow().clone();
+            self.status.update(|message| message.text = text);
+            self.status_generation
+                .set(self.status_generation.get_untracked().wrapping_add(1));
+        } else {
+            self.clear_status();
+        }
+    }
+
+    fn refresh_revision_busy(&self) {
+        let owner = self
+            .revision_cancellation
+            .borrow()
+            .as_ref()
+            .map(|(tab_id, _)| *tab_id);
+        let active = self.active.get();
+        self.revision_busy
+            .set(owner.is_some_and(|owner| active == Some(owner)));
+        self.revision_busy_elsewhere
+            .set(owner.is_some_and(|owner| active != Some(owner)));
+    }
+
+    fn review_result(&self, id: u64) -> Option<ReviewView> {
+        self.review_views.borrow().get(&id).cloned()
+    }
+
+    /// Staleness is recomputed on the way in, so an edit made while another
+    /// tab was on screen shows on the result's return.
+    fn load_review_result(&self, id: u64) {
+        let stored = self.review_result(id);
+        let shown = self
+            .review_view
+            .get_untracked()
+            .filter(|view| view.tab_id.is_none_or(|tab| tab == id));
+        self.review_view.set(stored.or(shown));
+        match self.review_bindings.borrow().get(&id).copied() {
+            Some(binding) => *self.review_binding.borrow_mut() = Some(binding),
+            None => *self.review_binding.borrow_mut() = None,
+        }
+        self.mark_review_stale(id);
     }
 
     fn reset_context(&self) {
@@ -1585,14 +1906,47 @@ impl AppState {
             state.context_busy.set(false);
             match scanned {
                 Ok((resolved, skills, instructions)) => {
-                    state.context_selected.set(Vec::new());
+                    let retained = state.context_selected.get();
+                    let previous = state.context_resolved.get().map(|resolved| {
+                        retained
+                            .into_iter()
+                            .filter_map(|index| resolved.sources.get(index).cloned())
+                            .flat_map(|source| {
+                                [Some(source.path), source.physical_path]
+                                    .into_iter()
+                                    .flatten()
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    let selected = match previous {
+                        Some(previous) => resolved
+                            .sources
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, source)| {
+                                previous.iter().any(|path| {
+                                    *path == source.path
+                                        || source.physical_path.as_deref() == Some(path)
+                                })
+                            })
+                            .map(|(index, _)| index)
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    state.context_selected.set(selected);
                     state.context_resolved.set(Some(resolved));
                     state.harness_skills.set(skills);
                     state.harness_instructions.set(instructions);
                 }
-                Err(error) => state.context_error.set(Some(SharedString::from(format!(
-                    "Context resolution failed: {error}"
-                )))),
+                Err(error) => {
+                    let language = state.settings.get().language;
+                    state
+                        .context_error
+                        .set(Some(SharedString::from(match language {
+                            Language::English => format!("Context resolution failed ({error})."),
+                            Language::Chinese => format!("上下文解析失败（{error}）。"),
+                        })))
+                }
             }
         });
     }
@@ -1609,6 +1963,10 @@ impl AppState {
     }
 
     pub fn review_with_context(&self) {
+        if self.review_busy_elsewhere.get_untracked() {
+            self.notify_review_waiting();
+            return;
+        }
         self.context_open.set(false);
         self.start_review();
     }
@@ -1669,7 +2027,12 @@ impl AppState {
                 last_edit: now,
                 last_checkpoint: None,
             });
-        let changed = self.review_binding.borrow().is_some_and(|binding| {
+        self.mark_review_stale(id);
+    }
+
+    fn mark_review_stale(&self, id: u64) {
+        let binding = self.review_bindings.borrow().get(&id).copied();
+        let changed = binding.is_some_and(|binding| {
             binding.tab_id == id
                 && self
                     .tabs
@@ -1678,12 +2041,22 @@ impl AppState {
                     .find(|tab| tab.id == id)
                     .is_none_or(|tab| tab.revision.get() != binding.snapshot.revision)
         });
-        if changed && let Some(mut view) = self.review_view.get() {
+        if !changed {
+            return;
+        }
+        let stale = {
+            let mut views = self.review_views.borrow_mut();
+            let Some(view) = views.get_mut(&id) else {
+                return;
+            };
             view.status =
                 crate::i18n::t(self.settings.get().language, crate::i18n::Key::ReviewStale)
                     .to_owned();
             view.stale = true;
-            self.review_view.set(Some(view));
+            view.clone()
+        };
+        if self.active.get() == Some(id) {
+            self.review_view.set(Some(stale));
         }
     }
 
@@ -2356,10 +2729,18 @@ impl AppState {
     }
 
     fn close_tab_now(&self, id: u64) {
+        // The tab's live model work goes with it: the cancel frees the
+        // app-wide Review and Revision slots for the remaining tabs.
+        self.cancel_review_owned_by(id);
+        self.cancel_revision_owned_by(id);
+        self.revision_sessions.borrow_mut().remove(&id);
         if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() {
             self.retire_tab_recovery(&tab);
         }
         self.recovery_tracks.borrow_mut().remove(&id);
+        self.review_views.borrow_mut().remove(&id);
+        self.review_bindings.borrow_mut().remove(&id);
+        self.review_open_tabs.borrow_mut().remove(&id);
         self.tabs.update(|tabs| tabs.retain(|tab| tab.id != id));
         if self.active.get() == Some(id) {
             let next = self.tabs.get().last().map(|tab| tab.id);
@@ -2367,6 +2748,11 @@ impl AppState {
                 Some(id) => self.set_active(id),
                 None => {
                     self.active.set(None);
+                    self.review_view.set(None);
+                    *self.review_binding.borrow_mut() = None;
+                    self.show_revision_session(&RevisionSession::default());
+                    self.refresh_review_busy();
+                    self.refresh_revision_busy();
                     self.reset_context();
                 }
             }
@@ -2613,13 +2999,15 @@ impl AppState {
         };
         let source = Document::new(Some(tab.path.clone()), tab.text.get().to_string());
         let request = TranslationRequest::prepare(&source, &Scope::Document);
+        let language = self.settings.get().language;
         if request.inputs().is_empty() {
-            self.notify_held(SharedString::from("No translatable text in this document."));
+            self.notify_held(SharedString::from(
+                flow_copy::S::TranslationNoText.text(language),
+            ));
             return;
         }
 
         let settings = self.settings.get();
-        let language = settings.language;
         let target = if settings.translate_to.trim().is_empty() {
             "zh".to_owned()
         } else {
@@ -2629,48 +3017,77 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_translation_failure(&error);
-                self.notify_error(format!("Translation unavailable: {error}"));
+                self.notify_error(flow_copy::translation_unavailable(language));
                 return;
             }
         };
         let prepared: PreparedTranslationRequest = prepared.bind_request(request);
         let disclosure = prepared.disclosure().clone();
-        let description = crate::i18n::model_request_disclosure(language, &disclosure);
-        let state = self.clone();
-        self.spawn_task(async move {
-            let answer = alert_dialog()
-                .title(crate::i18n::t(language, crate::i18n::Key::Translate).to_owned())
-                .description(description)
-                .action(
-                    "translate",
-                    crate::i18n::t(language, crate::i18n::Key::SendToModel).to_owned(),
-                )
-                .cancel(
-                    "cancel",
-                    crate::i18n::t(language, crate::i18n::Key::Cancel).to_owned(),
-                )
-                .show()
-                .await;
-            if !answer.is_ok_and(|answer| answer.action.as_deref() == Some("translate")) {
+        let manifest = OutboundConsent {
+            items: vec![OutboundItem {
+                origin: OutboundOrigin::Document,
+                path: Some(self.display_path(&tab.path)),
+                reason: None,
+                bytes: disclosure.scope().primary_content_byte_size(),
+                content_leaves: true,
+            }],
+            stays: Vec::new(),
+            disclosure,
+        };
+        self.translation_consent.set(Some(SharedString::from(
+            crate::i18n::model_request_disclosure(language, prepared.disclosure()),
+        )));
+        self.translation_manifest.set(Some(manifest));
+        *self.pending_translation.borrow_mut() = Some(PendingTranslation {
+            prepared,
+            origin,
+            target,
+        });
+    }
+
+    pub fn send_translation(&self) {
+        let Some(pending) = self.pending_translation.borrow_mut().take() else {
+            return;
+        };
+        let language = self.settings.get().language;
+        let disclosure = pending.prepared.disclosure().clone();
+        let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
+        let authorization = match pending.prepared.authorize(&mut consent) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                self.translation_consent.set(None);
+                self.translation_manifest.set(None);
+                self.notify_error(flow_copy::failed(
+                    flow_copy::S::TranslationUnavailable,
+                    language,
+                    &error,
+                ));
                 return;
             }
-
-            let mut consent =
-                ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
-            let authorization = match prepared.authorize(&mut consent) {
-                Ok(authorization) => authorization,
-                Err(error) => {
-                    state.notify_error(format!("Translation unavailable: {error}"));
-                    return;
-                }
-            };
-            state.translation_busy.set(true);
-            state.notify_held(SharedString::from(
-                crate::i18n::t(language, crate::i18n::Key::ModelRequestWaiting).to_owned(),
-            ));
-            let target_for_request = target.clone();
+        };
+        let PendingTranslation {
+            prepared,
+            origin,
+            target,
+        } = pending;
+        self.translation_consent.set(None);
+        self.translation_manifest.set(None);
+        self.translation_busy.set(true);
+        self.notify_held(SharedString::from(crate::i18n::t(
+            language,
+            crate::i18n::Key::ModelRequestWaiting,
+        )));
+        let target_for_request = target.clone();
+        let state = self.clone();
+        let generation = self.translation_generation.get_untracked();
+        self.spawn_task(async move {
             let result =
                 blocking(move || prepared.execute(authorization, &target_for_request)).await;
+            if state.translation_generation.get_untracked() != generation {
+                // Withdrawn while the request was out: its answer is not this
+                // surface's to apply.
+                return;
+            }
             state.translation_busy.set(false);
             match result {
                 Ok(Ok(translation)) => {
@@ -2688,22 +3105,22 @@ impl AppState {
                         .cloned()
                     else {
                         state.record_usage(UsageEvent::StaleResultBlocked);
-                        state.notify_held(SharedString::from(
-                            crate::i18n::t(language, crate::i18n::Key::ModelRequestDocumentClosed)
-                                .to_owned(),
-                        ));
+                        state.notify_held(SharedString::from(crate::i18n::t(
+                            language,
+                            crate::i18n::Key::ModelRequestDocumentClosed,
+                        )));
                         return;
                     };
                     if origin.snapshot.revision != tab.revision.get() {
                         state.record_usage(UsageEvent::StaleResultBlocked);
-                        state.notify_held(SharedString::from(
-                            crate::i18n::t(language, crate::i18n::Key::ModelRequestDocumentChanged)
-                                .to_owned(),
-                        ));
+                        state.notify_held(SharedString::from(crate::i18n::t(
+                            language,
+                            crate::i18n::Key::ModelRequestDocumentChanged,
+                        )));
                         return;
                     }
                     state.write_model_text(&tab, translated);
-                    state.notify(format!("Translated {segments} segment(s) into {target}."));
+                    state.notify(flow_copy::translation_done(language, segments, &target));
                 }
                 Ok(Err(error)) => {
                     if let Some(error) = error.downcast_ref::<TranslationError>() {
@@ -2711,17 +3128,44 @@ impl AppState {
                     } else {
                         state.record_usage(UsageEvent::ProviderFailure);
                     }
-                    state.notify_error(format!("Translation failed: {error}"));
+                    state.notify_error(flow_copy::translation_failed(language, &error));
                 }
-                Err(error) => state.notify_error(format!("Translation task failed: {error}")),
+                Err(error) => state.notify_error(flow_copy::translation_failed(language, &error)),
             }
         });
+    }
+
+    pub fn cancel_translation(&self) {
+        self.pending_translation.borrow_mut().take();
+        self.translation_consent.set(None);
+        self.translation_manifest.set(None);
+        self.focus_editor();
+    }
+
+    /// Withdraw a Translation whose request is already in flight: the task's
+    /// generation becomes stale, so its late answer is discarded, and the
+    /// notice says nothing will be applied.
+    pub fn cancel_translation_in_flight(&self) {
+        self.translation_generation
+            .update(|generation| *generation += 1);
+        self.translation_busy.set(false);
+        self.notify_at(
+            StatusSurface::Editor,
+            StatusKind::Info,
+            flow_copy::S::CancelledNothingApplied.text(self.settings.get().language),
+        );
+        self.focus_editor();
     }
 
     /// Prepare one Review: bind the frozen document request, resolve the
     /// configured endpoint and credential, and show the exact disclosure.
     /// Nothing leaves the machine until [`send_review`](Self::send_review).
+    /// A Review in flight on another document waits its turn, and says so.
     pub fn start_review(&self) {
+        if self.review_busy_elsewhere.get_untracked() {
+            self.notify_review_waiting();
+            return;
+        }
         self.prepare_review(false);
     }
 
@@ -2729,6 +3173,10 @@ impl AppState {
     /// the request, the disclosure and the bytes are the selected text's
     /// alone. Without a non-empty selection nothing is prepared.
     pub fn start_review_selection(&self) {
+        if self.review_busy_elsewhere.get_untracked() {
+            self.notify_review_waiting();
+            return;
+        }
         self.prepare_review(true);
     }
 
@@ -2810,7 +3258,7 @@ impl AppState {
             }
             return true;
         }
-        if self.review_consent.get().is_some() || self.revision_consent.get().is_some() {
+        if self.consent_open() {
             return true;
         }
         if self.palette_open.get() {
@@ -2833,6 +3281,21 @@ impl AppState {
             return true;
         }
         false
+    }
+
+    /// Whether an open layer above the document owns the keyboard, so
+    /// [`focus_editor`](Self::focus_editor) must not put it behind that layer.
+    fn editor_focus_blocked(&self) -> bool {
+        self.settings_open.get() || self.guard.get().is_some() || self.consent_open()
+    }
+
+    /// Whether a consent card is waiting. While one is open it is modal in
+    /// full: the room's shortcuts are inert, no background result moves the
+    /// keyboard, and the card's own handlers are the only ones that act.
+    pub fn consent_open(&self) -> bool {
+        self.review_consent.get().is_some()
+            || self.revision_consent.get().is_some()
+            || self.translation_consent.get().is_some()
     }
 
     fn retry_document_focus(&self, active: u64, frames_left: u8) {
@@ -2864,6 +3327,9 @@ impl AppState {
     /// subtree is keyed by tab, so the ref a switch replaces must not take
     /// the keyboard.
     fn focus_mounted_document(&self, active: u64) -> bool {
+        if self.editor_focus_blocked() {
+            return false;
+        }
         let Some((_, view)) = self.document_view.get().filter(|(tab, _)| *tab == active) else {
             return false;
         };
@@ -2874,6 +3340,9 @@ impl AppState {
     }
 
     fn focus_mounted_editor(&self, active: u64) -> bool {
+        if self.editor_focus_blocked() {
+            return false;
+        }
         let Some(api) = self
             .source_editor
             .get()
@@ -2924,32 +3393,32 @@ impl AppState {
     /// [`start_review`](Self::start_review) for the whole document, or for
     /// the selection with `selection`.
     fn prepare_review(&self, selection: bool) {
-        // A review that is prepared replaces any review still in flight: its
-        // task writes nothing when it comes back, and the loading state it
-        // left is not this run's to show — the early returns below must not
-        // leave the field saying `Reviewing…`.
-        self.review_generation.update(|generation| *generation += 1);
-        self.review_busy.set(false);
-        self.review_in_flight.borrow_mut().take();
+        // One Review is in flight app-wide. This tab's own request is
+        // replaced, so its generation goes first; another document's request
+        // is not this tab's to touch (the entry points wait and say why).
+        let active = self.active.get_untracked();
+        let owner = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .map(|origin| origin.tab_id);
+        if let Some(owner) = owner {
+            if Some(owner) == active {
+                self.cancel_review_owned_by(owner);
+            } else {
+                return;
+            }
+        }
         let Some(tab) = self.active_tab() else {
             return;
         };
+        let language = self.settings.get().language;
         let origin = ReviewOrigin {
             tab_id: tab.id,
             snapshot: SourceSnapshot::new(tab.revision.get(), 0),
         };
-        self.context_open.set(false);
-        self.review_view.set(None);
-        self.review_unavailable.set(None);
-        self.review_consent.set(None);
-        self.review_manifest.set(None);
-        *self.review_origin.borrow_mut() = None;
-        *self.review_binding.borrow_mut() = None;
-        self.review_selection.set(None);
-        self.reset_revision();
-
         let settings = self.settings.get();
-        let language = match settings.language {
+        let review_language = match settings.language {
             Language::Chinese => ReviewLanguage::SimplifiedChinese,
             Language::English => ReviewLanguage::English,
         };
@@ -2957,15 +3426,19 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
-                self.review_unavailable.set(Some(match error {
+                self.set_review_unavailable(match error {
                     ReviewError::UnsupportedConfiguredProvider
                     | ReviewError::InvalidEndpoint { .. }
                     | ReviewError::CredentialAccess { .. }
                     | ReviewError::MissingCredential { .. }
                     | ReviewError::NoAvailableCredential => ReviewUnavailable::NotSetUp,
                     _ => ReviewUnavailable::Unpreparable,
-                }));
-                self.notify_review_error(format!("Review unavailable: {error}"));
+                });
+                self.notify_review_error(flow_copy::failed(
+                    flow_copy::S::ReviewUnavailable,
+                    language,
+                    &error,
+                ));
                 return;
             }
         };
@@ -3004,9 +3477,12 @@ impl AppState {
         let mut request = match built {
             Ok(built) => built.into_parts().0,
             Err(error) => {
-                self.review_unavailable
-                    .set(Some(ReviewUnavailable::Unpreparable));
-                self.notify_review_error(format!("Review request rejected: {error}"));
+                self.set_review_unavailable(ReviewUnavailable::Unpreparable);
+                self.notify_review_error(flow_copy::failed(
+                    flow_copy::S::ReviewRequestRejected,
+                    language,
+                    &error,
+                ));
                 return;
             }
         };
@@ -3018,24 +3494,36 @@ impl AppState {
                 let selected = match context.select_sources(&selected) {
                     Ok(selected) => selected,
                     Err(error) => {
-                        self.notify_review_error(format!("Context selection rejected: {error}"));
+                        self.notify_review_error(flow_copy::failed(
+                            flow_copy::S::ContextSelectionRejected,
+                            language,
+                            &error,
+                        ));
                         return;
                     }
                 };
                 request = match request.with_effective_agent_context(selected) {
                     Ok(request) => request,
                     Err(error) => {
-                        self.notify_review_error(format!("Context request rejected: {error}"));
+                        self.notify_review_error(flow_copy::failed(
+                            flow_copy::S::ContextRequestRejected,
+                            language,
+                            &error,
+                        ));
                         return;
                     }
                 };
             }
         }
         let context_included = request.effective_agent_context.is_some();
-        let bound = match prepared.bind_document_request(request, language) {
+        let bound = match prepared.bind_document_request(request, review_language) {
             Ok(bound) => bound,
             Err(error) => {
-                self.notify_review_error(format!("Review request rejected: {error}"));
+                self.notify_review_error(flow_copy::failed(
+                    flow_copy::S::ReviewRequestRejected,
+                    language,
+                    &error,
+                ));
                 return;
             }
         };
@@ -3049,6 +3537,15 @@ impl AppState {
         // The selection is offered only where a selection can be bound: an
         // Agent Skill package is reviewed whole.
         let selectable = matches!(bound.request().source, ReviewSource::Document { .. });
+        // Nothing past the validation can fail: park the session this
+        // preparation replaces, then commit it.
+        self.park_review_session();
+        self.context_open.set(false);
+        self.review_consent.set(None);
+        self.review_manifest.set(None);
+        *self.review_origin.borrow_mut() = None;
+        *self.review_binding.borrow_mut() = None;
+        self.review_selection.set(None);
         *self.pending_review.borrow_mut() = Some(bound);
         *self.review_origin.borrow_mut() = Some(origin);
         self.review_selection.set(captured.filter(|_| selectable));
@@ -3131,6 +3628,7 @@ impl AppState {
         let Some((target, base, language)) = self.review_base() else {
             return;
         };
+        let copy_language = self.settings.get().language;
         let scope = match choice {
             ReviewScopeChoice::Selection => {
                 let Some((start, end)) = self.review_selection.get() else {
@@ -3139,7 +3637,11 @@ impl AppState {
                 match ByteRange::new(start as u64, end as u64) {
                     Ok(range) => ReviewScope::selection(range),
                     Err(error) => {
-                        self.notify_review_error(format!("Review request rejected: {error}"));
+                        self.notify_review_error(flow_copy::failed(
+                            flow_copy::S::ReviewRequestRejected,
+                            copy_language,
+                            &error,
+                        ));
                         return;
                     }
                 }
@@ -3154,7 +3656,11 @@ impl AppState {
         let mut request = match ReviewRequest::new(base.lens, scope, base.source, base.snapshot) {
             Ok(request) => request,
             Err(error) => {
-                self.notify_review_error(format!("Review request rejected: {error}"));
+                self.notify_review_error(flow_copy::failed(
+                    flow_copy::S::ReviewRequestRejected,
+                    copy_language,
+                    &error,
+                ));
                 return;
             }
         };
@@ -3163,14 +3669,22 @@ impl AppState {
                 Ok(Some(context)) => context,
                 Ok(None) => return,
                 Err(error) => {
-                    self.notify_review_error(format!("Context selection rejected: {error}"));
+                    self.notify_review_error(flow_copy::failed(
+                        flow_copy::S::ContextSelectionRejected,
+                        copy_language,
+                        &error,
+                    ));
                     return;
                 }
             };
             request = match request.with_effective_agent_context(context) {
                 Ok(request) => request,
                 Err(error) => {
-                    self.notify_review_error(format!("Context request rejected: {error}"));
+                    self.notify_review_error(flow_copy::failed(
+                        flow_copy::S::ContextRequestRejected,
+                        copy_language,
+                        &error,
+                    ));
                     return;
                 }
             };
@@ -3180,7 +3694,11 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
-                self.notify_review_error(format!("Review unavailable: {error}"));
+                self.notify_review_error(flow_copy::failed(
+                    flow_copy::S::ReviewUnavailable,
+                    copy_language,
+                    &error,
+                ));
                 self.cancel_review();
                 return;
             }
@@ -3189,7 +3707,11 @@ impl AppState {
         let bound = match prepared.bind_document_request(request, language) {
             Ok(bound) => bound,
             Err(error) => {
-                self.notify_review_error(format!("Review request rejected: {error}"));
+                self.notify_review_error(flow_copy::failed(
+                    flow_copy::S::ReviewRequestRejected,
+                    copy_language,
+                    &error,
+                ));
                 self.cancel_review();
                 return;
             }
@@ -3448,15 +3970,29 @@ impl AppState {
         let authorization = match bound.authorize(&mut consent) {
             Ok(authorization) => authorization,
             Err(error) => {
-                self.notify_review_error(format!("Review consent rejected: {error}"));
+                self.notify_review_error(flow_copy::failed(
+                    flow_copy::S::ReviewConsentRejected,
+                    self.settings.get().language,
+                    &error,
+                ));
                 return;
             }
         };
 
+        self.review_view.set(None);
+        self.clear_review_unavailable_for(origin.tab_id);
         self.review_consent.set(None);
         self.review_manifest.set(None);
-        self.review_busy.set(true);
+        self.review_snapshot.borrow_mut().take();
+        // The sent Review replaces this tab's old result, its binding and the
+        // Revision built from it: the in-flight Revision transport ends here,
+        // when the new Review is sent, not while its consent card waits.
+        self.review_views.borrow_mut().remove(&origin.tab_id);
+        self.review_bindings.borrow_mut().remove(&origin.tab_id);
+        *self.review_binding.borrow_mut() = None;
+        self.reset_revision_for(origin.tab_id);
         *self.review_in_flight.borrow_mut() = Some(origin);
+        self.refresh_review_busy();
         self.record_usage(UsageEvent::review_started(&revision_request));
         let started = Instant::now();
         let state = self.clone();
@@ -3470,15 +4006,18 @@ impl AppState {
             .unwrap_or_else(|| signal(0));
         self.spawn_task(async move {
             let result = blocking(move || bound.execute(authorization)).await;
-            if state.review_generation.get_untracked() != generation {
+            let stale = state.review_generation.get_untracked() != generation;
+            #[cfg(any(test, feature = "test-vault"))]
+            crate::test_vault::review_generation_checked();
+            if stale {
                 // Withdrawn (or replaced) while the request was out: its
                 // answer is not this surface's to show, and it must not touch
                 // the view, the revision context or the busy flag.
                 return;
             }
-            state.review_busy.set(false);
             *state.review_in_flight.borrow_mut() = None;
-            let view = match result {
+            state.refresh_review_busy();
+            let (view, binding) = match result {
                 Ok(Ok(transport)) => {
                     state.record_usage(UsageEvent::ReviewCompleted(
                         ReviewDurationBucket::from_duration(started.elapsed()),
@@ -3492,31 +4031,37 @@ impl AppState {
                             revision_language,
                         );
                     }
-                    *state.review_binding.borrow_mut() = Some(binding);
                     let mut view = ReviewView::from_result(
                         &transport.result,
                         stale,
                         state.settings.get().language,
                     );
-                    view.tab_id = Some(origin.tab_id);
                     view.partial = partial;
-                    view
+                    (view, Some(binding))
                 }
                 Ok(Err(error)) => {
                     state.record_review_failure(&error);
-                    ReviewView::from_error(&error, state.settings.get().language)
-                }
-                Err(error) => ReviewView {
-                    status: crate::i18n::t(
-                        state.settings.get().language,
-                        crate::i18n::Key::ReviewFailed,
+                    (
+                        ReviewView::from_error(&error, state.settings.get().language),
+                        None,
                     )
-                    .to_owned(),
-                    diagnostic: Some(error.to_string()),
-                    ..ReviewView::default()
-                },
+                }
+                Err(error) => (
+                    ReviewView {
+                        status: crate::i18n::t(
+                            state.settings.get().language,
+                            crate::i18n::Key::ReviewFailed,
+                        )
+                        .to_owned(),
+                        diagnostic: Some(error.to_string()),
+                        ..ReviewView::default()
+                    },
+                    None,
+                ),
             };
-            state.review_view.set(Some(view));
+            let mut view = view;
+            view.tab_id = Some(origin.tab_id);
+            state.set_review_result(view, binding);
         });
     }
 
@@ -3538,33 +4083,44 @@ impl AppState {
                 answer: signal(String::new()),
             })
             .collect();
-        *self.revision_context.borrow_mut() = Some(RevisionContext {
-            tab_id: origin.tab_id,
-            revision: origin.snapshot.revision,
-            request,
-            output,
-            language,
-        });
-        self.cancel_revision();
-        *self.revision_ledger.borrow_mut() = None;
-        self.revision_not_applied.set(0);
-        self.revision_questions.set(questions);
-        self.revision_consent.set(None);
-        self.revision_manifest.set(None);
-        self.revision_hunks.set(Vec::new());
-        self.revision_status.set(None);
+        self.write_revision_session(
+            origin.tab_id,
+            RevisionSession {
+                context: Some(RevisionContext {
+                    tab_id: origin.tab_id,
+                    revision: origin.snapshot.revision,
+                    request,
+                    output,
+                    language,
+                }),
+                questions,
+                ..RevisionSession::default()
+            },
+        );
+        self.cancel_revision_for(origin.tab_id);
     }
 
     fn reset_revision(&self) {
-        *self.revision_context.borrow_mut() = None;
-        self.cancel_revision();
-        *self.revision_ledger.borrow_mut() = None;
-        self.revision_not_applied.set(0);
-        self.revision_questions.set(Vec::new());
-        self.revision_consent.set(None);
-        self.revision_manifest.set(None);
-        self.revision_hunks.set(Vec::new());
-        self.revision_status.set(None);
+        let Some(tab_id) = self
+            .revision_context
+            .borrow()
+            .as_ref()
+            .map(|context| context.tab_id)
+            .or_else(|| self.active.get_untracked())
+        else {
+            return;
+        };
+        self.reset_revision_for(tab_id);
+    }
+
+    /// Clear `tab_id`'s Revision session; the shown signals only when that tab
+    /// is the one on screen.
+    fn reset_revision_for(&self, tab_id: u64) {
+        self.revision_sessions.borrow_mut().remove(&tab_id);
+        if self.active.get_untracked() == Some(tab_id) {
+            self.show_revision_session(&RevisionSession::default());
+        }
+        self.cancel_revision_for(tab_id);
     }
 
     /// Build a Revision request from the frozen Review output and the answer
@@ -3572,7 +4128,14 @@ impl AppState {
     /// happens once the text changed since the Review: the Review describes
     /// text that is gone, and Review again is the only next step.
     pub fn start_revision(&self) {
-        if self.revision_busy.get_untracked() {
+        if self.revision_cancellation.borrow().is_some() {
+            if self.revision_busy_elsewhere.get_untracked() {
+                self.notify_at(
+                    StatusSurface::Review,
+                    StatusKind::Info,
+                    flow_copy::S::RevisionWaitingElsewhere.text(self.settings.get().language),
+                );
+            }
             return;
         }
         let context = self.revision_context.borrow().as_ref().map(|context| {
@@ -3585,7 +4148,10 @@ impl AppState {
             )
         });
         let Some((tab_id, reviewed, request, output, language)) = context else {
-            self.set_revision_status(REVISION_UNAVAILABLE, true);
+            self.set_revision_status(
+                flow_copy::S::RevisionUnavailable.text(self.settings.get().language),
+                true,
+            );
             return;
         };
         let current = self
@@ -3614,7 +4180,14 @@ impl AppState {
         let answers = match RevisionAnswers::new(answers) {
             Ok(answers) => answers,
             Err(error) => {
-                self.set_revision_status(format!("Answers rejected: {error}"), true);
+                self.set_revision_status(
+                    flow_copy::failed(
+                        flow_copy::S::RevisionAnswersRejected,
+                        self.settings.get().language,
+                        &error,
+                    ),
+                    true,
+                );
                 return;
             }
         };
@@ -3623,14 +4196,21 @@ impl AppState {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.record_review_failure(&error);
-                self.set_revision_status(format!("Revision unavailable: {error}"), true);
+                self.set_revision_status(flow_copy::revision_unavailable(settings.language), true);
                 return;
             }
         };
         let bound = match prepared.bind_revision_request(request, output, answers, language) {
             Ok(bound) => bound,
             Err(error) => {
-                self.set_revision_status(format!("Revision request rejected: {error}"), true);
+                self.set_revision_status(
+                    flow_copy::failed(
+                        flow_copy::S::RevisionRequestRejected,
+                        settings.language,
+                        &error,
+                    ),
+                    true,
+                );
                 return;
             }
         };
@@ -3640,56 +4220,86 @@ impl AppState {
         )));
         let manifest = self.revision_manifest_of(&bound, tab_id);
         self.revision_manifest.set(Some(manifest));
-        *self.pending_revision.borrow_mut() = Some(bound);
+        *self.pending_revision.borrow_mut() = Some((tab_id, bound));
     }
 
+    /// Withdraw the waiting Revision consent: the card is modal, one at a
+    /// time, so no transport is out beside it.
     pub fn cancel_revision(&self) {
+        if self.pending_revision.borrow_mut().take().is_some() {
+            self.revision_consent.set(None);
+            self.revision_manifest.set(None);
+        }
+    }
+
+    /// Withdraw the Revision request the tab on screen owns: its transport
+    /// stops and its late answer is discarded. Another tab's request is
+    /// untouched.
+    pub fn cancel_active_revision(&self) {
+        if let Some(tab_id) = self.active.get_untracked() {
+            self.cancel_revision_owned_by(tab_id);
+        }
+    }
+
+    fn cancel_revision_for(&self, tab_id: u64) {
+        self.cancel_revision_owned_by(tab_id);
+    }
+
+    fn cancel_revision_owned_by(&self, tab_id: u64) {
+        if self
+            .pending_revision
+            .borrow()
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == tab_id)
+        {
+            *self.pending_revision.borrow_mut() = None;
+            self.revision_consent.set(None);
+            self.revision_manifest.set(None);
+        }
+        let in_flight = self
+            .revision_cancellation
+            .borrow()
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == tab_id);
+        if !in_flight {
+            return;
+        }
         self.revision_generation
             .set(self.revision_generation.get().wrapping_add(1));
-        if let Some(cancelled) = self.revision_cancellation.borrow_mut().take() {
+        if let Some((_, cancelled)) = self.revision_cancellation.borrow_mut().take() {
             cancelled.store(true, Ordering::Release);
             if self.status_surface.get_untracked() == StatusSurface::Review {
-                self.status.set(StatusMessage::default());
+                self.clear_status();
             }
         }
-        *self.pending_revision.borrow_mut() = None;
-        self.revision_consent.set(None);
-        self.revision_manifest.set(None);
-        self.revision_busy.set(false);
+        self.refresh_revision_busy();
     }
 
     /// Send the prepared Revision after one-shot consent, then expose the
     /// validated hunks for explicit per-change approval.
     pub fn send_revision(&self) {
-        let Some(bound) = self.pending_revision.borrow_mut().take() else {
+        let Some((tab_id, bound)) = self.pending_revision.borrow_mut().take() else {
             return;
         };
-        // The answer belongs to the document this Review read, and only for
-        // as long as this context lives.
-        let Some(tab_id) = self
-            .revision_context
-            .borrow()
-            .as_ref()
-            .map(|context| context.tab_id)
-        else {
-            self.set_revision_status(REVISION_UNAVAILABLE, true);
-            return;
-        };
+        let language = self.settings.get().language;
         let generation = self.revision_generation.get();
         let disclosure = bound.disclosure().clone();
         let mut consent = ConsentCapability::from_decision(&disclosure, ConsentDecision::Approve);
         let authorization = match bound.authorize(&mut consent) {
             Ok(authorization) => authorization,
             Err(error) => {
-                self.set_revision_status(format!("Revision consent rejected: {error}"), true);
+                self.set_revision_status(
+                    flow_copy::failed(flow_copy::S::RevisionConsentRejected, language, &error),
+                    true,
+                );
                 return;
             }
         };
         self.revision_consent.set(None);
         self.revision_manifest.set(None);
-        self.revision_busy.set(true);
         let cancelled = Arc::new(AtomicBool::new(false));
-        *self.revision_cancellation.borrow_mut() = Some(Arc::clone(&cancelled));
+        *self.revision_cancellation.borrow_mut() = Some((tab_id, Arc::clone(&cancelled)));
+        self.refresh_revision_busy();
         for answer in bound.answers().as_slice() {
             if matches!(answer, RevisionAnswer::Answered(_)) {
                 self.record_usage(UsageEvent::ClarificationAnswered);
@@ -3707,7 +4317,7 @@ impl AppState {
                 return;
             }
             state.revision_cancellation.borrow_mut().take();
-            state.revision_busy.set(false);
+            state.refresh_revision_busy();
             match result {
                 Ok(Ok(transport)) => state.present_revision_for(tab_id, transport.into_proposal()),
                 Ok(Err(error)) => {
@@ -3722,11 +4332,17 @@ impl AppState {
                     ) {
                         state.record_usage(UsageEvent::ProviderFailure);
                     }
-                    state.set_revision_status(format!("Revision failed: {error}"), true);
+                    state.set_revision_status_for(
+                        tab_id,
+                        flow_copy::revision_failed(language, &error),
+                        true,
+                    );
                 }
-                Err(error) => {
-                    state.set_revision_status(format!("Revision task failed: {error}"), true)
-                }
+                Err(error) => state.set_revision_status_for(
+                    tab_id,
+                    flow_copy::revision_task_failed(language, &error),
+                    true,
+                ),
             }
         });
     }
@@ -3738,6 +4354,41 @@ impl AppState {
         if let Some(tab_id) = self.active.get() {
             self.present_revision_for(tab_id, proposal);
         }
+    }
+
+    /// Arm `tab_id`'s Revision as in flight for a probe: the projection and
+    /// the per-tab cancel paths then read a real owner, with no provider.
+    #[cfg(test)]
+    pub(crate) fn arm_revision_in_flight(&self, tab_id: u64) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.revision_cancellation.borrow_mut() = Some((tab_id, cancelled));
+        self.refresh_revision_busy();
+    }
+
+    /// Take `tab_id`'s Revision out of flight for a probe, as its task would
+    /// when the answer lands.
+    #[cfg(test)]
+    pub(crate) fn finish_revision_in_flight(&self, tab_id: u64) {
+        let owned = self
+            .revision_cancellation
+            .borrow()
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == tab_id);
+        if owned {
+            self.revision_cancellation.borrow_mut().take();
+        }
+        self.refresh_revision_busy();
+    }
+
+    /// Arm `tab_id`'s Review as in flight for a probe, as a sent request
+    /// would, with no provider.
+    #[cfg(test)]
+    pub(crate) fn arm_review_in_flight(&self, tab_id: u64) {
+        *self.review_in_flight.borrow_mut() = Some(ReviewOrigin {
+            tab_id,
+            snapshot: SourceSnapshot::new(0, 0),
+        });
+        self.refresh_review_busy();
     }
 
     /// Show a validated proposal for per-change decisions: its hunks in the
@@ -3760,15 +4411,50 @@ impl AppState {
                     .or_insert_with(|| signal(false)),
             })
             .collect();
-        *self.revision_ledger.borrow_mut() = Some(RevisionLedger::new(tab_id, &proposal));
-        self.revision_not_applied.set(0);
-        self.revision_hunks.set(hunks);
-        self.set_revision_status(REVISION_READY, false);
+        let mut session = self
+            .revision_sessions
+            .borrow()
+            .get(&tab_id)
+            .cloned()
+            .unwrap_or_default();
+        session.ledger = Some(RevisionLedger::new(tab_id, &proposal));
+        session.not_applied = 0;
+        session.hunks = hunks;
+        session.status = Some(
+            flow_copy::S::RevisionReady
+                .text(self.settings.get().language)
+                .into(),
+        );
+        session.status_error = false;
+        self.write_revision_session(tab_id, session);
     }
 
     fn set_revision_status(&self, message: impl Into<SharedString>, error: bool) {
         self.revision_status_error.set(error);
         self.revision_status.set(Some(message.into()));
+        self.store_shown_revision_session_if_active();
+    }
+
+    /// Set `tab_id`'s Revision status; shown only when that tab is the one on
+    /// screen, so a background tab's failure does not speak for this tab.
+    fn set_revision_status_for(&self, tab_id: u64, message: impl Into<SharedString>, error: bool) {
+        let mut session = self
+            .revision_sessions
+            .borrow()
+            .get(&tab_id)
+            .cloned()
+            .unwrap_or_default();
+        session.status = Some(message.into());
+        session.status_error = error;
+        self.write_revision_session(tab_id, session);
+    }
+
+    /// Mirror a shown status change into the store; a no-op while another
+    /// tab is on screen (the change was not the shown tab's).
+    fn store_shown_revision_session_if_active(&self) {
+        if let Some(tab_id) = self.active.get_untracked() {
+            self.store_shown_revision_session(tab_id);
+        }
     }
 
     /// Write one change into the buffer now, as one edit: `applied` puts its
@@ -3778,10 +4464,11 @@ impl AppState {
     /// saved — the tab is only dirty.
     pub fn set_revision_change_applied(&self, change_id: u32, applied: bool) -> bool {
         let change = ChangeId(change_id);
+        let language = self.settings.get().language;
         let mut slot = self.revision_ledger.borrow_mut();
         let Some(ledger) = slot.as_mut() else {
             drop(slot);
-            self.set_revision_status(REVISION_UNAVAILABLE, true);
+            self.set_revision_status(flow_copy::S::RevisionUnavailable.text(language), true);
             return false;
         };
         if ledger.applied(change) == applied {
@@ -3790,10 +4477,7 @@ impl AppState {
         let Some(tab) = self.active_tab().filter(|tab| tab.id == ledger.tab_id()) else {
             drop(slot);
             self.record_usage(UsageEvent::StaleResultBlocked);
-            self.set_revision_status(
-                "This Revision belongs to another document. Return to it to decide.",
-                false,
-            );
+            self.set_revision_status(flow_copy::S::RevisionOtherTab.text(language), false);
             return false;
         };
         let written = match tab
@@ -3804,13 +4488,15 @@ impl AppState {
             Err(refusal) => {
                 drop(slot);
                 let message = match (refusal, applied) {
-                    (LedgerRefusal::UnknownChange, _) => "This change is not part of the Revision.",
+                    (LedgerRefusal::UnknownChange, _) => {
+                        flow_copy::S::RevisionUnknownChange.text(language)
+                    }
                     (LedgerRefusal::PartChanged, true) => {
                         self.record_usage(UsageEvent::StaleResultBlocked);
-                        "Can't apply — this part changed."
+                        flow_copy::S::RevisionCannotApply.text(language)
                     }
                     (LedgerRefusal::PartChanged, false) => {
-                        "Can't undo — this part was edited after it was accepted."
+                        flow_copy::S::RevisionCannotUndo.text(language)
                     }
                 };
                 self.set_revision_status(message, true);
@@ -3832,7 +4518,10 @@ impl AppState {
         if let Some(text) = written {
             self.write_model_text(&tab, text);
         }
-        self.set_revision_status(REVISION_READY, false);
+        self.set_revision_status(
+            flow_copy::S::RevisionReady.text(self.settings.get().language),
+            false,
+        );
         true
     }
 
@@ -3891,14 +4580,30 @@ impl AppState {
     }
 
     /// Follow an edit of tab `id` with the live proposal's ledger, so each
-    /// hunk the edit did not touch keeps its place.
+    /// hunk the edit did not touch keeps its place. The tab on screen uses the
+    /// shown ledger; a background tab's session keeps its own.
     fn observe_revision_edit(&self, id: u64) {
-        let mut slot = self.revision_ledger.borrow_mut();
-        let Some(ledger) = slot.as_mut().filter(|ledger| ledger.tab_id() == id) else {
-            return;
+        let edit = |ledger: &mut RevisionLedger| {
+            if ledger.tab_id() != id {
+                return;
+            }
+            if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
+                tab.text.with(|text| ledger.observe(text));
+            }
         };
-        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
-            tab.text.with(|text| ledger.observe(text));
+        if self.active.get_untracked() == Some(id) {
+            let mut slot = self.revision_ledger.borrow_mut();
+            if let Some(ledger) = slot.as_mut() {
+                edit(ledger);
+            }
+            return;
+        }
+        let mut sessions = self.revision_sessions.borrow_mut();
+        if let Some(ledger) = sessions
+            .get_mut(&id)
+            .and_then(|session| session.ledger.as_mut())
+        {
+            edit(ledger);
         }
     }
 
@@ -3907,7 +4612,10 @@ impl AppState {
     /// never written; the outcome line counts them. Nothing is saved.
     pub fn finish_revision(&self, undecided: usize) {
         if self.revision_ledger.borrow_mut().take().is_none() {
-            self.set_revision_status(REVISION_UNAVAILABLE, true);
+            self.set_revision_status(
+                flow_copy::S::RevisionUnavailable.text(self.settings.get().language),
+                true,
+            );
             return;
         }
         let hunks = self.revision_hunks.get();
@@ -3921,11 +4629,12 @@ impl AppState {
         }
         self.revision_hunks.set(Vec::new());
         self.revision_not_applied.set(undecided);
+        let language = self.settings.get().language;
         self.set_revision_status(
             if accepted_hunks > 0 {
-                "Approved changes applied to the buffer."
+                flow_copy::revision_applied(language)
             } else {
-                "No changes approved."
+                flow_copy::S::RevisionNoChanges.text(language).to_owned()
             },
             false,
         );
@@ -3943,32 +4652,175 @@ impl AppState {
             .is_some_and(|ledger| self.active.get() != Some(ledger.tab_id()))
     }
 
-    /// Withdraw the prepared request before it is sent.
+    /// Withdraw the prepared request before it is sent. A parked Review
+    /// session comes back unchanged — result, binding, selection scope and
+    /// Revision state — and its staleness is recomputed against the
+    /// document; a cancel with nothing parked keeps the shown result, or
+    /// closes the field cleanly.
     pub fn cancel_review(&self) {
         self.pending_review.borrow_mut().take();
         self.review_origin.borrow_mut().take();
         self.review_consent.set(None);
         self.review_manifest.set(None);
-        self.review_busy.set(false);
+        self.refresh_review_busy();
+        if let Some(session) = self.review_snapshot.borrow_mut().take() {
+            self.restore_review_session(session);
+            self.sync_undo_surface();
+            return;
+        }
+        if self.review_view.get().is_some() {
+            self.review_open.set(true);
+        } else {
+            self.clear_review_unavailable();
+            self.review_open.set(false);
+            self.focus_editor();
+        }
+        self.sync_undo_surface();
     }
 
-    /// Withdraw a review whose request is already in flight: the task's
-    /// generation becomes stale, so when the model answers it writes nothing
-    /// — no view, no revision context, no busy flag. What the user cancelled
-    /// stays cancelled.
-    pub fn cancel_review_in_flight(&self) {
+    /// Park the Review session a new preparation replaces, once per
+    /// preparation: a superseding preparation must not park what it already
+    /// replaced.
+    fn park_review_session(&self) {
+        let mut slot = self.review_snapshot.borrow_mut();
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(ReviewSessionSnapshot {
+            view: self.review_view.get_untracked(),
+            binding: *self.review_binding.borrow(),
+            selection: self.review_selection.get(),
+        });
+    }
+
+    /// Put a parked session back, then recompute its staleness against the
+    /// document's current revision: an edit while the new consent card was
+    /// open leaves the restored result stale.
+    fn restore_review_session(&self, session: ReviewSessionSnapshot) {
+        self.clear_review_unavailable();
+        match (session.view, session.binding) {
+            (Some(view), binding) => self.set_review_result(view, binding),
+            (None, binding) => {
+                self.review_view.set(None);
+                *self.review_binding.borrow_mut() = binding;
+                if let Some(binding) = binding {
+                    self.review_bindings
+                        .borrow_mut()
+                        .insert(binding.tab_id, binding);
+                }
+            }
+        }
+        self.review_selection.set(session.selection);
+        // The Revision session was never parked: record the shown session
+        // before reading the store, so the newest decisions and reading
+        // position come back with the proposal. A proposal that arrived
+        // while the card waited is the store's newest and comes back too.
+        if let Some(tab_id) = self.active.get_untracked() {
+            self.store_shown_revision_session(tab_id);
+            self.load_revision_session(tab_id);
+        }
+        if let Some(binding) = *self.review_binding.borrow() {
+            self.mark_review_stale(binding.tab_id);
+        }
+        if self.review_view.get_untracked().is_some() {
+            self.review_open.set(true);
+        } else {
+            self.review_open.set(false);
+            self.focus_editor();
+        }
+    }
+
+    fn cancel_review_owned_by(&self, tab_id: u64) {
+        let owned = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .is_some_and(|origin| origin.tab_id == tab_id);
+        if !owned {
+            return;
+        }
         self.review_generation.update(|generation| *generation += 1);
         self.review_in_flight.borrow_mut().take();
-        self.cancel_review();
+        self.refresh_review_busy();
     }
 
-    pub fn close_review(&self) {
+    /// Withdraw the Review request the tab on screen owns: the task's
+    /// generation becomes stale, so when the model answers it writes nothing
+    /// — no view, no revision context, no busy flag. What the user cancelled
+    /// stays cancelled, and the notice says so without claiming a recall.
+    pub fn cancel_review_in_flight(&self) {
+        let Some(tab_id) = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .filter(|origin| self.active.get_untracked() == Some(origin.tab_id))
+            .map(|origin| origin.tab_id)
+        else {
+            return;
+        };
+        self.cancel_review_owned_by(tab_id);
         self.cancel_review();
-        self.reset_revision();
-        self.review_view.set(None);
-        self.review_unavailable.set(None);
+        self.notify_at(
+            StatusSurface::Editor,
+            StatusKind::Info,
+            flow_copy::S::CancelledNothingApplied.text(self.settings.get().language),
+        );
+    }
+
+    /// Hide the result without clearing it: the titlebar Review reopens it. A
+    /// Revision on screen is a decision surface, not a reading pane, and its
+    /// Close discards the proposal as before.
+    pub fn close_review(&self) {
         self.review_open.set(false);
+        self.clear_review_unavailable();
+        if self.revision_busy.get_untracked()
+            || !self.revision_hunks.get_untracked().is_empty()
+            || self.revision_status.get_untracked().is_some()
+        {
+            self.reset_revision();
+        }
         self.sync_undo_surface();
+    }
+
+    /// Whether the active tab's hidden Review result could be reopened:
+    /// closing the field is not a discard, so the titlebar Review brings the
+    /// result back before it prepares a new one.
+    pub fn can_reopen_review(&self) -> bool {
+        !self.review_open.get()
+            && self
+                .review_view
+                .get()
+                .is_some_and(|view| view.tab_id.is_none_or(|tab| self.active.get() == Some(tab)))
+    }
+
+    /// Reopen the hidden Review result for the active tab, if there is one.
+    pub fn reopen_review(&self) -> bool {
+        if !self.can_reopen_review() {
+            return false;
+        }
+        self.review_open.set(true);
+        self.sync_undo_surface();
+        true
+    }
+
+    /// Whether a Review entry point must wait: a Review is in flight on
+    /// another document, and this tab has no hidden result to reopen.
+    pub fn review_start_waiting(&self) -> bool {
+        self.review_busy_elsewhere.get() && !self.can_reopen_review()
+    }
+
+    fn notify_review_waiting(&self) {
+        let surface = if self.review_open.get_untracked() {
+            StatusSurface::Review
+        } else {
+            StatusSurface::Editor
+        };
+        self.notify_at(
+            surface,
+            StatusKind::Info,
+            flow_copy::S::ReviewWaitingElsewhere.text(self.settings.get().language),
+        );
+        self.review_wait_notice.set(true);
     }
 
     pub fn open_settings(&self) {
@@ -4018,6 +4870,11 @@ impl AppState {
         }
         if self.revision_consent.get().is_some() {
             crate::ui::review::cancel_revision(self);
+            self.focus_editor();
+            return true;
+        }
+        if self.translation_consent.get().is_some() {
+            self.cancel_translation();
             self.focus_editor();
             return true;
         }
@@ -4958,6 +5815,470 @@ mod tests {
         assert_eq!(undone, SOURCE);
     }
 
+    /// The shown Review survives preparing a new one and cancelling it; a
+    /// cancel with nothing shown closes the field cleanly.
+    static REVIEW_PRESERVATION: std::sync::Mutex<Option<(bool, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn ReviewPreservationProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        state.new_document();
+        let kept = ReviewView {
+            status: "kept".to_owned(),
+            ..ReviewView::default()
+        };
+        state.review_view.set(Some(kept.clone()));
+        state.review_open.set(true);
+        state.start_review();
+        let after_prepare =
+            state.review_view.get() == Some(kept.clone()) && state.review_open.get();
+        state.cancel_review();
+        let after_cancel = state.review_view.get() == Some(kept);
+        state.review_view.set(None);
+        state.cancel_review();
+        *REVIEW_PRESERVATION.lock().expect("the outcome") =
+            Some((after_prepare && after_cancel, state.review_open.get()));
+        view()
+    }
+
+    #[test]
+    fn preparing_or_cancelling_a_review_keeps_the_shown_result() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ReviewPreservationProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (kept, closed) = REVIEW_PRESERVATION
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(kept, "preparing and cancelling never discard the result");
+        assert!(!closed, "a cancel with nothing shown closes the field");
+    }
+
+    /// A probe with no source editor mounted: the focus round-trip must reach
+    /// the document view standing in for it, and an open consent card must
+    /// refuse to put the focus behind it.
+    #[component]
+    fn DocumentViewFocusProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the tab");
+        let reference = element_ref();
+        state.attach_document_view(tab.id, reference);
+        let focused = signal(false);
+        let focus_state = focused;
+        let press_state = state.clone();
+        let block_state = state.clone();
+        let block_view = reference;
+        view()
+            .flex_col()
+            .w(px(400.0))
+            .h(px(300.0))
+            .child(
+                view()
+                    .test_id("document-view")
+                    .element_ref(&reference)
+                    .focusable(true)
+                    .on_focus(move || focus_state.set(true))
+                    .on_blur(move || focus_state.set(false))
+                    .child(prims_text("document")),
+            )
+            .child(
+                view()
+                    .test_id("document-view-focus")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| press_state.focus_editor())
+                    .child(prims_text("focus")),
+            )
+            .child(
+                view()
+                    .test_id("document-view-block")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        block_state
+                            .review_consent
+                            .set(Some(SharedString::from("waiting")));
+                        block_view.blur();
+                        block_state.focus_editor();
+                    })
+                    .child(prims_text("block")),
+            )
+            .child(
+                text(move || format!("focused: {}", focused.get())).test_id("document-view-state"),
+            )
+    }
+
+    fn prims_text(label: &'static str) -> impl IntoElement {
+        text(SharedString::from(label))
+    }
+
+    #[test]
+    fn focus_round_trips_to_the_document_view_and_refuses_behind_a_card() {
+        let mut config =
+            nsh_engine::EngineConfig::new(nsh_engine::Root::of::<DocumentViewFocusProbe>());
+        // A platform that gives ordinary views the keyboard focus, as the
+        // Windows host does.
+        config.environment.os = nsh_core::platform::Os::Linux;
+        let mut app = nsh_testing::Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(400.0), Points(300.0)))
+            .expect("viewport");
+        app.wait_for("id:document-view-focus")
+            .expect("the probe renders");
+        app.press("id:document-view-focus")
+            .expect("return the focus");
+        app.wait_for("text:focused: true")
+            .expect("the document view took the focus");
+
+        // With a consent waiting, the same round-trip must not put the
+        // keyboard behind the card.
+        app.press("id:document-view-block")
+            .expect("try to return the focus behind the card");
+        app.wait_for("text:focused: false")
+            .expect("the document view stayed out of the card's way");
+    }
+
+    /// The whole Review session a new preparation parks and a cancel puts
+    /// back: result (stale against the current revision), binding, selection
+    /// scope, answers, Revision state, and the per-tab display rule.
+    /// What the R7 interleaving proves: the restored result is stale, the
+    /// binding and selection come back, the answers survive, and the Revision
+    /// that arrived while the card waited is kept — the cancel never puts the
+    /// pre-answer state back.
+    type SessionOutcome = (bool, bool, bool, String, bool, bool, bool, bool, bool);
+
+    static SESSION_PRESERVATION: std::sync::Mutex<Option<SessionOutcome>> =
+        std::sync::Mutex::new(None);
+
+    /// A Review output with one clarification question, for the Revision
+    /// probes.
+    fn revision_output(goal: &str, question: &str) -> ReviewModelOutput {
+        ReviewModelOutput {
+            schema_version: mt_core::review::REVIEW_SCHEMA_VERSION.to_owned(),
+            scope: ReviewScope::Document,
+            understood_intent: mt_core::review::ReviewSections {
+                stated_goal: goal.into(),
+                relevant_context: Vec::new(),
+                constraints: Vec::new(),
+                non_goals: Vec::new(),
+                expected_deliverable: "a plan".into(),
+                success_evidence: Vec::new(),
+                inferred_assumptions: Vec::new(),
+                unresolved_decisions: Vec::new(),
+            },
+            findings: Vec::new(),
+            clarification_questions: vec![mt_core::review::ClarificationQuestion {
+                priority: ClarificationPriority::High,
+                question: question.into(),
+                impact: None,
+            }],
+        }
+    }
+
+    #[component]
+    fn ReviewSessionProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the tab");
+        tab.text.set(SharedString::from(SOURCE));
+        let snapshot = SourceSnapshot::new(tab.revision.get(), 0);
+        let request = ReviewRequest::document(ArtifactLens::default_lens(), SOURCE, snapshot)
+            .expect("a review request");
+        state.set_revision_context(
+            ReviewOrigin {
+                tab_id: tab.id,
+                snapshot,
+            },
+            request,
+            revision_output("keep the plan", "Which one?"),
+            ReviewLanguage::English,
+        );
+        state
+            .revision_questions
+            .get()
+            .first()
+            .expect("the question")
+            .answer
+            .set(String::from("answered"));
+        state.set_review_result(
+            ReviewView {
+                status: "kept".to_owned(),
+                tab_id: Some(tab.id),
+                ..ReviewView::default()
+            },
+            Some(ReviewOrigin {
+                tab_id: tab.id,
+                snapshot,
+            }),
+        );
+        state.review_open.set(true);
+        state.review_selection.set(Some((1, 4)));
+
+        state.start_review();
+        // While the consent card waits, the in-flight Revision's answer
+        // arrives and presents a proposal, and a write moves the document
+        // past the result's binding. The cancel must keep the arrived
+        // proposal and restore the review stale (R7).
+        let change = RevisionChange::new(
+            "the in-flight answer",
+            vec![RevisionEdit::new(
+                ByteRange::new(0, 8).expect("a range"),
+                "compiles",
+                "ships",
+            )],
+        );
+        let proposal = RevisionProposal::validate(
+            SOURCE,
+            SourceSnapshot::new(0, 0),
+            vec![change],
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision_for(tab.id, proposal);
+        state.write_model_text(&tab, "changed while consent waited".to_owned());
+        state.cancel_review();
+
+        let restored = state.review_view.get().expect("the restored result");
+        let stale = restored.stale
+            && restored.status
+                == crate::i18n::t(state.settings.get().language, crate::i18n::Key::ReviewStale);
+        let binding_ok = (*state.review_binding.borrow()).is_some_and(|binding| {
+            binding.tab_id == tab.id && binding.snapshot.revision < tab.revision.get()
+        });
+        let selection_ok = state.review_selection.get() == Some((1, 4));
+        let answers = state
+            .revision_questions
+            .get()
+            .first()
+            .map(|question| question.answer.get())
+            .unwrap_or_default();
+        let arrived_kept = state
+            .revision_hunks
+            .get()
+            .first()
+            .is_some_and(|hunk| hunk.after == "ships");
+        let revision_kept = state.revision_status.get()
+            == Some(SharedString::from(
+                flow_copy::S::RevisionReady.text(state.settings.get().language),
+            ));
+        let shown = crate::ui::review::is_open(&state);
+
+        let hidden = {
+            state.close_review();
+            !state.review_open.get() && state.review_view.get().is_some()
+        };
+        let reopened = state.reopen_review() && state.review_open.get();
+
+        // Results belong to their tab: another tab shows none, and switching
+        // back shows the result again.
+        state.new_document();
+        let hidden_on_other = !crate::ui::review::is_open(&state);
+        state.set_active(tab.id);
+        let shown_on_return = crate::ui::review::is_open(&state);
+
+        *SESSION_PRESERVATION.lock().expect("the outcome") = Some((
+            stale,
+            binding_ok,
+            selection_ok,
+            answers,
+            arrived_kept,
+            revision_kept,
+            shown,
+            hidden && reopened,
+            hidden_on_other && shown_on_return,
+        ));
+        view()
+    }
+
+    #[test]
+    fn cancelling_a_new_review_keeps_the_revision_that_arrived() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ReviewSessionProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (stale, binding, selection, answers, arrived, revision, shown, closed, tabs) =
+            SESSION_PRESERVATION
+                .lock()
+                .expect("the outcome")
+                .take()
+                .expect("the probe ran");
+        assert!(
+            stale,
+            "the restored result is stale against the moved-on document"
+        );
+        assert!(binding, "the binding came back");
+        assert!(selection, "the selection scope came back");
+        assert_eq!(answers, "answered", "the answers survived the wait");
+        assert!(
+            arrived,
+            "the Revision that arrived while the card waited is kept"
+        );
+        assert!(revision, "its ready status is kept");
+        assert!(shown, "the restored result and its Revision are both open");
+        assert!(
+            closed,
+            "closing hides the result, and the titlebar reopens it"
+        );
+        assert!(tabs, "results show only on their tab");
+    }
+
+    /// Whether A's own Review output, question and answer are what A's
+    /// `Prepare revision` discloses after B completed one.
+    static REVISION_TABS: std::sync::Mutex<Option<(bool, bool, bool, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn RevisionPerTabProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        state.settings.update(|settings| {
+            settings.model_provider = mt_core::model::Provider::OpenAiChat.key().to_owned();
+            settings.model_base_url = "http://127.0.0.1:9/v1".to_owned();
+        });
+        state
+            .store_session_credential("probe-key")
+            .expect("a session credential");
+        state.new_document();
+        let context_on = |state: &AppState, goal: &str, question: &str| {
+            let tab = state.active_tab().expect("the tab");
+            tab.text.set(SharedString::from(SOURCE));
+            let snapshot = SourceSnapshot::new(tab.revision.get(), 0);
+            let request = ReviewRequest::document(ArtifactLens::default_lens(), SOURCE, snapshot)
+                .expect("a review request");
+            state.set_revision_context(
+                ReviewOrigin {
+                    tab_id: tab.id,
+                    snapshot,
+                },
+                request,
+                revision_output(goal, question),
+                ReviewLanguage::English,
+            );
+            tab.id
+        };
+        let a = context_on(&state, "A goal", "Which A?");
+        state
+            .revision_questions
+            .get()
+            .first()
+            .expect("A's question")
+            .answer
+            .set(String::from("A answer"));
+        state.new_document();
+        let b = context_on(&state, "B goal", "Which B?");
+        state
+            .revision_questions
+            .get()
+            .first()
+            .expect("B's question")
+            .answer
+            .set(String::from("B answer"));
+
+        // Back on A: its own question and answer show, and Prepare revision
+        // discloses A's output and answers, never B's.
+        state.set_active(a);
+        let shown_a = state
+            .revision_questions
+            .get()
+            .first()
+            .is_some_and(|question| {
+                question.question == "Which A?" && question.answer.get() == "A answer"
+            });
+        state.start_revision();
+        let (output_a, answer_is_a, disclosed) = {
+            let bound = state.pending_revision.borrow();
+            match bound.as_ref() {
+                Some((_, bound)) => {
+                    let answer_is_a = bound.answers().as_slice().first().is_some_and(|answer| {
+                        matches!(answer, RevisionAnswer::Answered(text) if text == "A answer")
+                    });
+                    (
+                        bound.review_output().understood_intent.stated_goal.as_str() == "A goal",
+                        answer_is_a,
+                        state.revision_consent.get().is_some(),
+                    )
+                }
+                None => (false, false, false),
+            }
+        };
+        // B's session is untouched by A's preparation.
+        state.set_active(b);
+        let shown_b = state
+            .revision_questions
+            .get()
+            .first()
+            .is_some_and(|question| {
+                question.question == "Which B?" && question.answer.get() == "B answer"
+            });
+        *REVISION_TABS.lock().expect("the outcome") =
+            Some((shown_a, output_a, answer_is_a, disclosed && shown_b));
+        view()
+    }
+
+    #[test]
+    fn preparing_a_revision_discloses_the_tabs_own_review() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                RevisionPerTabProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (shown_a, output_a, answer_a, b_kept) = REVISION_TABS
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(shown_a, "returning to A shows A's own question and answer");
+        assert!(output_a, "the disclosure carries A's Review output");
+        assert!(answer_a, "the disclosure carries A's answer");
+        assert!(b_kept, "A's preparation left B's session untouched");
+    }
+
+    /// Whether a Review-unavailable reason stays with the tab that failed.
+    static REVIEW_UNAVAILABLE_TABS: std::sync::Mutex<Option<(bool, bool, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn ReviewUnavailablePerTabProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        state.new_document();
+        let a = state.active.get().expect("A");
+        state.set_review_unavailable(ReviewUnavailable::NotSetUp);
+        state.new_document();
+        let b = state.active.get().expect("B");
+        let other_clean = state.review_unavailable.get().is_none();
+        state.set_review_unavailable(ReviewUnavailable::Unpreparable);
+        state.set_active(a);
+        let a_reason = state.review_unavailable.get() == Some(ReviewUnavailable::NotSetUp);
+        state.set_active(b);
+        let b_reason = state.review_unavailable.get() == Some(ReviewUnavailable::Unpreparable);
+        *REVIEW_UNAVAILABLE_TABS.lock().expect("the outcome") =
+            Some((other_clean, a_reason, b_reason));
+        view()
+    }
+
+    #[test]
+    fn a_review_unavailable_reason_stays_with_its_tab() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ReviewUnavailablePerTabProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (other_clean, a_reason, b_reason) = REVIEW_UNAVAILABLE_TABS
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(other_clean, "a new tab starts with no failure of another");
+        assert!(a_reason, "returning to A shows A's own reason");
+        assert!(b_reason, "B keeps its own reason");
+    }
+
     /// The status after a first and a second `Done` over one proposal.
     static DONE_TWICE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
 
@@ -4991,8 +6312,14 @@ mod tests {
             .expect("the outcome")
             .take()
             .expect("the probe ran");
-        assert_eq!(first, "No changes approved.");
-        assert_eq!(second, REVISION_UNAVAILABLE);
+        assert_eq!(
+            first,
+            flow_copy::S::RevisionNoChanges.text(Language::English)
+        );
+        assert_eq!(
+            second,
+            flow_copy::S::RevisionUnavailable.text(Language::English)
+        );
     }
 
     /// Whether `start_revision` did anything (a disclosure or a status),
@@ -5595,6 +6922,351 @@ mod tests {
             !refusal.contains("at path") && !refusal.contains(&missing.display().to_string()),
             "the staged write leaks the library's path wording: {refusal}"
         );
+    }
+
+    static REVISION_CANCEL_KEEPS_UNDO: std::sync::Mutex<Option<(bool, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn RevisionCancelKeepsUndoProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let tab = state.active.get().expect("the tab");
+        // The Undo's line is the Review line, as it is while a Revision runs.
+        state.review_open.set(true);
+        let reversed = Rc::new(Cell::new(false));
+        let reverse = Rc::clone(&reversed);
+        state.notify_undo(
+            StatusSurface::Editor,
+            SharedString::from("Discarded recovered draft"),
+            UndoNotice {
+                label: SharedString::from("Undo"),
+                reverse: Rc::new(move || {
+                    reverse.set(true);
+                    Ok(())
+                }),
+                commit: Rc::new(|| {}),
+            },
+        );
+        *state.revision_cancellation.borrow_mut() = Some((tab, Arc::new(AtomicBool::new(false))));
+        state.refresh_revision_busy();
+        state.cancel_revision_owned_by(tab);
+        let offered = state.status.get_untracked().action.is_some();
+        state.undo_last();
+        *REVISION_CANCEL_KEEPS_UNDO.lock().expect("the outcome") = Some((offered, reversed.get()));
+        view()
+    }
+
+    #[test]
+    fn cancelling_a_revision_keeps_a_live_undo_reachable() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                RevisionCancelKeepsUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (offered, restored) = REVISION_CANCEL_KEEPS_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(offered, "the Revision cancel removed the live Undo");
+        assert!(restored, "the Undo did not restore its work");
+    }
+
+    const UNDO_TEXT: &str = "Discarded recovered draft";
+
+    fn review_wait_text() -> String {
+        flow_copy::S::ReviewWaitingElsewhere
+            .text(Language::English)
+            .to_owned()
+    }
+
+    /// B waits on A's in-flight Review while a live Undo owns the status
+    /// line: the wait notice carries the Undo's action.
+    fn waiting_with_a_live_undo() -> AppState {
+        let state = AppState::new();
+        state.new_document();
+        let reviewing = state.active.get().expect("the reviewing tab");
+        state.arm_review_in_flight(reviewing);
+        state.new_document();
+        state.notify_undo(
+            StatusSurface::Editor,
+            UNDO_TEXT,
+            UndoNotice {
+                label: SharedString::from("Undo"),
+                reverse: Rc::new(|| Ok(())),
+                commit: Rc::new(|| {}),
+            },
+        );
+        state.start_review();
+        state
+    }
+
+    fn release_the_review_slot(state: &AppState) {
+        *state.review_in_flight.borrow_mut() = None;
+        state.refresh_review_busy();
+    }
+
+    type WaitClearOutcome = (bool, bool, String, bool, bool);
+
+    static WAIT_CLEAR_BEFORE_UNDO: std::sync::Mutex<Option<WaitClearOutcome>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn WaitClearsBeforeUndoProbe() -> impl IntoElement {
+        let state = waiting_with_a_live_undo();
+        let waiting = state.status.get_untracked().text.to_string() == review_wait_text();
+        let carried = state.status.get_untracked().action.is_some();
+
+        release_the_review_slot(&state);
+        let text = state.status.get_untracked().text.to_string();
+        let kept = state.status.get_untracked().action.is_some();
+
+        state.commit_pending_undo();
+        let spent = state.status.get_untracked().action.is_none();
+        *WAIT_CLEAR_BEFORE_UNDO.lock().expect("the outcome") =
+            Some((waiting, carried, text, kept, spent));
+        view()
+    }
+
+    #[test]
+    fn a_freed_review_slot_clears_the_wait_notice_before_the_undo_expires() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                WaitClearsBeforeUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (waiting, carried, text, kept, spent) = WAIT_CLEAR_BEFORE_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(waiting, "B never showed the wait notice");
+        assert!(carried, "the wait notice dropped the live Undo's action");
+        assert_eq!(
+            text, UNDO_TEXT,
+            "a freed Review slot left the wait text on the line"
+        );
+        assert!(kept, "clearing the wait text dropped the live Undo");
+        assert!(spent, "the Undo expiry left its action behind");
+    }
+
+    static WAIT_OUTLIVES_UNDO: std::sync::Mutex<Option<(bool, bool, String)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn WaitOutlivesUndoProbe() -> impl IntoElement {
+        let state = waiting_with_a_live_undo();
+        state.commit_pending_undo();
+        let wait_kept = state.status.get_untracked().text.to_string() == review_wait_text();
+        let action_gone = state.status.get_untracked().action.is_none();
+
+        release_the_review_slot(&state);
+        let text = state.status.get_untracked().text.to_string();
+        *WAIT_OUTLIVES_UNDO.lock().expect("the outcome") = Some((wait_kept, action_gone, text));
+        view()
+    }
+
+    #[test]
+    fn an_expired_undo_leaves_no_wait_notice_once_the_slot_frees() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                WaitOutlivesUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (wait_kept, action_gone, text) = WAIT_OUTLIVES_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(wait_kept, "the expiry cleared a wait still in progress");
+        assert!(action_gone, "the Undo expiry left its action behind");
+        assert!(
+            text.is_empty(),
+            "a freed Review slot left the wait text on the line: {text:?}"
+        );
+    }
+
+    static PREPARE_SNAPSHOT: std::sync::Mutex<Option<(bool, bool)>> = std::sync::Mutex::new(None);
+
+    #[component]
+    fn PrepareSnapshotProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        configure_endpoint(&state);
+        state
+            .store_session_credential("probe-key")
+            .expect("a session credential");
+        state.new_document();
+        // A: Review selection with no selection fails before showing anything.
+        state.prepare_review(true);
+
+        state.new_document();
+        let b = state.active.get().expect("B");
+        state
+            .active_tab()
+            .expect("B's tab")
+            .text
+            .set(SharedString::from("# B\nA document with text.\n"));
+        state.review_open.set(true);
+        state.set_review_result(
+            ReviewView {
+                tab_id: Some(b),
+                status: "B's result".to_owned(),
+                ..ReviewView::default()
+            },
+            None,
+        );
+        state.prepare_review(false);
+        let disclosed = state.review_consent.get().is_some();
+        state.cancel_review();
+        let kept = state
+            .review_view
+            .get()
+            .is_some_and(|view| view.status == "B's result");
+        *PREPARE_SNAPSHOT.lock().expect("the outcome") = Some((disclosed, kept));
+        view()
+    }
+
+    #[test]
+    fn a_failed_selection_prepare_does_not_park_another_tabs_session() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                PrepareSnapshotProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (disclosed, kept) = PREPARE_SNAPSHOT
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(disclosed, "B's preparation did not reach its disclosure");
+        assert!(kept, "cancelling B's Review restored A's empty snapshot");
+    }
+
+    static CLOSED_TAB_SESSION: std::sync::Mutex<Option<(bool, bool)>> = std::sync::Mutex::new(None);
+
+    #[component]
+    fn ClosedTabSessionProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let a = state.active.get().expect("A");
+        state.write_revision_session(
+            a,
+            RevisionSession {
+                status: Some(SharedString::from("A's revision")),
+                ..RevisionSession::default()
+            },
+        );
+        state.new_document();
+        let b = state.active.get().expect("B");
+        state.set_active(a);
+        state.close_tab_now(a);
+        let still_stored = state.revision_sessions.borrow().contains_key(&a);
+        *CLOSED_TAB_SESSION.lock().expect("the outcome") =
+            Some((still_stored, state.active.get() == Some(b)));
+        view()
+    }
+
+    #[test]
+    fn closing_a_tab_releases_its_revision_session() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ClosedTabSessionProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (still_stored, active_b) = CLOSED_TAB_SESSION
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(
+            !still_stored,
+            "the closed tab's Revision session stayed in the store"
+        );
+        assert!(active_b, "the other tab became active");
+    }
+
+    type LastTabRevisionOutcome = (bool, bool, bool, bool, bool);
+
+    static LAST_TAB_REVISION: std::sync::Mutex<Option<LastTabRevisionOutcome>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn LastTabRevisionProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the only tab");
+        tab.text.set(SharedString::from(SOURCE));
+        let snapshot = SourceSnapshot::new(tab.revision.get(), 0);
+        let request = ReviewRequest::document(ArtifactLens::default_lens(), SOURCE, snapshot)
+            .expect("a review request");
+        state.set_revision_context(
+            ReviewOrigin {
+                tab_id: tab.id,
+                snapshot,
+            },
+            request,
+            revision_output("keep the plan", "Which one?"),
+            ReviewLanguage::English,
+        );
+        let start = SOURCE.find("compiles but").expect("in the source") as u64;
+        let range = ByteRange::new(start, start + 12).expect("a range");
+        let change = RevisionChange::new(
+            "Tighten.",
+            vec![RevisionEdit::new(range, "compiles but", "compiles, but")],
+        );
+        let proposal = RevisionProposal::validate(
+            SOURCE,
+            SourceSnapshot::new(0, 0),
+            vec![change],
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision(proposal);
+        let open_before = crate::ui::revision::is_open(&state);
+
+        state.close_tab_now(tab.id);
+        let open_after = crate::ui::revision::is_open(&state);
+        let context_cleared = state.revision_context.borrow().is_none();
+        let hunks_cleared = state.revision_hunks.get_untracked().is_empty();
+        let ledger_cleared = state.revision_ledger.borrow().is_none();
+        *LAST_TAB_REVISION.lock().expect("the outcome") = Some((
+            open_before,
+            open_after,
+            context_cleared,
+            hunks_cleared,
+            ledger_cleared,
+        ));
+        view()
+    }
+
+    #[test]
+    fn closing_the_last_tab_clears_the_shown_revision() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                LastTabRevisionProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (open_before, open_after, context_cleared, hunks_cleared, ledger_cleared) =
+            LAST_TAB_REVISION
+                .lock()
+                .expect("the outcome")
+                .take()
+                .expect("the probe ran");
+        assert!(open_before, "the probe never showed a Revision");
+        assert!(
+            !open_after,
+            "closing the last tab left the Revision field open"
+        );
+        assert!(context_cleared, "the Review's output stayed in memory");
+        assert!(hunks_cleared, "the hunks stayed on screen");
+        assert!(ledger_cleared, "the decision stack stayed in memory");
     }
 }
 

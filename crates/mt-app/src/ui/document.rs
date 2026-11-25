@@ -33,7 +33,7 @@ use nsh_core::{
 
 use crate::{
     state::{AppState, Pane, Tab},
-    ui::{glow, motion, notices, preview, revision, titlebar, tokens},
+    ui::{glow, motion, notices, preview, review, revision, titlebar, tokens},
 };
 
 /// The column's content for the active document, by pane. Empty while no
@@ -218,15 +218,19 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     // one headless `--lib` run in four). The later of the two wins.
     let focuses = signal(0u64);
     let editor_box = element_ref();
+    let focus_state = state.clone();
     #[cfg(test)]
     let box_focus_state = state.clone();
     editor_box.on_focus_in(move || {
         focuses.update(|count| *count += 1);
+        focus_state.source_editor_focused.set(true);
         #[cfg(test)]
         box_focus_state
             .focus_last
             .set(Some(crate::state::FocusTarget::Editor));
     });
+    let blur_state = state.clone();
+    editor_box.on_focus_out(move || blur_state.source_editor_focused.set(false));
     let keys_state = state.clone();
     effect(move || {
         focuses.get();
@@ -427,7 +431,7 @@ pub fn has_document(state: &AppState) -> bool {
 /// the editor's line numbers — a reading pass's gutter — only then; the context
 /// reads a document of its own and never moves this one.
 fn docked_surfaces(state: &AppState) -> bool {
-    state.review_open.get() || revision::is_open(state) || notices::compare_is_open(state)
+    review::is_open(state) || revision::is_open(state) || notices::compare_is_open(state)
 }
 
 // The editor clamps scroll at zero, so centering an early line needs space

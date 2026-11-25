@@ -76,6 +76,8 @@ mod refine_state_status;
 mod reload_edit_race;
 #[path = "review_partial.rs"]
 mod review_partial;
+#[path = "review_preserve.rs"]
+mod review_preserve;
 #[path = "review_selection.rs"]
 mod review_selection;
 #[path = "review_selection_stale.rs"]
@@ -102,6 +104,8 @@ mod tab_switch;
 mod test_vault;
 #[path = "theme.rs"]
 mod theme;
+#[path = "translation_cancel.rs"]
+mod translation_cancel;
 #[path = "translation_flow.rs"]
 mod translation_flow;
 #[path = "untitled_discard.rs"]

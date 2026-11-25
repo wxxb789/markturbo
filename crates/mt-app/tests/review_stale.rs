@@ -7,6 +7,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 #[test]
 fn editing_the_reviewed_document_marks_the_result_stale() {
     let output = serde_json::json!({
@@ -79,7 +81,7 @@ fn editing_the_reviewed_document_marks_the_result_stale() {
     app.press("id:title-review").expect("open Review");
     // Nothing leaves the device before the consent card's hold completes.
     app.wait_for("id:consent-card").expect("Review disclosure");
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     // The result is up when the field offers its one next action, and the
     // model's understood intent is on screen.
     app.wait_for_within("id:review-prepare", Duration::from_secs(20))

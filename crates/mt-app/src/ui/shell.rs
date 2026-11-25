@@ -88,12 +88,23 @@ pub(crate) fn shell_with_status(
 ) -> impl IntoElement {
     hide_system_title_bar();
     let body_state = state.clone();
+    let capture_state = state.clone();
     view()
         .test_id("shell")
         .flex_1()
         .h(relative(1.0))
         .w_full()
         .flex_col()
+        // While a consent card is open it is the topmost layer: Enter and
+        // Space belong to it even if the focus wandered to a control behind
+        // it, so a stray key never presses the dimmed room.
+        .capture_keys(move || {
+            if consent::is_open(&capture_state) {
+                consent::key_capture()
+            } else {
+                nsh_core::KeyCapture::None
+            }
+        })
         .on_layout(|frame: &Bounds<Points>| {
             // The shell measures itself: `window()` keeps the size the window
             // was opened with until the next resize (Windows), so a harness
@@ -417,8 +428,7 @@ pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoEle
                 effect({
                     let state = consent_state.clone();
                     move || {
-                        let kind = consent::is_open(&state)
-                            .then(|| state.revision_consent.get().is_some());
+                        let kind = consent::kind_of(&state);
                         if previous.replace(kind) != kind && kind.is_some() {
                             session.update(|session| *session += 1);
                         }
@@ -2016,6 +2026,7 @@ mod tests {
     #[component]
     fn ReviewStatusRowProbe() -> impl IntoElement {
         let state = AppState::new();
+        state.new_document();
         state.review_open.set(true);
         state.review_view.set(Some(crate::state::ReviewView {
             sections: vec![crate::state::ReviewSection {
@@ -2042,7 +2053,9 @@ mod tests {
                         state.status.set(Default::default());
                     }))
                     .child(control("revision-start", &state, |state| {
-                        state.revision_busy.set(true);
+                        if let Some(tab_id) = state.active.get() {
+                            state.arm_revision_in_flight(tab_id);
+                        }
                         state.notify_count_at(
                             crate::state::StatusSurface::Review,
                             crate::state::StatusKind::Success,
@@ -2061,7 +2074,9 @@ mod tests {
                                 after: "Revised draft".to_owned(),
                                 accepted: signal(false),
                             }]);
-                        state.revision_busy.set(false);
+                        if let Some(tab_id) = state.active.get() {
+                            state.finish_revision_in_flight(tab_id);
+                        }
                     })),
             )
             .child(shell(state, Language::English, Layout::Wide))

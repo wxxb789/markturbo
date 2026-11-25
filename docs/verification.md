@@ -178,7 +178,7 @@ How nsh 0.6.1 exposes views to UIA, and so how the harnesses select them:
   restores it once at its end. Selection and Review use the editor's own keys
   (Ctrl+A, Ctrl+Enter).
 - UIA Invoke is one tap. The consent card's `consent-send` sends only after a
-  held press, so the harnesses hold the real pointer past the control's 1.2 s
+  held press, so the harnesses hold the real pointer past the control's 900 ms
   threshold; an Invoke is never consent.
 - Ctrl+Enter depends on state: it starts Review from the title row, sends from
   the consent card, and is Done on the Revision field. The harnesses send it
@@ -247,7 +247,7 @@ the app only where the behaviour itself needs a restart.
   once across the multibyte offsets; Reject(h2) reads `2 of 2 decided`;
   `Undo` (`revision-undo`) takes it back to `1 of 2 decided`; `Copy`
   (`revision-copy`) puts exactly the approved text on the OS clipboard; an
-  edit over the whole document shows `Can't apply — this part changed` with
+  edit over the whole document shows `Can't apply — this section was edited since the review` with
   no Accept; `Done` leaves the file on disk unchanged. `QUIT`: one
   guard, Discard, the process exits. A consent hold whose request never reaches the loopback
   fails at once (`REVIEW_REQUEST_NOT_SENT` / `REVISION_REQUEST_NOT_SENT`).

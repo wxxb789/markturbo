@@ -14,6 +14,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 #[test]
 fn the_slot_keeps_a_reviewed_tab_that_is_not_on_screen() {
     let output = serde_json::json!({
@@ -92,7 +94,7 @@ fn the_slot_keeps_a_reviewed_tab_that_is_not_on_screen() {
 
     app.press("id:title-review").expect("open Review");
     app.wait_for("id:consent-card").expect("Review disclosure");
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("Review result");
     app.wait_for("text:keep the document intent")

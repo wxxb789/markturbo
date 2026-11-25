@@ -14,7 +14,11 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use nsh_core::element::{Idiom, Os};
+use nsh_core::{
+    EventKind, EventPayload, KeyEvent,
+    element::{Idiom, Os, SharedString},
+    keymap::Modifiers,
+};
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
@@ -23,12 +27,11 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 const SOURCE: &str = "Original\n";
 const EDITOR: &str = "label:Markdown source";
 
-/// The app on `plan.md`, on Windows. With `provider` the settings point
-/// Review at a loopback provider that answers with no findings, and the app
-/// runs on a manual clock under reduced motion, so a key's auto-repeats can
-/// be played at the platform's rate. The directories live as long as the
-/// returned guards.
-fn start(provider: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+/// The app on `plan.md`, on `os`. With `provider` the settings point Review
+/// at a loopback provider that answers with no findings, and the app runs on
+/// a manual clock under reduced motion, so the hold's charge runs only as far
+/// as the test moves it. The directories live as long as the returned guards.
+fn start(provider: bool, os: Os) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let directory = tempfile::tempdir().expect("document dir");
     let config = tempfile::tempdir().expect("config dir");
     let document = directory.path().join("plan.md");
@@ -63,7 +66,7 @@ fn start(provider: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
-    engine.environment.os = Os::Windows;
+    engine.environment.os = os;
     engine.environment.idiom = Idiom::Desktop;
     if provider {
         engine.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
@@ -83,19 +86,45 @@ fn sent(app: &Headless) -> bool {
         .expect("the selector")
 }
 
-/// `Ctrl+Enter` held for `ms` on an armed card: the press and its
-/// auto-repeats, one every 33ms (Windows' fastest repeat rate).
-fn hold_ctrl_enter(app: &mut Headless, ms: u64) {
-    for _ in 0..ms / 33 {
-        app.press_key("ctrl+enter").expect("ctrl+enter");
-        app.run_for(Duration::from_millis(33))
-            .expect("the next repeat");
+/// One raw `KeyDown`/`KeyUp` on the focused card, as the platform's
+/// focused-view delivery sends it (the headless backend delivers raw keys on
+/// `Os::Linux`, as the Windows host does for a focused custom view).
+fn card_key(app: &mut Headless, key: &str, down: bool, modifiers: Modifiers, repeat: bool) {
+    let id = app.screen().id("id:consent-card").expect("the card");
+    let mut event = KeyEvent::default();
+    event.key = SharedString::from(key.to_owned());
+    event.modifiers = modifiers;
+    event.repeat = repeat;
+    let engine = app.engine().control();
+    engine.dispatch_event(
+        id,
+        if down {
+            EventKind::KeyDown
+        } else {
+            EventKind::KeyUp
+        },
+        EventPayload::Key(event),
+    );
+    let (sent, received) = std::sync::mpsc::channel();
+    engine.flush(move |_| {
+        let _ = sent.send(());
+    });
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the key flushed");
+    app.catch_up();
+}
+
+fn ctrl_enter() -> Modifiers {
+    Modifiers {
+        ctrl: true,
+        ..Modifiers::default()
     }
 }
 
 /// The app with the consent card opened by `Ctrl+Enter` from the editor.
-fn open_card_with_ctrl_enter() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
-    let (mut app, directory, config) = start(true);
+fn open_card_with_ctrl_enter(os: Os) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+    let (mut app, directory, config) = start(true, os);
     app.type_text(EDITOR, "").expect("focus the editor");
     app.press_key("ctrl+enter").expect("ctrl+enter");
     app.wait_for("id:consent-card").expect("the card opened");
@@ -105,18 +134,26 @@ fn open_card_with_ctrl_enter() -> (Headless, tempfile::TempDir, tempfile::TempDi
 #[test]
 fn the_ctrl_enter_that_opens_the_card_never_sends_it() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut app, _directory, _config) = open_card_with_ctrl_enter();
+    let (mut app, _directory, _config) = open_card_with_ctrl_enter(Os::Linux);
 
-    // The same key stays down for well past the charge a send needs. Until
-    // the card arms, its binding takes no auto-repeats: the platform
-    // swallows them, so the card hears nothing.
-    app.run_for(Duration::from_millis(2_700))
-        .expect("the opening key held");
+    // The same key stays down for well past the charge a send needs. The
+    // opening press reached the focus before the card existed; its
+    // auto-repeats carry `repeat` and must not charge it. The headless source
+    // reports no repeats, so the test plays the opening hold as the platform
+    // does.
+    for _ in 0..40 {
+        card_key(&mut app, "Enter", true, ctrl_enter(), true);
+        app.run_for(Duration::from_millis(33))
+            .expect("the next repeat");
+    }
     assert!(!sent(&app), "the key that opened the card sent it");
     assert!(app.shows("Send for review?"), "the card is still waiting");
 
     // Let go, then a deliberate hold at once: that one sends.
-    hold_ctrl_enter(&mut app, 1_500);
+    card_key(&mut app, "Enter", false, ctrl_enter(), false);
+    card_key(&mut app, "Enter", true, ctrl_enter(), false);
+    app.run_for(Duration::from_millis(1_500))
+        .expect("the fresh hold");
     assert!(
         sent(&app),
         "a fresh hold after the release sends: {:?}",
@@ -127,13 +164,15 @@ fn the_ctrl_enter_that_opens_the_card_never_sends_it() {
 #[test]
 fn a_fresh_hold_soon_after_the_opening_tap_sends() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut app, _directory, _config) = open_card_with_ctrl_enter();
+    let (mut app, _directory, _config) = open_card_with_ctrl_enter(Os::Linux);
 
     // The opening press was a tap; a deliberate hold follows well inside the
     // platform's slowest repeat delay, and needs no pause before it.
     app.run_for(Duration::from_millis(300))
         .expect("a short release");
-    hold_ctrl_enter(&mut app, 1_500);
+    card_key(&mut app, "Enter", true, ctrl_enter(), false);
+    app.run_for(Duration::from_millis(1_500))
+        .expect("the fresh hold");
     assert!(
         sent(&app),
         "a hold 300ms after the opening tap sends: {:?}",
@@ -144,7 +183,7 @@ fn a_fresh_hold_soon_after_the_opening_tap_sends() {
 #[test]
 fn the_consent_card_reads_question_destination_boundary_and_key() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut app, _directory, _config) = start(true);
+    let (mut app, _directory, _config) = start(true, Os::Windows);
     app.press("id:title-review").expect("Review");
     app.wait_for("id:consent-card").expect("the card opened");
 
@@ -203,10 +242,63 @@ fn the_consent_card_reads_question_destination_boundary_and_key() {
         .expect("Cancel closed the card");
 }
 
+// While a consent card is open it is modal: the room's own shortcuts are
+// inert, so no picker opens and no tab closes during a charge, and the
+// charge itself is one unbroken press.
+#[test]
+fn a_waiting_consent_card_keeps_the_room_shortcuts_inert() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut app, _directory, _config) = open_card_with_ctrl_enter(Os::Linux);
+
+    // `Ctrl+,` is inert too: Settings never opens under the card.
+    app.press_key("ctrl+,").expect("the settings shortcut");
+    assert_eq!(
+        app.screen().matches("id:settings-page"),
+        Ok(false),
+        "Settings opened under the consent card: {:?}",
+        app.screen().texts()
+    );
+
+    // A deliberate hold is underway.
+    card_key(&mut app, "Enter", true, ctrl_enter(), false);
+    app.run_for(Duration::from_millis(300)).expect("held");
+
+    // The platform has file dialogs: a request would be recorded.
+    app.on_pick_paths(Vec::new()).expect("file dialogs");
+    app.press_key("ctrl+o").expect("the folder shortcut");
+    assert!(
+        app.screen().file_requests().is_empty(),
+        "the folder picker opened during the charge: {:?}",
+        app.screen().file_requests()
+    );
+    app.press_key("ctrl+w").expect("the tab-close shortcut");
+    assert_eq!(
+        app.screen().matches("id:title-file"),
+        Ok(true),
+        "the card's tab was closed: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        app.screen().matches("id:consent-card"),
+        Ok(true),
+        "the card stays while the hold runs"
+    );
+
+    // The hold was one unbroken press: the inert shortcuts changed nothing,
+    // and the charge completed at its own deadline.
+    app.run_for(Duration::from_millis(600))
+        .expect("the rest of the charge");
+    assert!(
+        sent(&app),
+        "the unbroken hold sent after the shortcuts did nothing: {:?}",
+        app.screen().texts()
+    );
+}
+
 #[test]
 fn ctrl_s_saves_from_the_focused_editor() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut app, directory, _config) = start(false);
+    let (mut app, directory, _config) = start(false, Os::Windows);
     let path = directory.path().join("plan.md");
     app.type_text(EDITOR, "Saved by key.")
         .expect("type into the editor");
@@ -232,7 +324,7 @@ fn ctrl_s_saves_from_the_focused_editor() {
 #[test]
 fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (mut app, _directory, _config) = start(false);
+    let (mut app, _directory, _config) = start(false, Os::Windows);
 
     // `Review` draws its own underline, in the medium face.
     let review = app

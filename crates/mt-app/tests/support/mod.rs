@@ -68,3 +68,15 @@ pub fn wait_for_pending_dialog(app: &mut Headless, what: &str, timeout: Duration
         pump(app);
     }
 }
+
+/// A full hold-to-send: the production control declares no long-press delay,
+/// so the harness holds past the charge itself.
+pub fn hold_send(app: &mut Headless) {
+    use nsh_core::geometry::{point, px};
+
+    app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
+        .expect("hold the send control");
+    app.wait(Duration::from_millis(1_100))
+        .expect("the full charge");
+    app.drop_held().expect("release the send control");
+}

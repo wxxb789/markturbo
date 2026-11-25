@@ -8,6 +8,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 #[test]
 fn a_second_review_replaces_the_loading_state_of_the_first() {
     let output = serde_json::json!({
@@ -81,7 +83,7 @@ fn a_second_review_replaces_the_loading_state_of_the_first() {
         .expect("source editor");
     app.press("id:title-review").expect("open Review");
     app.wait_for("id:consent-card").expect("Review disclosure");
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     app.wait_for("id:review-cancel").expect("the loading line");
 
     // Another Review, pressed while the first is in flight.

@@ -89,6 +89,31 @@ impl SecureCredentialStore for MemoryStore {
 
 static STORE: LazyLock<Arc<MemoryStore>> = LazyLock::new(Arc::default);
 
+type ReviewGenerationHook = Box<dyn Fn() + Send + 'static>;
+
+// One hook, run when a sent Review's task reaches its generation check. A
+// later install replaces it.
+static REVIEW_GENERATION_CHECKED: LazyLock<Mutex<Option<ReviewGenerationHook>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+// Runs `hook` when a sent Review's task reaches its generation check: a
+// test waits on that instead of on the transport, so a late answer's
+// handling is observed where it is decided.
+pub fn on_review_generation_checked(hook: impl Fn() + Send + 'static) {
+    *REVIEW_GENERATION_CHECKED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+}
+
+pub(crate) fn review_generation_checked() {
+    let hook = REVIEW_GENERATION_CHECKED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hook) = hook.as_ref() {
+        hook();
+    }
+}
+
 /// The vault [`AppState::new`](crate::state::AppState::new) uses in a test
 /// build.
 pub(crate) fn vault() -> CredentialVault {

@@ -348,6 +348,71 @@ fn settings_opened_from_the_review_panel_keeps_the_live_undo() {
     assert_eq!(checkpoint_files(&keys), 2, "nothing was deleted");
 }
 
+/// Switching tabs unmounts the Review panel the previous tab owned: a live
+/// Undo must move to the editor line of the tab now on screen (contract
+/// amendment 18, the tab-switch path).
+#[test]
+fn switching_tabs_carries_the_live_undo_to_the_visible_editor() {
+    if !cfg!(windows) {
+        // DPAPI is the production protector; non-Windows builds intentionally
+        // have no plaintext recovery fallback.
+        return;
+    }
+    let mut seeded = two_recovered();
+    let keys = seeded.keys.clone();
+    let app = &mut seeded.app;
+    open_first_document(app, seeded._dir.path());
+
+    // A second document, so the switch has a tab without a Review panel.
+    app.press_key("mod+p").expect("open the palette");
+    app.wait_for("id:palette-input").expect("the palette input");
+    app.type_text("id:palette-input", "second")
+        .expect("filter to second.md");
+    app.press("id:palette-row").expect("open second.md");
+    app.wait_for("id:title-file >> text:second.md")
+        .expect("B's tab");
+
+    // Back on A, open its Review panel: with no model set up the panel is
+    // the unavailable state, and it still owns the review status line.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "first")
+        .expect("filter to first.md");
+    app.press("id:palette-row").expect("open first.md");
+    app.wait_for("id:title-file >> text:first.md")
+        .expect("A's tab");
+    app.press("id:title-review").expect("open A's Review");
+    app.wait_for_within("id:review-unavailable", Duration::from_secs(20))
+        .expect("A's Review panel");
+
+    // The discard's Undo renders on the review line while A owns it.
+    app.press("id:recovery-discard-all").expect("discard all");
+    app.wait_for("id:field >> id:status-action")
+        .expect("the Undo on A's review line");
+
+    // Back to B: B has no Review panel, so the Undo must land on B's editor
+    // line instead of unmounting with A's panel.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "second")
+        .expect("filter to second.md");
+    app.press("id:palette-row").expect("open second.md");
+    app.wait_for("id:title-file >> text:second.md")
+        .expect("B's tab");
+    app.wait_for_gone("id:review-unavailable", Duration::from_secs(5))
+        .expect("A's Review panel closes");
+    app.wait_for("id:status-action")
+        .expect("the Undo is on B's editor line");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo renders on exactly one status line"
+    );
+
+    // It still restores the held rows and their store entries.
+    app.press("id:status-action").expect("undo from B's editor");
+    app.wait_for("id:recovery-banner").expect("the rows return");
+    assert_eq!(checkpoint_files(&keys), 2, "nothing was deleted");
+}
+
 /// For the file a rejoined path's checkpoint is named by.
 fn record_path(key: &RecoveryKey) -> std::path::PathBuf {
     mt_core::runtime_paths::recovery_dir()

@@ -182,6 +182,69 @@ These override any conflicting text in the advisor body below.
           turn. A transition delivered then cancels the hold.
         - Test through injectable queue-status, key-state and transition sources: a release and re-press queued at
           886/894 ms, while the hook has not yet seen them at 900 ms, sends nothing.
+    - **Superseded by amendment 15.** The thread hook and `GetQueueStatus` above do not work in nsh 0.6.1.
+15. **Keyboard hold mechanism (replaces the mechanism in amendment 11; PR #72 review).**
+    - **Why the old one fails.** nsh 0.6.1 receives keyboard messages on its Win32 window thread and runs app callbacks
+      on a separate engine thread (`nsh-platform-windows` `surface.rs`).
+      - A `WH_KEYBOARD` thread hook installed from a callback watches the wrong thread.
+      - `GetQueueStatus` only describes the calling thread's queue.
+    - **Mechanism.**
+      - While a keyboard hold charges, run a low-level keyboard hook (`WH_KEYBOARD_LL`) on a dedicated hook thread
+        that pumps its own message loop. The hook is installed when the hold starts and removed when it ends.
+      - The hook proc only records `Enter`/modifier transitions into an atomic, and always calls `CallNextHookEx`.
+      - A low-level hook sees input before any thread queue and before `GetAsyncKeyState` changes. So at the decision
+        moment, "no transition recorded and both keys down per `GetAsyncKeyState`" proves a continuous hold, up to a
+        release that lands at the deadline itself, which is acceptable.
+      - Drop `GetQueueStatus`.
+    - **Fail closed.** If the thread or hook cannot start, or is removed early, the keyboard hold never authorizes.
+      Removal failure keeps the handle and refuses a new install until it is removed.
+      - Install and remove are paired on every path: success, cancel, card rebuild, unmount. Test that pairing with a
+        counting fake.
+    - **One input path per hold.**
+      - A hold is owned by the input that started it: the pointer, `Ctrl+Enter`, or `Enter`/`Space` on the focused
+        Send control.
+      - A press through another path, or a second non-repeat press on the same path, cancels the hold to zero and its
+        completion timer with it. A new hold starts from 0.
+      - `Enter`/`Space` on the Send control use the same hook-plus-key-state proof as `Ctrl+Enter`.
+    - **Window deactivation cancels.** Losing the foreground window (`WM_ACTIVATE` inactive or nsh's window-blur
+      event), from any focus, cancels any hold. At decision time the foreground window must belong to this process.
+    - **Tests** use injectable hook, key-state and foreground sources:
+      - Ctrl released and pressed again mid-hold sends nothing;
+      - a pointer press during a keyboard hold, followed by holding the pointer for the rest, sends nothing;
+      - two short `Enter` presses on Send, 500 ms apart, send nothing;
+      - window deactivation with the keys still down sends nothing;
+      - a hook that fails to start, or fails to remove, never authorizes and does not leak;
+      - a clean continuous hold sends exactly once.
+16. **Consent keys follow focus (owner decision, 2026-11-25; replaces amendments 11 and 15).**
+    - **Why.** Five review rounds found authorization gaps in every focus-independent design: thread hooks, queue
+      checks, and low-level hooks racing the async key state. The owner chose the focus-based mechanism instead.
+    - **Focus.** The consent card takes keyboard focus when it opens. Focus stays inside the card (Send and Cancel)
+      while it is open.
+    - **Hold.** A keyboard hold is measured only from `KeyDown`/`KeyUp` events delivered to the focused card:
+      - `Ctrl+Enter` anywhere in the card;
+      - `Enter`/`Space` on Send.
+    - **Cancel.** Any of these cancels the hold to zero, together with its completion timer, and a new hold starts
+      from 0:
+      - a `KeyUp` of `Enter` or the modifier;
+      - a non-repeat `KeyDown` of either key;
+      - blur, card unmount, or window deactivation;
+      - a press through another input path.
+    - **First press.** The press that opened the card never counts. The card arms only after that key is released, as
+      it does today.
+    - **Removed.**
+      - The system keyboard hook, the hook thread, `GetQueueStatus`, the `GetAsyncKeyState` and foreground polling,
+        and the `test-harness` keyboard source injection.
+      - Headless tests drive real `KeyDown`/`KeyUp` events into the focused card instead.
+    - **Unchanged.** The pointer hold works on every platform, and one input path per hold still applies.
+    - **`AGENTS.md`.** Its consent-key invariant is updated in the same PR.
+    - **Tests:**
+      - continuous hold sends once;
+      - release and re-press mid-hold sends nothing;
+      - blur or window deactivation mid-hold sends nothing;
+      - a mixed pointer/keyboard path sends nothing;
+      - a short press sends nothing;
+      - the opening press does not arm;
+      - the card holds focus when it opens.
 12. **Undo commit boundary (amends Done when 4 and amendment 2).**
     - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
       pending slot. When the slot is taken, the older action's Undo ends at the same moment.

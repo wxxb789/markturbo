@@ -44,7 +44,7 @@ use nsh_core::{
 
 use crate::{
     i18n::{self, Key},
-    state::AppState,
+    state::{AppState, flow_copy},
     ui::{
         motion::{
             EASE_IN_OUT, EASE_OUT, IGNITE_MS, LINEAR, OUTBOUND_DECAY_MS, REDUCED_CROSSFADE_MS,
@@ -78,6 +78,9 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
     // re-resolution may put a different file at the same index, and that file
     // must not open unasked.
     let expanded = signal(None::<PathBuf>);
+    // The profile's assumptions collapse by default: they are verification
+    // detail, not the chain the user acts on.
+    let assumptions_open = signal(false);
     view()
         .test_id("context-field")
         .w_full()
@@ -96,7 +99,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                 .child(busy_line(state.clone(), language))
                 .child(error_line(state.clone()))
                 .child(status_line(state.clone(), language))
-                .child(diagnostics(state.clone()))
+                .child(diagnostics(state.clone(), language))
                 .child(no_sources_line(state.clone(), language))
                 .child(each(
                     move || source_rows(&rows_state, language),
@@ -108,7 +111,11 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                 ))
                 .child(instructions_section(state.clone(), language))
                 .child(skills_section(state.clone(), language))
-                .child(assumptions_section(state.clone(), language))
+                .child(assumptions_section(
+                    state.clone(),
+                    language,
+                    assumptions_open,
+                ))
                 .child(project_root_line(state.clone(), language)),
         )
         .child(
@@ -221,24 +228,24 @@ fn status_line(state: AppState, language: Language) -> impl IntoElement {
     )
 }
 
-/// Resolution diagnostics: what could not be read or is not followed. Their
-/// messages are the resolver's, shown as they are; errors in the danger ink,
-/// warnings at resting ink. Two informative notices are kept because they
+/// Resolution diagnostics: what could not be read or is not followed. The
+/// resolver's codes are rendered as localized templates; errors in the danger
+/// ink, warnings at resting ink. Two informative notices are kept because they
 /// change what the rows mean — a duplicated source and a duplicated line are
 /// deduplicated in the request while every row still shows its own bytes; the
 /// rest (truncation, no instructions) the rows already carry.
 ///
 /// Every conditional block of this surface is a `when` region and not an
 /// empty view: a region's content goes, an empty view would still take a gap.
-fn diagnostics(state: AppState) -> impl IntoElement {
+fn diagnostics(state: AppState, language: Language) -> impl IntoElement {
     let condition_state = state.clone();
     let rows_state = state.clone();
     when(
-        move || !diagnostic_rows(&condition_state).is_empty(),
+        move || !diagnostic_rows(&condition_state, language).is_empty(),
         move || {
             let rows_state = rows_state.clone();
             view().flex_col().gap(px(SPACE_2)).child(each(
-                move || diagnostic_rows(&rows_state),
+                move || diagnostic_rows(&rows_state, language),
                 |row: &DiagnosticRow| row.key.clone(),
                 move |row, _| {
                     let severity = row.get().severity;
@@ -796,8 +803,13 @@ fn instruction_ink() -> Color {
 
 /// The profile's assumptions: what the frozen `codex-agents-md` profile takes
 /// for granted, including what it does not claim. They travel with every
-/// context-backed request, so they are shown as they are, at faint ink.
-fn assumptions_section(state: AppState, language: Language) -> impl IntoElement {
+/// context-backed request, so they stay inspectable — collapsed behind their
+/// own quiet action by default, at faint ink when open.
+fn assumptions_section(
+    state: AppState,
+    language: Language,
+    open: Signal<bool>,
+) -> impl IntoElement {
     let condition_state = state.clone();
     let rows_state = state.clone();
     when(
@@ -809,25 +821,40 @@ fn assumptions_section(state: AppState, language: Language) -> impl IntoElement 
         },
         move || {
             let rows_state = rows_state.clone();
-            view().flex_col().gap(px(SPACE_2)).child(each(
-                move || {
-                    rows_state
-                        .context_resolved
-                        .get()
-                        .map(|resolved| resolved.assumptions)
-                        .unwrap_or_default()
-                },
-                |assumption: &String| assumption.clone(),
-                move |assumption: ReadSignal<String>, _| {
-                    prims::faint(move || {
-                        format!(
-                            "{}: {}",
-                            i18n::t(language, Key::Assumption),
-                            assumption.get()
-                        )
-                    })
-                },
-            ))
+            let toggle = open;
+            view()
+                .flex_col()
+                .gap(px(SPACE_2))
+                .child(prims::quiet_action(
+                    "context-profile-details",
+                    s(S::ProfileRules, language),
+                    move || toggle.update(|open| *open = !*open),
+                ))
+                .child(when(
+                    move || toggle.get(),
+                    move || {
+                        let rows_state = rows_state.clone();
+                        view().flex_col().gap(px(SPACE_2)).child(each(
+                            move || {
+                                rows_state
+                                    .context_resolved
+                                    .get()
+                                    .map(|resolved| resolved.assumptions)
+                                    .unwrap_or_default()
+                            },
+                            |assumption: &String| assumption.clone(),
+                            move |assumption: ReadSignal<String>, _| {
+                                prims::faint(move || {
+                                    format!(
+                                        "{}: {}",
+                                        i18n::t(language, Key::Assumption),
+                                        assumption.get()
+                                    )
+                                })
+                            },
+                        ))
+                    },
+                ))
         },
     )
 }
@@ -1018,34 +1045,66 @@ fn project_root_line(state: AppState, language: Language) -> impl IntoElement {
 }
 
 /// The state's one next action: the review, with what is selected riding
-/// along; with nothing selected it is the ordinary review.
+/// along; with nothing selected it is the ordinary review. With no document
+/// open there is nothing to review, so the action is disabled in place.
 fn review_action(state: AppState, language: Language) -> impl IntoElement {
     let count_state = state.clone();
     let selected_state = state.clone();
-    view().flex_shrink_0().child(
-        when(
-            move || !count_state.context_selected.get().is_empty(),
-            move || {
-                let press_state = state.clone();
-                prims::primary_action(
-                    "context-review",
-                    i18n::t(language, Key::ReviewWithContext),
-                    move || press_state.review_with_context(),
-                )
-            },
+    let enabled_with_context = state.clone();
+    let hint_state = state.clone();
+    let enabled_plain = state;
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_2))
+        .flex_shrink_0()
+        .child(
+            when(
+                move || !count_state.context_selected.get().is_empty(),
+                move || {
+                    let press_state = selected_state.clone();
+                    let enabled = enabled_with_context.clone();
+                    prims::primary_action(
+                        "context-review",
+                        i18n::t(language, Key::ReviewWithContext),
+                        move || press_state.review_with_context(),
+                    )
+                    .disabled(move || context_review_disabled(&enabled))
+                    .disabled_style(|style| style.opacity(0.5))
+                },
+            )
+            .otherwise({
+                let press_state = enabled_plain;
+                move || {
+                    let press_state = press_state.clone();
+                    let enabled = press_state.clone();
+                    prims::primary_action(
+                        "context-review",
+                        i18n::t(language, Key::Review),
+                        move || press_state.review_with_context(),
+                    )
+                    .disabled(move || context_review_disabled(&enabled))
+                    .disabled_style(|style| style.opacity(0.5))
+                }
+            }),
         )
-        .otherwise({
-            let press_state = selected_state;
+        .child(when(
+            move || hint_state.review_busy_elsewhere.get(),
             move || {
-                let press_state = press_state.clone();
-                prims::primary_action(
-                    "context-review",
-                    i18n::t(language, Key::Review),
-                    move || press_state.review_with_context(),
-                )
-            }
-        }),
-    )
+                view()
+                    .test_id("context-review-wait")
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
+                    .child(
+                        prims::faint(move || flow_copy::S::ReviewWaitingElsewhere.text(language))
+                            .truncate(),
+                    )
+            },
+        ))
+}
+
+fn context_review_disabled(state: &AppState) -> bool {
+    state.active.get().is_none() || state.review_busy_elsewhere.get()
 }
 
 /// The scope a source in the chain covers: a global source applies to every
@@ -1190,7 +1249,7 @@ struct DiagnosticRow {
     severity: Severity,
 }
 
-fn diagnostic_rows(state: &AppState) -> Vec<DiagnosticRow> {
+fn diagnostic_rows(state: &AppState, language: Language) -> Vec<DiagnosticRow> {
     let Some(resolved) = state.context_resolved.get() else {
         return Vec::new();
     };
@@ -1206,10 +1265,94 @@ fn diagnostic_rows(state: &AppState) -> Vec<DiagnosticRow> {
         })
         .map(|diagnostic| DiagnosticRow {
             key: SharedString::from(diagnostic.to_string()),
-            message: SharedString::from(diagnostic.message.clone()),
+            message: SharedString::from(diagnostic_message(diagnostic, language)),
             severity: diagnostic.severity,
         })
         .collect()
+}
+
+/// One resolver diagnostic as the field reads it: the internal codes are
+/// rendered as localized templates, never as the resolver's own English.
+/// A `{path}: {error}` message keeps the OS's own error text; the resolver's
+/// explanation is always replaced.
+fn diagnostic_message(diagnostic: &mt_core::diagnostic::Diagnostic, language: Language) -> String {
+    let raw = diagnostic.message.as_str();
+    if language == Language::English {
+        return match diagnostic.source.as_str() {
+            "context.global-read" | "context.project-read" | "context.unsupported-remote" => {
+                match raw.split_once(": ") {
+                    Some((path, error)) => format!("Could not read {path}: {error}"),
+                    None => raw.to_owned(),
+                }
+            }
+            "context.project-unavailable" => {
+                "Project instructions could not be read; their content is unavailable.".to_owned()
+            }
+            _ => raw.to_owned(),
+        };
+    }
+    match diagnostic.source.as_str() {
+        "context.duplicate-source" | "context.duplicate-directive" => {
+            match raw.split_once(" duplicates ") {
+                Some((path, previous)) => format!("{path} 与 {previous} 内容重复"),
+                None => "重复的指令来源。".to_owned(),
+            }
+        }
+        "context.global-read" | "context.project-read" => match raw.split_once(": ") {
+            Some((path, error)) => format!("无法读取 {path}：{error}"),
+            None => "无法读取指令文件。".to_owned(),
+        },
+        // The error half can be the resolver's own English, so only the path
+        // survives.
+        "context.unsupported-remote" => match raw.split_once(": ") {
+            Some((path, _)) => format!("无法访问远程指令文件：{path}"),
+            None => "无法访问远程指令文件。".to_owned(),
+        },
+        "context.cyclic-discovery" => match raw.split_once(": ") {
+            Some((path, error)) => format!("{path}：发现路径循环，无法继续读取（{error}）。"),
+            None => "发现路径循环。".to_owned(),
+        },
+        "context.invalid-path" => {
+            if let Some((name, error)) = raw.split_once(": ") {
+                return format!("无法解析 {name} 路径：{error}");
+            }
+            if raw.ends_with("must be an absolute lexical path without parent traversal.") {
+                return "路径必须是绝对路径，且不能包含上级目录。".to_owned();
+            }
+            if raw.ends_with("must name an existing directory.") {
+                return "路径必须指向已存在的目录。".to_owned();
+            }
+            format!("无法解析此路径：{raw}")
+        }
+        "context.outside-workspace" => "目标文件与执行目录都必须位于已打开的工作区内。".to_owned(),
+        "context.unsupported-configuration" => "指令文件名必须相对于其发现目录。".to_owned(),
+        "context.unsupported-profile" => "仅冻结的 Codex 配置支持有效上下文解析。".to_owned(),
+        "context.profile-snapshot" => "内置配置未建立冻结的解析规则，无法解析此文件。".to_owned(),
+        "context.unsupported-metadata" => match raw.split_once(": ") {
+            Some((path, _)) => {
+                format!("{path}：元数据会作为普通指令文本，不会成为 Codex 适用规则。")
+            }
+            None => "元数据会作为普通指令文本，不会成为 Codex 适用规则。".to_owned(),
+        },
+        "context.unsupported-import" => match raw.split_once(": ") {
+            Some((path, _)) => format!("{path}：不会跟随类似 import 的文本。"),
+            None => "不会跟随类似 import 的文本。".to_owned(),
+        },
+        "context.unsupported-scope" => match raw.split_once(": ") {
+            Some((path, _)) => {
+                format!("{path}：类似作用域的文本不会改变 Codex 的发现适用范围。")
+            }
+            None => "类似作用域的文本不会改变 Codex 的发现适用范围。".to_owned(),
+        },
+        "context.malformed-metadata" => match raw.split_once(": ") {
+            Some((path, _)) => {
+                format!("{path}：未闭合的类元数据块仍作为普通指令文本。")
+            }
+            None => "未闭合的类元数据块仍作为普通指令文本。".to_owned(),
+        },
+        "context.project-unavailable" => "无法读取项目指令；其内容不可用。".to_owned(),
+        _ => "无法解析此指令来源。请检查项目指令文件后重试。".to_owned(),
+    }
 }
 
 /// A danger-ink line; the foundation's primitives stop at faint.
@@ -1240,12 +1383,13 @@ enum S {
     Empty,
     ContentUnavailable,
     ProjectRoot,
+    ProfileRules,
 }
 
 fn s(key: S, language: Language) -> &'static str {
     match (key, language) {
-        (S::Context, Language::English) => "Context",
-        (S::Context, Language::Chinese) => "上下文",
+        (S::Context, Language::English) => "Agent Context",
+        (S::Context, Language::Chinese) => "智能体上下文",
         (S::OrderCaption, Language::English) => "Applies to this file, in this order",
         (S::OrderCaption, Language::Chinese) => "按此顺序应用于此文件",
         (S::LaterOverrides, Language::English) => "Later overrides earlier",
@@ -1257,15 +1401,19 @@ fn s(key: S, language: Language) -> &'static str {
         (S::NoSources, Language::English) => "No AGENTS.md file applies to this file",
         (S::NoSources, Language::Chinese) => "没有 AGENTS.md 文件适用于此文件",
         (S::StatusPartial, Language::English) => {
-            "Partially resolved \u{2014} project instructions are unavailable"
+            "Partially resolved — some project instruction files could not be read."
         }
-        (S::StatusPartial, Language::Chinese) => "部分解析——项目指令不可用",
-        (S::StatusInvalid, Language::English) => "Not resolved for this file",
-        (S::StatusInvalid, Language::Chinese) => "未能为此文件解析",
+        (S::StatusPartial, Language::Chinese) => "部分解析——部分项目指令文件无法读取。",
+        (S::StatusInvalid, Language::English) => {
+            "Could not resolve instructions for this file. Open a workspace folder and try Refresh."
+        }
+        (S::StatusInvalid, Language::Chinese) => {
+            "无法解析此文件的指令。请打开工作区文件夹并点击“刷新”。"
+        }
         (S::StatusInventory, Language::English) => {
-            "Inventory only \u{2014} no verified profile applies"
+            "Listed for information — Codex rules are not verified for this file."
         }
-        (S::StatusInventory, Language::Chinese) => "仅清单——没有已验证的 profile 适用",
+        (S::StatusInventory, Language::Chinese) => "仅供查看——尚未验证此文件的 Codex 规则。",
         (S::AppliesEverywhere, Language::English) => "Applies to every project",
         (S::AppliesEverywhere, Language::Chinese) => "适用于所有项目",
         (S::AppliesFromRoot, Language::English) => "Applies from the repository root",
@@ -1276,6 +1424,8 @@ fn s(key: S, language: Language) -> &'static str {
         (S::ContentUnavailable, Language::Chinese) => "内容不可用",
         (S::ProjectRoot, Language::English) => "Project root",
         (S::ProjectRoot, Language::Chinese) => "项目根目录",
+        (S::ProfileRules, Language::English) => "Profile rules & assumptions",
+        (S::ProfileRules, Language::Chinese) => "规则与假设说明",
     }
 }
 
@@ -1484,16 +1634,19 @@ mod tests {
         assert!(at("Applies under docs/") < at("Not applied by Codex"));
         assert!(at("Not applied by Codex") < at("fix-bug"));
         assert_eq!(app.screen().count("id:context-include-2").unwrap(), 1);
-        // The profile's assumptions travel with every context-backed request,
-        // so they are on screen (at faint ink); a source's own text is not —
-        // it waits behind its row's press.
+        // The profile's assumptions travel with every context-backed request:
+        // they stay inspectable behind `Profile rules & assumptions`, closed
+        // by default. A source's own text is not on screen — it waits behind
+        // its row's press.
         assert!(
-            shown.contains("Assumption: This profile freezes inspected source semantics"),
-            "{shown}"
+            !shown.contains("Assumption: This profile freezes inspected source semantics"),
+            "assumptions start collapsed:\n{shown}"
         );
+        app.press("id:context-profile-details")
+            .expect("open the profile rules and assumptions");
+        app.wait_for("text:/^Assumption: This profile freezes inspected source semantics/")
+            .expect("the assumptions are inspectable");
         assert!(!shown.contains("Project rules."), "{shown}");
-        // A clean resolution has no status line of its own.
-        assert!(!shown.contains("Not resolved for this file"), "{shown}");
 
         // The surface fills the field under the title row, the rows sit in
         // it and the actions below them: a percentage height would collapse
@@ -1553,6 +1706,17 @@ mod tests {
         app.wait_for("text:selected:1")
             .expect("the selection recorded");
 
+        // Refresh re-resolves the same chain: the included source still
+        // resolves, so the choice survives instead of being wiped.
+        app.press("label:Refresh").expect("refresh the chain");
+        app.wait(Duration::from_millis(300))
+            .expect("let the resolution land");
+        assert!(
+            app.shows("selected:1"),
+            "the inclusion survives a Refresh: {:?}",
+            app.screen().texts()
+        );
+
         // The path opens the text that would leave — and reading it keeps the
         // selection (opening the file as a document would clear it).
         app.press("text:docs/AGENTS.md")
@@ -1610,5 +1774,167 @@ mod tests {
         app.press("label:Close").expect("close the context");
         app.wait_for_gone("id:context-field", Duration::from_secs(5))
             .expect("the field closed");
+    }
+
+    #[test]
+    fn resolver_diagnostics_are_localized_templates() {
+        let duplicate = mt_core::diagnostic::Diagnostic::info(
+            "context.duplicate-source",
+            "a.md duplicates b.md",
+        );
+        assert_eq!(
+            diagnostic_message(&duplicate, Language::English),
+            "a.md duplicates b.md"
+        );
+        assert_eq!(
+            diagnostic_message(&duplicate, Language::Chinese),
+            "a.md 与 b.md 内容重复"
+        );
+        let read = mt_core::diagnostic::Diagnostic::error(
+            "context.project-read",
+            "C:/x/AGENTS.md: access denied",
+        );
+        assert_eq!(
+            diagnostic_message(&read, Language::Chinese),
+            "无法读取 C:/x/AGENTS.md：access denied"
+        );
+        let scope = mt_core::diagnostic::Diagnostic::warning(
+            "context.unsupported-scope",
+            "C:/x/AGENTS.md: scope-like text does not alter Codex discovery applicability",
+        );
+        assert_eq!(
+            diagnostic_message(&scope, Language::Chinese),
+            "C:/x/AGENTS.md：类似作用域的文本不会改变 Codex 的发现适用范围。"
+        );
+        // A source this build does not know never leaks the resolver's
+        // English into a Chinese line.
+        let unknown = mt_core::diagnostic::Diagnostic::error(
+            "context.future-code",
+            "Some new English detail.",
+        );
+        assert_eq!(
+            diagnostic_message(&unknown, Language::Chinese),
+            "无法解析此指令来源。请检查项目指令文件后重试。"
+        );
+        assert_eq!(
+            diagnostic_message(&unknown, Language::English),
+            "Some new English detail."
+        );
+
+        // A resolver-authored explanation never survives in a Chinese line,
+        // whether it is the whole message or the part after the path.
+        let remote = mt_core::diagnostic::Diagnostic::error(
+            "context.unsupported-remote",
+            "Remote context paths are not supported.",
+        );
+        let remote_path = mt_core::diagnostic::Diagnostic::error(
+            "context.unsupported-remote",
+            "C:/x/AGENTS.md: Remote context paths are not supported.",
+        );
+        for message in [
+            diagnostic_message(&remote, Language::Chinese),
+            diagnostic_message(&remote_path, Language::Chinese),
+        ] {
+            assert!(
+                !message.contains("Remote"),
+                "the resolver's English is not spliced: {message}"
+            );
+        }
+        let changed_shape = mt_core::diagnostic::Diagnostic::error(
+            "context.project-read",
+            "the resolver changed shape",
+        );
+        assert!(
+            !diagnostic_message(&changed_shape, Language::Chinese)
+                .contains("the resolver changed shape"),
+            "an unparsed fallback does not splice the raw message"
+        );
+    }
+
+    #[component]
+    fn NoDocumentFieldProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let root = PathBuf::from(std::env::var_os("MT_CONTEXT_FIXTURE").expect("fixture root"));
+        state.open_folder(root);
+        state.toggle_context();
+        let field_state = state.clone();
+        let open_state = state.context_open;
+        view().flex_col().child(when(
+            move || open_state.get(),
+            move || crate::ui::context::field(field_state.clone(), Language::English),
+        ))
+    }
+
+    #[test]
+    fn review_is_disabled_with_no_document_open() {
+        let _fixture = Fixture::new();
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<NoDocumentFieldProbe>())).expect("start");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("wide viewport");
+        app.wait_for("id:context-review")
+            .expect("the review action");
+        assert!(
+            app.press("id:context-review").is_err(),
+            "a disabled Review cannot be pressed"
+        );
+    }
+
+    #[component]
+    fn WaitingFieldProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let root = PathBuf::from(std::env::var_os("MT_CONTEXT_FIXTURE").expect("fixture root"));
+        state.root.set(Some(root.clone()));
+        state.open_file(root.join("docs").join("plan.md"));
+        state.toggle_context();
+        let armed = state.clone();
+        effect(move || {
+            if armed.context_resolved.get().is_none() {
+                return;
+            }
+            if armed.context_selected.get().is_empty() {
+                armed.context_selected.set(vec![2]);
+                return;
+            }
+            let active = armed.active.get_untracked().expect("a document");
+            armed.arm_review_in_flight(active + 1);
+            armed.review_with_context();
+        });
+        let field_state = state.clone();
+        let open_state = state.context_open;
+        view().flex_col().child(when(
+            move || open_state.get(),
+            move || crate::ui::context::field(field_state.clone(), Language::English),
+        ))
+    }
+
+    #[test]
+    fn a_review_elsewhere_disables_review_with_context_and_keeps_the_panel() {
+        let _fixture = Fixture::new();
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<WaitingFieldProbe>())).expect("start");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("wide viewport");
+        app.wait_for("id:context-review >> text:Review with selected context")
+            .expect("the context-backed action");
+        assert!(
+            app.screen()
+                .accessibility_state("id:context-review")
+                .expect("the action's state")
+                .disabled,
+            "Review with context waits"
+        );
+        app.wait_for("id:context-review-wait >> text:Waiting for Review on another document.")
+            .expect("the reason is visible");
+        assert!(
+            app.press("id:context-review").is_err(),
+            "a waiting Review with context cannot be pressed"
+        );
+        assert_eq!(
+            app.screen().matches("id:consent-card"),
+            Ok(false),
+            "no consent card opened under the wait: {:?}",
+            app.screen().texts()
+        );
     }
 }
