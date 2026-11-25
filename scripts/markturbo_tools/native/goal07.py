@@ -64,12 +64,12 @@ REVISION_REJECT_AUTOMATION_ID = "revision-reject"
 REVISION_DONE_AUTOMATION_ID = "revision-done"
 REVISION_UNDO_AUTOMATION_ID = "revision-undo"
 REVISION_DECISION_WORDS = ("Accepted", "Rejected")
-REVISION_PART_CHANGED_TEXT = "Can't apply \u2014 this part changed"
+REVISION_PART_CHANGED_TEXT = "Can't apply \u2014 this section was edited since the review."
 REVISION_COPY_AUTOMATION_ID = "revision-copy"
 REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
 REVISION_PROPOSAL_AFTER_NAME = "Proposed text"
 # `state.rs` `finish_revision`: Done's outcome line with an accepted hunk.
-REVISION_APPLIED = "Approved changes applied to the buffer."
+REVISION_APPLIED = "Approved changes applied to the document \u2014 press Ctrl+S to save to disk."
 CASE_REVISION_SESSION = "revision_session"
 CASE_FLOWS = {
     CASE_REVISION_SESSION: (

@@ -14,6 +14,8 @@ use nsh_core::element::{Idiom, Os};
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 const SOURCE: &str = "Original\nUnchanged\n";
@@ -267,14 +269,14 @@ fn ctrl_enter_from_the_focused_editor_is_done_while_hunks_are_docked() {
     let (mut app, _directory, _config) = start(false);
     app.press("id:title-review").expect("start review");
     app.wait_for("id:consent-card").expect("review disclosure");
-    app.long_press("id:consent-send").expect("send review");
+    support::hold_send(&mut app);
     app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("review ready");
     app.press("label:Prepare revision")
         .expect("prepare revision");
     app.wait_for("text:Ask for a revision?")
         .expect("revision disclosure");
-    app.long_press("id:consent-send").expect("send revision");
+    support::hold_send(&mut app);
     app.wait_for_within("id:revision-accept", Duration::from_secs(20))
         .expect("the hunks arrive");
     app.press("label:Accept").expect("accept the first hunk");
@@ -397,7 +399,6 @@ fn a_refocus_in_the_middle_of_a_ctrl_enter_hold_keeps_one_tap_from_sending() {
 #[test]
 fn a_ctrl_release_and_repress_mid_hold_sends_nothing_from_the_editor() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // The same manual clock and reduced motion as the held-key test above.
     let (mut app, _directory, _config) = start(true);
     app.press("id:title-review").expect("start review");
     app.wait_for("id:consent-card").expect("review disclosure");

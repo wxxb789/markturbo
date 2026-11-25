@@ -10,6 +10,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 const SKILL: &str = "---\nname: tool\ndescription: Runs the tool.\n---\n# Tool\n\nFollow [the guide](references/guide.md).\n";
 
 #[test]
@@ -117,7 +119,7 @@ fn a_package_missing_a_referenced_file_is_reviewed_as_partial() {
         .expect("the omission is disclosed");
     assert!(app.shows("references/guide.md"), "the omitted path");
     assert!(app.shows("referenced file not found"), "why it is not sent");
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     let body = received
         .recv_timeout(Duration::from_secs(20))
         .expect("the request reached the endpoint");
@@ -142,7 +144,7 @@ fn a_package_missing_a_referenced_file_is_reviewed_as_partial() {
             .is_ok(),
         "nothing stays behind"
     );
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     let body = received
         .recv_timeout(Duration::from_secs(20))
         .expect("the second request reached the endpoint");

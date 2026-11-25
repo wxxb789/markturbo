@@ -151,8 +151,11 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     let review_state = state.clone();
     effect(move || bind_mod_enter(&review_state));
 
+    let menu = MenuMotion::new();
+
     // Escape stands a waiting Translation down, as it does a waiting Review:
-    // the late answer is discarded by generation and nothing is applied.
+    // the late answer is discarded by generation and nothing is applied. The
+    // menu is the topmost layer: while it is open, Escape closes it alone.
     let translation_state = state.clone();
     effect(move || {
         if !translation_state.translation_busy.get() {
@@ -165,11 +168,17 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
                 when: When::Always,
                 ..KeyOptions::default()
             },
-            move |_| keys_state.cancel_translation_in_flight(),
+            move |_| {
+                // Only the newest matching binding fires: this one stands in
+                // for the menu's own Escape while it is open.
+                if menu.is_open() {
+                    menu.close();
+                } else {
+                    keys_state.cancel_translation_in_flight();
+                }
+            },
         );
     });
-
-    let menu = MenuMotion::new();
 
     // The menu's document commands, reachable without it.
     let open_state = state.clone();

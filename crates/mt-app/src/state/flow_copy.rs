@@ -1,5 +1,3 @@
-//! Localized status copy for the review, revision and translation flows.
-
 use mt_core::settings::Language;
 
 use crate::ui::titlebar;
@@ -113,7 +111,6 @@ impl S {
     }
 }
 
-/// The status for an operation that failed, with the error's own text.
 pub(crate) fn failed(s: S, language: Language, error: &dyn std::fmt::Display) -> String {
     let label = s.text(language);
     match language {
@@ -122,7 +119,6 @@ pub(crate) fn failed(s: S, language: Language, error: &dyn std::fmt::Display) ->
     }
 }
 
-/// Why a revision request failed, with what happens to the answers.
 pub(crate) fn revision_failed(language: Language, error: &dyn std::fmt::Display) -> String {
     let label = S::RevisionFailed.text(language);
     match language {
@@ -133,7 +129,6 @@ pub(crate) fn revision_failed(language: Language, error: &dyn std::fmt::Display)
     }
 }
 
-/// Why a revision task could not finish, with what happens to the answers.
 pub(crate) fn revision_task_failed(language: Language, error: &dyn std::fmt::Display) -> String {
     let label = S::RevisionTaskFailed.text(language);
     match language {
@@ -144,18 +139,20 @@ pub(crate) fn revision_task_failed(language: Language, error: &dyn std::fmt::Dis
     }
 }
 
-/// Why a translation failed, with what happened to the document.
+/// Why a translation failed, with what happened to the document. Every
+/// `TranslationError` is the app's own English, so the Chinese line states
+/// the outcome without splicing it; only the operating system's text may keep
+/// its language.
 pub(crate) fn translation_failed(language: Language, error: &dyn std::fmt::Display) -> String {
     let label = S::TranslationFailed.text(language);
     match language {
         Language::English => {
             format!("{label} ({error}). The document was not changed — try again.")
         }
-        Language::Chinese => format!("{label}（{error}）。文档未做任何更改——请重试。"),
+        Language::Chinese => format!("{label}。文档未做任何更改——请重试。"),
     }
 }
 
-/// What a completed translation did, and the key that saves it.
 pub(crate) fn translation_done(language: Language, segments: usize, target: &str) -> String {
     let shortcut = titlebar::shortcut(false, "S");
     match language {
@@ -168,10 +165,35 @@ pub(crate) fn translation_done(language: Language, segments: usize, target: &str
     }
 }
 
-/// The ready line, with its key.
 pub(crate) fn revision_applied(language: Language) -> String {
     let shortcut = titlebar::shortcut(false, "S");
     S::RevisionApplied
         .text(language)
         .replace("{mod+S}", &shortcut)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mt_core::{
+        model::{EndpointIdentity, Provider},
+        translate::provider::TranslationError,
+    };
+
+    #[test]
+    fn a_chinese_translation_failure_omits_the_app_english() {
+        let endpoint =
+            EndpointIdentity::parse(Provider::OpenAiChat, None).expect("the default endpoint");
+        let error = TranslationError::InvalidTranslationResponse {
+            provider: Provider::OpenAiChat,
+            endpoint,
+        };
+        let message = translation_failed(Language::Chinese, &error);
+        assert!(
+            !message.contains("invalid") && !message.contains("OpenAI"),
+            "the app's English detail is not spliced: {message}"
+        );
+        assert!(message.contains("翻译失败"), "the localized label stays");
+        assert!(message.contains("请重试"), "the next step stays");
+    }
 }

@@ -83,7 +83,7 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
     );
     app.press("id:title-review").expect("prepare Review");
     app.wait_for("id:consent-card").expect("Review disclosure");
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("Review ready");
     app.wait_for(&format!("text:{question}"))
@@ -116,7 +116,7 @@ fn cancelling_revision_stops_the_pending_request_and_restores_review() {
             .expect("the finding selector"),
         "preparing Revision hides the expanded finding"
     );
-    app.long_press("id:consent-send").expect("send Revision");
+    support::hold_send(&mut app);
     request_received
         .recv_timeout(Duration::from_secs(5))
         .expect("request waiting for headers");
@@ -264,7 +264,7 @@ fn partial_accept_records_the_final_split_once() {
 
     app.press("id:title-review").expect("start review");
     app.wait_for("id:consent-card").expect("review disclosure");
-    app.long_press("id:consent-send").expect("send review");
+    support::hold_send(&mut app);
     app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("review ready");
 
@@ -273,7 +273,7 @@ fn partial_accept_records_the_final_split_once() {
         .expect("prepare revision");
     app.wait_for("text:Ask for a revision?")
         .expect("revision disclosure names the revision");
-    app.long_press("id:consent-send").expect("send revision");
+    support::hold_send(&mut app);
     // The hunks arrive with the reading position on the first group.
     app.wait_for("id:revision-accept").expect("revision hunk");
     app.wait_for(
@@ -963,11 +963,12 @@ fn RevisionAcrossDocuments() -> impl IntoElement {
         }))
 }
 
-/// A Revision answer that arrives after its Review was reset (here by a
-/// Review of another document) belongs to no live proposal: it shows no
-/// hunks, and nothing of it can be accepted into either document.
+/// Preparing a new Review does not cancel an in-flight Revision; only
+/// sending it does. The late answer presents on its own tab and cannot be
+/// applied from another one, and the send clears it without writing either
+/// document.
 #[test]
-fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
+fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
     let _guard = TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -978,7 +979,7 @@ fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
     let (release, released) = std::sync::mpsc::channel::<()>();
     let (answered, answer_sent) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..3 {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
@@ -986,7 +987,6 @@ fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
             let request: serde_json::Value =
                 serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
             if request["stream"].as_bool().unwrap_or(false) {
-                // Held back until the test has reset the Review.
                 let _ = released.recv();
                 write_sse(&mut stream, &revision_output);
                 let _ = answered.send(());
@@ -1039,16 +1039,23 @@ fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
     app.wait_for("text:Busy: true")
         .expect("the Revision is out");
 
-    // Switch to the other document and review it: the first Review and its
-    // Revision are reset while the answer is still held back.
+    // Switch to the other document and prepare its Review: the in-flight
+    // Revision is not cancelled by the preparation alone.
     app.press("text:Open other")
         .expect("open the other document");
     app.wait_for("text:Tabs: 2")
         .expect("the other document is open");
     app.press("text:Review").expect("review the other document");
-    app.wait_for("text:Busy: false")
-        .expect("the reset clears the loading state");
+    app.wait(Duration::from_millis(300))
+        .expect("the preparation settles");
+    assert!(
+        app.shows("Busy: true"),
+        "preparing a Review must not cancel the Revision: {:?}",
+        app.screen().texts()
+    );
 
+    // The late answer lands on its own tab: its hunks present, and from the
+    // other tab nothing of them can be applied.
     release.send(()).expect("release the Revision answer");
     answer_sent
         .recv_timeout(Duration::from_secs(20))
@@ -1056,21 +1063,30 @@ fn a_revision_answer_after_its_review_was_reset_writes_nothing() {
     app.wait(Duration::from_millis(1500))
         .expect("the late answer lands");
     assert!(
-        app.shows("Hunks: 0") && app.shows("Busy: false"),
-        "a late answer to a reset Review presents nothing: {:?}",
+        app.shows("Hunks: 2") && app.shows("Busy: false"),
+        "the Revision, not its preparation, is still live: {:?}",
         app.screen().texts()
     );
     app.press("text:Approve first hunk")
-        .expect("try to accept a late hunk");
+        .expect("try to accept the other tab's hunk");
     app.wait(Duration::from_millis(300)).expect("settle");
     let both = format!("[{source}][{other_source}]");
     assert!(
         app.screen()
             .matches(&format!("text:{both}"))
             .expect("the documents selector"),
-        "neither document changes: {:?}",
+        "neither document changes from another tab: {:?}",
         app.screen().texts()
     );
+
+    // Sending the new Review is what resets the old Revision.
+    app.press("text:Send Review")
+        .expect("send the other document's Review");
+    app.wait_for("text:Hunks: 0")
+        .expect("the sent Review cleared the old Revision");
+    assert!(app.shows("Busy: false"), "the Revision is no longer live");
+    app.wait(Duration::from_millis(1500))
+        .expect("the other Review's answer lands");
     assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
     assert_eq!(std::fs::read_to_string(&other).unwrap(), other_source);
 }

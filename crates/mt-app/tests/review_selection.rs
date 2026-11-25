@@ -11,6 +11,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 const DOCUMENT: &str = "# Plan\n\nIntro OUTSIDE-BEFORE-SENTINEL.\n\nSELECTED-SENTINEL keep the target words.\n\nAfter OUTSIDE-AFTER-SENTINEL.\n";
 const SELECTED: &str = "SELECTED-SENTINEL keep the target words.";
 
@@ -153,7 +155,7 @@ fn a_selection_review_sends_only_the_selection_and_anchors_its_findings() {
     app.wait_for(&format!("text:{selected_bytes}"))
         .expect("the selection's bytes again");
 
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     let body = received
         .recv_timeout(Duration::from_secs(20))
         .expect("the request reached the endpoint");

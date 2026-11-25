@@ -12,6 +12,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 const RESULT: &str = "keep the document intent";
 
 #[test]
@@ -35,17 +37,17 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
     .to_string();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
-    let (release_second, second_waiting) = mpsc::channel();
-    std::thread::spawn(move || {
-        for request in 0..2 {
+    let (release_late, late_waiting) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        for request in 0..3 {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
             let _ = read_http_body(&mut stream);
-            if request == 1 {
-                second_waiting
+            if request == 2 {
+                late_waiting
                     .recv_timeout(Duration::from_secs(20))
-                    .expect("release the second review");
+                    .expect("release the late review");
             }
             write_review_json(&mut stream, &output);
         }
@@ -96,7 +98,7 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
     // One Review, then its result is up.
     app.press("id:title-review").expect("open Review");
     app.wait_for("id:consent-card").expect("Review disclosure");
-    app.long_press("id:consent-send").expect("send Review");
+    support::hold_send(&mut app);
     app.wait_for_within("id:review-prepare", Duration::from_secs(20))
         .expect("Review result");
     app.wait_for(&format!("text:{RESULT}"))
@@ -134,6 +136,27 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
     app.wait_for(&format!("text:{RESULT}"))
         .expect("the result shows on its own tab again");
 
+    // A Review completed on another tab does not replace this tab's result:
+    // B completes one, and coming back to A still shows A's own result.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("the other tab");
+    app.press("id:title-review")
+        .expect("prepare the other tab's Review");
+    app.wait_for("id:consent-card").expect("the disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("the other tab's result");
+    app.press_key("mod+p").expect("open the palette again");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter back to plan.md");
+    app.press("id:palette-row").expect("back to plan.md");
+    app.wait_for(&format!("text:{RESULT}"))
+        .expect("plan.md's result survived the other tab's Review");
+
     // An edit while the new consent card waits leaves the restored result
     // stale.
     app.press("id:title-review")
@@ -152,8 +175,7 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
     // discarded by generation, and the notice says nothing was applied.
     app.press("id:review-again").expect("start a fresh Review");
     app.wait_for("id:consent-card").expect("the new disclosure");
-    app.long_press("id:consent-send")
-        .expect("send the second Review");
+    support::hold_send(&mut app);
     app.wait_for("id:review-cancel")
         .expect("the waiting line is up");
     app.press_key("escape").expect("Escape cancels the wait");
@@ -174,8 +196,10 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
         notice()
     );
 
-    // The loopback answer arrives after the cancel and changes nothing.
-    release_second.send(()).expect("release the late answer");
+    // The loopback answer arrives after the cancel and changes nothing, and
+    // it cannot be reopened as a result.
+    release_late.send(()).expect("release the late answer");
+    server.join().expect("the loopback server finished");
     app.wait(Duration::from_millis(600))
         .expect("the late answer lands");
     assert!(
@@ -187,6 +211,18 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
         !app.shows(RESULT) && !app.shows("keep the document intent"),
         "nothing of the late result is shown"
     );
+    app.press("id:title-review")
+        .expect("Review after the late answer");
+    assert!(
+        app.wait_for("id:consent-card").is_ok(),
+        "the discarded result cannot be reopened; a new Review starts instead: {:?}",
+        app.screen().texts()
+    );
+    assert!(!app.shows(RESULT), "the late result never reappears");
+    app.press("id:consent-cancel-button")
+        .expect("cancel the new consent");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the consent closed");
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

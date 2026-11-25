@@ -278,6 +278,28 @@ fn session() -> Signal<Session> {
     global::<Session>()
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct SessionState(Session);
+
+pub(crate) fn capture_session(hunks: &[RevisionHunkView]) -> SessionState {
+    SessionState(session().get_untracked().synced(hunks))
+}
+
+pub(crate) fn restore_session(hunks: &[RevisionHunkView], state: SessionState) {
+    session().set(state.0.synced(hunks));
+}
+
+#[cfg(test)]
+pub(crate) fn seed_session(hunks: &[RevisionHunkView]) -> SessionState {
+    let mut current = Session::default().synced(hunks);
+    if !hunks.is_empty() {
+        current.record(hunks, 0, true);
+        current.advance(hunks, 0);
+    }
+    session().set(current.clone());
+    SessionState(current)
+}
+
 /// The identity of a proposal: its hunks' content.
 fn proposal_id(hunks: &[RevisionHunkView]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -943,7 +965,6 @@ fn decisions(
                 .justify_start()
                 .w_full()
                 .gap(px(SPACE_3))
-                // `Done` first: the field's one next action leads its footer.
                 .child(done_action(done_state, language, hunks, now))
                 .child(copy_action(copy_state, language))
                 .child(prims::quiet_action(

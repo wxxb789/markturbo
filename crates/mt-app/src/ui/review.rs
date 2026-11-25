@@ -49,8 +49,6 @@ use crate::{
 };
 
 /// Whether the field is showing a review, or explaining why it cannot.
-/// Results belong to their tab: a result whose tab is not the active one is
-/// hidden, and switching back shows it again.
 pub fn is_open(state: &AppState) -> bool {
     let belongs = state
         .review_view
@@ -140,16 +138,17 @@ fn focus_step() -> Signal<Option<Spawned<()>>> {
     global::<Option<Spawned<()>>>()
 }
 
-/// Which state takes the keyboard when a result arrives. A question never
-/// takes it from the source editor the user is typing in; without that focus
-/// it is the field's one next action (`Prepare revision`, `Review again`, or
-/// the question itself).
+/// A question never takes the keyboard from the source editor the user is
+/// typing in.
 fn arrival_focus(stale: bool, current: Option<usize>, editor_focused: bool) -> Option<Focus> {
-    match (stale, current) {
-        (true, _) => Some(Focus::ReviewAgain),
-        (false, Some(_)) if editor_focused => None,
-        (false, Some(index)) => Some(Focus::Answer(index)),
-        (false, None) => Some(Focus::Prepare),
+    if stale {
+        return Some(Focus::ReviewAgain);
+    }
+    match current {
+        Some(_) if editor_focused => None,
+        Some(index) => Some(Focus::Answer(index)),
+        None if editor_focused => None,
+        None => Some(Focus::Prepare),
     }
 }
 
@@ -2982,7 +2981,6 @@ mod tests {
             )
     }
 
-    /// A result with one question waiting.
     fn questioned_view() -> ReviewView {
         ReviewView {
             sections: vec![crate::state::ReviewSection {
@@ -3079,12 +3077,89 @@ mod tests {
         );
     }
 
+    /// The whole room over a document; a result with no questions arrives the
+    /// moment the source editor takes the keyboard.
+    #[component]
+    fn ArrivalWithoutQuestionsProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        if let Some(tab) = state.active_tab() {
+            tab.text.set(SharedString::from("probe\n"));
+        }
+        state.review_open.set(true);
+        let arrive = state.clone();
+        effect(move || {
+            if arrive.source_editor_focused.get() {
+                arrive.review_view.set(Some(ReviewView {
+                    sections: vec![crate::state::ReviewSection {
+                        title: "Stated goal".to_owned(),
+                        items: vec!["one".to_owned()],
+                    }],
+                    ..ReviewView::default()
+                }));
+            }
+        });
+        let text_state = state.clone();
+        view()
+            .flex_col()
+            .h(relative(1.0))
+            .child(
+                text(move || {
+                    if text_state
+                        .active_tab()
+                        .is_some_and(|tab| tab.text.get().contains('q'))
+                    {
+                        "typed"
+                    } else {
+                        "untouched"
+                    }
+                })
+                .test_id("editor-state"),
+            )
+            .child(crate::ui::shell::shell(
+                state,
+                Language::English,
+                crate::ui::tokens::Layout::Wide,
+            ))
+    }
+
+    #[test]
+    fn an_arriving_result_without_questions_does_not_steal_the_keyboard() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<ArrivalWithoutQuestionsProbe>()))
+                .expect("start the shell");
+        app.set_viewport(Size {
+            width: Points(1440.0),
+            height: Points(900.0),
+        })
+        .expect("a 1440x900 window");
+        app.first_render().expect("first render");
+        app.wait_for("label:Markdown source").expect("the editor");
+        app.type_text("label:Markdown source", "x")
+            .expect("type in the editor");
+        app.wait_for("id:review-prepare")
+            .expect("the result arrives while the editor holds the keyboard");
+        app.settle();
+        app.press_key("q").expect("keep typing");
+        app.wait_for("text:typed")
+            .expect("the editor kept the keyboard");
+        assert!(
+            app.screen().matches("id:review-answer-input") == Ok(false),
+            "no question input exists to take the keyboard"
+        );
+    }
+
     #[test]
     fn arrival_focus_never_takes_the_keyboard_from_the_editor() {
         assert_eq!(arrival_focus(false, Some(2), true), None);
         assert_eq!(arrival_focus(false, Some(2), false), Some(Focus::Answer(2)));
         assert_eq!(arrival_focus(true, Some(2), true), Some(Focus::ReviewAgain));
-        assert_eq!(arrival_focus(false, None, true), Some(Focus::Prepare));
+        assert_eq!(
+            arrival_focus(false, None, true),
+            None,
+            "a background result with no questions must not take the keyboard"
+        );
+        assert_eq!(arrival_focus(false, None, false), Some(Focus::Prepare));
     }
 
     /// Preparing a review supersedes whatever was in flight: the loading flag

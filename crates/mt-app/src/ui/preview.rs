@@ -47,8 +47,14 @@ pub fn is_open(state: &AppState) -> bool {
 
 /// The rendered document, in the column.
 pub fn column(state: AppState, language: Language) -> impl IntoElement {
+    let reference = element_ref();
+    if let Some(tab) = state.active_tab() {
+        state.attach_document_view(tab.id, reference);
+    }
     view()
         .test_id("preview-column")
+        .element_ref(&reference)
+        .focusable(true)
         .flex_1()
         .min_h(px(0.0))
         .h(relative(1.0))
@@ -110,8 +116,12 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
             .into_element();
     };
     let text = tab.text;
+    let reference = element_ref();
+    state.attach_document_view(tab.id, reference);
     view()
         .test_id("web-pane")
+        .element_ref(&reference)
+        .focusable(true)
         .flex_1()
         .min_h(px(0.0))
         .h(relative(1.0))

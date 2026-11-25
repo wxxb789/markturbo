@@ -26,6 +26,15 @@ fn run_app() -> impl std::process::Termination {
     #[cfg(all(test, target_os = "windows"))]
     tests::observe_app_start();
 
+    // The test harness injects the consent hold's platform source: a shipped
+    // app must refuse it as firmly as the test vault.
+    if cfg!(feature = "test-harness") {
+        eprintln!(
+            "This markturbo build enables the test harness; \
+             rebuild with `cargo build -p mt-app` to run the app."
+        );
+        std::process::exit(2);
+    }
     // `cargo test` builds this binary with the crate's test features, so the
     // copy it leaves in target/<profile>/ keeps keys in memory only. Such a
     // build must never pass for the shipped app or accept a person's key.

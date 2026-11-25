@@ -1250,34 +1250,85 @@ fn diagnostic_rows(state: &AppState, language: Language) -> Vec<DiagnosticRow> {
 
 /// One resolver diagnostic as the field reads it: the internal codes are
 /// rendered as localized templates, never as the resolver's own English.
+/// A `{path}: {error}` message keeps the OS's own error text; the resolver's
+/// explanation is always replaced.
 fn diagnostic_message(diagnostic: &mt_core::diagnostic::Diagnostic, language: Language) -> String {
     let raw = diagnostic.message.as_str();
+    if language == Language::English {
+        return match diagnostic.source.as_str() {
+            "context.global-read" | "context.project-read" | "context.unsupported-remote" => {
+                match raw.split_once(": ") {
+                    Some((path, error)) => format!("Could not read {path}: {error}"),
+                    None => raw.to_owned(),
+                }
+            }
+            "context.project-unavailable" => {
+                "Project instructions could not be read; their content is unavailable.".to_owned()
+            }
+            _ => raw.to_owned(),
+        };
+    }
     match diagnostic.source.as_str() {
         "context.duplicate-source" | "context.duplicate-directive" => {
             match raw.split_once(" duplicates ") {
-                Some((path, previous)) => match language {
-                    Language::English => format!("{path} duplicates {previous}"),
-                    Language::Chinese => format!("{path} 与 {previous} 内容重复"),
-                },
-                None => raw.to_owned(),
+                Some((path, previous)) => format!("{path} 与 {previous} 内容重复"),
+                None => "重复的指令来源。".to_owned(),
             }
         }
-        "context.global-read" | "context.project-read" | "context.unsupported-remote" => {
-            match raw.split_once(": ") {
-                Some((path, error)) => match language {
-                    Language::English => format!("Could not read {path}: {error}"),
-                    Language::Chinese => format!("无法读取 {path}：{error}"),
-                },
-                None => raw.to_owned(),
-            }
-        }
-        "context.project-unavailable" => match language {
-            Language::English => {
-                "Project instructions could not be read; their content is unavailable.".to_owned()
-            }
-            Language::Chinese => "无法读取项目指令；其内容不可用。".to_owned(),
+        "context.global-read" | "context.project-read" => match raw.split_once(": ") {
+            Some((path, error)) => format!("无法读取 {path}：{error}"),
+            None => "无法读取指令文件。".to_owned(),
         },
-        _ => raw.to_owned(),
+        // The error half can be the resolver's own English, so only the path
+        // survives.
+        "context.unsupported-remote" => match raw.split_once(": ") {
+            Some((path, _)) => format!("无法访问远程指令文件：{path}"),
+            None => "无法访问远程指令文件。".to_owned(),
+        },
+        "context.cyclic-discovery" => match raw.split_once(": ") {
+            Some((path, error)) => format!("{path}：发现路径循环，无法继续读取（{error}）。"),
+            None => "发现路径循环。".to_owned(),
+        },
+        "context.invalid-path" => {
+            if let Some((name, error)) = raw.split_once(": ") {
+                return format!("无法解析 {name} 路径：{error}");
+            }
+            if raw.ends_with("must be an absolute lexical path without parent traversal.") {
+                return "路径必须是绝对路径，且不能包含上级目录。".to_owned();
+            }
+            if raw.ends_with("must name an existing directory.") {
+                return "路径必须指向已存在的目录。".to_owned();
+            }
+            format!("无法解析此路径：{raw}")
+        }
+        "context.outside-workspace" => "目标文件与执行目录都必须位于已打开的工作区内。".to_owned(),
+        "context.unsupported-configuration" => "指令文件名必须相对于其发现目录。".to_owned(),
+        "context.unsupported-profile" => "仅冻结的 Codex 配置支持有效上下文解析。".to_owned(),
+        "context.profile-snapshot" => "内置配置未建立冻结的解析规则，无法解析此文件。".to_owned(),
+        "context.unsupported-metadata" => match raw.split_once(": ") {
+            Some((path, _)) => {
+                format!("{path}：元数据会作为普通指令文本，不会成为 Codex 适用规则。")
+            }
+            None => "元数据会作为普通指令文本，不会成为 Codex 适用规则。".to_owned(),
+        },
+        "context.unsupported-import" => match raw.split_once(": ") {
+            Some((path, _)) => format!("{path}：不会跟随类似 import 的文本。"),
+            None => "不会跟随类似 import 的文本。".to_owned(),
+        },
+        "context.unsupported-scope" => match raw.split_once(": ") {
+            Some((path, _)) => {
+                format!("{path}：类似作用域的文本不会改变 Codex 的发现适用范围。")
+            }
+            None => "类似作用域的文本不会改变 Codex 的发现适用范围。".to_owned(),
+        },
+        "context.malformed-metadata" => match raw.split_once(": ") {
+            Some((path, _)) => {
+                format!("{path}：未闭合的类元数据块仍作为普通指令文本。")
+            }
+            None => "未闭合的类元数据块仍作为普通指令文本。".to_owned(),
+        },
+        "context.project-unavailable" => "无法读取项目指令；其内容不可用。".to_owned(),
+        _ => "无法解析此指令来源。请检查项目指令文件后重试。".to_owned(),
     }
 }
 
@@ -1724,10 +1775,59 @@ mod tests {
             diagnostic_message(&read, Language::Chinese),
             "无法读取 C:/x/AGENTS.md：access denied"
         );
+        let scope = mt_core::diagnostic::Diagnostic::warning(
+            "context.unsupported-scope",
+            "C:/x/AGENTS.md: scope-like text does not alter Codex discovery applicability",
+        );
+        assert_eq!(
+            diagnostic_message(&scope, Language::Chinese),
+            "C:/x/AGENTS.md：类似作用域的文本不会改变 Codex 的发现适用范围。"
+        );
+        // A source this build does not know never leaks the resolver's
+        // English into a Chinese line.
+        let unknown = mt_core::diagnostic::Diagnostic::error(
+            "context.future-code",
+            "Some new English detail.",
+        );
+        assert_eq!(
+            diagnostic_message(&unknown, Language::Chinese),
+            "无法解析此指令来源。请检查项目指令文件后重试。"
+        );
+        assert_eq!(
+            diagnostic_message(&unknown, Language::English),
+            "Some new English detail."
+        );
+
+        // A resolver-authored explanation never survives in a Chinese line,
+        // whether it is the whole message or the part after the path.
+        let remote = mt_core::diagnostic::Diagnostic::error(
+            "context.unsupported-remote",
+            "Remote context paths are not supported.",
+        );
+        let remote_path = mt_core::diagnostic::Diagnostic::error(
+            "context.unsupported-remote",
+            "C:/x/AGENTS.md: Remote context paths are not supported.",
+        );
+        for message in [
+            diagnostic_message(&remote, Language::Chinese),
+            diagnostic_message(&remote_path, Language::Chinese),
+        ] {
+            assert!(
+                !message.contains("Remote"),
+                "the resolver's English is not spliced: {message}"
+            );
+        }
+        let changed_shape = mt_core::diagnostic::Diagnostic::error(
+            "context.project-read",
+            "the resolver changed shape",
+        );
+        assert!(
+            !diagnostic_message(&changed_shape, Language::Chinese)
+                .contains("the resolver changed shape"),
+            "an unparsed fallback does not splice the raw message"
+        );
     }
 
-    /// The field over a workspace root with no document open: there is
-    /// nothing to review.
     #[component]
     fn NoDocumentFieldProbe() -> impl IntoElement {
         let state = AppState::new();

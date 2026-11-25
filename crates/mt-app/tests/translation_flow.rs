@@ -81,7 +81,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("start translation");
     app.wait_for("id:consent-card")
         .expect("translation disclosure");
-    app.long_press("id:consent-send").expect("send translation");
+    support::hold_send(&mut app);
     app.wait_for_within(
         "text:/^Translated 1 segments into zh\\./",
         Duration::from_secs(20),
@@ -108,8 +108,7 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("start another translation");
     app.wait_for("id:consent-card")
         .expect("the second translation's disclosure");
-    app.long_press("id:consent-send")
-        .expect("send the second translation");
+    support::hold_send(&mut app);
     app.wait_for("text:Waiting for model request approval…")
         .expect("second translation is pending");
     // Open another document and dirty it: the pending translation must land on

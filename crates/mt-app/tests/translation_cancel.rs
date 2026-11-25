@@ -9,6 +9,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 #[test]
 fn escape_discards_a_late_translation() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -70,9 +72,23 @@ fn escape_discards_a_late_translation() {
         .expect("start translation");
     app.wait_for("id:consent-card")
         .expect("translation disclosure");
-    app.long_press("id:consent-send").expect("send translation");
+    support::hold_send(&mut app);
     app.wait_for("text:Waiting for model request approval…")
         .expect("the translation is waiting");
+
+    // The menu is the topmost layer: Escape closes it and leaves the waiting
+    // translation alone; only the next Escape cancels the request.
+    app.press("id:title-settings").expect("open the menu");
+    app.wait_for("id:title-menu-translate")
+        .expect("the menu is open");
+    app.press_key("escape").expect("Escape closes the menu");
+    app.wait_for_gone("id:title-menu-translate", Duration::from_secs(2))
+        .expect("the menu closed");
+    assert!(
+        app.shows("Waiting for model request approval…"),
+        "the menu's Escape did not cancel the translation: {:?}",
+        app.screen().texts()
+    );
 
     app.press_key("escape").expect("Escape cancels the wait");
     app.wait_for("text:Cancelled — nothing will be applied.")
