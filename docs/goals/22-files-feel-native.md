@@ -79,7 +79,8 @@ app must never lock files while picking up other editors' changes promptly, with
        Hovering a tick shows the document's name; clicking it switches to that document.
    - **One list.** This replaces decision 1's separate "open documents" section.
      - The folder tree marks open files with a small ink dot. The active file has full ink.
-     - An "Outside folder" group appears at the top only when an open file lies outside the workspace.
+     - An "Outside folder" group appears at the top only when it has members: open files outside the workspace,
+       untitled buffers, or buffers whose file was deleted or moved on disk.
    - **View control.**
      - A small three-segment glyph that shows the split ratio, plus the current state's label.
      - Cycling (`Ctrl+E`, or a click) slides the divider between the panes: Edit puts it at the right edge, Split in the
@@ -100,8 +101,10 @@ app must never lock files while picking up other editors' changes promptly, with
    - **Drop.** The nsh 0.6.1 `FileDragEvent` carries no position, and Windows only sends enter/leave when the hit target
      changes. So:
      - The screen always slides in from the right edge, the side away from the sidebar.
-     - It names the first file and the count ("Open plan.md", "Open 3 files") when the names are known. When they are
-       not, it says "Drop to open".
+     - It counts only items it can confirm it will open: supported document names, plus folders when the event
+       identifies them as folders. It shows "Open plan.md" for one, or "Open 3 files" for several.
+     - When nothing can be confirmed (no names, or only inferred types), it says "Drop to open". Skipped items are
+       reported after the drop, by decision 3's count notice.
      - When every known name is an unsupported type, it says "Can't open this file type" instead.
      - The prototype's "side being dragged over" is not required.
      - The screen clears on leave or drop.
@@ -119,12 +122,15 @@ app must never lock files while picking up other editors' changes promptly, with
    - Shoji, decision 6 (lane 22-A):
      - cycling moves the divider to the matching stop;
      - dragging the divider snaps to the nearest of the three stops;
-     - pressing again mid-slide reverses from the current position without a jump;
+     - pressing again mid-slide retargets from the current position without a jump, in both cases:
+       - the next stop is in the same direction (Edit to Split, pressed again mid-slide, continues toward Preview);
+       - it is the opposite direction (Split to Preview, pressed mid-slide, goes back to Edit);
      - under reduced motion there is no translation, only opacity;
      - with the sidebar expanded, every open tab, including untitled and deleted-on-disk buffers, can be switched to
        in one click;
    - drop and reload motion (lane 22-B):
-     - the drop screen text follows decision 6's known-name, unknown-name and unsupported cases;
+     - the drop screen text follows decision 6's confirmed, unknown and unsupported cases;
+     - the drop screen slides in from the right edge, and under reduced motion it fades in with no translation;
      - the reload slip plays only after a successful adoption;
    - drops:
      - a drop event opens the files, a folder drop sets the workspace, and an unsupported drop shows the count notice;
