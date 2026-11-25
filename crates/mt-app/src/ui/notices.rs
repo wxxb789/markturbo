@@ -1463,6 +1463,8 @@ pub(crate) fn status_line_at(
                                 SharedString::default()
                             }
                         })
+                        .flex_shrink(1.0)
+                        .min_w(px(0.0))
                         .font_family(tokens::FONT_UI)
                         .text_size(px(tokens::TYPE_UI))
                         .line_height(px(tokens::TYPE_UI_LINE))
@@ -1501,6 +1503,7 @@ pub(crate) fn status_line_at(
                                 .unwrap_or_default();
                             view()
                                 .flex_row()
+                                .flex_shrink_0()
                                 .items_center()
                                 .gap(px(SPACE_1))
                                 .child(

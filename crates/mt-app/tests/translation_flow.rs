@@ -154,7 +154,8 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         .expect("register the draft's destination");
 
     // Quit: the in-app guard takes the decision, its Save saves the named
-    // tab and then parks on the draft's Save As, and it must await it.
+    // tab and then parks before the draft's Save As, so the picker holds no
+    // answer yet.
     app.press("id:title-settings").expect("open the menu");
     app.press("id:title-menu-quit").expect("request quit");
     app.wait_for("text:Quit without saving?")
@@ -162,21 +163,23 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
     app.press("id:guard-save")
         .expect("start saving the dirty tabs");
 
-    // The draft's Save As reached the platform and waits for its answer:
-    // the translation returns while the picker is open, after it was asked
-    // (contract amendment 13).
     app.wait_until(
-        "the draft's Save As picker to be asked",
+        "the draft's Save As to wait for its answer",
         Duration::from_secs(10),
-        |screen| {
-            screen
-                .file_requests()
-                .iter()
-                .any(|request| matches!(request, nsh_core::file_dialog::FileRequest::SaveDialog(_)))
-        },
+        |_| mt_app::test_vault::save_gate_reached(),
     )
-    .expect("the Save As reached its picker before the translation returns");
+    .expect("the Save As waits without an answer");
+    assert!(
+        !app.screen()
+            .file_requests()
+            .iter()
+            .any(|request| matches!(request, nsh_core::file_dialog::FileRequest::SaveDialog(_))),
+        "the picker was asked and answered before the translation returned"
+    );
 
+    // The translation returns while the Save As answer does not exist yet:
+    // the picker is still unanswered when the tab turns dirty (contract
+    // amendment 13).
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:# 你好，再见", Duration::from_secs(20))
         .expect("the translation applies while the Save As waits");
@@ -185,6 +188,13 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
             .matches("id:guard-card")
             .expect("guard selector"),
         "Quit must still be pending while the Save As picker waits"
+    );
+    assert!(
+        !app.screen()
+            .file_requests()
+            .iter()
+            .any(|request| matches!(request, nsh_core::file_dialog::FileRequest::SaveDialog(_))),
+        "the translation arrived before the Save As answer"
     );
     std::fs::write(&save_gate, "go").expect("release the Save As picker");
 

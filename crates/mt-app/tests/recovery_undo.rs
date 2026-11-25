@@ -48,9 +48,13 @@ fn two_recovered() -> Recovered {
     std::fs::write(&first, "# First\n").expect("write first");
     std::fs::write(&second, "# Second\n").expect("write second");
 
-    // SAFETY: this binary has one test.
+    // SAFETY: nextest runs each test in its own process.
     unsafe {
         std::env::remove_var("MARKTURBO_OPEN");
+        // No environment credential may make Review preparable: the
+        // amendments' Review scenarios want the `No model set up` panel.
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
         std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
         std::env::set_var(
@@ -94,6 +98,23 @@ fn two_recovered() -> Recovered {
     }
 }
 
+/// Opens the fixture's `first.md` as a document over `workspace`, so a
+/// Review can be prepared while a live Undo holds its rows.
+fn open_first_document(app: &mut Headless, workspace: &std::path::Path) {
+    app.on_pick_paths(vec![workspace.to_path_buf()])
+        .expect("answer the folder picker");
+    app.press("id:welcome-open-folder")
+        .expect("open the workspace");
+    app.wait_for("id:workspace-home").expect("the workspace");
+    app.press_key("mod+p").expect("open the palette");
+    app.wait_for("id:palette-input").expect("the palette input");
+    app.type_text("id:palette-input", "first")
+        .expect("filter to first.md");
+    app.submit("id:palette-input").expect("open first.md");
+    app.wait_for("label:Markdown source")
+        .expect("the source editor");
+}
+
 #[test]
 fn tier_two_discard_holds_and_commit_boundaries() {
     if !cfg!(windows) {
@@ -130,6 +151,11 @@ fn a_live_undo_stays_reachable_on_settings() {
     app.wait_for("id:settings-page").expect("the settings page");
     app.wait_for("id:status-action")
         .expect("the Undo follows the user to Settings");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo renders on exactly one status line"
+    );
 
     app.press("id:status-action")
         .expect("undo on the settings surface");
@@ -181,6 +207,11 @@ fn a_live_undo_stays_reachable_when_a_background_notice_arrives() {
     app.wait_for("id:settings-page").expect("the settings page");
     app.wait_for("id:settings-page >> id:status-action")
         .expect("the Undo follows the user to Settings");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo renders on exactly one status line"
+    );
 
     // The scan completes: `Opened …` must not hide the Undo. The commit's
     // Recents write proves the notice landed while the checks run.
@@ -200,6 +231,12 @@ fn a_live_undo_stays_reachable_when_a_background_notice_arrives() {
         app.screen().texts()
     );
     assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the background notice put the Undo on a second line: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
         checkpoint_files(&keys),
         2,
         "nothing was deleted while the Undo had to stay reachable"
@@ -211,6 +248,93 @@ fn a_live_undo_stays_reachable_when_a_background_notice_arrives() {
     app.press("id:settings-close").expect("close Settings");
     app.wait_for("id:recovery-banner")
         .expect("the rows are back in the banner");
+    assert_eq!(checkpoint_files(&keys), 2, "nothing was deleted");
+}
+
+/// A live Undo and an open Review: starting a Review with no model set up
+/// posts its own notice, and the Undo renders on the review line; closing
+/// the panel must carry it back to the editor's line (contract amendment
+/// 18).
+#[test]
+fn closing_the_review_panel_carries_the_live_undo_back_to_the_editor() {
+    let mut seeded = two_recovered();
+    let keys = seeded.keys.clone();
+    let app = &mut seeded.app;
+    open_first_document(app, seeded._dir.path());
+
+    // The discard's Undo must stay reachable through the Review panel.
+    app.press("id:recovery-discard-all").expect("discard all");
+    app.wait_for("id:status-action").expect("the Undo");
+
+    // Review cannot be prepared without a model; its error notice carries
+    // the live Undo, and the review line is where that Undo renders.
+    app.press("id:title-review").expect("start Review");
+    app.wait_for("id:review-unavailable")
+        .expect("Review says no model is set up");
+    app.wait_for("id:field >> id:status-action")
+        .expect("the Undo renders on the review line");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo renders on exactly one status line"
+    );
+
+    // Closing the panel unmounts the review line; the Undo must move to the
+    // editor's line, not vanish with the panel.
+    app.press("id:review-close")
+        .expect("close the review panel");
+    app.wait_for_gone("id:review-unavailable", Duration::from_secs(5))
+        .expect("the panel closes");
+    app.wait_for("id:status-action")
+        .expect("the Undo is back on the editor line");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo moved, it was not duplicated"
+    );
+
+    // It still restores the held rows and their store entries.
+    app.press("id:status-action").expect("undo from the editor");
+    app.wait_for("id:recovery-banner").expect("the rows return");
+    assert_eq!(checkpoint_files(&keys), 2, "nothing was deleted");
+}
+
+/// Settings opened from the Review panel's own way forward: the one visible
+/// status line is Settings', so the live Undo renders there (contract
+/// amendment 18).
+#[test]
+fn settings_opened_from_the_review_panel_keeps_the_live_undo() {
+    let mut seeded = two_recovered();
+    let keys = seeded.keys.clone();
+    let app = &mut seeded.app;
+    open_first_document(app, seeded._dir.path());
+
+    // The discard's Undo must stay reachable through the Review panel.
+    app.press("id:recovery-discard-all").expect("discard all");
+    app.wait_for("id:status-action").expect("the Undo");
+    app.press("id:title-review").expect("start Review");
+    app.wait_for("id:review-unavailable")
+        .expect("Review says no model is set up");
+    app.wait_for("id:field >> id:status-action")
+        .expect("the Undo renders on the review line");
+
+    // Review's way forward opens Settings; the Undo follows to the one
+    // status line still on screen.
+    app.press("id:review-open-settings")
+        .expect("open Settings from Review");
+    app.wait_for("id:settings-page").expect("the settings page");
+    app.wait_for("id:settings-page >> id:status-action")
+        .expect("the Undo follows the user to Settings");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo renders on exactly one status line"
+    );
+
+    app.press("id:settings-page >> id:status-action")
+        .expect("undo from the settings surface");
+    app.wait_for_gone("id:status-action", Duration::from_secs(5))
+        .expect("the Undo is spent");
     assert_eq!(checkpoint_files(&keys), 2, "nothing was deleted");
 }
 

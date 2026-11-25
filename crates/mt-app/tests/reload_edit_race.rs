@@ -24,7 +24,7 @@ fn edits_during_the_reload_read_stay_in_the_buffer() {
     let release = dir.path().join("release-reload");
     std::fs::write(&path, "# Original\n").expect("write fixture");
 
-    // SAFETY: this binary has one test.
+    // SAFETY: nextest runs each test in its own process.
     unsafe {
         std::env::set_var("MARKTURBO_OPEN", &path);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
@@ -196,5 +196,97 @@ fn a_stale_reload_answer_does_not_reconflict_a_synced_tab() {
         editor_text(&app).contains("External change"),
         "the stale answer wrote over the synced buffer: {:?}",
         editor_text(&app)
+    );
+}
+
+/// The same reverse order with a *failing* older read: the newer Reload
+/// syncs the tab, then the older read's source is gone and its answer is an
+/// error. The token check owns that answer before any notice, so the stale
+/// failure must not post `Reload failed` over the newer sync.
+#[test]
+fn a_stale_reload_failure_writes_no_notice() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = dir.path().join("plan.md");
+    let first_release = dir.path().join("release-first");
+    let second_release = dir.path().join("release-second");
+    std::fs::write(&path, "# Original\n").expect("write fixture");
+
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &path);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+    }
+
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
+        .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    // An external write makes the save refuse, raising the conflict banner
+    // with its Use-disk choice.
+    std::fs::write(&path, "# External change\n").expect("replace the file");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save").expect("attempt save");
+    app.wait_for("id:conflict-use-disk")
+        .expect("the conflict banner's use-disk choice");
+
+    // Each of the two Reloads parks on its own release, so the second's
+    // answer is forced to land before the first's.
+    mt_app::test_vault::gate_reads(&path, [first_release.clone(), second_release.clone()]);
+    app.press("id:conflict-use-disk")
+        .expect("ask to reload from disk");
+    app.wait_for("id:guard-reload").expect("the reload guard");
+    app.press("id:guard-reload")
+        .expect("confirm the first reload");
+    app.wait_until(
+        "the first reload's read to reach its gate",
+        Duration::from_secs(5),
+        |_| mt_app::test_vault::gate_reads_started(&path) == 1,
+    )
+    .expect("the first reload waits on the disk");
+    app.press("id:conflict-use-disk")
+        .expect("ask to reload from disk again");
+    app.wait_for("id:guard-reload")
+        .expect("the second reload guard");
+    app.press("id:guard-reload")
+        .expect("confirm the second reload");
+    app.wait_until(
+        "the second reload's read to reach its gate",
+        Duration::from_secs(5),
+        |_| mt_app::test_vault::gate_reads_started(&path) == 2,
+    )
+    .expect("the second reload waits on the disk");
+
+    // The second request's answer arrives first and syncs the tab.
+    std::fs::write(&second_release, "go").expect("release the second reload");
+    app.wait_for_gone("id:conflict-banner", Duration::from_secs(20))
+        .expect("the disk version lands and the conflict clears");
+
+    // The first read now fails: its source is gone. The answer is stale,
+    // and its handling is the only proof the failure was processed.
+    std::fs::remove_file(&path).expect("remove the source of the stale read");
+    std::fs::write(&first_release, "go").expect("release the first reload");
+    app.wait_until(
+        "the stale reload failure to be handled",
+        Duration::from_secs(10),
+        |_| mt_app::test_vault::reload_superseded(&path),
+    )
+    .expect("the stale failure was handled");
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Reload failed")),
+        "the stale failure posted over the newer sync: {:?}",
+        app.screen().texts()
     );
 }

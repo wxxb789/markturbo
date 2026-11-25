@@ -84,9 +84,11 @@ fn a_slow_first_open_never_commits_over_a_fast_second() {
     app.wait_for("id:context-source-0 >> text:AGENTS.md")
         .expect("the fast root's instructions resolve");
 
-    // Release the slow scan and wait until it actually returns: a
+    // The slow scan's source is gone when it finally runs: its answer is
+    // an error. Release it and wait until it actually returns: a
     // superseded open changes nothing on screen, so its token check is the
     // only proof the stale scan ran at all (contract amendment 7).
+    std::fs::remove_dir_all(slow.path()).expect("remove the superseded workspace");
     std::fs::write(&release, "go").expect("release the slow scan");
     app.wait_until(
         "the superseded slow open to return",
@@ -128,8 +130,11 @@ fn a_slow_first_open_never_commits_over_a_fast_second() {
         app.screen().texts()
     );
     assert!(
-        !app.shows("Open folder failed"),
-        "the stale open wrote an error the one-point check would have missed: {:?}",
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Open folder failed")),
+        "the stale open wrote its failure over the fast one: {:?}",
         app.screen().texts()
     );
     let settings = std::fs::read_to_string(config.path().join("settings.toml")).unwrap_or_default();

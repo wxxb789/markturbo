@@ -923,13 +923,12 @@ impl AppState {
 
     fn publish(&self, mut surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
         // A pending Undo stays on the line: a newer message carries it on
-        // until its deadline, when the slot is freed or taken. The line is
-        // the one the user can see: with Settings open, the editor's status
-        // line is unmounted, so a background notice must not route the Undo
-        // there (contract amendment 2).
+        // until its deadline, when the slot is freed or taken. Its line is
+        // the surface the user sees, computed from the UI state, never the
+        // surface the notice was first routed to (contract amendment 18).
         let live_undo = self.undo_hold.borrow().as_ref().map(|hold| hold.generation);
-        if live_undo.is_some() && self.settings_open.get_untracked() {
-            surface = StatusSurface::Settings;
+        if live_undo.is_some() {
+            surface = self.undo_surface();
         }
         if let Some(generation) = live_undo {
             let state = self.clone();
@@ -944,6 +943,31 @@ impl AppState {
         self.status.set(message);
         if let Some(hold) = self.undo_hold.borrow_mut().as_mut() {
             hold.status_generation = self.status_generation.get_untracked();
+        }
+    }
+
+    /// Where a live Undo renders: Settings when it is open, otherwise the
+    /// Review line while its panel is open, otherwise the editor's
+    /// (contract amendment 18). The UI state decides, not the notice.
+    fn undo_surface(&self) -> StatusSurface {
+        if self.settings_open.get_untracked() {
+            StatusSurface::Settings
+        } else if self.review_open.get_untracked()
+            || self.review_unavailable.get_untracked().is_some()
+        {
+            StatusSurface::Review
+        } else {
+            StatusSurface::Editor
+        }
+    }
+
+    /// Move a live Undo to the surface the user now sees, when a surface was
+    /// opened or closed without a new notice. The hold's deadline must stay
+    /// reachable until it fires; lanes that open Settings or the Review
+    /// panel call this with their transition.
+    pub(crate) fn sync_undo_surface(&self) {
+        if self.undo_hold.borrow().is_some() {
+            self.status_surface.set(self.undo_surface());
         }
     }
 
@@ -2180,7 +2204,7 @@ impl AppState {
         let state = self.clone();
         self.spawn_task(async move {
             let path = tab.path.clone();
-            let loaded = match blocking({
+            let answer = blocking({
                 let path = path.clone();
                 move || {
                     #[cfg(any(test, feature = "test-vault"))]
@@ -2188,8 +2212,16 @@ impl AppState {
                     io::load(&path)
                 }
             })
-            .await
-            {
+            .await;
+            // A newer Reload took this tab's slot while the disk was read:
+            // every answer, a failure included, belongs to the request the
+            // user replaced and writes nothing.
+            if tab.reload.get() != request {
+                #[cfg(any(test, feature = "test-vault"))]
+                crate::test_vault::note_superseded_reload(&path);
+                return;
+            }
+            let loaded = match answer {
                 Ok(Ok(loaded)) => loaded,
                 Ok(Err(error)) => {
                     state.notify_failure(crate::i18n::Key::ReloadFailed, &error);
@@ -2200,11 +2232,6 @@ impl AppState {
                     return;
                 }
             };
-            // A newer Reload took this tab's slot while the disk was read:
-            // the latest request's answer is the one the user asked for.
-            if tab.reload.get() != request {
-                return;
-            }
             let Some(current) = state
                 .tabs
                 .get()
@@ -2326,6 +2353,11 @@ impl AppState {
 
     async fn save_as_tab(&self, tab: Tab) -> SaveAsOutcome {
         let language = self.settings.get().language;
+        // Test-only: the picker's answer does not exist yet. A test holds
+        // the save here while other work interleaves and proves the work
+        // landed before the answer, not merely before it was read.
+        #[cfg(any(test, feature = "test-vault"))]
+        let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         let picked = pick_save_path(
             SaveDialog::new()
                 .title(crate::i18n::t(
@@ -2338,10 +2370,6 @@ impl AppState {
                     ["md", "markdown"],
                 )),
         );
-        // The picker is asked before this test-only stop: a test holds the
-        // answer while other work interleaves with the save.
-        #[cfg(any(test, feature = "test-vault"))]
-        let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         match picked.await {
             Ok(Some(path)) => {
                 if !tab.untitled && path == tab.path {
@@ -2953,6 +2981,7 @@ impl AppState {
             .set(Some(SharedString::from(disclosure)));
         self.review_manifest.set(Some(manifest));
         self.review_open.set(true);
+        self.sync_undo_surface();
     }
 
     /// Whether the waiting Review consent may be bound to the source
@@ -3864,27 +3893,19 @@ impl AppState {
         self.review_view.set(None);
         self.review_unavailable.set(None);
         self.review_open.set(false);
+        self.sync_undo_surface();
     }
 
     pub fn open_settings(&self) {
         self.refresh_usage_counts();
         self.settings_open.set(true);
-        self.carry_undo_to(StatusSurface::Settings);
-    }
-
-    /// Move a live Undo with the surface the user is on: opening Settings
-    /// unmounts the editor's status line, and the hold's deadline must stay
-    /// reachable until it fires.
-    fn carry_undo_to(&self, surface: StatusSurface) {
-        if self.undo_hold.borrow().is_some() && self.status.get_untracked().action.is_some() {
-            self.status_surface.set(surface);
-        }
+        self.sync_undo_surface();
     }
 
     pub fn close_settings(&self) {
         if self.persist_settings(StatusSurface::Editor) {
             self.settings_open.set(false);
-            self.carry_undo_to(StatusSurface::Editor);
+            self.sync_undo_surface();
         }
     }
 
@@ -4362,7 +4383,9 @@ pub fn language_for_path(path: &Path) -> &'static str {
 /// hotspot); the `match` is exhaustive, so a missing translation is a compile
 /// error.
 mod s {
-    use mt_core::settings::Language;
+    use mt_core::{document::io::ConcurrentCommitOutcome, settings::Language};
+
+    use super::SaveError;
 
     pub(super) fn opening_folder(language: Language) -> &'static str {
         match language {
@@ -4407,18 +4430,53 @@ mod s {
     }
 
     /// `guard_save_failed` with the write's own reason embedded, in the
-    /// contract's `{error}` position (contract amendment 10).
-    pub(super) fn save_as_write_failed(
-        language: Language,
-        error: &dyn std::fmt::Display,
-    ) -> String {
+    /// contract's `{error}` position (contract amendment 10). The app's own
+    /// refusals are localized; an OS I/O error keeps the OS's wording.
+    pub(super) fn save_as_write_failed(language: Language, error: &SaveError) -> String {
+        let reason = save_refusal(language, error);
         match language {
             Language::English => format!(
-                "Could not save this document ({error}), so it stays open. Check file permissions or try Save As…."
+                "Could not save this document ({reason}), so it stays open. Check file permissions or try Save As…."
             ),
             Language::Chinese => {
-                format!("文档未能保存（{error}），已保持打开。请检查文件权限或尝试“另存为…”。")
+                format!("文档未能保存（{reason}），已保持打开。请检查文件权限或尝试“另存为…”。")
             }
+        }
+    }
+
+    /// Why the write failed, in the user's language. Only the OS's own I/O
+    /// text is passed through unchanged (contract amendment 10).
+    fn save_refusal(language: Language, error: &SaveError) -> String {
+        if matches!(language, Language::English) {
+            return error.to_string();
+        }
+        match error {
+            SaveError::Io(error) => error.to_string(),
+            SaveError::Conflict => {
+                "文件在打开后已在磁盘上更改。请比较版本、保留你的版本、采用磁盘版本，或选择“另存为…”。"
+                    .to_owned()
+            }
+            SaveError::DestinationExists => {
+                "目标位置已存在同名文件；请选择是否替换。".to_owned()
+            }
+            SaveError::Missing => "源文件路径已不存在；请重新创建或另存副本。".to_owned(),
+            SaveError::SourceIdentityChanged => {
+                "源文件路径或其符号链接目标已更改；请另存副本。".to_owned()
+            }
+            SaveError::DecodeLoss => {
+                "原始字节无法精确解码；请转换为 UTF-8 或另存副本。".to_owned()
+            }
+            SaveError::Unrepresentable { encoding } => {
+                format!("文本无法以 {encoding} 表示；请转换为 UTF-8 或另存副本。")
+            }
+            SaveError::ConcurrentCommit { outcome, .. } => match outcome {
+                ConcurrentCommitOutcome::ExternalVersionRestored => {
+                    "并发写入已恢复到原始目标位置；请检查保留的副本并另存。".to_owned()
+                }
+                ConcurrentCommitOutcome::Indeterminate => {
+                    "并发写入导致保存结果不确定；请检查保留的文件并另存。".to_owned()
+                }
+            },
         }
     }
 
@@ -4957,6 +5015,32 @@ mod tests {
             .expect("the probe ran");
         assert_eq!(translated, "translated\n");
         assert_eq!(reloaded, "on disk\n");
+    }
+
+    /// The Save As guard's Chinese copy embeds the app's own refusal reason in
+    /// Chinese; only an OS I/O error keeps the OS's wording (contract
+    /// amendment 10).
+    #[test]
+    fn a_chinese_save_as_refusal_does_not_show_the_apps_english_reason() {
+        let refusal = s::save_as_write_failed(Language::Chinese, &SaveError::Conflict);
+        assert!(
+            !refusal.contains("the file changed on disk"),
+            "the app's English reason leaks into the Chinese guard: {refusal}"
+        );
+        assert!(
+            refusal.contains("磁盘"),
+            "the Chinese guard does not name the conflict in Chinese: {refusal}"
+        );
+
+        let os = SaveError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access is denied. (os error 5)",
+        ));
+        let refusal = s::save_as_write_failed(Language::Chinese, &os);
+        assert!(
+            refusal.contains("Access is denied. (os error 5)"),
+            "the OS's own error text must be kept: {refusal}"
+        );
     }
 }
 
