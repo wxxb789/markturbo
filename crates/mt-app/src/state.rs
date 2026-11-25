@@ -1336,6 +1336,8 @@ impl AppState {
             self.load_review_result(id);
             self.load_revision_session(id);
             self.load_review_unavailable(id);
+            self.refresh_review_busy();
+            self.refresh_revision_busy();
         }
         if changed && self.context_open.get() {
             self.refresh_context();
@@ -1481,6 +1483,26 @@ impl AppState {
                 *self.review_binding.borrow_mut() = binding;
             }
         }
+    }
+
+    fn refresh_review_busy(&self) {
+        let owner = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .map(|origin| origin.tab_id);
+        self.review_busy
+            .set(owner.is_some_and(|owner| self.active.get() == Some(owner)));
+    }
+
+    fn refresh_revision_busy(&self) {
+        let owner = self
+            .revision_cancellation
+            .borrow()
+            .as_ref()
+            .map(|(tab_id, _)| *tab_id);
+        self.revision_busy
+            .set(owner.is_some_and(|owner| self.active.get() == Some(owner)));
     }
 
     fn review_result(&self, id: u64) -> Option<ReviewView> {
@@ -2205,6 +2227,8 @@ impl AppState {
                     self.active.set(None);
                     self.review_view.set(None);
                     *self.review_binding.borrow_mut() = None;
+                    self.refresh_review_busy();
+                    self.refresh_revision_busy();
                     self.reset_context();
                 }
             }
@@ -2776,8 +2800,8 @@ impl AppState {
         // left is not this run's to show — the early returns below must not
         // leave the field saying `Reviewing…`.
         self.review_generation.update(|generation| *generation += 1);
-        self.review_busy.set(false);
         self.review_in_flight.borrow_mut().take();
+        self.refresh_review_busy();
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -3359,8 +3383,8 @@ impl AppState {
         self.review_bindings.borrow_mut().remove(&origin.tab_id);
         *self.review_binding.borrow_mut() = None;
         self.reset_revision_for(origin.tab_id);
-        self.review_busy.set(true);
         *self.review_in_flight.borrow_mut() = Some(origin);
+        self.refresh_review_busy();
         self.record_usage(UsageEvent::review_started(&revision_request));
         let started = Instant::now();
         let state = self.clone();
@@ -3383,8 +3407,8 @@ impl AppState {
                 // the view, the revision context or the busy flag.
                 return;
             }
-            state.review_busy.set(false);
             *state.review_in_flight.borrow_mut() = None;
+            state.refresh_review_busy();
             let (view, binding) = match result {
                 Ok(Ok(transport)) => {
                     state.record_usage(UsageEvent::ReviewCompleted(
@@ -3496,7 +3520,7 @@ impl AppState {
     /// happens once the text changed since the Review: the Review describes
     /// text that is gone, and Review again is the only next step.
     pub fn start_revision(&self) {
-        if self.revision_busy.get_untracked() {
+        if self.revision_cancellation.borrow().is_some() {
             return;
         }
         let context = self.revision_context.borrow().as_ref().map(|context| {
@@ -3584,21 +3608,34 @@ impl AppState {
         *self.pending_revision.borrow_mut() = Some((tab_id, bound));
     }
 
+    /// Withdraw the waiting Revision consent: the card is modal, one at a
+    /// time, so no transport is out beside it.
     pub fn cancel_revision(&self) {
-        self.cancel_revision_owned_by(None);
+        if self.pending_revision.borrow_mut().take().is_some() {
+            self.revision_consent.set(None);
+            self.revision_manifest.set(None);
+        }
+    }
+
+    /// Withdraw the Revision request the tab on screen owns: its transport
+    /// stops and its late answer is discarded. Another tab's request is
+    /// untouched.
+    pub fn cancel_active_revision(&self) {
+        if let Some(tab_id) = self.active.get_untracked() {
+            self.cancel_revision_owned_by(tab_id);
+        }
     }
 
     fn cancel_revision_for(&self, tab_id: u64) {
-        self.cancel_revision_owned_by(Some(tab_id));
+        self.cancel_revision_owned_by(tab_id);
     }
 
-    fn cancel_revision_owned_by(&self, tab_id: Option<u64>) {
-        let owns = |owner: u64| tab_id.is_none_or(|active| active == owner);
+    fn cancel_revision_owned_by(&self, tab_id: u64) {
         if self
             .pending_revision
             .borrow()
             .as_ref()
-            .is_some_and(|(owner, _)| owns(*owner))
+            .is_some_and(|(owner, _)| *owner == tab_id)
         {
             *self.pending_revision.borrow_mut() = None;
             self.revision_consent.set(None);
@@ -3608,8 +3645,8 @@ impl AppState {
             .revision_cancellation
             .borrow()
             .as_ref()
-            .is_some_and(|(owner, _)| owns(*owner));
-        if tab_id.is_some() && !in_flight {
+            .is_some_and(|(owner, _)| *owner == tab_id);
+        if !in_flight {
             return;
         }
         self.revision_generation
@@ -3620,7 +3657,7 @@ impl AppState {
                 self.status.set(StatusMessage::default());
             }
         }
-        self.revision_busy.set(false);
+        self.refresh_revision_busy();
     }
 
     /// Send the prepared Revision after one-shot consent, then expose the
@@ -3645,9 +3682,9 @@ impl AppState {
         };
         self.revision_consent.set(None);
         self.revision_manifest.set(None);
-        self.revision_busy.set(true);
         let cancelled = Arc::new(AtomicBool::new(false));
         *self.revision_cancellation.borrow_mut() = Some((tab_id, Arc::clone(&cancelled)));
+        self.refresh_revision_busy();
         for answer in bound.answers().as_slice() {
             if matches!(answer, RevisionAnswer::Answered(_)) {
                 self.record_usage(UsageEvent::ClarificationAnswered);
@@ -3665,7 +3702,7 @@ impl AppState {
                 return;
             }
             state.revision_cancellation.borrow_mut().take();
-            state.revision_busy.set(false);
+            state.refresh_revision_busy();
             match result {
                 Ok(Ok(transport)) => state.present_revision_for(tab_id, transport.into_proposal()),
                 Ok(Err(error)) => {
@@ -3702,6 +3739,41 @@ impl AppState {
         if let Some(tab_id) = self.active.get() {
             self.present_revision_for(tab_id, proposal);
         }
+    }
+
+    /// Arm `tab_id`'s Revision as in flight for a probe: the projection and
+    /// the per-tab cancel paths then read a real owner, with no provider.
+    #[cfg(test)]
+    pub(crate) fn arm_revision_in_flight(&self, tab_id: u64) {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *self.revision_cancellation.borrow_mut() = Some((tab_id, cancelled));
+        self.refresh_revision_busy();
+    }
+
+    /// Take `tab_id`'s Revision out of flight for a probe, as its task would
+    /// when the answer lands.
+    #[cfg(test)]
+    pub(crate) fn finish_revision_in_flight(&self, tab_id: u64) {
+        let owned = self
+            .revision_cancellation
+            .borrow()
+            .as_ref()
+            .is_some_and(|(owner, _)| *owner == tab_id);
+        if owned {
+            self.revision_cancellation.borrow_mut().take();
+        }
+        self.refresh_revision_busy();
+    }
+
+    /// Arm `tab_id`'s Review as in flight for a probe, as a sent request
+    /// would, with no provider.
+    #[cfg(test)]
+    pub(crate) fn arm_review_in_flight(&self, tab_id: u64) {
+        *self.review_in_flight.borrow_mut() = Some(ReviewOrigin {
+            tab_id,
+            snapshot: SourceSnapshot::new(0, 0),
+        });
+        self.refresh_review_busy();
     }
 
     /// Show a validated proposal for per-change decisions: its hunks in the
@@ -3975,7 +4047,7 @@ impl AppState {
         self.review_origin.borrow_mut().take();
         self.review_consent.set(None);
         self.review_manifest.set(None);
-        self.review_busy.set(false);
+        self.refresh_review_busy();
         if let Some(session) = self.review_snapshot.borrow_mut().take() {
             self.restore_review_session(session);
             return;
@@ -4046,6 +4118,14 @@ impl AppState {
     /// — no view, no revision context, no busy flag. What the user cancelled
     /// stays cancelled, and the notice says so without claiming a recall.
     pub fn cancel_review_in_flight(&self) {
+        let owned = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .is_some_and(|origin| self.active.get_untracked() == Some(origin.tab_id));
+        if !owned {
+            return;
+        }
         self.review_generation.update(|generation| *generation += 1);
         self.review_in_flight.borrow_mut().take();
         self.cancel_review();

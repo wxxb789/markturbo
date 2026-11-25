@@ -1048,7 +1048,8 @@ fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
         .expect("the Revision is out");
 
     // Switch to the other document and prepare its Review: the in-flight
-    // Revision is not cancelled by the preparation alone.
+    // Revision is not cancelled by the preparation alone. The shown tab has
+    // no busy row of it; the switch back proves it still owns the request.
     app.press("text:Open other")
         .expect("open the other document");
     app.wait_for("text:Tabs: 2")
@@ -1057,13 +1058,18 @@ fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
     app.wait(Duration::from_millis(300))
         .expect("the preparation settles");
     assert!(
-        app.shows("Busy: true"),
-        "preparing a Review must not cancel the Revision: {:?}",
+        app.shows("Busy: false") && app.shows("Hunks: 0"),
+        "the other tab shows nothing of the in-flight Revision: {:?}",
         app.screen().texts()
     );
+    app.press("text:Open first")
+        .expect("back to the reviewed tab");
+    app.wait_for("text:Busy: true")
+        .expect("preparing a Review must not cancel the Revision");
 
     // The late answer lands in its own tab's session: the shown tab has no
     // hunks of it, and nothing of it can be applied from there.
+    app.press("text:Open other").expect("back to the other tab");
     release.send(()).expect("release the Revision answer");
     answer_sent
         .recv_timeout(Duration::from_secs(20))
@@ -1196,21 +1202,29 @@ fn a_prepared_revision_lands_on_the_tab_that_prepared_it() {
     app.wait_for("text:Tabs: 2").expect("B shown");
     app.press("text:Send Revision")
         .expect("send the prepared Revision");
+    assert!(
+        app.shows("Busy: false") && app.shows("Hunks: 0"),
+        "the sent request belongs to A, not B: {:?}",
+        app.screen().texts()
+    );
+    app.press("text:Open first").expect("back to A");
+    app.wait_for("text:Busy: true")
+        .expect("A owns the sent request");
     release.send(()).expect("release the Revision answer");
     app.wait_for_within("text:Busy: false", Duration::from_secs(20))
         .expect("the Revision finished");
+    app.wait_for_within("text:Hunks: 2", Duration::from_secs(20))
+        .expect("A's own Revision is live");
     app.wait(Duration::from_millis(300))
         .expect("the answer settles");
 
-    // B, the shown tab, has nothing of the answer.
+    // B, the other tab, has nothing of the answer.
+    app.press("text:Open other").expect("back to B");
     assert!(
         app.shows("Hunks: 0"),
         "B took A's answer: {:?}",
         app.screen().texts()
     );
-    app.press("text:Open first").expect("back to A");
-    app.wait_for("text:Hunks: 2")
-        .expect("A's own Revision is live again");
     // Neither document changed: nothing was decided.
     let both = format!("[{source}][{other_source}]");
     assert!(
@@ -1743,24 +1757,33 @@ fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
     let (revision_started_tx, revision_started_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let (release_revision, revision_waits) = std::sync::mpsc::channel::<()>();
+    let (b_review_started_tx, b_review_started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_b_review, b_review_waits) = std::sync::mpsc::channel::<()>();
+    let (server_done_tx, server_done_rx) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
+        let Some(mut stream) = accept_within(&listener, Duration::from_secs(20)) else {
             return;
         };
         read_http_body(&mut stream);
         write_review_json(&mut stream, &review_output);
-        let Ok((mut stream, _)) = listener.accept() else {
+        let Some(mut stream) = accept_within(&listener, Duration::from_secs(20)) else {
             return;
         };
         read_http_body(&mut stream);
         let _ = revision_started_tx.send(());
-        let _ = revision_waits.recv();
-        write_sse(&mut stream, &revision_output);
-        let Ok((mut stream, _)) = listener.accept() else {
+        let revision = std::thread::spawn(move || {
+            let _ = revision_waits.recv_timeout(Duration::from_secs(30));
+            write_sse(&mut stream, &revision_output);
+        });
+        let Some(mut stream) = accept_within(&listener, Duration::from_secs(20)) else {
             return;
         };
         read_http_body(&mut stream);
+        let _ = b_review_started_tx.send(());
+        let _ = b_review_waits.recv_timeout(Duration::from_secs(30));
         write_review_json(&mut stream, &review_output);
+        let _ = revision.join();
+        let _ = server_done_tx.send(());
     });
     let directory = tempfile::tempdir().expect("document dir");
     let config = tempfile::tempdir().expect("config dir");
@@ -1815,6 +1838,25 @@ fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
         .recv_timeout(Duration::from_secs(20))
         .expect("A's Revision reached the server");
 
+    // B is idle: A's Revision row does not follow the tab, and coming back
+    // to A shows it again.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    app.wait_for_gone("id:revision-busy", Duration::from_secs(2))
+        .expect("B never shows A's Revision row");
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter back to plan.md");
+    app.press("id:palette-row").expect("back to A");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("A's tab");
+    app.wait_for("id:revision-busy")
+        .expect("A still owns its Revision");
+
     // B sends its Review while A's Revision still waits.
     app.press_key("mod+p").expect("open the palette");
     app.type_text("id:palette-input", "other")
@@ -1827,6 +1869,33 @@ fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
     support::hold_send(&mut app);
     app.wait_for_gone("id:consent-card", Duration::from_secs(2))
         .expect("B's Review is out");
+    b_review_started_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("B's Review reached the server");
+
+    // B shows its own waiting line, never A's Revision row; Escape cancels
+    // B's Review and discards its late answer.
+    app.wait_for_within("id:review-cancel", Duration::from_secs(5))
+        .expect("B's own Review waiting line");
+    app.wait_for_gone("id:revision-busy", Duration::from_secs(2))
+        .expect("A's Revision row is not B's");
+    app.press_key("escape").expect("cancel B's Review");
+    app.wait_for_gone("id:review-field", Duration::from_secs(2))
+        .expect("B's cancelled wait closed");
+    release_b_review.send(()).expect("release B's answer");
+    app.wait(Duration::from_millis(300))
+        .expect("B's late answer lands");
+    app.catch_up();
+    let ids: Vec<String> = app
+        .screen()
+        .layout_nodes()
+        .iter()
+        .filter_map(|node| node.test_id.as_deref().map(str::to_owned))
+        .collect();
+    assert!(
+        !ids.iter().any(|id| id == "review-prepare"),
+        "the cancelled Review must never land: {ids:?}"
+    );
 
     // A's release must still land on A, under its own name.
     release_revision
@@ -1842,6 +1911,9 @@ fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
         .expect("A's Revision still lands");
     app.wait_for("text:0 of 2 decided")
         .expect("A's hunks arrived");
+    server_done_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the server finished");
     let _ = server.join();
 }
 
@@ -1878,6 +1950,30 @@ fn revision_usage_totals() -> (u64, u64, u64, u64) {
                         .unwrap_or_default(),
             )
         })
+}
+
+/// Accept one loopback connection, or `None` after `timeout`: a server that
+/// waits forever turns a missing request into a hung test.
+fn accept_within(listener: &TcpListener, timeout: Duration) -> Option<TcpStream> {
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).expect("blocking stream");
+                return Some(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

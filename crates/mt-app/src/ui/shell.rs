@@ -1863,6 +1863,7 @@ mod tests {
     #[component]
     fn ReviewStatusRowProbe() -> impl IntoElement {
         let state = AppState::new();
+        state.new_document();
         state.review_open.set(true);
         state.review_view.set(Some(crate::state::ReviewView {
             sections: vec![crate::state::ReviewSection {
@@ -1889,7 +1890,9 @@ mod tests {
                         state.status.set(Default::default());
                     }))
                     .child(control("revision-start", &state, |state| {
-                        state.revision_busy.set(true);
+                        if let Some(tab_id) = state.active.get() {
+                            state.arm_revision_in_flight(tab_id);
+                        }
                         state.notify_count_at(
                             crate::state::StatusSurface::Review,
                             crate::state::StatusKind::Success,
@@ -1908,7 +1911,9 @@ mod tests {
                                 after: "Revised draft".to_owned(),
                                 accepted: signal(false),
                             }]);
-                        state.revision_busy.set(false);
+                        if let Some(tab_id) = state.active.get() {
+                            state.finish_revision_in_flight(tab_id);
+                        }
                     })),
             )
             .child(shell(state, Language::English, Layout::Wide))

@@ -462,7 +462,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                         "revision-cancel",
                         i18n::t(language, Key::Cancel),
                         move || {
-                            review::cancel_revision(&state);
+                            review::cancel_active_revision(&state);
                             state.focus_editor();
                         },
                     ))
@@ -1116,7 +1116,7 @@ fn bind_busy_escape(state: &AppState) {
                 if titlebar::escape_closes_menu(&keys) {
                     return;
                 }
-                review::cancel_revision(&keys);
+                review::cancel_active_revision(&keys);
                 keys.focus_editor();
             },
         );
@@ -1968,7 +1968,8 @@ mod tests {
     fn BusyEscapeProbe() -> impl IntoElement {
         let state = AppState::new();
         open_probe_document(&state, PROBE_TEXT);
-        state.revision_busy.set(true);
+        let tab = state.active_tab().expect("the tab");
+        state.arm_revision_in_flight(tab.id);
         let open_state = state.clone();
         view()
             .child(when(
@@ -1988,6 +1989,61 @@ mod tests {
         app.wait_for_gone("id:revision-field", Duration::from_secs(2))
             .expect("the cancelled revision left the field");
         app.wait_for("text:probe-tail").expect("the probe's tail");
+    }
+
+    /// Two documents, one Revision out on the first: the busy row follows its
+    /// owner, and Escape on an idle tab never cancels the owner's request.
+    #[component]
+    fn RevisionBusyProjectionProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        let first = state.active.get().expect("A");
+        open_probe_document(&state, PROBE_TEXT);
+        let second = state.active.get().expect("B");
+        state.set_active(first);
+        state.arm_revision_in_flight(first);
+        let open_b = state.clone();
+        let open_a = state.clone();
+        let open_state = state.clone();
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .test_id("probe-open-b")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_b.set_active(second))
+                    .child(prims::rest("Open B")),
+            )
+            .child(
+                view()
+                    .test_id("probe-open-a")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| open_a.set_active(first))
+                    .child(prims::rest("Open A")),
+            )
+            .child(when(
+                move || is_open(&open_state),
+                move || field(state.clone(), Language::English),
+            ))
+    }
+
+    #[test]
+    fn a_busy_revision_shows_only_on_the_tab_that_owns_it() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionBusyProjectionProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-busy").expect("A's busy row");
+        app.press("id:probe-open-b").expect("switch to B");
+        app.wait_for_gone("id:revision-busy", Duration::from_secs(2))
+            .expect("B never shows A's busy row");
+        app.press_key("escape").expect("Esc on the idle tab");
+        app.press("id:probe-open-a").expect("back to A");
+        app.wait_for("id:revision-busy")
+            .expect("A's row is back, its request untouched by B's Esc");
+        app.press_key("escape").expect("Esc on the owning tab");
+        app.wait_for_gone("id:revision-busy", Duration::from_secs(2))
+            .expect("the owning tab's Esc cancels its own row");
     }
 
     /// A surface that routes on `is_open`, as the shell does.

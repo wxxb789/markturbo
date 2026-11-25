@@ -179,12 +179,23 @@ fn prepare_revision(state: &AppState, session: Signal<Session>) {
 }
 
 pub(crate) fn cancel_revision(state: &AppState) {
+    restore_showing_finding();
+    state.cancel_revision();
+}
+
+/// Cancel the Revision the tab on screen owns, restoring the session state
+/// the prepare switched away from.
+pub(crate) fn cancel_active_revision(state: &AppState) {
+    restore_showing_finding();
+    state.cancel_active_revision();
+}
+
+fn restore_showing_finding() {
     session().update(|session| {
         if let Some(showing_finding) = session.showing_finding_before_revision.take() {
             session.showing_finding = showing_finding;
         }
     });
-    state.cancel_revision();
 }
 
 /// Every model item's heat: the goal, the questions (in the state's order)
@@ -3093,6 +3104,8 @@ mod tests {
     #[component]
     fn BusyProbe() -> impl IntoElement {
         let state = AppState::new();
+        state.new_document();
+        let tab = state.active.get().expect("the probe document");
         let arm_state = state.clone();
         let start_state = state.clone();
         view()
@@ -3118,7 +3131,7 @@ mod tests {
                     .test_id("busy-arm")
                     .w_full()
                     .h(px(24.0))
-                    .on_press(move || arm_state.review_busy.set(true)),
+                    .on_press(move || arm_state.arm_review_in_flight(tab)),
             )
             .child(
                 view()
@@ -3239,7 +3252,7 @@ mod tests {
             ..ReviewView::default()
         }));
         state.review_open.set(true);
-        state.revision_busy.set(true);
+        state.arm_revision_in_flight(tab.id);
         state
             .review_consent
             .set(Some(SharedString::from("disclosure text")));
@@ -3247,7 +3260,7 @@ mod tests {
         effect(move || {
             let arrive = arrive.clone();
             let _timer = set_timeout(Duration::from_millis(50), move || {
-                arrive.revision_busy.set(false);
+                arrive.finish_revision_in_flight(tab.id);
             });
         });
         crate::ui::shell::shell(state, Language::English, crate::ui::tokens::Layout::Wide)
