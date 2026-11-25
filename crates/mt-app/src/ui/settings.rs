@@ -9,10 +9,7 @@
 //! wired lives here, with the same `test_id`s the tests use: `api-key`,
 //! `usage-counters`, `usage-summary`, `usage-retention`, `usage-details`.
 //!
-//! The page obeys the Afterglow rule: nothing here emits light. A credential is
-//! shown as words (`Key saved in Windows Credential Manager`, `No key saved`),
-//! never as the key; a base URL is validated as it is typed, and the error is
-//! the line under the field.
+//! The page obeys the Afterglow rule: nothing here emits light.
 //!
 //! Reactions: the page is rebuilt when the language or the layout changes
 //! (`app.rs` re-keys the shell), so its labels are read once. Everything that
@@ -26,14 +23,14 @@ use mt_core::{
     settings::{Language, SettingsData, ThemePreference},
 };
 use nsh_base::{button, input};
-use nsh_core::{Color, prelude::*};
+use nsh_core::{Color, keymap::When, prelude::*};
 
 use crate::{
     i18n::{self, Key},
     state::{AppState, CredentialStatus},
     ui::{
         fonts::{Companion, CompanionAction, CompanionFailure, CompanionStatus},
-        notices, prims,
+        motion, notices, prims,
         tokens::{
             self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_NARROW, MEASURE_WIDE, RAIL_W,
             SELECTION_UNDERLINE, SETTINGS_HEADER_H, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
@@ -56,8 +53,20 @@ pub(crate) fn page(
     // key — and nothing in this process reports that, so every (re)build of the
     // page reads the vault afresh. Within a page, the status is memoised.
     state.forget_credential_status();
+    let escape_state = state.clone();
+    on_key_with(
+        "escape",
+        KeyOptions {
+            when: When::Always,
+            ..KeyOptions::default()
+        },
+        move |_| {
+            if !escape_state.escape_top_layer() {
+                escape_state.close_settings();
+            }
+        },
+    );
     let close_state = state.clone();
-    let save_state = state.clone();
     view()
         .test_id("settings-page")
         .flex_1()
@@ -78,22 +87,13 @@ pub(crate) fn page(
                 .items_center()
                 .child(heading(i18n::t(language, Key::Settings)))
                 .child(view().flex_1())
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(SPACE_3))
-                        .child(prims::primary_action(
-                            "settings-save",
-                            i18n::t(language, Key::SaveSettings),
-                            move || save_state.save_settings(),
-                        ))
-                        .child(prims::quiet_action(
-                            "settings-close",
-                            i18n::t(language, Key::Close),
-                            move || close_state.close_settings(),
-                        )),
-                ),
+                .child(view().flex_row().items_center().gap(px(SPACE_3)).child(
+                    prims::quiet_action(
+                        "settings-close",
+                        i18n::t(language, Key::Close),
+                        move || close_state.close_settings(),
+                    ),
+                )),
         )
         .child(
             view()
@@ -216,26 +216,11 @@ fn field_row(
         .child(view().max_w(px(MEASURE_NARROW)).child(note))
 }
 
-/// One labelled field with nothing under it: an empty note would still cost
-/// the gap above it.
-fn field_row_bare(label: &'static str, field: impl IntoElement) -> impl IntoElement {
-    view()
-        .flex_col()
-        .gap(px(SPACE_2))
-        .child(prims::rest(label))
-        .child(
-            view()
-                .max_w(px(MEASURE_NARROW))
-                .pb(px(SPACE_1 - HAIRLINE))
-                .child(field),
-        )
-}
-
-/// The model endpoint: the wire format, the base URL with its validation line,
-/// and the model id.
 fn endpoint_section(state: AppState, language: Language) -> impl IntoElement {
     let base_change_state = state.clone();
+    let base_blur_state = state.clone();
     let model_change_state = state.clone();
+    let model_blur_state = state.clone();
     let snapshot = state.settings.get();
     section(
         s(S::Endpoint, language),
@@ -251,6 +236,12 @@ fn endpoint_section(state: AppState, language: Language) -> impl IntoElement {
                 state.clone(),
                 set_provider,
             ))
+            .child(
+                view()
+                    .max_w(px(MEASURE_WIDE))
+                    .min_h(px(2.0 * TYPE_UI_LINE))
+                    .child(prims::faint(i18n::t(language, Key::ProviderHelp))),
+            )
             .child(field_row(
                 i18n::t(language, Key::BaseUrl),
                 prims::text_field(
@@ -263,12 +254,15 @@ fn endpoint_section(state: AppState, language: Language) -> impl IntoElement {
                             .settings
                             .update(|settings| settings.model_base_url = value.to_owned());
                     },
+                    move || {
+                        base_blur_state.save_settings_quietly();
+                    },
                 ),
                 base_url_note_view(state.clone(), language),
             ))
-            .child(field_row_bare(
+            .child(field_row(
                 i18n::t(language, Key::Model),
-                prims::text_field(
+                view().pb(px(SPACE_1 - HAIRLINE)).child(prims::text_field(
                     "settings-model",
                     i18n::t(language, Key::Model),
                     snapshot.model_name.clone(),
@@ -278,7 +272,13 @@ fn endpoint_section(state: AppState, language: Language) -> impl IntoElement {
                             .settings
                             .update(|settings| settings.model_name = value.to_owned());
                     },
-                ),
+                    move || {
+                        model_blur_state.save_settings_quietly();
+                    },
+                )),
+                view()
+                    .min_h(px(2.0 * TYPE_UI_LINE))
+                    .child(prims::faint(i18n::t(language, Key::ModelHelp))),
             )),
     )
 }
@@ -331,8 +331,6 @@ fn provider_choice(settings: &SettingsData) -> ProviderChoice {
     }
 }
 
-/// Write the chosen wire format into the settings, in memory; `Save` or
-/// `Close` persists it, as the old page did.
 fn set_provider(state: &AppState, choice: ProviderChoice) {
     let key = match choice {
         ProviderChoice::Best => "",
@@ -342,6 +340,7 @@ fn set_provider(state: &AppState, choice: ProviderChoice) {
     state
         .settings
         .update(|settings| settings.model_provider = key.to_owned());
+    state.save_settings_quietly();
 }
 
 /// The line under the base URL: the localized parse error while the value is
@@ -413,6 +412,7 @@ fn base_url_note_view(state: AppState, language: Language) -> impl IntoElement {
 /// The target language the translation operations aim at.
 fn translation_section(state: AppState, language: Language) -> impl IntoElement {
     let change_state = state.clone();
+    let blur_state = state.clone();
     let snapshot = state.settings.get();
     section(
         i18n::t(language, Key::Translation),
@@ -427,6 +427,9 @@ fn translation_section(state: AppState, language: Language) -> impl IntoElement 
                     change_state
                         .settings
                         .update(|settings| settings.translate_to = value.to_owned());
+                },
+                move || {
+                    blur_state.save_settings_quietly();
                 },
             )),
             prims::faint(s(S::TargetLanguageHint, language)),
@@ -521,6 +524,9 @@ fn credential_status_text(state: &AppState, language: Language) -> SharedString 
             };
             SharedString::from(i18n::t(language, key))
         }
+        CredentialStatus::Missing if !state.secure_store_supported() => {
+            SharedString::from(i18n::t(language, Key::SecureStoreUnavailable))
+        }
         CredentialStatus::Missing => s(S::NoKeySaved, language).into(),
         CredentialStatus::Session => s(S::KeySavedSession, language).into(),
         CredentialStatus::Stored => s(S::KeySavedStored, language).into(),
@@ -531,8 +537,6 @@ fn credential_status_text(state: &AppState, language: Language) -> SharedString 
     }
 }
 
-/// The credential's actions: store (or replace) the typed key, use it for this
-/// session only, and forget the endpoint's key.
 fn credential_actions(
     store_state: AppState,
     session_state: AppState,
@@ -541,33 +545,52 @@ fn credential_actions(
     store_ref: ElementRef,
 ) -> impl IntoElement {
     let label_state = store_state.clone();
+    let store_enabled_state = store_state.clone();
+    let session_enabled_state = session_state.clone();
+    let store_supported = store_state.secure_store_supported();
     let remove_condition = remove_state.clone();
     view()
         .flex_row()
         .items_center()
         .gap(px(SPACE_3))
-        .child(
-            reactive_action(
-                "settings-credential-store",
-                move || {
-                    if current_credential_status(&label_state) == CredentialStatus::Stored {
-                        s(S::Replace, language).into()
-                    } else {
-                        SharedString::from(i18n::t(language, Key::StoreCredentialSecurely))
-                    }
-                },
-                {
-                    let state = store_state.clone();
-                    move || store_key(&state, language, false)
-                },
-            )
-            .element_ref(&store_ref),
-        )
-        .child(prims::quiet_action(
-            "settings-credential-session",
-            i18n::t(language, Key::UseCredentialForSession),
-            move || store_key(&session_state, language, true),
+        .child(when(
+            move || store_supported,
+            move || {
+                let label_state = label_state.clone();
+                let store_enabled_state = store_enabled_state.clone();
+                reactive_action(
+                    "settings-credential-store",
+                    move || {
+                        if current_credential_status(&label_state) == CredentialStatus::Stored {
+                            s(S::Replace, language).into()
+                        } else {
+                            SharedString::from(i18n::t(language, Key::StoreCredentialSecurely))
+                        }
+                    },
+                    move || {
+                        current_credential_status(&store_enabled_state)
+                            != CredentialStatus::Unconfigured
+                    },
+                    {
+                        let state = store_state.clone();
+                        move || store_key(&state, language, false)
+                    },
+                )
+                .element_ref(&store_ref)
+                .into_element()
+            },
         ))
+        .child(
+            prims::quiet_action(
+                "settings-credential-session",
+                i18n::t(language, Key::UseCredentialForSession),
+                move || store_key(&session_state, language, true),
+            )
+            .disabled(move || {
+                current_credential_status(&session_enabled_state) == CredentialStatus::Unconfigured
+            })
+            .disabled_style(|style| style.opacity(0.45)),
+        )
         .child(when(
             move || {
                 matches!(
@@ -576,9 +599,9 @@ fn credential_actions(
                 )
             },
             move || {
-                prims::quiet_action("settings-credential-remove", s(S::Remove, language), {
+                prims::danger_action("settings-credential-remove", s(S::Remove, language), {
                     let state = remove_state.clone();
-                    move || remove_key(&state, language, store_ref)
+                    move || remove_key(&state, store_ref)
                 })
                 .into_element()
             },
@@ -614,16 +637,9 @@ fn store_key(state: &AppState, language: Language, session: bool) {
     }
 }
 
-/// Forget the endpoint's key, in the secure store and in this process.
-fn remove_key(state: &AppState, language: Language, focus_after: ElementRef) {
+fn remove_key(state: &AppState, focus_after: ElementRef) {
     match state.remove_credential() {
-        Ok(()) => {
-            state.settings_credential_revision.update(|n| *n += 1);
-            state.set_settings_notice(i18n::t(language, Key::CredentialDeleted), false);
-            // This button goes away with the key it forgot: the keyboard user
-            // lands on the store control instead of nowhere.
-            focus_after.focus();
-        }
+        Ok(()) => focus_after.focus(),
         Err(error) => state.set_settings_notice(error, true),
     }
 }
@@ -720,7 +736,7 @@ pub(super) fn cjk_font_section(companion: Companion, language: Language) -> impl
     let total = companion.size();
     let offers = |action| {
         let companion = companion.clone();
-        move || companion.action() == Some(action)
+        move || companion.offers(action)
     };
     let disclosure = companion.clone();
     let (download, retry, cancel, remove) = (
@@ -861,7 +877,6 @@ fn usage_section(state: AppState, language: Language) -> impl IntoElement {
         .test_id("usage-counters")
         .flex_col()
         .gap(px(SPACE_3))
-        .child(prims::rest(i18n::t(language, Key::UsageCounters)))
         .child(
             view()
                 .max_w(px(MEASURE_WIDE))
@@ -869,7 +884,7 @@ fn usage_section(state: AppState, language: Language) -> impl IntoElement {
         )
         .child(choice_row(
             "usage-toggle",
-            "",
+            i18n::t(language, Key::UsageCounters),
             &[
                 ("usage-off", i18n::t(language, Key::UsageOff), false),
                 ("usage-on", i18n::t(language, Key::UsageOn), true),
@@ -891,9 +906,17 @@ fn usage_section(state: AppState, language: Language) -> impl IntoElement {
                 .flex_row()
                 .items_center()
                 .gap(px(SPACE_3))
-                .child(prims::quiet_action(
+                .child(reactive_action(
                     "usage-inspect",
-                    i18n::t(language, Key::UsageInspect),
+                    move || {
+                        let language = inspection_state.settings.get().language;
+                        if inspection_state.usage_inspection_open.get() {
+                            SharedString::from(i18n::t(language, Key::UsageHideDetails))
+                        } else {
+                            SharedString::from(i18n::t(language, Key::UsageInspect))
+                        }
+                    },
+                    || true,
                     move || inspect_state.inspect_usage(),
                 ))
                 .child(prims::quiet_action(
@@ -901,7 +924,7 @@ fn usage_section(state: AppState, language: Language) -> impl IntoElement {
                     i18n::t(language, Key::UsageExport),
                     move || export_state.export_usage(),
                 ))
-                .child(prims::quiet_action(
+                .child(prims::danger_action(
                     "usage-clear",
                     i18n::t(language, Key::UsageClear),
                     move || clear_state.clear_usage(),
@@ -945,6 +968,8 @@ fn choice_row<T: Copy + PartialEq + 'static>(
 ) -> impl IntoElement {
     let mut row = view()
         .test_id(test_id)
+        .role(AccessibilityRole::Radiogroup)
+        .optional_label(Some(SharedString::from(label)))
         .flex_row()
         .items_center()
         .gap(px(SPACE_3));
@@ -981,6 +1006,7 @@ fn choice_button(
     current: impl Fn() -> bool + Clone + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
+    let duration = prims::press_color_duration();
     let label: SharedString = label.into();
     let colour = {
         let current = current.clone();
@@ -1014,56 +1040,63 @@ fn choice_button(
             .bg(Color::TRANSPARENT)
             .cursor_pointer()
             .rounded(px(0.0))
-            .hover(|s| s.text_color(|| tokens::palette().ink).underline())
-            .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
+            .group()
             .on_press(move |_: &PressEvent| on_press()),
     )
     .child(
-        text(label)
-            .font_family(FONT_UI)
-            .text_size(px(TYPE_UI))
-            .line_height(px(TYPE_UI_LINE))
-            .text_color(colour),
+        motion::ease_out(
+            text(label)
+                .font_family(FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(colour)
+                .transition_colors()
+                .duration(move || duration.get()),
+        )
+        .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+        .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
     )
 }
 
-/// A quiet local action whose label follows the state. The credential's one
-/// store control must stay the same element while its label changes from
-/// 'Store securely' to 'Replace', or the focus a keyboard user put on it is
-/// thrown away.
 fn reactive_action(
     test_id: &'static str,
     label: impl Fn() -> SharedString + Clone + 'static,
+    enabled: impl Fn() -> bool + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
-    view()
-        .test_id(test_id)
-        .bg(Color::TRANSPARENT)
-        .window_drag(false)
+    let duration = prims::press_color_duration();
+    view().bg(Color::TRANSPARENT).window_drag(false).child(
+        prims::press_feedback(
+            button()
+                .test_id(test_id)
+                .accessibility_label({
+                    let label = label.clone();
+                    move || Some(label())
+                })
+                .px(px(2.0))
+                .py(px(4.0))
+                .bg(Color::TRANSPARENT)
+                .cursor_pointer()
+                .rounded(px(0.0))
+                .disabled(move || !enabled())
+                .disabled_style(|style| style.opacity(0.45))
+                .group()
+                .on_press(on_press),
+        )
         .child(
-            prims::press_feedback(
-                button()
-                    .accessibility_label({
-                        let label = label.clone();
-                        move || Some(label())
-                    })
-                    .px(px(2.0))
-                    .py(px(4.0))
-                    .bg(Color::TRANSPARENT)
-                    .cursor_pointer()
-                    .rounded(px(0.0))
-                    .hover(|s| s.text_color(|| tokens::palette().ink).underline())
-                    .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
-                    .on_press(on_press),
-            )
-            .child(
+            motion::ease_out(
                 text(label)
                     .font_family(FONT_UI)
                     .text_size(px(TYPE_UI))
                     .line_height(px(TYPE_UI_LINE))
-                    .text_color(move || tokens::palette().ink_rest),
-            ),
-        )
+                    .text_color(move || tokens::palette().ink_rest)
+                    .transition_colors()
+                    .duration(move || duration.get()),
+            )
+            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
+        ),
+    )
 }
 
 /// The settings page's own copy. New strings live here rather than in
@@ -1104,15 +1137,15 @@ fn s(key: S, language: Language) -> &'static str {
         Language::English => match key {
             S::Endpoint => "Endpoint",
             S::BaseUrlHint => {
-                "Leave empty for the provider default. Remote hosts need HTTPS; include the \
-                 API path, e.g. /v1."
+                "Leave empty for the default endpoint. Remote hosts require HTTPS; plain HTTP \
+                 is allowed only for numeric loopback addresses (e.g. 127.0.0.1:11434/v1)."
             }
-            S::ProviderDefault => "Provider default",
+            S::ProviderDefault => "Wire format default",
             S::TargetLanguagePlaceholder => "zh",
             S::TargetLanguageHint => "A language name or code, e.g. zh, ja, German.",
-            S::ReplacementKey => "Enter a replacement key",
-            S::NoKeySaved => "No key saved",
-            S::KeySavedStored => "Key saved in Windows Credential Manager",
+            S::ReplacementKey => "Enter API key or token",
+            S::NoKeySaved => "No credential stored",
+            S::KeySavedStored => "Credential stored securely for this endpoint",
             S::KeySavedSession => "Key saved for this session only",
             S::KeyFromEnvironment => "Key taken from the environment",
             S::Replace => "Replace",
@@ -1129,7 +1162,8 @@ fn s(key: S, language: Language) -> &'static str {
                 "Removed. Chinese text keeps Source Han Sans CN until MarkTurbo restarts."
             }
             S::FontFailedNetwork => {
-                "Download failed: the network request did not complete. Nothing was installed."
+                "Download failed: could not reach the font server. Nothing was installed \
+                 — check your connection and press Retry."
             }
             S::FontFailedVerification => {
                 "Download failed: the file was not the expected font, so it was discarded."
@@ -1145,14 +1179,14 @@ fn s(key: S, language: Language) -> &'static str {
         Language::Chinese => match key {
             S::Endpoint => "端点",
             S::BaseUrlHint => {
-                "留空则使用服务商默认值。远程主机必须使用 HTTPS；请包含 API 路径，例如 /v1。"
+                "留空则使用默认端点。远程主机必须使用 HTTPS；仅数字回环地址（如 127.0.0.1:11434/v1）可使用 HTTP。"
             }
-            S::ProviderDefault => "服务商默认值",
+            S::ProviderDefault => "协议格式默认值",
             S::TargetLanguagePlaceholder => "zh",
             S::TargetLanguageHint => "语言名称或代码，例如 zh、ja、German。",
-            S::ReplacementKey => "输入替换密钥",
-            S::NoKeySaved => "未保存密钥",
-            S::KeySavedStored => "密钥已保存在 Windows 凭据管理器中",
+            S::ReplacementKey => "输入 API 密钥或令牌",
+            S::NoKeySaved => "未存储凭据",
+            S::KeySavedStored => "此端点的凭据已安全存储",
             S::KeySavedSession => "密钥仅在本次会话中有效",
             S::KeyFromEnvironment => "密钥来自环境变量",
             S::Replace => "替换",
@@ -1166,7 +1200,9 @@ fn s(key: S, language: Language) -> &'static str {
             S::FontInstalled => "已安装并应用：中文使用思源黑体 CN。",
             S::FontRemoving => "正在移除…",
             S::FontRemoved => "已移除。重启 MarkTurbo 前，中文仍使用思源黑体 CN。",
-            S::FontFailedNetwork => "下载失败：网络请求未完成。未安装任何内容。",
+            S::FontFailedNetwork => {
+                "下载失败：无法连接字体服务器。未安装任何内容——请检查网络连接后点击“重试”。"
+            }
             S::FontFailedVerification => "下载失败：文件与预期字体不符，已丢弃。",
             S::FontFailedDisk => "无法在 MarkTurbo 的数据目录中保存或读回字体文件。",
             S::FontFailedRegistration => "字体注册失败，未能应用。",
@@ -1205,9 +1241,77 @@ mod tests {
             })))
     }
 
-    /// A choice's test id names the pressable button itself — the element UI
-    /// Automation exposes with that AutomationId — and the button says it is
-    /// the current choice.
+    #[component]
+    fn MountedTransitionProbe() -> impl IntoElement {
+        let shown = signal(false);
+        view()
+            .flex_col()
+            .child(prims::primary_action("probe-show", "Show", move || {
+                shown.set(true)
+            }))
+            .child(when(
+                move || shown.get(),
+                move || {
+                    view()
+                        .flex_col()
+                        .child(prims::quiet_action("probe-quiet", "Quiet", || {}))
+                        .child(choice_button("probe-choice", "Choice", || true, || {}))
+                        .into_element()
+                },
+            ))
+    }
+
+    #[test]
+    fn an_actions_label_colour_transition_uses_the_ease_out_curve() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::MountItem;
+
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                MountedTransitionProbe,
+            >()))
+            .expect("start the harness");
+        app.wait_for("id:probe-show").expect("the harness");
+        let batches = Arc::new(Mutex::new(Vec::<MountItem>::new()));
+        app.observe({
+            let batches = batches.clone();
+            move |_, batch| {
+                batches
+                    .lock()
+                    .expect("lock the batch record")
+                    .extend(batch.items.iter().cloned());
+            }
+        });
+        app.press("id:probe-show").expect("mount the labels");
+        app.wait_for("id:probe-choice").expect("the choice");
+        let batches = batches.lock().expect("lock the batch record");
+        for text in ["Quiet", "Choice"] {
+            let label = batches
+                .iter()
+                .find_map(|item| match item {
+                    MountItem::Text {
+                        id, text: content, ..
+                    } if content.text == text => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {text} label's text node"));
+            let transition = batches
+                .iter()
+                .find_map(|item| match item {
+                    MountItem::ViewStyle { id, style } if *id == label => style.transition,
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {text} label's colour transition"));
+            assert_eq!(
+                transition.easing,
+                [0.23, 1.0, 0.32, 1.0],
+                "{text} must ease out, not ride nsh's default curve"
+            );
+            assert_eq!(transition.duration, motion::HOVER_MS, "{text} hover timing");
+        }
+    }
+
     #[test]
     fn a_choices_test_id_is_on_the_button_itself() {
         let mut app =
@@ -1243,6 +1347,7 @@ mod tests {
         values: Mutex<HashMap<String, Secret>>,
         reads: AtomicUsize,
         fail_read: AtomicBool,
+        fail_write: AtomicBool,
     }
 
     impl CountingStore {
@@ -1299,6 +1404,9 @@ mod tests {
         }
 
         fn write(&self, target: &str, secret: &Secret) -> Result<(), CredentialError> {
+            if self.fail_write.load(Ordering::Relaxed) {
+                return Err(Self::an_error());
+            }
             self.values
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1313,6 +1421,113 @@ mod tests {
                 .remove(target);
             Ok(())
         }
+    }
+
+    struct NoSecureStore;
+
+    impl SecureCredentialStore for NoSecureStore {
+        fn is_supported(&self) -> bool {
+            false
+        }
+        fn read(&self, _: &str) -> Result<Option<Secret>, CredentialError> {
+            Ok(None)
+        }
+        fn write(&self, _: &str, _: &Secret) -> Result<(), CredentialError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
+
+    #[component]
+    fn CredentialErrorProbe() -> impl IntoElement {
+        let configure = |state: &AppState| {
+            state.settings.update(|settings| {
+                settings.model_provider = "openai-chat".to_owned();
+                settings.model_base_url = "http://127.0.0.1:11434/v1".to_owned();
+            });
+        };
+        let unsupported = AppState::with_vault(
+            mt_core::credentials::CredentialVault::with_test_store(Arc::new(NoSecureStore)),
+        );
+        configure(&unsupported);
+        let unsupported_status = credential_status_text(&unsupported, Language::English);
+        let unsupported_status_chinese = credential_status_text(&unsupported, Language::Chinese);
+        let unsupported_error = unsupported
+            .store_persistent_credential("synthetic")
+            .expect_err("an unsupported store refuses a secure write");
+        unsupported
+            .settings
+            .update(|settings| settings.language = Language::Chinese);
+        let unsupported_error_chinese = unsupported
+            .store_persistent_credential("synthetic")
+            .expect_err("an unsupported store refuses a secure write in Chinese");
+
+        let failing = Arc::new(CountingStore::default());
+        failing.fail_write.store(true, Ordering::Relaxed);
+        let failing_state = AppState::with_vault(
+            mt_core::credentials::CredentialVault::with_test_store(failing),
+        );
+        configure(&failing_state);
+        let write_error = failing_state
+            .store_persistent_credential("synthetic")
+            .expect_err("a failing store reports the write refusal");
+        failing_state
+            .settings
+            .update(|settings| settings.language = Language::Chinese);
+        let write_error_chinese = failing_state
+            .store_persistent_credential("synthetic")
+            .expect_err("a failing store reports the write refusal in Chinese");
+
+        let unreadable = Arc::new(CountingStore::default());
+        unreadable.fail_read.store(true, Ordering::Relaxed);
+        let unreadable_state = AppState::with_vault(
+            mt_core::credentials::CredentialVault::with_test_store(unreadable),
+        );
+        configure(&unreadable_state);
+        let read_error = credential_status_text(&unreadable_state, Language::English);
+        let read_error_chinese = credential_status_text(&unreadable_state, Language::Chinese);
+
+        view()
+            .test_id("credential-errors")
+            .child(prims::ink(SharedString::from(format!(
+                "A:{unsupported_status}|B:{unsupported_error}|C:{write_error}\
+                 |D:{unsupported_status_chinese}|E:{unsupported_error_chinese}|F:{write_error_chinese}\
+                 |G:{read_error}|H:{read_error_chinese}"
+            ))))
+    }
+
+    #[test]
+    fn credential_failures_are_localized_with_a_next_step() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                CredentialErrorProbe,
+            >()))
+            .expect("start the probe");
+        app.wait_for("id:credential-errors")
+            .expect("the probe's line");
+        let summary = app
+            .screen()
+            .texts()
+            .into_iter()
+            .find(|text| text.starts_with("A:"))
+            .expect("the probe's line");
+        assert_eq!(
+            summary,
+            "A:OS keychain storage is unavailable on this system. Use \"Use for session\" or set an environment variable.\
+             |B:OS keychain storage is unavailable on this system. Use \"Use for session\" or set an environment variable.\
+             |C:Could not save to secure storage. Use \"Use for session\" instead, or check your OS keychain permissions.\
+             |D:当前系统不支持安全凭据存储。请点击“仅本次会话使用”或配置环境变量。\
+             |E:当前系统不支持安全凭据存储。请点击“仅本次会话使用”或配置环境变量。\
+             |F:无法写入系统安全存储。请改用“仅本次会话使用”，或检查系统凭据管理器权限。\
+             |G:The secure credential could not be read. Retry, or use \"Use for session\" or an environment variable.\
+             |H:无法读取安全存储的凭据。请重试，或改用“仅本次会话使用”或环境变量。"
+        );
+        assert!(
+            !summary.contains("synthetic"),
+            "a credential error echoed the key: {summary}"
+        );
     }
 
     /// The probe's vault: one per test binary, read by the test that drives the
@@ -1500,7 +1715,7 @@ mod tests {
         let settings_path = mt_core::settings::settings_path().expect("the hermetic settings path");
         std::fs::create_dir(&settings_path).expect("block the settings file with a directory");
         app.press("id:settings-close").expect("close Settings");
-        app.wait_for("id:settings-page >> text:Could not save settings.")
+        app.wait_for("id:settings-page >> text:Could not save settings. Check that the settings file is writable, then try again.")
             .expect("the failed save is shown in Settings");
         assert!(
             app.screen()
@@ -1510,7 +1725,7 @@ mod tests {
         );
         assert_eq!(
             app.screen()
-                .span_style("text:Could not save settings.")
+                .span_style("text:Could not save settings. Check that the settings file is writable, then try again.")
                 .expect("the Settings save error")
                 .color,
             tokens::LIGHT.danger
@@ -1550,8 +1765,10 @@ mod tests {
         app.wait_for("id:title-menu-settings").expect("the menu");
         app.press("id:title-menu-settings").expect("open settings");
         app.wait_for("id:settings-page").expect("the page");
-        app.wait_for("text:The secure credential could not be read.")
-            .expect("the failed read is shown");
+        app.wait_for(
+            "text:The secure credential could not be read. Retry, or use \"Use for session\" or an environment variable.",
+        )
+        .expect("the failed read is shown");
 
         // The failure was a moment, not a state: an unrelated change re-reads
         // the vault and the status recovers without the endpoint moving.
@@ -1560,7 +1777,7 @@ mod tests {
             .expect("clear the model field");
         app.type_text("id:settings-model", "probe-model")
             .expect("type a model");
-        app.wait_for("text:No key saved")
+        app.wait_for("text:No credential stored")
             .expect("the status recovered");
 
         // A remote HTTP endpoint is refused, and the line under the field says
@@ -1568,7 +1785,7 @@ mod tests {
         app.clear("id:settings-base-url").expect("clear the field");
         app.type_text("id:settings-base-url", "http://example.com/v1")
             .expect("type a base URL");
-        app.wait_for("text:Remote endpoints must use HTTPS.")
+        app.wait_for("text:HTTPS is required for remote hosts. For a local server on this machine, use a numeric loopback address such as http://127.0.0.1:11434/v1.")
             .expect("validation error");
 
         // A numeric loopback URL over HTTP is the one plain-HTTP case the core
@@ -1577,7 +1794,7 @@ mod tests {
         app.type_text("id:settings-base-url", "http://127.0.0.1:8000/v1")
             .expect("type a loopback URL");
         app.wait_for_gone(
-            "text:Remote endpoints must use HTTPS.",
+            "text:HTTPS is required for remote hosts. For a local server on this machine, use a numeric loopback address such as http://127.0.0.1:11434/v1.",
             std::time::Duration::from_secs(5),
         )
         .expect("validation error gone");
@@ -1587,11 +1804,13 @@ mod tests {
         // status is this process's own.
         app.press("text:Best available")
             .expect("choose best available");
-        app.wait_for("text:Choose a provider before configuring credentials.")
-            .expect("unconfigured status");
+        app.wait_for(
+            "text:Choose a wire format above (not Best available) to configure its credential.",
+        )
+        .expect("unconfigured status");
         app.press("text:OpenAI Chat Completions")
             .expect("choose a wire format");
-        app.wait_for("text:No key saved")
+        app.wait_for("text:No credential stored")
             .expect("configured status");
 
         // A choice that is now the current one stays the same control: pressing
@@ -1601,7 +1820,8 @@ mod tests {
             .expect("the current wire format is still a control");
         app.press("text:English")
             .expect("the current language is still a control");
-        app.wait_for("text:No key saved").expect("unchanged status");
+        app.wait_for("text:No credential stored")
+            .expect("unchanged status");
         assert!(
             !app.screen().shows("Settings saved."),
             "pressing the current choice saved the settings again"
@@ -1647,7 +1867,7 @@ mod tests {
         app.type_text("id:api-key", "synthetic-probe-key")
             .expect("type a key");
         app.press("text:Store securely").expect("store securely");
-        app.wait_for("text:Key saved in Windows Credential Manager")
+        app.wait_for("text:Credential stored securely for this endpoint")
             .expect("stored status");
         app.wait_for("text:Key stored securely.")
             .expect("store notice");
@@ -1672,7 +1892,7 @@ mod tests {
             .expect("type a replacement");
         app.press("text:Replace")
             .expect("the same control, replaced");
-        app.wait_for("text:Key saved in Windows Credential Manager")
+        app.wait_for("text:Credential stored securely for this endpoint")
             .expect("still stored");
         assert_eq!(
             PROBE_STORE.stored(&target).as_deref(),
@@ -1688,12 +1908,33 @@ mod tests {
             "the field keeps the key after replacing it"
         );
         app.press("text:Remove").expect("forget the stored key");
-        app.wait_for("text:No key saved")
+        app.wait_for("text:No credential stored")
             .expect("status after removal");
+        assert_eq!(
+            PROBE_STORE.stored(&target).as_deref(),
+            Some("synthetic-replacement-key"),
+            "Remove committed before its undo hold elapsed"
+        );
+        app.press("id:status-undo").expect("undo the removal");
+        app.wait_for("text:Credential stored securely for this endpoint")
+            .expect("the stored status is back");
+        assert_eq!(
+            PROBE_STORE.stored(&target).as_deref(),
+            Some("synthetic-replacement-key"),
+            "Undo lost the credential"
+        );
+        app.press("text:Remove")
+            .expect("forget the stored key for good");
+        app.wait_for("text:No credential stored")
+            .expect("status after the second removal");
+        app.wait(std::time::Duration::from_millis(
+            crate::ui::motion::UNDO_HOLD_MS + 500,
+        ))
+        .expect("the hold elapses");
         assert_eq!(
             PROBE_STORE.stored(&target),
             None,
-            "Remove left the key in the vault"
+            "the delete never committed after the hold"
         );
 
         // The session fallback stores nothing persistent and is forgotten the
@@ -1712,7 +1953,7 @@ mod tests {
             "the session key was written to the secure store"
         );
         app.press("text:Remove").expect("forget the key");
-        app.wait_for("text:No key saved")
+        app.wait_for("text:No credential stored")
             .expect("status after removal");
 
         // A key another instance of the app stores appears when the page is
@@ -1725,7 +1966,7 @@ mod tests {
         app.wait_for("id:title-menu-settings").expect("the menu");
         app.press("id:title-menu-settings")
             .expect("open settings again");
-        app.wait_for("text:Key saved in Windows Credential Manager")
+        app.wait_for("text:Credential stored securely for this endpoint")
             .expect("the status read the store afresh");
     }
 }

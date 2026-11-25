@@ -49,7 +49,8 @@ pub enum Key {
     System,
     Light,
     Dark,
-    SaveSettings,
+    Undo,
+    ActionUndone,
     KeyStoredForSession,
     KeyStoredSecurely,
     ClipboardTextUnavailable,
@@ -118,7 +119,9 @@ pub enum Key {
     Language_,
     Translation,
     Provider,
+    ProviderHelp,
     Model,
+    ModelHelp,
     BaseUrl,
     TargetLanguage,
     ApiKey,
@@ -134,6 +137,9 @@ pub enum Key {
     CredentialDeleted,
     CredentialReadFailed,
     CredentialRequired,
+    CredentialWriteFailed,
+    CredentialDeleteFailed,
+    SecureStoreUnavailable,
 
     // Endpoint validation
     EndpointInvalidUrl,
@@ -151,6 +157,7 @@ pub enum Key {
     UsageOff,
     UsageOn,
     UsageInspect,
+    UsageHideDetails,
     UsageExport,
     UsageClear,
     UsageExportFileName,
@@ -161,7 +168,6 @@ pub enum Key {
     UsageExported,
     UsageExportFailed,
     UsageCleared,
-    UsageUtcDay,
     UsageFirstLaunch,
     UsageArtifactOpened,
     UsageArtifactPasted,
@@ -219,10 +225,10 @@ pub fn usage_summary(language: Language, counts: &mt_core::usage::UsageAggregate
         .fold(0_u64, |sum, count| sum.saturating_add(*count));
     match language {
         Language::English => format!(
-            "{days} retained UTC days · {reviews} Reviews completed · {decisions} revision decisions · {events} events"
+            "Last 180 days: {days} days active · {reviews} Reviews · {decisions} revision decisions · {events} total events"
         ),
         Language::Chinese => format!(
-            "保留 {days} 个 UTC 日 · 完成 {reviews} 次审查 · {decisions} 次修订决定 · {events} 个事件"
+            "近 180 天：活跃 {days} 天 · 完成审查 {reviews} 次 · 修订决定 {decisions} 次 · 共 {events} 条记录"
         ),
     }
 }
@@ -234,7 +240,7 @@ pub fn usage_details(language: Language, counts: &mt_core::usage::UsageAggregate
     };
     let mut lines = Vec::new();
     for (day, counts) in counts.days() {
-        lines.push(format!("{} {day}", t(language, Key::UsageUtcDay)));
+        lines.push(civil_date(*day));
         for (kind, count) in &counts.events {
             let key = match kind {
                 UsageEventKind::FirstLaunch => Key::UsageFirstLaunch,
@@ -294,6 +300,25 @@ pub fn usage_details(language: Language, counts: &mt_core::usage::UsageAggregate
         ));
     }
     lines.join("\n")
+}
+
+fn civil_date(days_since_epoch: u64) -> String {
+    let z = days_since_epoch as i64 + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 pub(crate) fn quoted_path(path: &std::path::Path) -> String {
@@ -397,8 +422,8 @@ pub fn effective_context_choice_label(language: Language, selected: bool) -> &'s
     match (language, selected) {
         (Language::English, false) => "Include context source (unchecked)",
         (Language::English, true) => "Include context source (selected)",
-        (Language::Chinese, false) => "包含 Context 来源（未选择）",
-        (Language::Chinese, true) => "包含 Context 来源（已选择）",
+        (Language::Chinese, false) => "包含智能体上下文来源（未选择）",
+        (Language::Chinese, true) => "包含智能体上下文来源（已选择）",
     }
 }
 
@@ -493,7 +518,7 @@ pub fn model_request_disclosure(language: Language, disclosure: &ModelRequestDis
                 .collect::<Vec<_>>()
                 .join("\n");
             format!(
-                "范围：文档及 Effective Agent Context，{} UTF-8 文档字节\nContext 来源：\n{sources}",
+                "范围：文档及有效智能体上下文，{} UTF-8 文档字节\n上下文来源：\n{sources}",
                 disclosure.scope().primary_content_byte_size()
             )
         }
@@ -549,7 +574,7 @@ pub fn model_request_disclosure(language: Language, disclosure: &ModelRequestDis
             .join("\n");
         match language {
             Language::English => format!("{scope}\nEffective Agent Context sources:\n{sources}"),
-            Language::Chinese => format!("{scope}\nEffective Agent Context 来源：\n{sources}"),
+            Language::Chinese => format!("{scope}\n有效智能体上下文来源：\n{sources}"),
         }
     } else {
         scope
@@ -722,14 +747,17 @@ fn english(key: Key) -> &'static str {
         Key::SaveAsFailed => "Save As failed",
         Key::OverwriteFailed => "Overwrite failed",
         Key::SettingsSaved => "Settings saved.",
-        Key::SettingsSaveFailed => "Could not save settings.",
+        Key::SettingsSaveFailed => {
+            "Could not save settings. Check that the settings file is writable, then try again."
+        }
         Key::ReviewWithContext => "Review with selected context",
         Key::File => "File",
         Key::Assumption => "Assumption",
         Key::System => "System",
         Key::Light => "Light",
         Key::Dark => "Dark",
-        Key::SaveSettings => "Save",
+        Key::Undo => "Undo",
+        Key::ActionUndone => "Undone.",
         Key::KeyStoredForSession => "Key stored for this session.",
         Key::KeyStoredSecurely => "Key stored securely.",
         Key::ClipboardTextUnavailable => "Clipboard does not contain text or is unavailable.",
@@ -795,8 +823,16 @@ fn english(key: Key) -> &'static str {
         Key::Theme => "Theme",
         Key::Language_ => "Language",
         Key::Translation => "Translation",
-        Key::Provider => "Provider",
+        Key::Provider => "Wire format",
+        Key::ProviderHelp => {
+            "Selects the API protocol. Choose a specific format to store its credential; \
+             Best available automatically picks a configured format when Review starts."
+        }
         Key::Model => "Model",
+        Key::ModelHelp => {
+            "Leave empty to use MARKTURBO_MODEL, then MARKTURBO_TRANSLATE_MODEL, then the wire \
+             format's default model."
+        }
         Key::BaseUrl => "Base URL",
         Key::TargetLanguage => "Target language",
         Key::ApiKey => "API key",
@@ -805,12 +841,28 @@ fn english(key: Key) -> &'static str {
 
         Key::StoreCredentialSecurely => "Store securely",
         Key::UseCredentialForSession => "Use for session",
-        Key::ChooseProviderForCredential => "Choose a provider before configuring credentials.",
-        Key::UnsupportedProvider => "The configured provider is not supported.",
+        Key::ChooseProviderForCredential => {
+            "Choose a wire format above (not Best available) to configure its credential."
+        }
+        Key::UnsupportedProvider => "The configured wire format is not supported.",
         Key::CredentialEndpointInvalid => "Fix the endpoint before configuring credentials.",
         Key::CredentialDeleted => "Credential deleted for this endpoint.",
-        Key::CredentialReadFailed => "The secure credential could not be read.",
+        Key::CredentialReadFailed => {
+            "The secure credential could not be read. Retry, or use \"Use for session\" or an \
+             environment variable."
+        }
         Key::CredentialRequired => "Enter a credential first.",
+        Key::CredentialWriteFailed => {
+            "Could not save to secure storage. Use \"Use for session\" instead, or check your \
+             OS keychain permissions."
+        }
+        Key::CredentialDeleteFailed => {
+            "Could not delete the stored credential. Try again, or remove it in your OS keychain."
+        }
+        Key::SecureStoreUnavailable => {
+            "OS keychain storage is unavailable on this system. Use \"Use for session\" or set an \
+             environment variable."
+        }
 
         Key::EndpointInvalidUrl => "The endpoint URL is invalid.",
         Key::EndpointUnsupportedScheme => "The endpoint must use HTTP or HTTPS.",
@@ -818,18 +870,25 @@ fn english(key: Key) -> &'static str {
         Key::EndpointUserInfoNotAllowed => "The endpoint URL cannot contain user information.",
         Key::EndpointQueryNotAllowed => "The endpoint URL cannot contain query parameters.",
         Key::EndpointFragmentNotAllowed => "The endpoint URL cannot contain a fragment.",
-        Key::EndpointInsecureRemoteTransport => "Remote endpoints must use HTTPS.",
+        Key::EndpointInsecureRemoteTransport => {
+            "HTTPS is required for remote hosts. For a local server on this machine, use a numeric \
+             loopback address such as http://127.0.0.1:11434/v1."
+        }
 
         Key::UsageCounters => "Local usage counters",
         Key::UsageDisclosure => {
-            "Optional, local only: daily counts of opted-in first launch, artifact open/paste/save, Review starts (scope and lens), completed Reviews (duration bucket), submitted clarification answers, revision decisions (accepted/rejected hunk totals), applied revisions, provider/credential failures, stale-result blocks and recovery restores. No content, names, paths, credentials, identities or precise timestamps. Nothing is uploaded; export only when you choose."
+            "Optional local-only daily counts (opens, saves, Reviews, answers, revision decisions, \
+             and errors). Never records document text, filenames, paths, credentials, or \
+             timestamps. Stays on this device unless you export it."
         }
         Key::UsageRetention => {
-            "Retain counts for 180 days; prune older days on load/save. Day keys are UTC days since 1970-01-01. Off stops recording; Clear deletes local counts, not your exported copies."
+            "Counts are kept for 180 days and pruned automatically. Turning this Off stops \
+             recording; Clear counts deletes local history without affecting exported files."
         }
         Key::UsageOff => "Off",
         Key::UsageOn => "On",
-        Key::UsageInspect => "Inspect counts",
+        Key::UsageInspect => "Show details",
+        Key::UsageHideDetails => "Hide details",
         Key::UsageExport => "Export counts…",
         Key::UsageClear => "Clear counts",
         Key::UsageExportFileName => "markturbo-usage.json",
@@ -848,7 +907,6 @@ fn english(key: Key) -> &'static str {
         Key::UsageCleared => {
             "Local counts deleted. Recording preference and exported copies are unchanged."
         }
-        Key::UsageUtcDay => "UTC day since 1970-01-01:",
         Key::UsageFirstLaunch => "First opted-in launch",
         Key::UsageArtifactOpened => "Artifacts opened",
         Key::UsageArtifactPasted => "Artifacts pasted",
@@ -907,14 +965,15 @@ fn chinese(key: Key) -> &'static str {
         Key::SaveAsFailed => "另存为失败",
         Key::OverwriteFailed => "覆盖失败",
         Key::SettingsSaved => "设置已保存。",
-        Key::SettingsSaveFailed => "无法保存设置。",
+        Key::SettingsSaveFailed => "无法保存设置。请检查设置文件是否可写，然后重试。",
         Key::ReviewWithContext => "使用所选上下文审查",
         Key::File => "文件",
         Key::Assumption => "假设",
         Key::System => "跟随系统",
         Key::Light => "浅色",
         Key::Dark => "深色",
-        Key::SaveSettings => "保存",
+        Key::Undo => "撤销",
+        Key::ActionUndone => "已撤销。",
         Key::KeyStoredForSession => "密钥已保存到当前会话。",
         Key::KeyStoredSecurely => "密钥已安全保存。",
         Key::ClipboardTextUnavailable => "剪贴板中没有文本，或剪贴板当前不可用。",
@@ -974,8 +1033,14 @@ fn chinese(key: Key) -> &'static str {
         Key::Theme => "主题",
         Key::Language_ => "界面语言",
         Key::Translation => "翻译",
-        Key::Provider => "服务商",
+        Key::Provider => "协议格式",
+        Key::ProviderHelp => {
+            "选择 API 协议格式。指定具体格式后即可配置其凭据；“自动选择”会在审查开始时自动选用已配置凭据的格式。"
+        }
         Key::Model => "模型",
+        Key::ModelHelp => {
+            "留空则依次使用 MARKTURBO_MODEL、MARKTURBO_TRANSLATE_MODEL，再使用该协议格式的默认模型。"
+        }
         Key::BaseUrl => "接口地址",
         Key::TargetLanguage => "目标语言",
         Key::ApiKey => "API key",
@@ -984,12 +1049,25 @@ fn chinese(key: Key) -> &'static str {
 
         Key::StoreCredentialSecurely => "安全存储",
         Key::UseCredentialForSession => "仅本次会话使用",
-        Key::ChooseProviderForCredential => "请先选择服务商，再配置凭据。",
-        Key::UnsupportedProvider => "当前配置的服务商不受支持。",
+        Key::ChooseProviderForCredential => {
+            "请先在上方选择具体的协议格式（非“自动选择”），再配置其凭据。"
+        }
+        Key::UnsupportedProvider => "当前配置的协议格式不受支持。",
         Key::CredentialEndpointInvalid => "请先修正端点，再配置凭据。",
         Key::CredentialDeleted => "已删除此端点的凭据。",
-        Key::CredentialReadFailed => "无法读取安全存储的凭据。",
+        Key::CredentialReadFailed => {
+            "无法读取安全存储的凭据。请重试，或改用“仅本次会话使用”或环境变量。"
+        }
         Key::CredentialRequired => "请先输入凭据。",
+        Key::CredentialWriteFailed => {
+            "无法写入系统安全存储。请改用“仅本次会话使用”，或检查系统凭据管理器权限。"
+        }
+        Key::CredentialDeleteFailed => {
+            "无法删除已存储的凭据。请重试，或在系统凭据管理器中手动删除。"
+        }
+        Key::SecureStoreUnavailable => {
+            "当前系统不支持安全凭据存储。请点击“仅本次会话使用”或配置环境变量。"
+        }
 
         Key::EndpointInvalidUrl => "端点 URL 无效。",
         Key::EndpointUnsupportedScheme => "端点必须使用 HTTP 或 HTTPS。",
@@ -997,18 +1075,21 @@ fn chinese(key: Key) -> &'static str {
         Key::EndpointUserInfoNotAllowed => "端点 URL 不能包含用户信息。",
         Key::EndpointQueryNotAllowed => "端点 URL 不能包含查询参数。",
         Key::EndpointFragmentNotAllowed => "端点 URL 不能包含片段。",
-        Key::EndpointInsecureRemoteTransport => "远程端点必须使用 HTTPS。",
+        Key::EndpointInsecureRemoteTransport => {
+            "远程主机必须使用 HTTPS。如果连接本机服务，请使用数字回环地址（例如 http://127.0.0.1:11434/v1）。"
+        }
 
         Key::UsageCounters => "本地使用计数",
         Key::UsageDisclosure => {
-            "可选且仅限本地：按日记录启用后的首次启动、工件打开/粘贴/保存、审查开始（范围及视角）、审查完成（耗时区间）、已提交的澄清回答、修订决定（接受/拒绝的修改块总数）、已应用的修订、服务商/凭据失败、过期结果拦截和恢复操作次数。不记录内容、名称、路径、凭据、身份或精确时间。不上传任何数据；仅由您主动导出。"
+            "可选的纯本地按日计数（打开、保存、审查、回答、修订决定及错误次数）。绝不记录文档正文、文件名、路径、凭据或时间戳。数据仅保存在本机，除非你主动导出。"
         }
         Key::UsageRetention => {
-            "计数保留 180 天，读取/保存时清理更早的日期。日期键为自 1970-01-01 起的 UTC 日数。关闭即停止记录；清除仅删除本地计数，不删除您导出的副本。"
+            "计数保留 180 天，过期自动清理。关闭即停止记录；“清除计数”仅删除本机记录，不影响已导出的文件。"
         }
         Key::UsageOff => "关闭",
         Key::UsageOn => "开启",
-        Key::UsageInspect => "查看计数",
+        Key::UsageInspect => "显示明细",
+        Key::UsageHideDetails => "隐藏明细",
         Key::UsageExport => "导出计数…",
         Key::UsageClear => "清除计数",
         Key::UsageExportFileName => "markturbo-usage.json",
@@ -1019,7 +1100,6 @@ fn chinese(key: Key) -> &'static str {
         Key::UsageExported => "已导出汇总计数，未上传任何数据。",
         Key::UsageExportFailed => "无法导出计数。请选择可写且尚不存在的路径。",
         Key::UsageCleared => "已删除本地计数。记录偏好和已导出的副本不变。",
-        Key::UsageUtcDay => "自 1970-01-01 起的 UTC 日数：",
         Key::UsageFirstLaunch => "启用后的首次启动",
         Key::UsageArtifactOpened => "工件打开次数",
         Key::UsageArtifactPasted => "工件粘贴次数",
@@ -1059,6 +1139,8 @@ mod tests {
         Key::ClipboardTextUnavailable,
         Key::Translate,
         Key::Review,
+        Key::Undo,
+        Key::ActionUndone,
         Key::ReviewLensPrompt,
         Key::ReviewLensAgentInstructions,
         Key::ReviewLensAgentSkill,
@@ -1106,7 +1188,9 @@ mod tests {
         Key::Language_,
         Key::Translation,
         Key::Provider,
+        Key::ProviderHelp,
         Key::Model,
+        Key::ModelHelp,
         Key::BaseUrl,
         Key::TargetLanguage,
         Key::ApiKey,
@@ -1120,6 +1204,9 @@ mod tests {
         Key::CredentialDeleted,
         Key::CredentialReadFailed,
         Key::CredentialRequired,
+        Key::CredentialWriteFailed,
+        Key::CredentialDeleteFailed,
+        Key::SecureStoreUnavailable,
         Key::EndpointInvalidUrl,
         Key::EndpointUnsupportedScheme,
         Key::EndpointMissingHost,
@@ -1133,6 +1220,7 @@ mod tests {
         Key::UsageOff,
         Key::UsageOn,
         Key::UsageInspect,
+        Key::UsageHideDetails,
         Key::UsageExport,
         Key::UsageClear,
         Key::UsageExportFileName,
@@ -1143,7 +1231,6 @@ mod tests {
         Key::UsageExported,
         Key::UsageExportFailed,
         Key::UsageCleared,
-        Key::UsageUtcDay,
         Key::UsageFirstLaunch,
         Key::UsageArtifactOpened,
         Key::UsageArtifactPasted,
@@ -1201,6 +1288,34 @@ mod tests {
         // A shared technical label remains readable, not an enum variant name.
         assert_eq!(t(Language::Chinese, Key::ModeWeb), "兼容预览");
         assert!(!t(Language::Chinese, Key::ModeWeb).contains("Key::"));
+    }
+
+    #[test]
+    fn usage_day_keys_render_as_dates() {
+        for (day, expected) in [
+            (0, "1970-01-01"),
+            (58, "1970-02-28"),
+            (59, "1970-03-01"),
+            (11_017, "2000-03-01"),
+            (20_410, "2025-11-18"),
+            (100_000, "2243-10-17"),
+        ] {
+            assert_eq!(civil_date(day), expected, "day {day}");
+        }
+    }
+
+    #[test]
+    fn usage_details_render_dates_not_day_numbers() {
+        let aggregate: mt_core::usage::UsageAggregate = serde_json::from_str(
+            r#"{"schema_version":1,"days":{"20410":{"events":{"artifact_pasted":1},"review_started":{},"review_durations":{},"accepted_hunks":0,"rejected_hunks":0}}}"#,
+        )
+        .expect("the aggregate parses");
+        let details = usage_details(Language::English, &aggregate);
+        assert!(
+            details.lines().any(|line| line == "2025-11-18"),
+            "{details}"
+        );
+        assert!(!details.contains("20410"), "{details}");
     }
 
     #[test]

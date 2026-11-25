@@ -169,19 +169,42 @@ pub fn quiet_action(
     label: impl Into<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
+    ink_action(test_id, label, || tokens::palette().ink, on_press)
+}
+
+pub fn danger_action(
+    test_id: &str,
+    label: impl Into<SharedString>,
+    on_press: impl Fn() + 'static,
+) -> impl Interactive + ParentElement {
+    ink_action(test_id, label, || tokens::palette().danger, on_press)
+}
+
+fn ink_action(
+    test_id: &str,
+    label: impl Into<SharedString>,
+    hover_ink: fn() -> Color,
+    on_press: impl Fn() + 'static,
+) -> impl Interactive + ParentElement {
+    let duration = press_color_duration();
     let label: SharedString = label.into();
     press_target(test_id, label.clone())
         .px(px(2.0))
         .py(px(4.0))
-        .hover(|s| s.text_color(|| tokens::palette().ink).underline())
-        .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
+        .group()
         .on_press(on_press)
         .child(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest),
+            motion::ease_out(
+                text(label)
+                    .font_family(FONT_UI)
+                    .text_size(px(TYPE_UI))
+                    .line_height(px(TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink_rest)
+                    .transition_colors()
+                    .duration(move || duration.get()),
+            )
+            .group_hover(move |s| s.text_color(hover_ink).underline())
+            .group_focus_visible(move |s| s.text_color(hover_ink).underline()),
         )
 }
 
@@ -192,6 +215,7 @@ pub fn primary_action(
     label: impl Into<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
+    let duration = press_color_duration();
     let label: SharedString = label.into();
     press_target(test_id, label.clone())
         .px(px(tokens::SPACE_3))
@@ -200,13 +224,20 @@ pub fn primary_action(
         .border_color(move || tokens::palette().ink_caption)
         .hover(|s| s.border_color(|| tokens::palette().ink))
         .focus_visible(|s| s.border_color(|| tokens::palette().ink))
+        .group()
         .on_press(on_press)
         .child(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink),
+            motion::ease_out(
+                text(label)
+                    .font_family(FONT_UI)
+                    .text_size(px(TYPE_UI))
+                    .line_height(px(TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink)
+                    .transition_colors()
+                    .duration(move || duration.get()),
+            )
+            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
         )
 }
 
@@ -323,6 +354,7 @@ pub fn text_field(
     value: impl IntoReactive<String>,
     placeholder: impl IntoReactive<String>,
     on_change: impl Fn(&str) + 'static,
+    on_blur: impl Fn() + 'static,
 ) -> impl ParentElement {
     view()
         .flex_col()
@@ -336,6 +368,7 @@ pub fn text_field(
                 .text_size(px(TYPE_UI))
                 .bg(Color::TRANSPARENT)
                 .on_change(move |text: &str| on_change(text))
+                .on_blur(on_blur)
                 .w_full(),
         )
         .child(hairline())
@@ -433,6 +466,68 @@ mod tests {
     use nsh_testing::Headless;
 
     #[test]
+    fn a_hovered_actions_label_steps_to_its_hover_ink() {
+        use nsh_core::{
+            platform::ColorScheme,
+            tailwind::state::{FOCUSED, HOVERED},
+        };
+
+        let mut config = EngineConfig::new(Root::of::<Harness>().tokens(tokens::theme()));
+        config.environment.color_scheme = ColorScheme::Light;
+        config.environment.reduce_motion = true;
+        let mut app = Headless::start(config).expect("start the harness");
+        app.wait_for("id:harness-danger").expect("the harness");
+        for (id, text, hovered, resting) in [
+            (
+                "harness-quiet",
+                "Quiet",
+                tokens::LIGHT.ink,
+                tokens::LIGHT.ink_rest,
+            ),
+            (
+                "harness-primary",
+                "Primary",
+                tokens::LIGHT.ink,
+                tokens::LIGHT.ink,
+            ),
+            (
+                "harness-danger",
+                "Danger",
+                tokens::LIGHT.danger,
+                tokens::LIGHT.ink_rest,
+            ),
+        ] {
+            let node = node_with(&app, id);
+            app.engine().control().set_states(node, HOVERED);
+            app.settle();
+            let style = app
+                .screen()
+                .span_style(&format!("id:{id} >> text:/^{text}$/"))
+                .expect("the hovered label");
+            assert_eq!(style.color, hovered, "{id} hovers in its ink");
+            assert!(style.decoration.underline, "{id} hovers underlined");
+            app.engine().control().set_states(node, 0);
+            app.settle();
+            let style = app
+                .screen()
+                .span_style(&format!("id:{id} >> text:/^{text}$/"))
+                .expect("the resting label");
+            assert_eq!(style.color, resting, "{id} rests again");
+
+            app.press_key("a").expect("keyboard modality");
+            app.engine().control().set_states(node, FOCUSED);
+            app.settle();
+            let style = app
+                .screen()
+                .span_style(&format!("id:{id} >> text:/^{text}$/"))
+                .expect("the focused label");
+            assert_eq!(style.color, hovered, "{id} focuses in its ink");
+            app.engine().control().set_states(node, 0);
+            app.settle();
+        }
+    }
+
+    #[test]
     fn script_runs_follow_primary_scripts_and_keep_graphemes_whole() {
         for (input, expected) in [
             ("A·B", vec![(false, "A·B")]),
@@ -464,6 +559,9 @@ mod tests {
                 presses.update(|n| *n += 1)
             }))
             .child(primary_action("harness-primary", "Primary", move || {
+                presses.update(|n| *n += 1)
+            }))
+            .child(danger_action("harness-danger", "Danger", move || {
                 presses.update(|n| *n += 1)
             }))
             .child(

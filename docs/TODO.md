@@ -141,3 +141,12 @@
     ` (os error N)`.
   - `wait_until()` gates on test markers that schedule no UI batch (`folder_open_token.rs`, `reload_edit_race.rs`,
     `translation_flow.rs`). Under the system clock they can time out after the condition already holds.
+- [ ] **Goal 20 lane 20-C follow-ups (PR #74 review)**:
+  - Accepted residual: on Windows, `delete_resolved()` (`crates/mt-core/src/credentials.rs`) compares the secret and
+    `LastWritten`, then calls `CredDeleteW` by target name. If the Credential Manager replaces the entry between the
+    compare and the delete, the newer credential is deleted.
+  - A staging temp file held open past the 5 s usage Undo window: `clear()` ignores the cleanup failure, but
+    `restore()` still needs the same file removed. The Undo can expire unrestored, and the staged counts can stay on
+    disk.
+  - The usage-failure notice is matched by its translated text. If the UI language changes between a failed and a
+    successful Undo, the red Settings notice stays. Match on a notice key instead of the text.

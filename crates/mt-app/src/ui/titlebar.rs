@@ -170,6 +170,8 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             save_as_state.save_as_active();
         }
     });
+    let settings_state = state.clone();
+    on_key("mod+,", move |_: &str| settings_state.toggle_settings());
     // Every Escape binding runs the same fixed-order decision, so the
     // newest one cannot pick a layer the contract puts lower.
     let escape_state = state.clone();

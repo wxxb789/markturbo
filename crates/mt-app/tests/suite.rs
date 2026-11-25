@@ -42,6 +42,8 @@ mod focus_after_close;
 mod folder_open_token;
 #[path = "goal17_settings.rs"]
 mod goal17_settings;
+#[path = "goal20_settings_lane.rs"]
+mod goal20_settings_lane;
 #[path = "guard_untitled_cancel.rs"]
 mod guard_untitled_cancel;
 #[path = "guard_untitled_save.rs"]

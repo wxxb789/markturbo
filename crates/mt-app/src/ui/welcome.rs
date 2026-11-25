@@ -27,7 +27,7 @@ use crate::{
     i18n::{self, Key},
     state::{AppState, Entry},
     ui::{
-        prims,
+        prims, titlebar,
         tokens::{
             self, FONT_UI, HAIRLINE, SPACE_1, SPACE_2, SPACE_3, SPACE_5, SPACE_6, TYPE_UI,
             TYPE_UI_LINE,
@@ -192,6 +192,15 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
                     .child(prims::faint(find_a_file(language))),
             ),
         )
+}
+
+fn find_a_file(language: Language) -> SharedString {
+    let keys = titlebar::shortcut(false, "P");
+    match language {
+        Language::English => format!("{keys} finds any file in this folder."),
+        Language::Chinese => format!("按 {keys} 查找此文件夹中的任意文件。"),
+    }
+    .into()
 }
 
 /// The files [`workspace_home`] lists: the workspace's files, in the
@@ -412,14 +421,6 @@ pub(crate) fn choose_folder(state: AppState) {
             Err(why) => state.notify_error(picker_failed(language, &why)),
         }
     });
-}
-
-fn find_a_file(language: Language) -> String {
-    let key = crate::ui::titlebar::shortcut(false, "P");
-    match language {
-        Language::English => format!("{key} finds any file in this folder."),
-        Language::Chinese => format!("按 {key} 查找此文件夹中的任意文件。"),
-    }
 }
 
 fn picker_failed(language: Language, why: &dyn std::fmt::Display) -> String {

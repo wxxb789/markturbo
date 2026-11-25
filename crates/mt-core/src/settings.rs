@@ -813,7 +813,7 @@ mod tests {
         );
 
         drop(settings_guard);
-        assert_eq!(usage.clear(), Ok(()));
+        assert!(usage.clear().is_ok());
     }
 
     #[test]

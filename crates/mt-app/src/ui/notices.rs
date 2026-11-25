@@ -32,7 +32,7 @@ use std::{
 use mt_core::{recovery::RecoveredRecord, settings::Language};
 use nsh_base::editor::{EditorDecoration, EditorPosition, EditorRange};
 use nsh_core::{
-    Color, DecorationStyle, PropertyValue, StyleKey, TextDecoration,
+    Color, DecorationStyle, EllipsizeMode, PropertyValue, StyleKey, TextDecoration,
     element::AnimatedValue,
     element::{KeyOptions, Style, on_key_with, untracked},
     keymap::When,
@@ -50,7 +50,7 @@ use crate::{
         prims,
         tokens::{
             self, CONSENT_BUTTON_H, CONSENT_BUTTON_W, FOCUS_RING, FOCUS_RING_OFFSET, HAIRLINE,
-            SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
+            SPACE_2, SPACE_3, SPACE_4, SPACE_5,
         },
     },
 };
@@ -1444,87 +1444,100 @@ pub(crate) fn status_line_at(
     let error = state.status_error;
     let message = state.status;
     let owner = state.status_surface;
-    let action_state = state.clone();
+    let undo_state = state;
+    let undo_message = message;
     view().test_id("status").w_full().pt(px(SPACE_3)).child(
         view()
             .w_full()
             .h(px(tokens::TYPE_UI_LINE))
             .bind_opacity(&presence.opacity)
             .bind_translate_y(&presence.rise)
+            .flex_row()
+            .items_center()
+            .gap(px(SPACE_2))
             .child(
-                view()
-                    .flex_row()
-                    .items_center()
-                    .child(
-                        text(move || {
-                            if owner.get() == surface {
-                                message.get().text
-                            } else {
-                                SharedString::default()
-                            }
-                        })
-                        .flex_shrink(1.0)
-                        .min_w(px(0.0))
-                        .font_family(tokens::FONT_UI)
-                        .text_size(px(tokens::TYPE_UI))
-                        .line_height(px(tokens::TYPE_UI_LINE))
-                        .number_of_lines(1)
-                        .text_color(move || {
-                            if error.get() {
-                                tokens::palette().danger
-                            } else {
-                                tokens::palette().ink_rest
-                            }
-                        })
-                        .child(tokens::mono_count(text(move || {
-                            if owner.get() == surface {
-                                message.get().count.clone().unwrap_or_default()
-                            } else {
-                                SharedString::default()
-                            }
-                        }))),
-                    )
-                    .child(when(
-                        {
-                            let visible_state = state.clone();
-                            move || {
-                                visible_state.status_surface.get() == surface
-                                    && visible_state.status.get().action.is_some()
-                            }
-                        },
-                        move || {
-                            let action = action_state.clone();
-                            let label = action
-                                .status
-                                .get()
-                                .action
-                                .as_ref()
-                                .map(|(label, _)| label.clone())
-                                .unwrap_or_default();
-                            view()
-                                .flex_row()
-                                .flex_shrink_0()
-                                .items_center()
-                                .gap(px(SPACE_1))
-                                .child(
-                                    text("·")
-                                        .font_family(tokens::FONT_UI)
-                                        .text_size(px(tokens::TYPE_UI))
-                                        .line_height(px(tokens::TYPE_UI_LINE))
-                                        .text_color(move || tokens::palette().ink_caption),
-                                )
-                                .child(prims::quiet_action("status-action", label, move || {
-                                    if let Some((_, run)) =
-                                        action.status.get_untracked().action.as_ref()
-                                    {
-                                        run();
-                                    }
-                                }))
-                                .into_element()
-                        },
-                    )),
-            ),
+                text(move || {
+                    if owner.get() == surface {
+                        message.get().text
+                    } else {
+                        SharedString::default()
+                    }
+                })
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .number_of_lines(1)
+                // A long notice ellipsizes instead of pushing its Undo off
+                // the line: the action must stay reachable.
+                .flex_1()
+                .min_w(px(0.0))
+                .text_overflow(EllipsizeMode::Tail)
+                .text_color(move || {
+                    if error.get() {
+                        tokens::palette().danger
+                    } else {
+                        tokens::palette().ink_rest
+                    }
+                })
+                .child(tokens::mono_count(text(move || {
+                    if owner.get() == surface {
+                        message.get().count.clone().unwrap_or_default()
+                    } else {
+                        SharedString::default()
+                    }
+                }))),
+            )
+            .child(when(
+                move || owner.get() == surface && undo_message.get().action.is_some(),
+                move || status_undo(undo_state.clone()),
+            )),
     )
+}
+
+fn status_undo(state: AppState) -> impl IntoElement {
+    let duration = prims::press_color_duration();
+    let label_state = state.clone();
+    let press_state = state;
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_2))
+        .child(prims::faint("\u{00b7}"))
+        .child(
+            prims::press_feedback(
+                view()
+                    .test_id("status-undo")
+                    .role(AccessibilityRole::Button)
+                    .optional_label({
+                        let label_state = label_state.clone();
+                        move || label_state.status.get().action.map(|action| action.label)
+                    })
+                    .window_drag(false)
+                    .cursor_pointer()
+                    .bg(Color::TRANSPARENT)
+                    .group()
+                    .on_press(move |_: &PressEvent| press_state.undo_last()),
+            )
+            .child(
+                text(move || {
+                    label_state
+                        .status
+                        .get()
+                        .action
+                        .map(|action| action.label)
+                        .unwrap_or_default()
+                })
+                .test_id("status-action")
+                .font_family(tokens::FONT_UI)
+                .text_size(px(tokens::TYPE_UI))
+                .line_height(px(tokens::TYPE_UI_LINE))
+                .text_color(move || tokens::palette().ink_rest)
+                .transition_colors()
+                .duration(move || duration.get())
+                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
+            ),
+        )
 }
 
 fn observe_status(watched: AppState, presence: StatusPresence) {
@@ -2377,6 +2390,61 @@ mod tests {
         assert_eq!(
             names_line(&four, Language::Chinese),
             "notes.md、draft.md 等 4 个文件"
+        );
+    }
+
+    #[component]
+    fn StatusSurfacesProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let presence = StatusPresence::new(state.clone());
+        let notify_state = state.clone();
+        let editor_state = state.clone();
+        let review_state = state;
+        view()
+            .flex_col()
+            .child(prims::primary_action("probe-notify", "Notify", move || {
+                notify_state.notify_undo(
+                    crate::state::StatusSurface::Editor,
+                    "Cleared the counts",
+                    crate::state::UndoNotice {
+                        label: SharedString::from("Undo"),
+                        reverse: std::rc::Rc::new(|| Ok(())),
+                        commit: std::rc::Rc::new(|| {}),
+                    },
+                );
+            }))
+            .child(view().test_id("probe-editor").child(status_line_at(
+                editor_state,
+                presence,
+                crate::state::StatusSurface::Editor,
+            )))
+            .child(view().test_id("probe-review").child(status_line_at(
+                review_state,
+                presence,
+                crate::state::StatusSurface::Review,
+            )))
+    }
+
+    #[test]
+    fn an_undo_renders_on_only_the_routed_surface() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<StatusSurfacesProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:probe-notify").expect("the probe");
+        app.press("id:probe-notify").expect("offer the Undo");
+        app.wait_for("id:probe-editor >> id:status-undo")
+            .expect("the routed line carries the Undo");
+        assert_eq!(
+            app.screen()
+                .count("id:status-undo")
+                .expect("valid status-undo selector"),
+            1,
+            "the Undo appeared on both status lines"
+        );
+        assert!(
+            !app.screen()
+                .matches("id:probe-review >> id:status-undo")
+                .expect("valid selector"),
+            "the un-routed line carried the Undo"
         );
     }
 }
