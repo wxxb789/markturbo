@@ -400,14 +400,20 @@ impl UsageStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)?;
+        // Best effort: the store is already deleted, so a stale staging file
+        // this process cannot remove must not cost the caller the captured
+        // counts, and with them the Undo.
+        if let Some(parent) = path.parent() {
+            let _ = Self::clear_staging(parent);
+        }
         Ok(captured)
     }
 
     /// Undo of [`clear`](Self::clear): add `captured`'s counters back into
     /// whatever the store holds now, so an event recorded during the Undo hold
-    /// is kept alongside them.
-    pub fn restore(&self, captured: &UsageAggregate) -> Result<(), UsageError> {
+    /// is kept alongside them. Counts outside the retention window are pruned
+    /// before saving, exactly as recording and inspection prune them.
+    pub fn restore(&self, captured: &UsageAggregate, now: SystemTime) -> Result<(), UsageError> {
         if captured.days.is_empty() {
             return Ok(());
         }
@@ -417,6 +423,7 @@ impl UsageStore {
         for (day, counts) in &captured.days {
             aggregate.days.entry(*day).or_default().add(counts);
         }
+        aggregate.prune(day_bucket(now));
         Self::save(path, &aggregate)
     }
 

@@ -136,7 +136,9 @@ pub(crate) enum StatusKind {
 #[derive(Clone)]
 pub(crate) struct UndoNotice {
     pub(crate) label: SharedString,
-    pub(crate) reverse: Rc<dyn Fn()>,
+    /// Returns a localized failure notice when the reversal could not happen,
+    /// so the caller can keep the action live for a retry.
+    pub(crate) reverse: Rc<dyn Fn() -> Result<(), SharedString>>,
     pub(crate) commit: Rc<dyn Fn()>,
 }
 
@@ -893,19 +895,29 @@ impl AppState {
     }
 
     pub(crate) fn undo_last(&self) {
-        self.undo_generation.update(|generation| generation + 1);
         let action = self.pending_undo.borrow_mut().take();
         let Some(action) = action else {
             return;
         };
-        (action.reverse)();
-        let language = self.settings.get().language;
-        let surface = self.status_surface.get();
-        self.publish(
-            surface,
-            StatusKind::Success,
-            StatusMessage::plain(crate::i18n::t(language, crate::i18n::Key::ActionUndone)),
-        );
+        match (action.reverse)() {
+            Ok(()) => {
+                self.undo_generation.update(|generation| generation + 1);
+                let language = self.settings.get().language;
+                let surface = self.status_surface.get();
+                self.publish(
+                    surface,
+                    StatusKind::Success,
+                    StatusMessage::plain(crate::i18n::t(language, crate::i18n::Key::ActionUndone)),
+                );
+            }
+            Err(notice) => {
+                // The action stays in the slot so the user can retry, and the
+                // untouched generation keeps its expiry timer alive.
+                self.pending_undo.borrow_mut().replace(action);
+                let surface = self.status_surface.get();
+                self.publish(surface, StatusKind::Error, StatusMessage::plain(notice));
+            }
+        }
     }
 
     fn commit_pending_undo(&self) {
@@ -1000,11 +1012,16 @@ impl AppState {
         let reverse = {
             let usage = Rc::clone(&self.usage);
             move || {
-                if let Err(error) = usage.borrow().restore(&captured) {
+                let outcome = usage.borrow().restore(&captured, SystemTime::now());
+                if let Err(error) = &outcome {
                     log::warn!("cannot restore usage counts: {error}");
                     state.usage_notice(crate::i18n::Key::UsageUnavailable);
                 }
                 state.refresh_usage_counts();
+                outcome.map_err(|_| {
+                    let language = state.settings.get().language;
+                    SharedString::from(crate::i18n::t(language, crate::i18n::Key::UsageUnavailable))
+                })
             }
         };
         let commit = move || {
@@ -3826,6 +3843,7 @@ impl AppState {
                 state
                     .settings_credential_revision
                     .update(|revision| *revision += 1);
+                Ok(())
             }
         };
         let commit = move || {

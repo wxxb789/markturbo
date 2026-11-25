@@ -2178,7 +2178,7 @@ mod tests {
                     "Cleared the counts",
                     crate::state::UndoNotice {
                         label: SharedString::from("Undo"),
-                        reverse: std::rc::Rc::new(|| {}),
+                        reverse: std::rc::Rc::new(|| Ok(())),
                         commit: std::rc::Rc::new(|| {}),
                     },
                 );

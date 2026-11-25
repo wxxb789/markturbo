@@ -315,7 +315,7 @@ fn clear_then_record_then_undo_restores_old_plus_new() {
     store
         .record(UsageEvent::ArtifactSaved, at_day(200))
         .unwrap();
-    store.restore(&captured).unwrap();
+    store.restore(&captured, at_day(200)).unwrap();
     let counts = store.inspect(at_day(200)).unwrap();
     let events = &counts.days()[&200].events;
     assert_eq!(events[&UsageEventKind::ArtifactOpened], 1);
@@ -340,6 +340,60 @@ fn clear_then_record_then_expiry_keeps_only_the_new_event() {
     let events = &counts.days()[&200].events;
     assert_eq!(events.len(), 1);
     assert_eq!(events[&UsageEventKind::ArtifactSaved], 1);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn a_held_stale_stage_still_yields_the_captured_counts() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = enabled_store(directory.path());
+    store
+        .record(UsageEvent::ArtifactSaved, at_day(200))
+        .unwrap();
+    let stale = directory.path().join(".markturbo-usage-AbCd12.tmp");
+    std::fs::write(&stale, "stale stage").unwrap();
+    // Deny every share mode so the OS refuses the stale file's deletion.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&stale)
+        .unwrap();
+    let captured = store.clear().unwrap();
+    assert_eq!(captured.days().len(), 1, "the captured counts were dropped");
+    drop(held);
+    store.restore(&captured, at_day(200)).unwrap();
+    let counts = store.inspect(at_day(200)).unwrap();
+    assert_eq!(
+        counts.days()[&200].events[&UsageEventKind::ArtifactSaved],
+        1,
+        "the Undo did not restore the captured counts"
+    );
+}
+
+#[test]
+fn restore_prunes_counts_older_than_retention_before_saving() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("usage.json");
+    let store = enabled_store(directory.path());
+    let mut aggregate = UsageAggregate::default();
+    for day in [19, 200] {
+        aggregate
+            .days
+            .entry(day)
+            .or_default()
+            .record(UsageEvent::ArtifactOpened);
+    }
+    std::fs::write(&path, serde_json::to_vec(&aggregate).unwrap()).unwrap();
+    let captured = store.clear().unwrap();
+    store.restore(&captured, at_day(200)).unwrap();
+    let persisted: UsageAggregate = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        persisted.days().keys().copied().collect::<Vec<_>>(),
+        [200],
+        "restore wrote a count older than the retention window"
+    );
 }
 
 #[test]

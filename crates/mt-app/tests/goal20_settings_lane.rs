@@ -639,3 +639,59 @@ fn clearing_a_corrupt_usage_file_deletes_it_at_once() {
     app.press("id:status-undo").expect("undo the empty clear");
     assert!(!store.exists(), "Undo resurrected the corrupt file");
 }
+
+#[test]
+fn a_failed_undo_keeps_the_counts_for_a_retry() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, config, _codex_home) = start_with_manual_clock();
+    let store = config.path().join("data").join("usage.json");
+    let day = mt_core::usage::day_bucket(std::time::SystemTime::now());
+    std::fs::create_dir_all(store.parent().expect("the data directory"))
+        .expect("the data directory");
+    std::fs::write(
+        &store,
+        format!(
+            r#"{{"schema_version":1,"days":{{"{day}":{{"events":{{"artifact_opened":1}},"review_started":{{}},"review_durations":{{}},"accepted_hunks":0,"rejected_hunks":0}}}}}}"#
+        ),
+    )
+    .expect("a seeded store");
+
+    open_settings(&mut app);
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.press("id:usage-clear").expect("clear the counts");
+    app.wait_for(
+        "text:Local counts deleted. Recording preference and exported copies are unchanged.",
+    )
+    .expect("clear confirmation");
+    assert!(!store.exists(), "the clear left the store behind");
+
+    // A directory at the store path makes every read of the store fail, so
+    // the Undo's restore fails. It stands in for a held write lock.
+    std::fs::create_dir(&store).expect("a decoy store");
+    app.press("id:status-undo").expect("run the failing Undo");
+    app.settle();
+    assert!(
+        !app.screen().shows("Undone."),
+        "a failed restore still reported success"
+    );
+    app.wait_for(
+        "text:Local usage counts could not be read or written. Editing and Review remain available.",
+    )
+    .expect("the failure notice");
+    app.wait_for("id:status-undo")
+        .expect("the failed Undo stayed live for a retry");
+
+    std::fs::remove_dir(&store).expect("clear the decoy");
+    app.press("id:status-undo").expect("retry the Undo");
+    app.wait_for("text:Undone.").expect("the retry succeeded");
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).expect("the restored store"))
+            .expect("valid JSON");
+    let day_key = day.to_string();
+    assert_eq!(
+        json["days"][&day_key]["events"]["artifact_opened"], 1,
+        "the retry did not restore the captured counts"
+    );
+}
