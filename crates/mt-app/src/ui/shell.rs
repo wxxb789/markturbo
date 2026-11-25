@@ -267,7 +267,23 @@ fn column(
                     },
                 )),
         )
-        .child(notices::status_line(state, language, status))
+        .child(
+            view()
+                .w_full()
+                // The overlay's edge, not the window's: a live Undo on this
+                // line must stay pressable under the narrow field.
+                .max_w(move || {
+                    px(if layout.field_overlays() {
+                        (client_width_now() * (1.0 - Layout::OVERLAY_FRACTION)
+                            - tokens::RAIL_W
+                            - tokens::COLUMN_GAP)
+                            .max(0.0)
+                    } else {
+                        layout.measure()
+                    })
+                })
+                .child(notices::status_line(state, language, status)),
+        )
 }
 
 fn track_reflow(deadline: Rc<Cell<Option<nsh_core::time::Instant>>>) -> impl Fn(f32) {
@@ -621,6 +637,36 @@ mod tests {
         }
     }
 
+    fn recovered_record() -> mt_core::recovery::RecoveredRecord {
+        use mt_core::{
+            document::io::{FileStamp, Newline, SourceIdentity},
+            recovery::{RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord},
+        };
+        RecoveredRecord {
+            record: RecoveryRecord {
+                key: RecoveryKey::for_document_id("shell-undo-probe"),
+                text: "Recovered text".to_owned(),
+                metadata: RecoveryMetadata {
+                    source_path: None,
+                    encoding_name: "UTF-8".to_owned(),
+                    had_bom: false,
+                    newline: Newline::Lf,
+                    original_stamp: FileStamp {
+                        modified: None,
+                        len: 0,
+                        digest: [0; 32],
+                        object_id: None,
+                    },
+                    source_identity: SourceIdentity::Regular,
+                    decode_had_errors: false,
+                },
+                checkpointed_at: std::time::SystemTime::UNIX_EPOCH,
+                revision: None,
+            },
+            source_conflicted: false,
+        }
+    }
+
     /// What the app's own last focus move handed the keyboard to, as text a
     /// test can read: one signal per app, so parallel lib tests never share
     /// a focus record.
@@ -676,6 +722,9 @@ mod tests {
                     }))
                     .child(control("probe-forget-focus", &state, |state| {
                         state.focus_last.set(None);
+                    }))
+                    .child(control("probe-discard-recovered", &state, |state| {
+                        state.discard_recovered(&recovered_record());
                     })),
             )
             .child(shell(state, Language::English, layout))
@@ -699,40 +748,12 @@ mod tests {
 
     #[component]
     fn RecoveryBannerProbe() -> impl IntoElement {
-        use mt_core::{
-            document::io::{FileStamp, Newline, SourceIdentity},
-            recovery::{RecoveredRecord, RecoveryKey, RecoveryMetadata, RecoveryRecord},
-        };
-
         let state = AppState::new();
-        let record = RecoveredRecord {
-            record: RecoveryRecord {
-                key: RecoveryKey::for_document_id("banner-motion-probe"),
-                text: "Recovered text".to_owned(),
-                metadata: RecoveryMetadata {
-                    source_path: None,
-                    encoding_name: "UTF-8".to_owned(),
-                    had_bom: false,
-                    newline: Newline::Lf,
-                    original_stamp: FileStamp {
-                        modified: None,
-                        len: 0,
-                        digest: [0; 32],
-                        object_id: None,
-                    },
-                    source_identity: SourceIdentity::Regular,
-                    decode_had_errors: false,
-                },
-                checkpointed_at: std::time::SystemTime::UNIX_EPOCH,
-                revision: None,
-            },
-            source_conflicted: false,
-        };
         view()
             .w_full()
             .h(relative(1.0))
             .child(control("probe-show-recovery", &state, move |state| {
-                state.recovery_records.set(vec![record.clone()]);
+                state.recovery_records.set(vec![recovered_record()]);
             }))
             .child(shell(state, Language::English, Layout::Wide))
     }
@@ -1870,6 +1891,51 @@ mod tests {
         assert!(
             (lens - expected).abs() < 0.5,
             "the overlay's lens starts at x{lens}, not x{expected}"
+        );
+    }
+
+    #[test]
+    fn a_live_undo_stays_inside_the_visible_editor_column() {
+        let mut app = start(Root::of::<NarrowProbe>(), 1000.0);
+        press(&mut app, "probe-split");
+        app.wait_for("id:preview-field").expect("the preview");
+        assert_undo_inside_visible_column(&mut app, 1000.0);
+
+        let mut app = start(Root::of::<WideProbe>(), 1280.0);
+        press(&mut app, "probe-split");
+        app.wait_for("id:preview-field").expect("the preview");
+        assert_undo_inside_visible_column(&mut app, 1280.0);
+
+        let mut app = start(Root::of::<NarrowProbe>(), 1000.0);
+        assert_undo_inside_visible_column(&mut app, 1000.0);
+    }
+
+    fn assert_undo_inside_visible_column(app: &mut Headless, width: f32) {
+        press(app, "probe-discard-recovered");
+        app.wait_for("id:status-undo").expect("the live Undo");
+        let column = node(app, "column").bounds;
+        let undo = node(app, "status-undo").bounds;
+        let visible_right = if Layout::of(width).field_overlays() {
+            width * (1.0 - Layout::OVERLAY_FRACTION)
+        } else {
+            column.origin.x.0 + column.size.width.0
+        };
+
+        app.press("id:status-undo")
+            .unwrap_or_else(|why| panic!("press the live Undo: {why}"));
+        app.wait_for("id:recovery-row-0")
+            .expect("the discarded draft returns");
+
+        let left = undo.origin.x.0;
+        let right = left + undo.size.width.0;
+        assert!(
+            left >= column.origin.x.0,
+            "the Undo starts at x{left}, left of the column at x{}",
+            column.origin.x.0
+        );
+        assert!(
+            right <= visible_right + 0.5,
+            "the Undo ends at x{right}, outside the visible column at x{visible_right}"
         );
     }
 
