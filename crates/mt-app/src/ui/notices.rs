@@ -1453,6 +1453,7 @@ pub(crate) fn status_line_at(
             .bind_opacity(&presence.opacity)
             .bind_translate_y(&presence.rise)
             .flex_row()
+            .justify_end()
             .items_center()
             .gap(px(SPACE_2))
             .child(

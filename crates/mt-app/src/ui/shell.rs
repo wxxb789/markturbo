@@ -270,11 +270,9 @@ fn column(
         .child(
             view()
                 .w_full()
-                // The overlay's edge, not the window's: a live Undo on this
-                // line must stay pressable under the narrow field.
                 .max_w(move || {
                     px(if layout.field_overlays() {
-                        (client_width_now() * (1.0 - Layout::OVERLAY_FRACTION)
+                        (layout.field_left(client_width_now())
                             - tokens::RAIL_W
                             - tokens::COLUMN_GAP)
                             .max(0.0)
@@ -351,8 +349,8 @@ fn field(
         area.absolute()
             .top(px(0.0))
             .bottom(px(0.0))
+            .left(move || px(layout.field_left(client_width_now())))
             .right(px(0.0))
-            .w(move || px(client_width_now() * Layout::OVERLAY_FRACTION))
             .bg(move || tokens::palette().room)
     } else {
         area.flex_1()
@@ -1937,6 +1935,52 @@ mod tests {
             right <= visible_right + 0.5,
             "the Undo ends at x{right}, outside the visible column at x{visible_right}"
         );
+    }
+
+    #[test]
+    fn a_live_undo_stays_clear_of_the_preview_at_220_points() {
+        let width = 220.0;
+        let mut app = start(Root::of::<NarrowProbe>(), width);
+        press(&mut app, "probe-split");
+        app.wait_for("id:preview-field").expect("the preview");
+        press(&mut app, "probe-discard-recovered");
+        app.wait_for("id:status-undo").expect("the live Undo");
+        assert_undo_left_of_overlay_and_pressable(&mut app, width);
+    }
+
+    #[test]
+    fn a_live_undo_follows_a_resize_inside_one_split_instance() {
+        let mut app = start(Root::of::<NarrowProbe>(), 1000.0);
+        press(&mut app, "probe-split");
+        app.wait_for("id:preview-field").expect("the preview");
+        press(&mut app, "probe-discard-recovered");
+        app.wait_for("id:status-undo").expect("the live Undo");
+
+        app.set_viewport(nsh_core::Size::new(Points(900.0), Points(900.0)))
+            .expect("shrink the window to 900 pt");
+        assert_undo_left_of_overlay_and_pressable(&mut app, 900.0);
+    }
+
+    fn assert_undo_left_of_overlay_and_pressable(app: &mut Headless, width: f32) {
+        let column = node(app, "column").bounds;
+        let undo = node(app, "status-undo").bounds;
+        let overlay_left = Layout::of(width).field_left(width);
+        let left = undo.origin.x.0;
+        let right = left + undo.size.width.0;
+        assert!(
+            left >= column.origin.x.0,
+            "the Undo starts at x{left}, left of the column at x{}",
+            column.origin.x.0
+        );
+        assert!(
+            right <= overlay_left + 0.5,
+            "the Undo is x{left}..{right}, past the overlay's edge at x{overlay_left}"
+        );
+
+        app.press("id:status-undo")
+            .unwrap_or_else(|why| panic!("press the live Undo: {why}"));
+        app.wait_for("id:recovery-row-0")
+            .expect("the discarded draft returns");
     }
 
     /// Opening a review leaves your text where it was: the line numbers it

@@ -345,6 +345,16 @@ impl Layout {
         matches!(self, Layout::Narrow)
     }
 
+    /// The field's left edge at `client_width`: where the overlay begins
+    /// below 1040, and the field's own column above it.
+    pub fn field_left(self, client_width: f32) -> f32 {
+        if self.field_overlays() {
+            client_width * (1.0 - Self::OVERLAY_FRACTION)
+        } else {
+            RAIL_W + COLUMN_GAP + self.measure() + FIELD_GAP
+        }
+    }
+
     /// How much the field takes of the width when it overlays the column.
     pub const OVERLAY_FRACTION: f32 = 0.46;
 
