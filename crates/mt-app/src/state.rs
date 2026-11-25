@@ -277,6 +277,9 @@ pub struct AppState {
     /// A Review is in flight on a tab other than the active one: the room's
     /// Review entry points wait for it and say why.
     pub review_busy_elsewhere: Signal<bool>,
+    /// The status generation the waiting notice was published under, so a
+    /// freed Review slot clears exactly that notice and no newer one.
+    review_wait_generation: Rc<Cell<Option<u64>>>,
     /// The source column's camera ([`DocumentFocus`]): the line a docked
     /// surface wants levelled with it. Set it with
     /// [`AppState::focus_document_line`].
@@ -853,6 +856,7 @@ impl AppState {
             review_view: signal(None),
             review_busy: signal(false),
             review_busy_elsewhere: signal(false),
+            review_wait_generation: Rc::new(Cell::new(None)),
             document_focus: signal(DocumentFocus::default()),
             review_unavailable: signal(None),
             translation_busy: signal(false),
@@ -1067,6 +1071,14 @@ impl AppState {
         if self.pending_undo.borrow().is_some() {
             self.status_surface.set(self.undo_surface());
         }
+    }
+
+    /// Clear the status line; a live Undo stays on it until its deadline.
+    pub(crate) fn clear_status(&self) {
+        if self.pending_undo.borrow().is_some() {
+            return;
+        }
+        self.status.set(StatusMessage::default());
     }
 
     pub(crate) fn notify_undo(
@@ -1576,7 +1588,9 @@ impl AppState {
             self.review_open_tabs
                 .borrow_mut()
                 .insert(previous, self.review_open.get_untracked());
-            self.store_shown_revision_session(previous);
+            if self.tabs.get().iter().any(|tab| tab.id == previous) {
+                self.store_shown_revision_session(previous);
+            }
             self.store_shown_review_unavailable(previous);
             let open = self
                 .review_open_tabs
@@ -1751,6 +1765,19 @@ impl AppState {
             .set(owner.is_some_and(|owner| active == Some(owner)));
         self.review_busy_elsewhere
             .set(owner.is_some_and(|owner| active != Some(owner)));
+        if owner.is_none() {
+            self.clear_review_wait_notice();
+        }
+    }
+
+    fn clear_review_wait_notice(&self) {
+        let Some(generation) = self.review_wait_generation.get() else {
+            return;
+        };
+        self.review_wait_generation.set(None);
+        if self.status_generation.get_untracked() == generation {
+            self.clear_status();
+        }
     }
 
     fn refresh_revision_busy(&self) {
@@ -1920,6 +1947,10 @@ impl AppState {
     }
 
     pub fn review_with_context(&self) {
+        if self.review_busy_elsewhere.get_untracked() {
+            self.notify_review_waiting();
+            return;
+        }
         self.context_open.set(false);
         self.start_review();
     }
@@ -2686,6 +2717,7 @@ impl AppState {
         // app-wide Review and Revision slots for the remaining tabs.
         self.cancel_review_owned_by(id);
         self.cancel_revision_owned_by(id);
+        self.revision_sessions.borrow_mut().remove(&id);
         if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() {
             self.retire_tab_recovery(&tab);
         }
@@ -3363,20 +3395,11 @@ impl AppState {
         let Some(tab) = self.active_tab() else {
             return;
         };
-        // Preparing parks the whole session: a cancel puts it back.
-        self.park_review_session();
         let language = self.settings.get().language;
         let origin = ReviewOrigin {
             tab_id: tab.id,
             snapshot: SourceSnapshot::new(tab.revision.get(), 0),
         };
-        self.context_open.set(false);
-        self.review_consent.set(None);
-        self.review_manifest.set(None);
-        *self.review_origin.borrow_mut() = None;
-        *self.review_binding.borrow_mut() = None;
-        self.review_selection.set(None);
-
         let settings = self.settings.get();
         let review_language = match settings.language {
             Language::Chinese => ReviewLanguage::SimplifiedChinese,
@@ -3497,6 +3520,15 @@ impl AppState {
         // The selection is offered only where a selection can be bound: an
         // Agent Skill package is reviewed whole.
         let selectable = matches!(bound.request().source, ReviewSource::Document { .. });
+        // Nothing past the validation can fail: park the session this
+        // preparation replaces, then commit it.
+        self.park_review_session();
+        self.context_open.set(false);
+        self.review_consent.set(None);
+        self.review_manifest.set(None);
+        *self.review_origin.borrow_mut() = None;
+        *self.review_binding.borrow_mut() = None;
+        self.review_selection.set(None);
         *self.pending_review.borrow_mut() = Some(bound);
         *self.review_origin.borrow_mut() = Some(origin);
         self.review_selection.set(captured.filter(|_| selectable));
@@ -4220,7 +4252,7 @@ impl AppState {
         if let Some((_, cancelled)) = self.revision_cancellation.borrow_mut().take() {
             cancelled.store(true, Ordering::Release);
             if self.status_surface.get_untracked() == StatusSurface::Review {
-                self.status.set(StatusMessage::default());
+                self.clear_status();
             }
         }
         self.refresh_revision_busy();
@@ -4771,6 +4803,8 @@ impl AppState {
             StatusKind::Info,
             flow_copy::S::ReviewWaitingElsewhere.text(self.settings.get().language),
         );
+        self.review_wait_generation
+            .set(Some(self.status_generation.get_untracked()));
     }
 
     pub fn open_settings(&self) {
@@ -6872,6 +6906,157 @@ mod tests {
             !refusal.contains("at path") && !refusal.contains(&missing.display().to_string()),
             "the staged write leaks the library's path wording: {refusal}"
         );
+    }
+
+    static REVISION_CANCEL_KEEPS_UNDO: std::sync::Mutex<Option<(bool, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn RevisionCancelKeepsUndoProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let tab = state.active.get().expect("the tab");
+        // The Undo's line is the Review line, as it is while a Revision runs.
+        state.review_open.set(true);
+        let reversed = Rc::new(Cell::new(false));
+        let reverse = Rc::clone(&reversed);
+        state.notify_undo(
+            StatusSurface::Editor,
+            SharedString::from("Discarded recovered draft"),
+            UndoNotice {
+                label: SharedString::from("Undo"),
+                reverse: Rc::new(move || {
+                    reverse.set(true);
+                    Ok(())
+                }),
+                commit: Rc::new(|| {}),
+            },
+        );
+        *state.revision_cancellation.borrow_mut() = Some((tab, Arc::new(AtomicBool::new(false))));
+        state.refresh_revision_busy();
+        state.cancel_revision_owned_by(tab);
+        let offered = state.status.get_untracked().action.is_some();
+        state.undo_last();
+        *REVISION_CANCEL_KEEPS_UNDO.lock().expect("the outcome") = Some((offered, reversed.get()));
+        view()
+    }
+
+    #[test]
+    fn cancelling_a_revision_keeps_a_live_undo_reachable() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                RevisionCancelKeepsUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (offered, restored) = REVISION_CANCEL_KEEPS_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(offered, "the Revision cancel removed the live Undo");
+        assert!(restored, "the Undo did not restore its work");
+    }
+
+    static PREPARE_SNAPSHOT: std::sync::Mutex<Option<(bool, bool)>> = std::sync::Mutex::new(None);
+
+    #[component]
+    fn PrepareSnapshotProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        configure_endpoint(&state);
+        state
+            .store_session_credential("probe-key")
+            .expect("a session credential");
+        state.new_document();
+        // A: Review selection with no selection fails before showing anything.
+        state.prepare_review(true);
+
+        state.new_document();
+        let b = state.active.get().expect("B");
+        state
+            .active_tab()
+            .expect("B's tab")
+            .text
+            .set(SharedString::from("# B\nA document with text.\n"));
+        state.review_open.set(true);
+        state.set_review_result(
+            ReviewView {
+                tab_id: Some(b),
+                status: "B's result".to_owned(),
+                ..ReviewView::default()
+            },
+            None,
+        );
+        state.prepare_review(false);
+        let disclosed = state.review_consent.get().is_some();
+        state.cancel_review();
+        let kept = state
+            .review_view
+            .get()
+            .is_some_and(|view| view.status == "B's result");
+        *PREPARE_SNAPSHOT.lock().expect("the outcome") = Some((disclosed, kept));
+        view()
+    }
+
+    #[test]
+    fn a_failed_selection_prepare_does_not_park_another_tabs_session() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                PrepareSnapshotProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (disclosed, kept) = PREPARE_SNAPSHOT
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(disclosed, "B's preparation did not reach its disclosure");
+        assert!(kept, "cancelling B's Review restored A's empty snapshot");
+    }
+
+    static CLOSED_TAB_SESSION: std::sync::Mutex<Option<(bool, bool)>> = std::sync::Mutex::new(None);
+
+    #[component]
+    fn ClosedTabSessionProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let a = state.active.get().expect("A");
+        state.write_revision_session(
+            a,
+            RevisionSession {
+                status: Some(SharedString::from("A's revision")),
+                ..RevisionSession::default()
+            },
+        );
+        state.new_document();
+        let b = state.active.get().expect("B");
+        state.set_active(a);
+        state.close_tab_now(a);
+        let still_stored = state.revision_sessions.borrow().contains_key(&a);
+        *CLOSED_TAB_SESSION.lock().expect("the outcome") =
+            Some((still_stored, state.active.get() == Some(b)));
+        view()
+    }
+
+    #[test]
+    fn closing_a_tab_releases_its_revision_session() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                ClosedTabSessionProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (still_stored, active_b) = CLOSED_TAB_SESSION
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(
+            !still_stored,
+            "the closed tab's Revision session stayed in the store"
+        );
+        assert!(active_b, "the other tab became active");
     }
 }
 

@@ -43,7 +43,7 @@ use crate::{
     i18n::{self, Key},
     state::{
         AppState, GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, GUARD_SAVE_CHOICE, GuardKind,
-        GuardRequest, StatusMessage, Tab,
+        GuardRequest, Tab,
     },
     ui::{
         motion::{self, reduced_motion},
@@ -1406,7 +1406,7 @@ fn card_action(
 
 fn clear_status_if_current(state: &AppState, generation: u64) {
     if state.status_generation.get_untracked() == generation {
-        state.status.set(StatusMessage::default());
+        state.clear_status();
     }
 }
 

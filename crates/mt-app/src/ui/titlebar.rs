@@ -207,7 +207,11 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
         }
     });
     let settings_state = state.clone();
-    on_key("mod+,", move |_: &str| settings_state.toggle_settings());
+    on_key("mod+,", move |_: &str| {
+        if !consent::is_open(&settings_state) {
+            settings_state.toggle_settings();
+        }
+    });
     // Every Escape binding runs the same fixed-order decision, so the
     // newest one cannot pick a layer the contract puts lower.
     let escape_state = state.clone();
@@ -417,32 +421,52 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
     };
     let press_enabled = enabled.clone();
     let waiting_state = state.clone();
+    let hint_state = state.clone();
     let start = state;
-    row_action(
-        "title-review",
-        i18n::t(language, Key::Review),
-        true,
-        enabled,
-        move || {
-            if press_enabled() && !start.reopen_review() {
-                // A newly opened consent card keeps focus; focus_editor
-                // only restores it when Review did not open a modal.
-                start.start_review();
-                start.focus_editor();
-            }
-        },
-    )
-    .optional_accessibility_description(move || {
-        if waiting_state.review_start_waiting() {
-            Some(SharedString::from(
-                flow_copy::S::ReviewWaitingElsewhere.text(language),
-            ))
-        } else if !blocked_state.revision_hunks.get().is_empty() {
-            Some(SharedString::from(review_blocked_label(language)))
-        } else {
-            None
-        }
-    })
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_2))
+        .child(
+            row_action(
+                "title-review",
+                i18n::t(language, Key::Review),
+                true,
+                enabled,
+                move || {
+                    if press_enabled() && !start.reopen_review() {
+                        // A newly opened consent card keeps focus; focus_editor
+                        // only restores it when Review did not open a modal.
+                        start.start_review();
+                        start.focus_editor();
+                    }
+                },
+            )
+            .optional_accessibility_description(move || {
+                if waiting_state.review_start_waiting() {
+                    Some(SharedString::from(
+                        flow_copy::S::ReviewWaitingElsewhere.text(language),
+                    ))
+                } else if !blocked_state.revision_hunks.get().is_empty() {
+                    Some(SharedString::from(review_blocked_label(language)))
+                } else {
+                    None
+                }
+            }),
+        )
+        .child(when(
+            move || hint_state.review_start_waiting(),
+            move || {
+                view()
+                    .test_id("title-review-wait")
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
+                    .child(
+                        prims::faint(move || flow_copy::S::ReviewWaitingElsewhere.text(language))
+                            .truncate(),
+                    )
+            },
+        ))
 }
 
 /// `Settings`, the word that opens the row's menu: quieter than `Review`,
@@ -652,6 +676,22 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                             })
                         })
                         .into_element()
+                    })
+                    .child({
+                        let hint_state = state.clone();
+                        when(
+                            move || hint_state.review_busy_elsewhere.get(),
+                            move || {
+                                view()
+                                    .test_id("title-menu-review-wait")
+                                    .w_full()
+                                    .px(px(SPACE_3))
+                                    .pb(px(SPACE_2))
+                                    .child(prims::faint(move || {
+                                        flow_copy::S::ReviewWaitingElsewhere.text(language)
+                                    }))
+                            },
+                        )
                     })
                     .into_element()
             }
@@ -1605,6 +1645,8 @@ mod tests {
             Some("Waiting for Review on another document."),
             "the Review action says why"
         );
+        app.wait_for("id:title-review-wait >> text:Waiting for Review on another document.")
+            .expect("the Review action shows the reason visibly");
         app.press("id:title-settings").expect("open the menu");
         app.wait_for("id:title-menu-review-selection")
             .expect("the menu's Review row");
@@ -1623,5 +1665,7 @@ mod tests {
             Some("Waiting for Review on another document."),
             "the menu's Review says why"
         );
+        app.wait_for("id:title-menu-review-wait >> text:Waiting for Review on another document.")
+            .expect("the menu's Review shows the reason visibly");
     }
 }

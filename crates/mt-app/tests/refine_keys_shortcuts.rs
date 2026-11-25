@@ -250,6 +250,15 @@ fn a_waiting_consent_card_keeps_the_room_shortcuts_inert() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _directory, _config) = open_card_with_ctrl_enter(Os::Linux);
 
+    // `Ctrl+,` is inert too: Settings never opens under the card.
+    app.press_key("ctrl+,").expect("the settings shortcut");
+    assert_eq!(
+        app.screen().matches("id:settings-page"),
+        Ok(false),
+        "Settings opened under the consent card: {:?}",
+        app.screen().texts()
+    );
+
     // A deliberate hold is underway.
     card_key(&mut app, "Enter", true, ctrl_enter(), false);
     app.run_for(Duration::from_millis(300)).expect("held");

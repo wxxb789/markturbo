@@ -44,7 +44,7 @@ use nsh_core::{
 
 use crate::{
     i18n::{self, Key},
-    state::AppState,
+    state::{AppState, flow_copy},
     ui::{
         motion::{
             EASE_IN_OUT, EASE_OUT, IGNITE_MS, LINEAR, OUTBOUND_DECAY_MS, REDUCED_CROSSFADE_MS,
@@ -1051,37 +1051,60 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
     let count_state = state.clone();
     let selected_state = state.clone();
     let enabled_with_context = state.clone();
+    let hint_state = state.clone();
     let enabled_plain = state;
-    view().flex_shrink_0().child(
-        when(
-            move || !count_state.context_selected.get().is_empty(),
-            move || {
-                let press_state = selected_state.clone();
-                let enabled = enabled_with_context.clone();
-                prims::primary_action(
-                    "context-review",
-                    i18n::t(language, Key::ReviewWithContext),
-                    move || press_state.review_with_context(),
-                )
-                .disabled(move || enabled.active.get().is_none())
-                .disabled_style(|style| style.opacity(0.5))
-            },
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(SPACE_2))
+        .flex_shrink_0()
+        .child(
+            when(
+                move || !count_state.context_selected.get().is_empty(),
+                move || {
+                    let press_state = selected_state.clone();
+                    let enabled = enabled_with_context.clone();
+                    prims::primary_action(
+                        "context-review",
+                        i18n::t(language, Key::ReviewWithContext),
+                        move || press_state.review_with_context(),
+                    )
+                    .disabled(move || context_review_disabled(&enabled))
+                    .disabled_style(|style| style.opacity(0.5))
+                },
+            )
+            .otherwise({
+                let press_state = enabled_plain;
+                move || {
+                    let press_state = press_state.clone();
+                    let enabled = press_state.clone();
+                    prims::primary_action(
+                        "context-review",
+                        i18n::t(language, Key::Review),
+                        move || press_state.review_with_context(),
+                    )
+                    .disabled(move || context_review_disabled(&enabled))
+                    .disabled_style(|style| style.opacity(0.5))
+                }
+            }),
         )
-        .otherwise({
-            let press_state = enabled_plain;
+        .child(when(
+            move || hint_state.review_busy_elsewhere.get(),
             move || {
-                let press_state = press_state.clone();
-                let enabled = press_state.clone();
-                prims::primary_action(
-                    "context-review",
-                    i18n::t(language, Key::Review),
-                    move || press_state.review_with_context(),
-                )
-                .disabled(move || enabled.active.get().is_none())
-                .disabled_style(|style| style.opacity(0.5))
-            }
-        }),
-    )
+                view()
+                    .test_id("context-review-wait")
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
+                    .child(
+                        prims::faint(move || flow_copy::S::ReviewWaitingElsewhere.text(language))
+                            .truncate(),
+                    )
+            },
+        ))
+}
+
+fn context_review_disabled(state: &AppState) -> bool {
+    state.active.get().is_none() || state.review_busy_elsewhere.get()
 }
 
 /// The scope a source in the chain covers: a global source applies to every
@@ -1854,6 +1877,64 @@ mod tests {
         assert!(
             app.press("id:context-review").is_err(),
             "a disabled Review cannot be pressed"
+        );
+    }
+
+    #[component]
+    fn WaitingFieldProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let root = PathBuf::from(std::env::var_os("MT_CONTEXT_FIXTURE").expect("fixture root"));
+        state.root.set(Some(root.clone()));
+        state.open_file(root.join("docs").join("plan.md"));
+        state.toggle_context();
+        let armed = state.clone();
+        effect(move || {
+            if armed.context_resolved.get().is_none() {
+                return;
+            }
+            if armed.context_selected.get().is_empty() {
+                armed.context_selected.set(vec![2]);
+                return;
+            }
+            let active = armed.active.get_untracked().expect("a document");
+            armed.arm_review_in_flight(active + 1);
+            armed.review_with_context();
+        });
+        let field_state = state.clone();
+        let open_state = state.context_open;
+        view().flex_col().child(when(
+            move || open_state.get(),
+            move || crate::ui::context::field(field_state.clone(), Language::English),
+        ))
+    }
+
+    #[test]
+    fn a_review_elsewhere_disables_review_with_context_and_keeps_the_panel() {
+        let _fixture = Fixture::new();
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<WaitingFieldProbe>())).expect("start");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("wide viewport");
+        app.wait_for("id:context-review >> text:Review with selected context")
+            .expect("the context-backed action");
+        assert!(
+            app.screen()
+                .accessibility_state("id:context-review")
+                .expect("the action's state")
+                .disabled,
+            "Review with context waits"
+        );
+        app.wait_for("id:context-review-wait >> text:Waiting for Review on another document.")
+            .expect("the reason is visible");
+        assert!(
+            app.press("id:context-review").is_err(),
+            "a waiting Review with context cannot be pressed"
+        );
+        assert_eq!(
+            app.screen().matches("id:consent-card"),
+            Ok(false),
+            "no consent card opened under the wait: {:?}",
+            app.screen().texts()
         );
     }
 }

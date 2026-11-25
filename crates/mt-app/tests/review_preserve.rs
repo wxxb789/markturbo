@@ -385,8 +385,33 @@ fn a_review_in_flight_elsewhere_blocks_a_second_review() {
         app.screen().texts()
     );
 
-    // A's answer still lands on A.
+    // A's answer still lands on A; freeing the slot takes B's wait notice
+    // with it. The wait is re-stated right before the release so the
+    // notice's own fade cannot pass for the slot's clear.
+    app.press_key("mod+enter").expect("re-state B's wait");
+    app.wait_for_within(
+        "text:Waiting for Review on another document.",
+        Duration::from_secs(5),
+    )
+    .expect("the reason is still shown");
     release.send(()).expect("release A's answer");
+    app.wait_until(
+        "B's Review to stop waiting",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .accessibility_state("id:title-review")
+                .is_ok_and(|state| !state.disabled)
+        },
+    )
+    .expect("the freed slot enables B's Review");
+    assert_eq!(
+        app.screen()
+            .matches("text:Waiting for Review on another document."),
+        Ok(false),
+        "the wait notice cleared with the slot: {:?}",
+        app.screen().texts()
+    );
     app.press_key("mod+p").expect("open the palette again");
     app.type_text("id:palette-input", "plan")
         .expect("filter back to plan.md");
