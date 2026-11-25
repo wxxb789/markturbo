@@ -107,12 +107,8 @@ fn daily_schema_aggregates_events_lenses_durations_and_hunk_counts() {
 
     let bytes = std::fs::read(directory.path().join("usage.json")).unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json.as_object().unwrap().len(), 3);
+    assert_eq!(json.as_object().unwrap().len(), 2);
     assert_eq!(json["schema_version"], 1);
-    assert_eq!(
-        json["generation"], 19,
-        "every save takes the next write generation"
-    );
     assert_eq!(json["days"].as_object().unwrap().len(), 2);
     assert_eq!(json["days"]["200"]["events"].as_object().unwrap().len(), 16);
     assert_eq!(json["days"]["200"]["events"]["artifact_opened"], 2);
@@ -255,53 +251,113 @@ fn clear_deletes_the_store_without_resurrecting_old_counts_or_deleting_exports()
     );
 }
 
+#[cfg(target_os = "windows")]
 #[test]
-fn a_second_commit_of_a_fully_cleared_snapshot_keeps_events_recorded_since() {
+fn a_read_failure_on_a_regular_file_is_deleted() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_WRITE};
+
     let directory = tempfile::tempdir().unwrap();
-    let first = enabled_store(directory.path());
-    let second = enabled_store(directory.path());
-    first
+    let path = directory.path().join("usage.json");
+    let store = enabled_store(directory.path());
+    store
         .record(UsageEvent::ArtifactOpened, at_day(200))
         .unwrap();
-    let from_first = first.inspect(at_day(200)).unwrap();
-    let from_second = second.inspect(at_day(200)).unwrap();
-    first.clear_keeping(&from_first).unwrap();
-    first
+    // A reader that denies sharing READ: `load` fails, but metadata still
+    // sees a regular file and a later delete is still allowed.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_DELETE.0 | FILE_SHARE_WRITE.0)
+        .open(&path)
+        .unwrap();
+    let captured = store.clear().unwrap();
+    assert!(captured.days().is_empty());
+    assert!(!path.exists(), "the unreadable store was not deleted");
+    drop(held);
+}
+
+#[test]
+fn nothing_survives_a_clear_except_events_recorded_after_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = enabled_store(directory.path());
+    store
         .record(UsageEvent::ArtifactOpened, at_day(200))
         .unwrap();
-    second.clear_keeping(&from_second).unwrap();
-    let counts = first.inspect(at_day(200)).unwrap();
+    store.clear().unwrap();
+    let names = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        counts.days()[&200].events[&UsageEventKind::ArtifactOpened],
-        1,
-        "the second instance subtracted the cleared snapshot from the new event"
+        names,
+        std::collections::BTreeSet::from(["settings.toml".to_owned()]),
+        "a file from the cleared store survived"
+    );
+    store
+        .record(UsageEvent::ArtifactSaved, at_day(200))
+        .unwrap();
+    let counts = store.inspect(at_day(200)).unwrap();
+    assert_eq!(counts.days()[&200].events.len(), 1);
+    assert_eq!(
+        counts.days()[&200].events[&UsageEventKind::ArtifactSaved],
+        1
     );
 }
 
 #[test]
-fn a_second_commit_of_a_partially_cleared_snapshot_keeps_events_recorded_since() {
+fn clear_then_record_then_undo_restores_old_plus_new() {
     let directory = tempfile::tempdir().unwrap();
-    let first = enabled_store(directory.path());
-    let second = enabled_store(directory.path());
-    first
+    let store = enabled_store(directory.path());
+    store
         .record(UsageEvent::ArtifactOpened, at_day(200))
         .unwrap();
-    let from_first = first.inspect(at_day(200)).unwrap();
-    let from_second = second.inspect(at_day(200)).unwrap();
-    first
+    let captured = store.clear().unwrap();
+    store
+        .record(UsageEvent::ArtifactSaved, at_day(200))
+        .unwrap();
+    store.restore(&captured).unwrap();
+    let counts = store.inspect(at_day(200)).unwrap();
+    let events = &counts.days()[&200].events;
+    assert_eq!(events[&UsageEventKind::ArtifactOpened], 1);
+    assert_eq!(events[&UsageEventKind::ArtifactSaved], 1);
+}
+
+#[test]
+fn clear_then_record_then_expiry_keeps_only_the_new_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = enabled_store(directory.path());
+    store
         .record(UsageEvent::ArtifactOpened, at_day(200))
         .unwrap();
-    first.clear_keeping(&from_first).unwrap();
-    first
-        .record(UsageEvent::ArtifactOpened, at_day(200))
+    // Expiry is the capture never being restored; the store was already
+    // cleared at press and nothing rewrites it again.
+    let captured = store.clear().unwrap();
+    store
+        .record(UsageEvent::ArtifactSaved, at_day(200))
         .unwrap();
-    second.clear_keeping(&from_second).unwrap();
-    let counts = first.inspect(at_day(200)).unwrap();
-    assert_eq!(
-        counts.days()[&200].events[&UsageEventKind::ArtifactOpened],
-        2,
-        "the second instance subtracted the cleared snapshot again"
-    );
+    drop(captured);
+    let counts = store.inspect(at_day(200)).unwrap();
+    let events = &counts.days()[&200].events;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[&UsageEventKind::ArtifactSaved], 1);
+}
+
+#[test]
+fn a_corrupt_file_is_cleared() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("usage.json");
+    let store = enabled_store(directory.path());
+    for text in [
+        "PRIVATE-INPUT",
+        r#"{"schema_version":1,"days":{"200":{}},"content":"PRIVATE-INPUT"}"#,
+        r#"{"schema_version":2,"days":{}}"#,
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let captured = store.clear().unwrap();
+        assert!(captured.days().is_empty());
+        assert!(!path.exists(), "clear left an unreadable store behind");
+        assert!(store.inspect(at_day(200)).unwrap().days().is_empty());
+    }
 }
 
 #[test]

@@ -142,10 +142,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         "text:Last 180 days: 0 days active · 0 Reviews · 0 revision decisions · 0 total events",
     )
     .expect("summary reflects Clear at once");
-    assert!(
-        store.exists(),
-        "Clear committed before its undo hold elapsed"
-    );
+    assert!(!store.exists(), "Clear did not commit at press");
     app.press("id:status-undo").expect("undo the clear");
     app.wait_for(
         "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 2 total events",

@@ -227,7 +227,6 @@ pub struct AppState {
     pending_undo: Rc<RefCell<Option<UndoNotice>>>,
     undo_generation: Rc<Cell<u64>>,
     credential_removal_pending: Rc<RefCell<Option<PendingCredentialRemoval>>>,
-    usage_clear_snapshot: Rc<RefCell<Option<UsageAggregate>>>,
     settings_base_url_saved: Rc<RefCell<String>>,
     pub usage_counts: Signal<UsageAggregate>,
     pub usage_inspection_open: Signal<bool>,
@@ -702,7 +701,6 @@ impl AppState {
             pending_undo: Rc::new(RefCell::new(None)),
             undo_generation: Rc::new(Cell::new(0)),
             credential_removal_pending: Rc::new(RefCell::new(None)),
-            usage_clear_snapshot: Rc::new(RefCell::new(None)),
             settings_base_url_saved,
             usage_counts: signal(UsageAggregate::default()),
             usage_inspection_open: signal(false),
@@ -946,13 +944,7 @@ impl AppState {
 
     fn refresh_usage_counts(&self) {
         match self.usage.borrow().inspect(SystemTime::now()) {
-            Ok(counts) => {
-                let kept = match self.usage_clear_snapshot.borrow().as_ref() {
-                    Some(cleared) => counts.without(cleared),
-                    None => counts,
-                };
-                self.usage_counts.set(kept);
-            }
+            Ok(counts) => self.usage_counts.set(counts),
             Err(_) => self.usage_notice(crate::i18n::Key::UsageUnavailable),
         }
     }
@@ -993,40 +985,31 @@ impl AppState {
     }
 
     pub fn clear_usage(&self) {
-        self.refresh_usage_counts();
-        let snapshot = match self.usage.borrow().inspect(SystemTime::now()) {
-            Ok(counts) => counts,
+        let captured = match self.usage.borrow().clear() {
+            Ok(captured) => captured,
             Err(_) => {
-                // A capture that failed holds nothing to undo: starting a
-                // hold would commit as a whole-store delete at its deadline.
+                // The store was not cleared, so there is nothing to undo and
+                // any previous pending Undo stays live.
                 self.usage_notice(crate::i18n::Key::UsageUnavailable);
                 return;
             }
         };
-        self.commit_pending_undo();
-        *self.usage_clear_snapshot.borrow_mut() = Some(snapshot);
-        self.usage_counts.set(UsageAggregate::default());
+        self.refresh_usage_counts();
         let language = self.settings.get().language;
         let state = self.clone();
-        let usage = Rc::clone(&self.usage);
         let reverse = {
-            let state = state.clone();
+            let usage = Rc::clone(&self.usage);
             move || {
-                state.usage_clear_snapshot.borrow_mut().take();
+                if let Err(error) = usage.borrow().restore(&captured) {
+                    log::warn!("cannot restore usage counts: {error}");
+                    state.usage_notice(crate::i18n::Key::UsageUnavailable);
+                }
                 state.refresh_usage_counts();
             }
         };
         let commit = move || {
-            // The reverse already took the snapshot: there is nothing left to
-            // commit, and a store-wide delete would wipe events recorded
-            // after the capture.
-            let Some(cleared) = state.usage_clear_snapshot.borrow_mut().take() else {
-                return;
-            };
-            if let Err(error) = usage.borrow().clear_keeping(&cleared) {
-                log::warn!("cannot clear usage counts: {error}");
-                state.usage_notice(crate::i18n::Key::UsageUnavailable);
-            }
+            // Clear commits at press: expiry keeps the events recorded since
+            // and drops the captured counts.
         };
         self.notify_undo(
             StatusSurface::Settings,
@@ -1058,17 +1041,7 @@ impl AppState {
             .await;
             match picked {
                 Ok(Some(path)) => {
-                    let current = state.usage.borrow().inspect(SystemTime::now());
-                    let result = match current {
-                        Ok(current) => {
-                            let kept = match state.usage_clear_snapshot.borrow().as_ref() {
-                                Some(cleared) => current.without(cleared),
-                                None => current,
-                            };
-                            state.usage.borrow().export_snapshot_to(&path, &kept)
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let result = state.usage.borrow().export_to(&path, SystemTime::now());
                     state.usage_notice(if result.is_ok() {
                         crate::i18n::Key::UsageExported
                     } else {

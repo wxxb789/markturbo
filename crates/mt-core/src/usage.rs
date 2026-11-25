@@ -180,48 +180,35 @@ impl UsageDayCounts {
         }
     }
 
-    fn without(&self, cleared: Option<&UsageDayCounts>) -> UsageDayCounts {
-        let Some(cleared) = cleared else {
-            return self.clone();
-        };
-        UsageDayCounts {
-            events: subtract(&self.events, &cleared.events),
-            review_started: self
-                .review_started
-                .iter()
-                .filter_map(|(scope, lenses)| {
-                    let bare = BTreeMap::new();
-                    let lenses =
-                        subtract(lenses, cleared.review_started.get(scope).unwrap_or(&bare));
-                    (!lenses.is_empty()).then_some((*scope, lenses))
-                })
-                .collect(),
-            review_durations: subtract(&self.review_durations, &cleared.review_durations),
-            accepted_hunks: self.accepted_hunks.saturating_sub(cleared.accepted_hunks),
-            rejected_hunks: self.rejected_hunks.saturating_sub(cleared.rejected_hunks),
+    /// Adds `other`'s counters back into these, per counter, saturating. Used
+    /// by Undo of a clear: the store already holds whatever was recorded
+    /// since the clear.
+    fn add(&mut self, other: &UsageDayCounts) {
+        for (kind, count) in &other.events {
+            increment(self.events.entry(*kind).or_default(), *count);
         }
+        for (scope, lenses) in &other.review_started {
+            for (lens, count) in lenses {
+                increment(
+                    self.review_started
+                        .entry(*scope)
+                        .or_default()
+                        .entry(*lens)
+                        .or_default(),
+                    *count,
+                );
+            }
+        }
+        for (bucket, count) in &other.review_durations {
+            increment(self.review_durations.entry(*bucket).or_default(), *count);
+        }
+        increment(&mut self.accepted_hunks, other.accepted_hunks);
+        increment(&mut self.rejected_hunks, other.rejected_hunks);
     }
-}
-
-fn subtract<K: Ord + Copy>(
-    kept: &BTreeMap<K, u64>,
-    cleared: &BTreeMap<K, u64>,
-) -> BTreeMap<K, u64> {
-    kept.iter()
-        .filter_map(|(key, count)| {
-            let left = count.saturating_sub(cleared.get(key).copied().unwrap_or(0));
-            (left > 0).then_some((*key, left))
-        })
-        .collect()
 }
 
 fn increment(count: &mut u64, amount: u64) {
     *count = count.saturating_add(amount);
-}
-
-/// The clear watermark beside `usage.json`; its extension replaces `json`.
-fn cleared_path(path: &Path) -> PathBuf {
-    path.with_extension("cleared")
 }
 
 /// The sole on-disk JSON document. Day keys are UTC Unix day indices.
@@ -229,11 +216,6 @@ fn cleared_path(path: &Path) -> PathBuf {
 #[serde(deny_unknown_fields)]
 pub struct UsageAggregate {
     schema_version: u32,
-    /// The write this document came from; every save takes the next one. A
-    /// held Clear names the write it captured, so a commit that has already
-    /// happened can be told apart from the events recorded since.
-    #[serde(default)]
-    generation: u64,
     days: BTreeMap<u64, UsageDayCounts>,
 }
 
@@ -241,7 +223,6 @@ impl Default for UsageAggregate {
     fn default() -> Self {
         Self {
             schema_version: USAGE_SCHEMA_VERSION,
-            generation: 0,
             days: BTreeMap::new(),
         }
     }
@@ -250,24 +231,6 @@ impl Default for UsageAggregate {
 impl UsageAggregate {
     pub fn days(&self) -> &BTreeMap<u64, UsageDayCounts> {
         &self.days
-    }
-
-    /// The counts left when the counts `cleared` held are removed: per
-    /// counter, saturating subtraction. Days whose events all reach zero are
-    /// dropped.
-    pub fn without(&self, cleared: &UsageAggregate) -> UsageAggregate {
-        UsageAggregate {
-            schema_version: USAGE_SCHEMA_VERSION,
-            generation: self.generation,
-            days: self
-                .days
-                .iter()
-                .filter_map(|(day, counts)| {
-                    let kept = counts.without(cleared.days.get(day));
-                    (!kept.events.is_empty()).then_some((*day, kept))
-                })
-                .collect(),
-        }
     }
 
     fn prune(&mut self, today: u64) -> bool {
@@ -374,7 +337,7 @@ impl UsageStore {
         let today = day_bucket(now);
         aggregate.prune(today);
         aggregate.days.entry(today).or_default().record(event);
-        Self::save(path, &mut aggregate)
+        Self::save(path, &aggregate)
     }
 
     /// Inspect retained counts even when recording is disabled. A disabled
@@ -384,7 +347,7 @@ impl UsageStore {
         let path = self.path()?;
         let mut aggregate = Self::load(path)?;
         if aggregate.prune(day_bucket(now)) && self.enabled && self.persisted_consent() {
-            Self::save(path, &mut aggregate)?;
+            Self::save(path, &aggregate)?;
         }
         Ok(aggregate)
     }
@@ -398,18 +361,7 @@ impl UsageStore {
     /// Deliberate user export. As with Save As, an existing destination is not
     /// overwritten. No destination path is retained in the aggregate or errors.
     pub fn export_to(&self, destination: &Path, now: SystemTime) -> Result<(), UsageError> {
-        let aggregate = self.inspect(now)?;
-        self.export_snapshot_to(destination, &aggregate)
-    }
-
-    /// [`export_to`](Self::export_to) of `aggregate` the caller already holds
-    /// (a pending Clear's kept counts).
-    pub fn export_snapshot_to(
-        &self,
-        destination: &Path,
-        aggregate: &UsageAggregate,
-    ) -> Result<(), UsageError> {
-        let bytes = aggregate.export_json()?;
+        let bytes = self.export_json(now)?;
         let parent = destination
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -423,81 +375,49 @@ impl UsageStore {
         Ok(())
     }
 
-    /// Explicit Clear deletes the aggregate, including while recording is off.
-    /// It does not change consent or delete copies previously exported by users.
-    pub fn clear(&self) -> Result<(), UsageError> {
+    /// Explicit Clear deletes the aggregate at once, including while recording
+    /// is off, and returns the counts it held for a later Undo. A corrupt or
+    /// unsupported store is discarded; a read failure discards a regular file
+    /// and otherwise reports the error. It does not change consent or delete
+    /// copies previously exported by users.
+    pub fn clear(&self) -> Result<UsageAggregate, UsageError> {
         let _guard = self.lock_settings_writes()?;
         let path = self.path()?;
-        // Say that every write so far is gone: a held Clear captured before
-        // this call must not subtract from events recorded after it.
-        if let Ok(current) = Self::load(path) {
-            Self::record_clear(path, current.generation)?;
-        }
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)
-    }
-
-    /// Commit a Clear that was held for undo: remove the counts `cleared`
-    /// held, keep anything recorded since, and delete the file when nothing
-    /// is left — as [`clear`](Self::clear). Each commit records the write it
-    /// cleared, so two instances holding the same capture remove it once: a
-    /// second commit of the same snapshot is a no-op.
-    pub fn clear_keeping(&self, cleared: &UsageAggregate) -> Result<(), UsageError> {
-        let _guard = self.lock_settings_writes()?;
-        let path = self.path()?;
-        if cleared.generation != 0 && cleared.generation <= Self::cleared_through(path)? {
-            return Ok(());
-        }
-        let mut kept = Self::load(path)?.without(cleared);
-        Self::record_clear(path, cleared.generation)?;
-        if !kept.days.is_empty() {
-            return Self::save(path, &mut kept);
-        }
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)
-    }
-
-    /// Raise the clear watermark to `through` if it is newer: writes at or
-    /// below it are gone, and a commit holding one of them must not subtract
-    /// again. The watermark lives beside the store, so a deleted store still
-    /// remembers which writes are gone.
-    fn record_clear(path: &Path, through: u64) -> Result<(), UsageError> {
-        if through <= Self::cleared_through(path)? {
-            return Ok(());
-        }
-        let parent = path.parent().ok_or(UsageError::DataDirectoryUnavailable)?;
-        std::fs::create_dir_all(parent)?;
-        Self::clear_staging(parent)?;
-        let mut temporary = tempfile::Builder::new()
-            .prefix(STAGING_PREFIX)
-            .suffix(STAGING_SUFFIX)
-            .tempfile_in(parent)?;
-        writeln!(temporary, "{through}")?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(cleared_path(path))
-            .map_err(|error| UsageError::from(error.error))?;
-        Ok(())
-    }
-
-    fn cleared_through(path: &Path) -> Result<u64, UsageError> {
-        let bytes = match std::fs::read(cleared_path(path)) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error.into()),
+        let captured = match Self::load(path) {
+            Ok(aggregate) => aggregate,
+            Err(UsageError::InvalidStore | UsageError::UnsupportedSchema) => {
+                UsageAggregate::default()
+            }
+            Err(error) => {
+                if !path.is_file() {
+                    return Err(error);
+                }
+                UsageAggregate::default()
+            }
         };
-        std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|text| text.trim().parse().ok())
-            .ok_or(UsageError::InvalidStore)
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)?;
+        Ok(captured)
+    }
+
+    /// Undo of [`clear`](Self::clear): add `captured`'s counters back into
+    /// whatever the store holds now, so an event recorded during the Undo hold
+    /// is kept alongside them.
+    pub fn restore(&self, captured: &UsageAggregate) -> Result<(), UsageError> {
+        if captured.days.is_empty() {
+            return Ok(());
+        }
+        let _guard = self.lock_settings_writes()?;
+        let path = self.path()?;
+        let mut aggregate = Self::load(path)?;
+        for (day, counts) in &captured.days {
+            aggregate.days.entry(*day).or_default().add(counts);
+        }
+        Self::save(path, &aggregate)
     }
 
     fn lock_settings_writes(&self) -> io::Result<crate::settings::SettingsWriteGuard> {
@@ -561,14 +481,10 @@ impl UsageStore {
         Ok(aggregate)
     }
 
-    fn save(path: &Path, aggregate: &mut UsageAggregate) -> Result<(), UsageError> {
+    fn save(path: &Path, aggregate: &UsageAggregate) -> Result<(), UsageError> {
         let parent = path.parent().ok_or(UsageError::DataDirectoryUnavailable)?;
         std::fs::create_dir_all(parent)?;
         Self::clear_staging(parent)?;
-        aggregate.generation = aggregate
-            .generation
-            .max(Self::cleared_through(path)?)
-            .wrapping_add(1);
         let mut temporary = tempfile::Builder::new()
             .prefix(STAGING_PREFIX)
             .suffix(STAGING_SUFFIX)

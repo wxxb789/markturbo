@@ -615,3 +615,27 @@ fn the_usage_row_carries_its_accessible_label() {
     app.wait_for("text:Show details")
         .expect("the closed toggle label");
 }
+
+#[test]
+fn clearing_a_corrupt_usage_file_deletes_it_at_once() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, config, _codex_home) = start();
+    let store = config.path().join("data").join("usage.json");
+    std::fs::create_dir_all(store.parent().expect("the data directory"))
+        .expect("the data directory");
+    std::fs::write(&store, "PRIVATE-INPUT").expect("a corrupt store");
+    open_settings(&mut app);
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.press("id:usage-clear")
+        .expect("clear the corrupt store");
+    app.wait_for(
+        "text:Local counts deleted. Recording preference and exported copies are unchanged.",
+    )
+    .expect("clear confirmation");
+    assert!(!store.exists(), "the corrupt store was not deleted");
+    app.wait_for("id:status-undo").expect("the Undo");
+    app.press("id:status-undo").expect("undo the empty clear");
+    assert!(!store.exists(), "Undo resurrected the corrupt file");
+}
