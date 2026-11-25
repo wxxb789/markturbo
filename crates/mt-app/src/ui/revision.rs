@@ -1073,12 +1073,13 @@ fn key_hints(language: Language) -> impl IntoElement {
 /// `A` / `R` decide the current hunk, `J` / `K` move between them, and
 /// `Ctrl+Z` takes the last decision back — all while no text input has the
 /// keyboard focus, so the document stays fully editable. The bindings exist
-/// only while a proposal is on screen: with no hunks there is nothing for
-/// them to do.
+/// only while a proposal is on screen and no consent card is modal: with no
+/// hunks there is nothing for them to do, and under a card the card's own
+/// keys are the only ones that act.
 fn bind_keys(state: &AppState, heat: Heat) {
     let state = state.clone();
     effect(move || {
-        if state.revision_hunks.get().is_empty() {
+        if state.revision_hunks.get().is_empty() || state.consent_open() {
             return;
         }
         let keys = state.clone();
@@ -1689,6 +1690,79 @@ mod tests {
         app.press_key("ctrl+z").expect("undo on A");
         app.wait_for("text:0 of 2 decided")
             .expect("Undo took A's decision back");
+    }
+
+    // A proposal with controls that open and clear a consent card: the
+    // Revision keys are inert while one waits, and come back when it goes.
+    #[component]
+    fn ConsentGatedKeysProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(&state, PROBE_TEXT, TWO_CHANGES);
+        let open_state = state.clone();
+        let clear_state = state.clone();
+        let field_state = state.clone();
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                view()
+                    .test_id("probe-waiting-consent")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        open_state
+                            .translation_consent
+                            .set(Some(SharedString::from("disclosure text")));
+                    })
+                    .child(prims::rest("Wait for consent")),
+            )
+            .child(
+                view()
+                    .test_id("probe-consent-gone")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| clear_state.translation_consent.set(None))
+                    .child(prims::rest("Drop consent")),
+            )
+            .child(field(field_state, Language::English))
+    }
+
+    #[test]
+    fn revision_keys_wait_for_a_consent_card_and_come_back() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ConsentGatedKeysProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:revision-field").expect("the field");
+        app.wait_for("text:0 of 2 decided").expect("the hunks");
+
+        // A decision before the card: the keys are the field's.
+        app.press_key("a").expect("accept the docked hunk");
+        app.wait_for("text:1 of 2 decided").expect("one decided");
+        app.wait(Duration::from_millis(150))
+            .expect("the advance settles");
+
+        // While the card waits, the keys do nothing: `A` does not decide
+        // the second hunk, and Undo does not take the first decision back.
+        app.press("id:probe-waiting-consent")
+            .expect("wait for consent");
+        app.press_key("a").expect("A under the card");
+        app.wait(Duration::from_millis(200))
+            .expect("a decision would land by now");
+        app.wait_for("text:1 of 2 decided")
+            .expect("A decided under the card");
+        app.press_key("ctrl+z").expect("Undo under the card");
+        app.wait(Duration::from_millis(200))
+            .expect("an undo would land by now");
+        app.wait_for("text:1 of 2 decided")
+            .expect("Undo took a decision under the card");
+
+        // The card goes: the keys are the field's again.
+        app.press("id:probe-consent-gone")
+            .expect("drop the consent");
+        app.press_key("a").expect("accept with the card gone");
+        app.wait_for("text:2 of 2 decided")
+            .expect("the keys came back");
+        app.press_key("ctrl+z").expect("undo with the card gone");
+        app.wait_for("text:1 of 2 decided").expect("Undo came back");
     }
 
     #[test]

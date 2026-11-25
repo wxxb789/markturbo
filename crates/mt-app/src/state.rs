@@ -2705,9 +2705,14 @@ impl AppState {
     /// Whether an open layer above the document owns the keyboard, so
     /// [`focus_editor`](Self::focus_editor) must not put it behind that layer.
     fn editor_focus_blocked(&self) -> bool {
-        self.settings_open.get()
-            || self.guard.get().is_some()
-            || self.review_consent.get().is_some()
+        self.settings_open.get() || self.guard.get().is_some() || self.consent_open()
+    }
+
+    /// Whether a consent card is waiting. While one is open it is modal in
+    /// full: the room's shortcuts are inert, no background result moves the
+    /// keyboard, and the card's own handlers are the only ones that act.
+    pub fn consent_open(&self) -> bool {
+        self.review_consent.get().is_some()
             || self.revision_consent.get().is_some()
             || self.translation_consent.get().is_some()
     }
@@ -3995,10 +4000,12 @@ impl AppState {
             }
         }
         self.review_selection.set(session.selection);
-        // The Revision session was never parked: its tab's store holds the
-        // newest state, so a proposal that arrived while the card waited is
-        // the one that comes back (the accepted R7 disposition).
+        // The Revision session was never parked: record the shown session
+        // before reading the store, so the newest decisions and reading
+        // position come back with the proposal. A proposal that arrived
+        // while the card waited is the store's newest and comes back too.
         if let Some(tab_id) = self.active.get_untracked() {
+            self.store_shown_revision_session(tab_id);
             self.load_revision_session(tab_id);
         }
         if let Some(binding) = *self.review_binding.borrow() {

@@ -1224,6 +1224,191 @@ fn a_prepared_revision_lands_on_the_tab_that_prepared_it() {
     assert_eq!(std::fs::read_to_string(&other).unwrap(), other_source);
 }
 
+/// Serve one Review and one Revision on loopback: the review with no
+/// findings and the revision of two changes, both over `source`. Its base
+/// URL.
+fn serve_review_and_revision(source: &str) -> String {
+    let (review_output, revision_output) = two_change_outputs(source);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let body = read_http_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            if request["stream"].as_bool().unwrap_or(false) {
+                write_sse(&mut stream, &revision_output);
+            } else {
+                write_review_json(&mut stream, &review_output);
+            }
+        }
+    });
+    base_url
+}
+
+// While any consent card is open it is modal in full: the Revision keys are
+// inert under the Translation card, and nothing of it reaches the proposal.
+#[test]
+fn revision_keys_are_inert_under_a_translation_card() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let base_url = serve_review_and_revision(source);
+    let (_document, _directory, _config) = revision_fixture(source, &base_url);
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    app.press("id:title-review").expect("prepare Review");
+    app.wait_for("id:consent-card").expect("Review disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("Review ready");
+    app.press("label:Prepare revision")
+        .expect("prepare Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("Revision disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:revision-accept", Duration::from_secs(20))
+        .expect("the hunks arrive");
+    app.wait_for("text:0 of 2 decided")
+        .expect("nothing is decided yet");
+
+    // The Translation consent card opens over the proposal.
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-translate")
+        .expect("start Translation");
+    app.wait_for("id:consent-card")
+        .expect("Translation disclosure");
+    app.wait_for("text:Send for translation?")
+        .expect("the Translation card");
+
+    // `A` is the card's to ignore: no decision, no buffer write.
+    app.press_key("a").expect("press A under the card");
+    app.wait(Duration::from_millis(200))
+        .expect("the decision would land by now");
+    assert!(
+        app.shows("0 of 2 decided"),
+        "A decided under the Translation card: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the buffer"),
+        Some(source),
+        "A wrote the hunk under the Translation card"
+    );
+
+    // The card closes with its Cancel; nothing of it reaches the proposal.
+    app.press("id:consent-cancel-button")
+        .expect("cancel the Translation");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the card closed");
+    app.wait(Duration::from_millis(500))
+        .expect("a late decision would land by now");
+    assert!(
+        app.shows("0 of 2 decided"),
+        "a decision landed after the card closed: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the buffer"),
+        Some(source),
+        "nothing wrote the hunk"
+    );
+}
+
+// The per-tab store must never hand back a session older than the screen: a
+// decision made before a later Review was prepared survives its cancel, and
+// Undo still takes its text back.
+#[test]
+fn a_decision_survives_the_cancel_of_a_later_review() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let base_url = serve_review_and_revision(source);
+    let (_document, _directory, _config) = revision_fixture(source, &base_url);
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    app.press("id:title-review").expect("prepare Review");
+    app.wait_for("id:consent-card").expect("Review disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("Review ready");
+    app.press("label:Prepare revision")
+        .expect("prepare Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("Revision disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:revision-accept", Duration::from_secs(20))
+        .expect("the hunks arrive");
+    app.wait_for("text:0 of 2 decided")
+        .expect("nothing is decided yet");
+
+    // Accept the docked hunk: the text and the decision are the screen's.
+    app.press("label:Accept").expect("accept the docked hunk");
+    app.wait_for("text:1 of 2 decided").expect("one decided");
+    assert_eq!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the buffer"),
+        Some("Revised\nUnchanged\n"),
+        "the accepted hunk entered the buffer"
+    );
+
+    // Select a line, start `Review selection` from the menu, then cancel the
+    // disclosure: the parked Review comes back and the Revision must too.
+    app.type_text("label:Markdown source", "")
+        .expect("focus the editor");
+    app.press_key("ctrl+home").expect("to the start");
+    app.press_key("down").expect("down one line");
+    app.press_key("shift+end").expect("select the line");
+    app.press("id:title-settings").expect("open the menu");
+    app.press("id:title-menu-review-selection")
+        .expect("Review selection");
+    app.wait_for("id:consent-card")
+        .expect("the selection disclosure");
+    app.press_key("escape").expect("cancel the new Review");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the disclosure closed");
+
+    // The decision is still the screen's, and Undo takes its text back.
+    app.wait_for("text:1 of 2 decided")
+        .expect("the decision survived the cancel");
+    app.press_key("ctrl+z").expect("undo the decision");
+    app.wait_for("text:0 of 2 decided")
+        .expect("Undo took the decision back");
+    assert_eq!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the buffer"),
+        Some(source),
+        "Undo restored the exact text"
+    );
+}
+
 /// Whether the buffer line reads `text` exactly (`shows` trims the final
 /// newline the buffer keeps).
 fn buffer_shows(app: &Headless, text: &str) -> bool {

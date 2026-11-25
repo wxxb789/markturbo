@@ -168,7 +168,7 @@ pub(crate) enum ConsentKind {
 
 /// Whether a consent is waiting: the shell dims the room and shows the card.
 pub fn is_open(state: &AppState) -> bool {
-    kind_of(state).is_some()
+    state.consent_open()
 }
 
 pub(crate) fn kind_of(state: &AppState) -> Option<ConsentKind> {

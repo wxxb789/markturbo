@@ -140,9 +140,16 @@ fn focus_step() -> Signal<Option<Spawned<()>>> {
 
 /// A question never takes the keyboard from the source editor the user is
 /// typing in — a stale result's `Review again` included: a background result
-/// arriving while the user types must not yank the focus anywhere.
-fn arrival_focus(stale: bool, current: Option<usize>, editor_focused: bool) -> Option<Focus> {
-    if editor_focused {
+/// arriving while the user types must not yank the focus anywhere. Nor does
+/// it take the keyboard from an open consent card, which owns it while it is
+/// open.
+fn arrival_focus(
+    stale: bool,
+    current: Option<usize>,
+    editor_focused: bool,
+    consent_open: bool,
+) -> Option<Focus> {
+    if editor_focused || consent_open {
         return None;
     }
     if stale {
@@ -265,6 +272,7 @@ fn observe(state: &AppState, session: Signal<Session>) {
                     view.stale,
                     current,
                     state.source_editor_focused.get_untracked(),
+                    state.consent_open(),
                 ));
             }
             None => {
@@ -298,7 +306,8 @@ fn loading_hint(state: &AppState, session: Signal<Session>) {
 /// `Esc` cancels the wait; `J`/`K` step the current finding. Both bind while
 /// this field's owner lives (the shell keeps it only while the review is the
 /// field's surface). `J`/`K` fire only while no text input edits, so typing
-/// an answer never steps a finding.
+/// an answer never steps a finding, and while no consent card owns the
+/// keyboard.
 fn keys(state: &AppState, session: Signal<Session>) {
     // `Esc` fires wherever the focus is: the keymap counts it as one an
     // editor uses, and the spec's 'Esc cancels' must reach this handler
@@ -331,19 +340,23 @@ fn keys(state: &AppState, session: Signal<Session>) {
             }
         },
     );
-    for (key, delta) in [("j", 1i32), ("k", -1i32)] {
-        on_key_with(
-            key,
-            KeyOptions {
-                when: When::NotEditing,
-                ..KeyOptions::default()
-            },
-            {
-                let state = state.clone();
-                move |_| step_finding(&state, session, delta)
-            },
-        );
-    }
+    let step_state = state.clone();
+    effect(move || {
+        if step_state.consent_open() {
+            return;
+        }
+        for (key, delta) in [("j", 1i32), ("k", -1i32)] {
+            let state = step_state.clone();
+            on_key_with(
+                key,
+                KeyOptions {
+                    when: When::NotEditing,
+                    ..KeyOptions::default()
+                },
+                move |_| step_finding(&state, session, delta),
+            );
+        }
+    });
 }
 
 fn step_finding(state: &AppState, session: Signal<Session>, delta: i32) {
@@ -2874,6 +2887,133 @@ mod tests {
         );
     }
 
+    /// A result with a question arrives while a consent card waits: the
+    /// arrival must leave every focus request untouched.
+    #[component]
+    fn ConsentArrivalProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.open_file(camera_fixture().to_path_buf());
+        state.review_open.set(true);
+        focus_request().set(None);
+        session().set(Session::default());
+        state
+            .translation_consent
+            .set(Some(SharedString::from("disclosure text")));
+        observe(&state, session());
+        let loaded_state = state.clone();
+        effect(move || {
+            if loaded_state.review_view.get_untracked().is_some() {
+                return;
+            }
+            let Some(tab) = loaded_state.active_tab() else {
+                return;
+            };
+            let mut loaded = camera_view(tab.id);
+            loaded.questions_detail =
+                vec![question(ClarificationPriority::High, "Which audience?")];
+            loaded_state.review_view.set(Some(loaded));
+        });
+        view()
+            .test_id("consent-arrival-probe")
+            .w(px(400.0))
+            .h(px(200.0))
+            .child(text(move || {
+                format!("arrived: {}", session().get().view.is_some())
+            }))
+            .child(text(move || format!("focus: {:?}", focus_request().get())))
+    }
+
+    #[test]
+    fn an_open_consent_card_leaves_the_arrival_focus_empty() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ConsentArrivalProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:consent-arrival-probe").expect("the probe");
+        app.wait_for("text:arrived: true").expect("the arrival ran");
+        assert!(
+            app.shows("focus: None"),
+            "an open consent card took a focus request: {:?}",
+            app.screen().texts()
+        );
+    }
+
+    /// A resting review with two findings and controls that open and clear a
+    /// consent card: the Review step keys are inert while one waits.
+    #[component]
+    fn ConsentGatedReviewKeysProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.open_file(camera_fixture().to_path_buf());
+        state.review_open.set(true);
+        session().set(Session::default());
+        load_result(state.clone());
+        let open_state = state.clone();
+        let clear_state = state.clone();
+        view()
+            .test_id("consent-review-keys-probe")
+            .flex_col()
+            .w(px(400.0))
+            .h(px(200.0))
+            .child(
+                view()
+                    .test_id("probe-waiting-consent")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        open_state
+                            .translation_consent
+                            .set(Some(SharedString::from("disclosure text")));
+                    })
+                    .child(prims::rest("Wait for consent")),
+            )
+            .child(
+                view()
+                    .test_id("probe-consent-gone")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| clear_state.translation_consent.set(None))
+                    .child(prims::rest("Drop consent")),
+            )
+            .child(camera_tab(&state))
+            .child(camera_request(&state))
+            .child(field(state.clone(), Language::English))
+    }
+
+    #[test]
+    fn review_step_keys_wait_for_a_consent_card_and_come_back() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ConsentGatedReviewKeysProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:consent-review-keys-probe")
+            .expect("the probe");
+        wait_for_text(&mut app, "camera-tab", "the fixture's tab lands", |tab| {
+            !tab.is_empty()
+        });
+        let tab = text_of(&app, "camera-tab");
+        wait_for_text(&mut app, "camera-request", "the arrival level", |request| {
+            request == format!("{tab}:0")
+        });
+
+        // While the card waits, two steps move nothing.
+        app.press("id:probe-waiting-consent")
+            .expect("wait for consent");
+        app.press_key("j").expect("step under the card");
+        app.press_key("j").expect("step under the card again");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:0"),
+            "a step under the card moved the finding"
+        );
+
+        // The card goes: the steps move the finding again.
+        app.press("id:probe-consent-gone")
+            .expect("drop the consent");
+        app.press_key("j").expect("step with the card gone");
+        app.press_key("j").expect("step with the card gone again");
+        app.settle();
+        assert_eq!(
+            text_of(&app, "camera-request"),
+            format!("{tab}:1"),
+            "the steps came back"
+        );
+    }
+
     /// The footer's own stepper, drawn with the fixture's two findings: what
     /// each press asks the column's camera for is on screen.
     #[component]
@@ -3207,24 +3347,45 @@ mod tests {
 
     #[test]
     fn arrival_focus_never_takes_the_keyboard_from_the_editor() {
-        assert_eq!(arrival_focus(false, Some(2), true), None);
-        assert_eq!(arrival_focus(false, Some(2), false), Some(Focus::Answer(2)));
+        assert_eq!(arrival_focus(false, Some(2), true, false), None);
         assert_eq!(
-            arrival_focus(true, Some(2), true),
+            arrival_focus(false, Some(2), false, false),
+            Some(Focus::Answer(2))
+        );
+        assert_eq!(
+            arrival_focus(true, Some(2), true, false),
             None,
             "a stale background result must not take the keyboard either"
         );
         assert_eq!(
-            arrival_focus(true, Some(2), false),
+            arrival_focus(true, Some(2), false, false),
             Some(Focus::ReviewAgain),
             "a stale result focuses Review again only without the editor"
         );
         assert_eq!(
-            arrival_focus(false, None, true),
+            arrival_focus(false, None, true, false),
             None,
             "a background result with no questions must not take the keyboard"
         );
-        assert_eq!(arrival_focus(false, None, false), Some(Focus::Prepare));
+        assert_eq!(
+            arrival_focus(false, None, false, false),
+            Some(Focus::Prepare)
+        );
+        assert_eq!(
+            arrival_focus(false, Some(2), false, true),
+            None,
+            "an open consent card keeps the keyboard from every arrival"
+        );
+        assert_eq!(
+            arrival_focus(true, Some(2), false, true),
+            None,
+            "a card keeps the keyboard from a stale arrival too"
+        );
+        assert_eq!(
+            arrival_focus(false, None, false, true),
+            None,
+            "a card keeps the keyboard from the Prepare action too"
+        );
     }
 
     /// Preparing a review supersedes whatever was in flight: the loading flag
