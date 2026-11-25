@@ -20,6 +20,8 @@ use mt_core::credentials::{CredentialError, CredentialVault, Secret, SecureCrede
 #[derive(Default)]
 struct MemoryStore {
     values: Mutex<HashMap<String, Secret>>,
+    generations: Mutex<HashMap<String, u64>>,
+    writes: Mutex<u64>,
 }
 
 impl MemoryStore {
@@ -39,13 +41,43 @@ impl SecureCredentialStore for MemoryStore {
         Ok(self.values().get(target).cloned())
     }
 
+    fn read_versioned(
+        &self,
+        target: &str,
+    ) -> Result<Option<(Secret, Option<u64>)>, CredentialError> {
+        let secret = self.read(target)?;
+        let identity = self
+            .generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(target)
+            .copied();
+        Ok(secret.map(|secret| (secret, identity)))
+    }
+
     fn write(&self, target: &str, secret: &Secret) -> Result<(), CredentialError> {
         self.values().insert(target.to_owned(), secret.clone());
+        let identity = {
+            let mut writes = self
+                .writes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *writes += 1;
+            *writes
+        };
+        self.generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(target.to_owned(), identity);
         Ok(())
     }
 
     fn delete(&self, target: &str) -> Result<(), CredentialError> {
         self.values().remove(target);
+        self.generations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(target);
         Ok(())
     }
 }

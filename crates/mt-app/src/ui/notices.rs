@@ -1295,15 +1295,12 @@ pub(crate) fn status_line_at(
                 }))),
             )
             .child(when(
-                move || undo_message.get().action.is_some(),
+                move || owner.get() == surface && undo_message.get().action.is_some(),
                 move || status_undo(undo_state.clone()),
             )),
     )
 }
 
-/// The status line's Tier 2 reversal: the `· Undo` control a notice offers
-/// until its hold commits, with the transient step to full ink a local action
-/// gets.
 fn status_undo(state: AppState) -> impl IntoElement {
     let duration = prims::press_color_duration();
     let label_state = state.clone();
@@ -2158,6 +2155,61 @@ mod tests {
         assert_eq!(
             names_line(&four, Language::Chinese),
             "notes.md、draft.md 等 4 个文件"
+        );
+    }
+
+    #[component]
+    fn StatusSurfacesProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let presence = StatusPresence::new(state.clone());
+        let notify_state = state.clone();
+        let editor_state = state.clone();
+        let review_state = state;
+        view()
+            .flex_col()
+            .child(prims::primary_action("probe-notify", "Notify", move || {
+                notify_state.notify_undo(
+                    crate::state::StatusSurface::Editor,
+                    "Cleared the counts",
+                    crate::state::UndoNotice {
+                        label: SharedString::from("Undo"),
+                        reverse: std::rc::Rc::new(|| {}),
+                        commit: std::rc::Rc::new(|| {}),
+                    },
+                );
+            }))
+            .child(view().test_id("probe-editor").child(status_line_at(
+                editor_state,
+                presence,
+                crate::state::StatusSurface::Editor,
+            )))
+            .child(view().test_id("probe-review").child(status_line_at(
+                review_state,
+                presence,
+                crate::state::StatusSurface::Review,
+            )))
+    }
+
+    #[test]
+    fn an_undo_renders_on_only_the_routed_surface() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<StatusSurfacesProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:probe-notify").expect("the probe");
+        app.press("id:probe-notify").expect("offer the Undo");
+        app.wait_for("id:probe-editor >> id:status-undo")
+            .expect("the routed line carries the Undo");
+        assert_eq!(
+            app.screen()
+                .count("id:status-undo")
+                .expect("valid status-undo selector"),
+            1,
+            "the Undo appeared on both status lines"
+        );
+        assert!(
+            !app.screen()
+                .matches("id:probe-review >> id:status-undo")
+                .expect("valid selector"),
+            "the un-routed line carried the Undo"
         );
     }
 }

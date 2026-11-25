@@ -1,8 +1,3 @@
-//! Goal 20 lane C: Settings backs out with Escape and comes back with
-//! `mod+,`; edits auto-save without a Save control; the wire format and model
-//! help render; credential actions wait for an endpoint; and the usage toggle
-//! carries its label.
-
 use std::{sync::Mutex, time::Duration};
 
 use mt_core::model::{EndpointIdentity, Provider};
@@ -76,6 +71,8 @@ fn set_base_url(app: &mut Headless, url: &str) {
 fn escape_closes_settings_and_the_editor_takes_typing_again() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, _config, _codex_home) = start();
+    app.set_viewport(Size::new(Points(2400.0), Points(1200.0)))
+        .expect("a viewport tall enough for both status lines");
     app.press("id:welcome-new-file").expect("new document");
     app.wait_for(EDITOR).expect("the source editor");
     open_settings(&mut app);
@@ -417,6 +414,82 @@ fn the_page_renders_the_wire_format_and_model_help() {
 }
 
 #[test]
+fn an_invalid_base_url_stays_out_of_settings_when_usage_is_toggled() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, config, _codex_home) = start();
+    open_settings(&mut app);
+    app.press("text:OpenAI Chat Completions")
+        .expect("choose a wire format");
+    set_base_url(&mut app, "http://127.0.0.1:11448/v1");
+    assert_eq!(
+        persisted(&config).model_base_url,
+        "http://127.0.0.1:11448/v1"
+    );
+
+    app.clear("id:settings-base-url")
+        .expect("clear the base URL");
+    app.type_text("id:settings-base-url", "https://user:secret@example.com/v1")
+        .expect("type a URL carrying userinfo");
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.press("id:usage-on").expect("toggle the usage counters");
+    app.wait_for("text:Usage-counter preference saved.")
+        .expect("the consent persisted");
+
+    assert_eq!(
+        persisted(&config).model_base_url,
+        "http://127.0.0.1:11448/v1",
+        "the usage toggle saved the invalid base URL"
+    );
+    let settings =
+        std::fs::read_to_string(config.path().join("settings.toml")).expect("the settings file");
+    assert!(
+        !settings.contains("secret"),
+        "the invalid URL's userinfo reached the settings file"
+    );
+}
+
+#[test]
+fn a_pending_removal_blocks_the_review_from_using_the_credential() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start();
+    app.press("id:welcome-new-file").expect("new document");
+    app.wait_for(EDITOR).expect("the source editor");
+    open_settings(&mut app);
+    app.press("text:OpenAI Chat Completions")
+        .expect("choose a wire format");
+    set_base_url(&mut app, "http://127.0.0.1:11449/v1");
+    app.type_text("id:api-key", "synthetic-pending-key")
+        .expect("type a key");
+    app.press("text:Store securely").expect("store the key");
+    app.wait_for("text:Credential stored securely for this endpoint")
+        .expect("the key is stored");
+
+    app.press("text:Remove").expect("start the removal hold");
+    app.wait_for("text:No credential stored")
+        .expect("the removal is shown at once");
+    assert_eq!(
+        mt_app::test_vault::stored(&openai_target("http://127.0.0.1:11449/v1")).as_deref(),
+        Some("synthetic-pending-key"),
+        "the hold keeps the vault's copy"
+    );
+
+    app.press("id:settings-close").expect("leave settings");
+    app.wait_for_gone("id:settings-page", Duration::from_secs(5))
+        .expect("settings closed");
+    app.press("id:title-review").expect("start a review");
+    app.wait_for_within("id:review-unavailable", Duration::from_secs(20))
+        .expect("the review says why it cannot run");
+    app.wait_for("text:No model set up")
+        .expect("the pending credential reads as missing");
+    assert!(
+        !app.screen().shows("Send for review?"),
+        "the pending removal must not arm a credential request"
+    );
+}
+
+#[test]
 fn credential_actions_wait_for_a_configured_endpoint() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, _config, _codex_home) = start();
@@ -425,6 +498,10 @@ fn credential_actions_wait_for_a_configured_endpoint() {
         "text:Choose a wire format above (not Best available) to configure its credential.",
     )
     .expect("unconfigured status");
+    app.wait_for("text:Use for session")
+        .expect("the session control exists");
+    app.wait_for("text:Store securely")
+        .expect("the store control exists");
     assert!(
         app.press("text:Use for session").is_err(),
         "the session action is disabled while unconfigured"

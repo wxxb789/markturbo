@@ -194,7 +194,6 @@ fn workspace_home(state: AppState, language: Language) -> impl IntoElement {
         )
 }
 
-/// The platform's own shortcut label (`Ctrl+P` / `⌘P`) for the palette hint.
 fn find_a_file(language: Language) -> SharedString {
     let keys = titlebar::shortcut(false, "P");
     match language {

@@ -172,9 +172,6 @@ pub fn quiet_action(
     ink_action(test_id, label, || tokens::palette().ink, on_press)
 }
 
-/// [`quiet_action`] in danger ink: a destructive local action (Remove,
-/// Clear counts) that still takes effect at once, so its hover and focus warn
-/// rather than glow.
 pub fn danger_action(
     test_id: &str,
     label: impl Into<SharedString>,
@@ -197,15 +194,17 @@ fn ink_action(
         .group()
         .on_press(on_press)
         .child(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest)
-                .transition_colors()
-                .duration(move || duration.get())
-                .group_hover(move |s| s.text_color(hover_ink).underline())
-                .group_focus_visible(move |s| s.text_color(hover_ink).underline()),
+            motion::ease_out(
+                text(label)
+                    .font_family(FONT_UI)
+                    .text_size(px(TYPE_UI))
+                    .line_height(px(TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink_rest)
+                    .transition_colors()
+                    .duration(move || duration.get()),
+            )
+            .group_hover(move |s| s.text_color(hover_ink).underline())
+            .group_focus_visible(move |s| s.text_color(hover_ink).underline()),
         )
 }
 
@@ -228,15 +227,17 @@ pub fn primary_action(
         .group()
         .on_press(on_press)
         .child(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink)
-                .transition_colors()
-                .duration(move || duration.get())
-                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
-                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
+            motion::ease_out(
+                text(label)
+                    .font_family(FONT_UI)
+                    .text_size(px(TYPE_UI))
+                    .line_height(px(TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink)
+                    .transition_colors()
+                    .duration(move || duration.get()),
+            )
+            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
         )
 }
 

@@ -129,6 +129,10 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     assert!(!mt_core::settings::SettingsData::load_from(&settings).usage_metrics_enabled);
     assert_eq!(std::fs::read(&store).unwrap(), disabled_bytes);
     open_settings(&mut app);
+    app.press("id:usage-on")
+        .expect("enable recording for the clear tests");
+    app.wait_for("text:Usage-counter preference saved.")
+        .expect("recording enabled");
     app.press("id:usage-clear").expect("clear local aggregate");
     app.wait_for(
         "text:Local counts deleted. Recording preference and exported copies are unchanged.",
@@ -142,49 +146,104 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
         store.exists(),
         "Clear committed before its undo hold elapsed"
     );
-    // Undo restores the counts the summary showed before Clear.
     app.press("id:status-undo").expect("undo the clear");
     app.wait_for(
         "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 2 total events",
     )
     .expect("the summary is back");
     assert!(store.exists(), "Undo left the store deleted");
-    // The second Clear commits when the hold ends. An event recorded while
-    // it is held belongs to the cleared state, and Undo brings the old
-    // counts back plus that event.
     app.press("id:usage-clear")
-        .expect("clear the local aggregate for good");
+        .expect("clear the local aggregate again");
     app.wait_for(
         "text:Last 180 days: 0 days active · 0 Reviews · 0 revision decisions · 0 total events",
     )
     .expect("summary reflects the second Clear");
-    let mut held: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
-    held["days"]
-        .as_object_mut()
-        .unwrap()
-        .values_mut()
-        .next()
-        .unwrap()["events"]["artifact_opened"] = 1.into();
-    std::fs::write(&store, serde_json::to_vec(&held).unwrap()).unwrap();
-    app.press("id:usage-inspect")
-        .expect("re-read the held counts");
+    app.set_clipboard(Some("HELD-PASTE-SENTINEL".to_owned()));
+    app.press("id:title-settings")
+        .expect("open the title menu over Settings");
+    app.press("id:title-menu-paste")
+        .expect("paste during the hold");
     app.wait_for(
-        "text:Last 180 days: 0 days active · 0 Reviews · 0 revision decisions · 0 total events",
+        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 1 total events",
     )
     .expect("an event recorded during the hold belongs to the cleared state");
     app.press("id:usage-inspect")
-        .expect("close the held details again");
+        .expect("inspect the held counts");
+    app.wait_for("id:usage-details").expect("daily details");
+    let held_export = export_dir.path().join("held-summary.json");
+    app.on_pick_save_path(Some(held_export.clone()))
+        .expect("choose the export destination");
+    app.press("id:usage-export")
+        .expect("export the held counts");
+    support::wait_for_path(
+        &mut app,
+        &held_export,
+        "export the held state",
+        Duration::from_secs(5),
+    );
+    let held: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&held_export).unwrap()).unwrap();
+    let days = held["days"].as_object().expect("the exported days");
+    assert_eq!(days.len(), 1, "the export carries one day");
+    let day = days.values().next().unwrap();
+    assert_eq!(
+        day["events"].as_object().unwrap().len(),
+        1,
+        "the export matches the details: only the held event"
+    );
+    assert_eq!(day["events"]["artifact_pasted"], 1);
+    assert!(
+        !std::fs::read_to_string(&held_export)
+            .unwrap()
+            .contains("HELD-PASTE-SENTINEL")
+    );
+    app.press("id:usage-inspect")
+        .expect("close the held details");
+    app.wait(Duration::from_millis(
+        mt_app::ui::motion::UNDO_HOLD_MS + 500,
+    ))
+    .expect("the undo hold elapses");
+    let committed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).unwrap()).unwrap();
+    let days = committed["days"].as_object().expect("the committed days");
+    assert_eq!(days.len(), 1, "the commit leaves one day");
+    let day = days.values().next().unwrap();
+    assert_eq!(
+        day["events"].as_object().unwrap().len(),
+        1,
+        "the commit dropped the cleared counts"
+    );
+    assert_eq!(
+        day["events"]["artifact_pasted"], 1,
+        "the commit kept the event recorded during the hold"
+    );
+    app.press("id:usage-clear")
+        .expect("clear the held counts again");
+    app.wait_for(
+        "text:Last 180 days: 0 days active · 0 Reviews · 0 revision decisions · 0 total events",
+    )
+    .expect("summary reflects the third Clear");
+    app.set_clipboard(Some("HELD-AGAIN".to_owned()));
+    app.press("id:title-settings")
+        .expect("open the title menu over Settings");
+    app.press("id:title-menu-paste")
+        .expect("paste during the hold again");
+    app.wait_for(
+        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 1 total events",
+    )
+    .expect("the pasted event shows during the hold");
     app.press("id:status-undo")
         .expect("undo the cleared counts");
     app.wait_for(
-        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 3 total events",
+        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 2 total events",
     )
     .expect("Undo restores the old counts plus the event recorded during the hold");
     app.press("id:usage-clear")
         .expect("clear the local aggregate for good");
-    app.wait(Duration::from_millis(5_500))
-        .expect("the undo hold elapses");
+    app.wait(Duration::from_millis(
+        mt_app::ui::motion::UNDO_HOLD_MS + 500,
+    ))
+    .expect("the undo hold elapses");
     assert!(!store.exists(), "Clear never committed after the hold");
     assert!(export.exists(), "Clear deleted the user's exported copy");
     app.press("id:settings-language-chinese")

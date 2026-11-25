@@ -315,7 +315,6 @@ fn the_chinese_font_is_downloaded_only_on_request_and_verified() {
         "startup fetched nothing"
     );
 
-    // A disk failure with the file on disk offers another removal and a retry.
     fs::remove_file(&installed).expect("clear the installed file");
     fs::create_dir(&installed).expect("make the file path unremovable as a file");
     app.press("id:settings-cjk-font-remove").expect("remove");

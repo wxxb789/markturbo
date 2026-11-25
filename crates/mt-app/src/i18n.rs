@@ -302,8 +302,6 @@ pub fn usage_details(language: Language, counts: &mt_core::usage::UsageAggregate
     lines.join("\n")
 }
 
-/// `YYYY-MM-DD` for a UTC day key (days since 1970-01-01), by the standard
-/// civil-from-days transform (Howard Hinnant).
 fn civil_date(days_since_epoch: u64) -> String {
     let z = days_since_epoch as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -849,7 +847,10 @@ fn english(key: Key) -> &'static str {
         Key::UnsupportedProvider => "The configured wire format is not supported.",
         Key::CredentialEndpointInvalid => "Fix the endpoint before configuring credentials.",
         Key::CredentialDeleted => "Credential deleted for this endpoint.",
-        Key::CredentialReadFailed => "The secure credential could not be read.",
+        Key::CredentialReadFailed => {
+            "The secure credential could not be read. Retry, or use \"Use for session\" or an \
+             environment variable."
+        }
         Key::CredentialRequired => "Enter a credential first.",
         Key::CredentialWriteFailed => {
             "Could not save to secure storage. Use \"Use for session\" instead, or check your \
@@ -1054,7 +1055,9 @@ fn chinese(key: Key) -> &'static str {
         Key::UnsupportedProvider => "当前配置的协议格式不受支持。",
         Key::CredentialEndpointInvalid => "请先修正端点，再配置凭据。",
         Key::CredentialDeleted => "已删除此端点的凭据。",
-        Key::CredentialReadFailed => "无法读取安全存储的凭据。",
+        Key::CredentialReadFailed => {
+            "无法读取安全存储的凭据。请重试，或改用“仅本次会话使用”或环境变量。"
+        }
         Key::CredentialRequired => "请先输入凭据。",
         Key::CredentialWriteFailed => {
             "无法写入系统安全存储。请改用“仅本次会话使用”，或检查系统凭据管理器权限。"

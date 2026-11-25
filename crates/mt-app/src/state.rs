@@ -133,9 +133,6 @@ pub(crate) enum StatusKind {
     Error,
 }
 
-/// A Tier 2 reversal offered on the status line: the label of the reversing
-/// action, what pressing it restores, and what commits when the hold
-/// ([`crate::ui::motion::UNDO_HOLD_MS`]) elapses unclaimed.
 #[derive(Clone)]
 pub(crate) struct UndoNotice {
     pub(crate) label: SharedString,
@@ -143,8 +140,6 @@ pub(crate) struct UndoNotice {
     pub(crate) commit: Rc<dyn Fn()>,
 }
 
-/// A status line's content: the message, the changing count it names, and the
-/// optional Tier 2 reversal it offers.
 #[derive(Clone, Default)]
 pub struct StatusMessage {
     pub(crate) text: SharedString,
@@ -190,9 +185,6 @@ impl StatusMessage {
     }
 }
 
-/// The credential removal a Tier 2 Undo holds: the endpoint captured at press
-/// time and the credential resolved for it, so the commit deletes exactly
-/// that credential and nothing a later write put under the endpoint.
 struct PendingCredentialRemoval {
     target: String,
     captured: Option<ResolvedCredential>,
@@ -232,20 +224,10 @@ pub struct AppState {
     /// that changes nothing about the endpoint does not read the secure store
     /// again; the settings page is the only reader.
     pub(crate) settings_credential_status: Signal<Option<(CredentialStatusKey, CredentialStatus)>>,
-    /// The Tier 2 action whose Undo notice is up, and the generation its hold
-    /// belongs to: a newer notice or an Undo makes the older timer a no-op.
     pending_undo: Rc<RefCell<Option<UndoNotice>>>,
     undo_generation: Rc<Cell<u64>>,
-    /// The endpoint and credential whose removal is still inside its undo
-    /// hold, captured at press time: that endpoint's settings say its
-    /// credential is gone while the vault still holds it, and a later endpoint
-    /// change never moves the commit.
     credential_removal_pending: Rc<RefCell<Option<PendingCredentialRemoval>>>,
-    /// Whether a usage clear is still inside its undo hold: the summary shows
-    /// zero, and the store still holds the counts.
-    usage_clear_pending: Rc<Cell<bool>>,
-    /// The last base URL persisted, so an invalid edit keeps it on disk while
-    /// the field shows the error.
+    usage_clear_snapshot: Rc<RefCell<Option<UsageAggregate>>>,
     settings_base_url_saved: Rc<RefCell<String>>,
     pub usage_counts: Signal<UsageAggregate>,
     pub usage_inspection_open: Signal<bool>,
@@ -720,7 +702,7 @@ impl AppState {
             pending_undo: Rc::new(RefCell::new(None)),
             undo_generation: Rc::new(Cell::new(0)),
             credential_removal_pending: Rc::new(RefCell::new(None)),
-            usage_clear_pending: Rc::new(Cell::new(false)),
+            usage_clear_snapshot: Rc::new(RefCell::new(None)),
             settings_base_url_saved,
             usage_counts: signal(UsageAggregate::default()),
             usage_inspection_open: signal(false),
@@ -875,8 +857,6 @@ impl AppState {
     }
 
     fn publish(&self, surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
-        // A pending Undo stays reachable: a newer message carries it on until
-        // its deadline frees the slot.
         if message.action.is_none()
             && let Some(action) = self.pending_undo.borrow().as_ref()
         {
@@ -890,11 +870,6 @@ impl AppState {
         self.status.set(message);
     }
 
-    /// Offer one Tier 2 reversal on `surface`'s status line: the action has
-    /// already taken effect, and its commit runs after
-    /// [`UNDO_HOLD_MS`](crate::ui::motion::UNDO_HOLD_MS) unless the status
-    /// line's Undo is pressed first. Starting another undoable action commits
-    /// this one at once.
     pub(crate) fn notify_undo(
         &self,
         surface: StatusSurface,
@@ -919,8 +894,6 @@ impl AppState {
         });
     }
 
-    /// Press the status line's Undo: reverse the pending Tier 2 action and
-    /// retire its hold.
     pub(crate) fn undo_last(&self) {
         self.undo_generation.update(|generation| generation + 1);
         let action = self.pending_undo.borrow_mut().take();
@@ -937,8 +910,6 @@ impl AppState {
         );
     }
 
-    /// Commit the pending Tier 2 action now (its hold elapsed, or a newer
-    /// action replaced it) and clear the notice when it is still up.
     fn commit_pending_undo(&self) {
         self.undo_generation.update(|generation| generation + 1);
         let Some(action) = self.pending_undo.borrow_mut().take() else {
@@ -974,11 +945,14 @@ impl AppState {
     }
 
     fn refresh_usage_counts(&self) {
-        if self.usage_clear_pending.get() {
-            return;
-        }
         match self.usage.borrow().inspect(SystemTime::now()) {
-            Ok(counts) => self.usage_counts.set(counts),
+            Ok(counts) => {
+                let kept = match self.usage_clear_snapshot.borrow().as_ref() {
+                    Some(cleared) => counts.without(cleared),
+                    None => counts,
+                };
+                self.usage_counts.set(kept);
+            }
             Err(_) => self.usage_notice(crate::i18n::Key::UsageUnavailable),
         }
     }
@@ -991,8 +965,12 @@ impl AppState {
         self.usage.borrow_mut().set_enabled(false);
         self.settings
             .update(|settings| settings.usage_metrics_enabled = false);
-        match settings.try_save_usage_metrics_consent() {
+        match self
+            .settings_for_persist(&settings)
+            .try_save_usage_metrics_consent()
+        {
             Ok(settings) => {
+                self.remember_persisted_base_url(&settings);
                 self.usage
                     .borrow_mut()
                     .set_enabled(settings.usage_metrics_enabled);
@@ -1010,14 +988,11 @@ impl AppState {
             .set(!self.usage_inspection_open.get());
     }
 
-    /// Tier 2: the summary reads zero at once, and the store is cleared after
-    /// the undo hold (`UNDO_HOLD_MS`). Events recorded during the hold belong
-    /// to the cleared state, and Undo restores the old counts plus those
-    /// events.
     pub fn clear_usage(&self) {
         self.refresh_usage_counts();
         self.commit_pending_undo();
-        self.usage_clear_pending.set(true);
+        *self.usage_clear_snapshot.borrow_mut() =
+            self.usage.borrow().inspect(SystemTime::now()).ok();
         self.usage_counts.set(UsageAggregate::default());
         let language = self.settings.get().language;
         let state = self.clone();
@@ -1025,13 +1000,17 @@ impl AppState {
         let reverse = {
             let state = state.clone();
             move || {
-                state.usage_clear_pending.set(false);
+                state.usage_clear_snapshot.borrow_mut().take();
                 state.refresh_usage_counts();
             }
         };
         let commit = move || {
-            state.usage_clear_pending.set(false);
-            if let Err(error) = usage.borrow().clear() {
+            let cleared = state.usage_clear_snapshot.borrow_mut().take();
+            let result = match cleared {
+                Some(cleared) => usage.borrow().clear_keeping(&cleared),
+                None => usage.borrow().clear(),
+            };
+            if let Err(error) = result {
                 log::warn!("cannot clear usage counts: {error}");
                 state.usage_notice(crate::i18n::Key::UsageUnavailable);
             }
@@ -1066,7 +1045,17 @@ impl AppState {
             .await;
             match picked {
                 Ok(Some(path)) => {
-                    let result = state.usage.borrow().export_to(&path, SystemTime::now());
+                    let current = state.usage.borrow().inspect(SystemTime::now());
+                    let result = match current {
+                        Ok(current) => {
+                            let kept = match state.usage_clear_snapshot.borrow().as_ref() {
+                                Some(cleared) => current.without(cleared),
+                                None => current,
+                            };
+                            state.usage.borrow().export_snapshot_to(&path, &kept)
+                        }
+                        Err(error) => Err(error),
+                    };
                     state.usage_notice(if result.is_ok() {
                         crate::i18n::Key::UsageExported
                     } else {
@@ -1778,7 +1767,12 @@ impl AppState {
         self.settings.update(|settings| {
             settings.record_recent_target(RecentTarget::new(path.to_path_buf(), kind, name));
         });
-        let _ = self.settings.get().try_save_general();
+        if let Ok(saved) = self
+            .settings_for_persist(&self.settings.get())
+            .try_save_general()
+        {
+            self.remember_persisted_base_url(&saved);
+        }
     }
 
     /// Search the workspace's documents for `text`. Runs the walk and the
@@ -3616,8 +3610,6 @@ impl AppState {
         self.persist_settings(StatusSurface::Settings);
     }
 
-    /// Persist valid edits without a status-line receipt: the page calls this
-    /// on field blur and on choice press, never on every keystroke.
     pub fn save_settings_quietly(&self) -> bool {
         let settings = self.settings.get();
         match self.settings_for_persist(&settings).try_save_general() {
@@ -3659,8 +3651,6 @@ impl AppState {
         saved
     }
 
-    /// The settings as they may be written: an invalid Base URL keeps the last
-    /// value that parsed, so a bad edit never lands on disk.
     fn settings_for_persist(&self, settings: &SettingsData) -> SettingsData {
         let mut to_save = settings.clone();
         if !model_base_url_valid(settings) {
@@ -3689,7 +3679,6 @@ impl AppState {
         self.save_settings();
     }
 
-    /// Whether this platform's secure store can hold a persistent credential.
     pub fn secure_store_supported(&self) -> bool {
         self.vault.secure_store_supported()
     }
@@ -3697,7 +3686,6 @@ impl AppState {
     /// Store a key for this process only. This path never writes a plaintext
     /// key.
     pub fn store_session_credential(&self, value: &str) -> Result<(), String> {
-        self.commit_pending_undo();
         let language = self.settings.get().language;
         let target = self.credential_target()?;
         self.vault
@@ -3719,7 +3707,6 @@ impl AppState {
                 crate::i18n::t(language, crate::i18n::Key::SecureStoreUnavailable).to_owned(),
             );
         }
-        self.commit_pending_undo();
         let target = self.credential_target()?;
         self.vault
             .replace_persistent(&target, value.to_owned())
@@ -3751,14 +3738,6 @@ impl AppState {
             return CredentialStatus::Unconfigured;
         };
         let target = endpoint.credential_target();
-        if self
-            .credential_removal_pending
-            .borrow()
-            .as_ref()
-            .is_some_and(|pending| pending.target == target.as_str())
-        {
-            return CredentialStatus::Missing;
-        }
         let environment_allowed = endpoint.is_vendor_default()
             || settings.model_environment_key_identity == target.as_str();
         let environment_value = environment_allowed
@@ -3819,26 +3798,29 @@ impl AppState {
         self.settings_credential_status.set(None);
     }
 
-    /// Forget the configured endpoint's key: the settings say it is gone at
-    /// once, and the vault delete commits after the undo hold
-    /// (`UNDO_HOLD_MS`) unless Undo restores it. The commit is bound to the
-    /// endpoint captured here; a later endpoint change never redirects it.
     pub fn remove_credential(&self) -> Result<(), String> {
         let target = self.credential_target()?;
         let language = self.settings.get().language;
         self.commit_pending_undo();
-        let captured = self.vault.resolve(&target, None, false).ok().flatten();
+        let captured = self.vault.resolve(&target, None, false).map_err(|error| {
+            log::warn!("cannot read the credential to remove: {error}");
+            self.record_usage(UsageEvent::CredentialFailure);
+            crate::i18n::t(language, crate::i18n::Key::CredentialReadFailed).to_owned()
+        })?;
         *self.credential_removal_pending.borrow_mut() = Some(PendingCredentialRemoval {
             target: target.clone(),
             captured,
         });
+        self.vault.deactivate(&target);
         self.settings_credential_revision
             .update(|revision| *revision += 1);
         let state = self.clone();
         let reverse = {
             let state = state.clone();
             move || {
-                *state.credential_removal_pending.borrow_mut() = None;
+                if let Some(pending) = state.credential_removal_pending.borrow_mut().take() {
+                    state.vault.reactivate(&pending.target);
+                }
                 state
                     .settings_credential_revision
                     .update(|revision| *revision += 1);
@@ -3849,17 +3831,25 @@ impl AppState {
             let Some(pending) = pending else {
                 return;
             };
-            if let Some(captured) = pending.captured
-                && let Err(error) = state.vault.delete_resolved(&pending.target, &captured)
+            if let Some(captured) = &pending.captured
+                && let Err(error) = state.vault.delete_resolved(&pending.target, captured)
             {
                 log::warn!("cannot delete the credential: {error}");
                 state.record_usage(UsageEvent::CredentialFailure);
                 let language = state.settings.get().language;
-                state.set_settings_notice(
-                    crate::i18n::t(language, crate::i18n::Key::CredentialDeleteFailed),
-                    true,
-                );
+                let notice = SharedString::from(crate::i18n::t(
+                    language,
+                    crate::i18n::Key::CredentialDeleteFailed,
+                ));
+                let surface = if state.settings_open.get_untracked() {
+                    StatusSurface::Settings
+                } else {
+                    StatusSurface::Editor
+                };
+                state.notify_at(surface, StatusKind::Error, notice.clone());
+                state.set_settings_notice(notice, true);
             }
+            state.vault.reactivate(&pending.target);
             state
                 .settings_credential_revision
                 .update(|revision| *revision += 1);
@@ -3892,9 +3882,6 @@ impl AppState {
     }
 }
 
-/// Whether the settings' base URL parses for the selected wire format. An
-/// empty URL uses the wire format's default; an unknown wire format is
-/// validated the way the page draws it (against OpenAI Chat Completions).
 pub(crate) fn model_base_url_valid(settings: &SettingsData) -> bool {
     let raw = settings.model_base_url.trim();
     if raw.is_empty() {
@@ -4549,6 +4536,226 @@ mod tests {
             .expect("the probe ran");
         assert_eq!(translated, "translated\n");
         assert_eq!(reloaded, "on disk\n");
+    }
+
+    #[derive(Default)]
+    struct FailingWriteStore;
+
+    impl SecureCredentialStore for FailingWriteStore {
+        fn is_supported(&self) -> bool {
+            true
+        }
+        fn read(&self, _: &str) -> Result<Option<Secret>, CredentialError> {
+            Ok(None)
+        }
+        fn write(&self, _: &str, _: &Secret) -> Result<(), CredentialError> {
+            Err(Secret::new("").expect_err("an empty secret is refused"))
+        }
+        fn delete(&self, _: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
+
+    struct FailingReadStore;
+
+    impl SecureCredentialStore for FailingReadStore {
+        fn is_supported(&self) -> bool {
+            true
+        }
+        fn read(&self, _: &str) -> Result<Option<Secret>, CredentialError> {
+            Err(Secret::new("").expect_err("an empty secret is refused"))
+        }
+        fn write(&self, _: &str, _: &Secret) -> Result<(), CredentialError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), CredentialError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingDeleteStore {
+        values: std::sync::Mutex<std::collections::HashMap<String, Secret>>,
+        fail_delete: std::sync::atomic::AtomicBool,
+    }
+
+    impl SecureCredentialStore for FailingDeleteStore {
+        fn is_supported(&self) -> bool {
+            true
+        }
+        fn read(&self, target: &str) -> Result<Option<Secret>, CredentialError> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(target)
+                .cloned())
+        }
+        fn read_versioned(
+            &self,
+            target: &str,
+        ) -> Result<Option<(Secret, Option<u64>)>, CredentialError> {
+            Ok(self.read(target)?.map(|secret| (secret, Some(1))))
+        }
+        fn write(&self, target: &str, secret: &Secret) -> Result<(), CredentialError> {
+            self.values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(target.to_owned(), secret.clone());
+            Ok(())
+        }
+        fn delete(&self, target: &str) -> Result<(), CredentialError> {
+            if self.fail_delete.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(Secret::new("").expect_err("an empty secret is refused"));
+            }
+            self.values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(target);
+            Ok(())
+        }
+    }
+
+    fn configure_endpoint(state: &AppState) {
+        state.settings.update(|settings| {
+            settings.model_provider = "openai-chat".to_owned();
+            settings.model_base_url = "http://127.0.0.1:11434/v1".to_owned();
+        });
+    }
+
+    static FAILED_SAVE_UNDO: std::sync::Mutex<Option<(bool, bool, bool)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn FailedSaveKeepsUndoProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(
+            FailingWriteStore,
+        )));
+        configure_endpoint(&state);
+        state.clear_usage();
+        let before = state.pending_undo.borrow().is_some();
+        let failed = state
+            .store_persistent_credential("synthetic")
+            .expect_err("the store refuses the write");
+        let after = state.pending_undo.borrow().is_some();
+        *FAILED_SAVE_UNDO.lock().expect("the outcome") = Some((before, !failed.is_empty(), after));
+        view()
+    }
+
+    #[test]
+    fn a_failing_credential_save_keeps_an_unrelated_pending_undo() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                FailedSaveKeepsUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (before, failed, after) = FAILED_SAVE_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(before, "there was no pending Undo to keep");
+        assert!(failed, "the credential save did not fail");
+        assert!(after, "a failing save committed the unrelated pending Undo");
+    }
+
+    static CAPTURE_FAILURE: std::sync::Mutex<Option<(String, bool, bool, String)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn CaptureFailureProbe() -> impl IntoElement {
+        let state =
+            AppState::with_vault(CredentialVault::with_test_store(Arc::new(FailingReadStore)));
+        configure_endpoint(&state);
+        let error = state
+            .remove_credential()
+            .expect_err("the read failure refuses the removal");
+        let undo = state.pending_undo.borrow().is_some();
+        let status_action = state.status.get_untracked().action.is_some();
+        let notice = state.settings_notice.get_untracked().to_string();
+        *CAPTURE_FAILURE.lock().expect("the outcome") = Some((error, undo, status_action, notice));
+        view()
+    }
+
+    #[test]
+    fn a_capture_read_failure_reports_it_without_a_deletion_or_undo() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                CaptureFailureProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (error, undo, status_action, notice) = CAPTURE_FAILURE
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert_eq!(
+            error,
+            "The secure credential could not be read. Retry, or use \"Use for session\" or an environment variable."
+        );
+        assert!(!undo, "a failed capture opened an Undo hold");
+        assert!(!status_action, "a failed capture offered an Undo");
+        assert!(notice.is_empty(), "a failed capture said {notice:?}");
+    }
+
+    #[component]
+    fn FailedDeleteProbe() -> impl IntoElement {
+        let store = Arc::new(FailingDeleteStore::default());
+        let state = AppState::with_vault(CredentialVault::with_test_store(store.clone()));
+        configure_endpoint(&state);
+        state
+            .store_persistent_credential("synthetic")
+            .expect("the write succeeds");
+        let remove_state = state.clone();
+        view()
+            .flex_1()
+            .w_full()
+            .h(relative(1.0))
+            .child(crate::ui::prims::primary_action(
+                "probe-arm",
+                "Arm",
+                move || {
+                    store
+                        .fail_delete
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    remove_state
+                        .remove_credential()
+                        .expect("the capture succeeds");
+                    remove_state.open_settings();
+                    remove_state.close_settings();
+                },
+            ))
+            .child(crate::ui::shell(
+                state,
+                Language::English,
+                crate::ui::tokens::Layout::Wide,
+            ))
+    }
+
+    #[test]
+    fn a_failed_commit_delete_reaches_the_status_line_after_settings_closes() {
+        let mut config = nsh_engine::EngineConfig::new(nsh_engine::Root::of::<FailedDeleteProbe>());
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        let mut app = nsh_testing::Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(
+            nsh_engine::Points(1440.0),
+            nsh_engine::Points(900.0),
+        ))
+        .expect("viewport");
+        app.wait_for("id:shell").expect("the shell");
+        app.press("id:probe-arm").expect("arm the removal");
+        app.wait_for_gone("id:settings-page", std::time::Duration::from_secs(5))
+            .expect("the user left Settings");
+        app.run_for(std::time::Duration::from_millis(
+            crate::ui::motion::UNDO_HOLD_MS + 1_000,
+        ))
+        .expect("the undo hold elapses");
+        app.wait_for(
+            "text:Could not delete the stored credential. Try again, or remove it in your OS keychain.",
+        )
+        .expect("the failed delete reaches the editor status line");
     }
 }
 

@@ -4,14 +4,19 @@
 //! serializes them, places them in process arguments, or includes them in
 //! diagnostics. Session credentials are held only for the life of the process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest as _, Sha256};
 
 use crate::settings::SettingsData;
+
+/// Names one write of a session credential: two writes of the same secret
+/// still get different values.
+static SESSION_WRITE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 /// Secret bytes with deliberately redacted formatting and best-effort clearing.
 #[derive(Clone, PartialEq, Eq)]
@@ -129,6 +134,17 @@ pub trait SecureCredentialStore: Send + Sync {
     fn read(&self, target: &str) -> Result<Option<Secret>, CredentialError>;
     fn write(&self, target: &str, secret: &Secret) -> Result<(), CredentialError>;
     fn delete(&self, target: &str) -> Result<(), CredentialError>;
+
+    /// `read`, with a value that changes whenever the entry for `target` is
+    /// written again, even to the same bytes. `None` where the store cannot
+    /// tell; a captured credential with `None` falls back to comparing the
+    /// secret alone.
+    fn read_versioned(
+        &self,
+        target: &str,
+    ) -> Result<Option<(Secret, Option<u64>)>, CredentialError> {
+        Ok(self.read(target)?.map(|secret| (secret, None)))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +157,7 @@ pub enum CredentialSource {
 pub struct ResolvedCredential {
     secret: Secret,
     source: CredentialSource,
+    identity: Option<u64>,
 }
 
 impl ResolvedCredential {
@@ -167,7 +184,8 @@ impl fmt::Debug for ResolvedCredential {
 #[derive(Clone)]
 pub struct CredentialVault {
     secure: Arc<dyn SecureCredentialStore>,
-    session: Arc<Mutex<HashMap<String, Secret>>>,
+    session: Arc<Mutex<HashMap<String, (Secret, u64)>>>,
+    deactivated: Arc<Mutex<HashSet<String>>>,
     #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
     isolate_test_operations: bool,
 }
@@ -177,6 +195,7 @@ impl CredentialVault {
         Self {
             secure: Arc::new(PlatformCredentialStore),
             session: Arc::new(Mutex::new(HashMap::new())),
+            deactivated: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
             isolate_test_operations: false,
         }
@@ -186,6 +205,7 @@ impl CredentialVault {
         Self {
             secure,
             session: Arc::new(Mutex::new(HashMap::new())),
+            deactivated: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
             isolate_test_operations: cfg!(test),
         }
@@ -213,6 +233,32 @@ impl CredentialVault {
         self.secure.is_supported()
     }
 
+    /// Keep `target`'s credential out of [`resolve`](Self::resolve) until a
+    /// write or [`reactivate`](Self::reactivate): a Tier 2 removal hides it
+    /// while its Undo is offered. The store itself is untouched; a commit
+    /// deletes exactly the captured credential.
+    pub fn deactivate(&self, target: &str) {
+        self.deactivated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(target.to_owned());
+    }
+
+    /// Let `target` resolve again.
+    pub fn reactivate(&self, target: &str) {
+        self.deactivated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(target);
+    }
+
+    fn is_deactivated(&self, target: &str) -> bool {
+        self.deactivated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(target)
+    }
+
     /// Resolve the key without ever moving an environment credential to a
     /// custom endpoint unless the caller proves that exact identity was
     /// authorized.
@@ -222,7 +268,10 @@ impl CredentialVault {
         environment_value: Option<String>,
         environment_allowed: bool,
     ) -> Result<Option<ResolvedCredential>, CredentialError> {
-        if let Some(secret) = self
+        if self.is_deactivated(target) {
+            return Ok(None);
+        }
+        if let Some((secret, identity)) = self
             .session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -232,15 +281,17 @@ impl CredentialVault {
             return Ok(Some(ResolvedCredential {
                 secret,
                 source: CredentialSource::Session,
+                identity: Some(identity),
             }));
         }
 
         let _operation = self.lock_operations()?;
-        let secure_read = self.read_persistent_unless_pending(target);
-        if let Ok(Some(secret)) = secure_read.as_ref() {
+        let secure_read = self.read_persistent_versioned(target);
+        if let Ok(Some((secret, identity))) = secure_read.as_ref() {
             return Ok(Some(ResolvedCredential {
                 secret: secret.clone(),
                 source: CredentialSource::Persistent,
+                identity: *identity,
             }));
         }
 
@@ -251,6 +302,7 @@ impl CredentialVault {
             return Ok(Some(ResolvedCredential {
                 secret,
                 source: CredentialSource::Environment,
+                identity: None,
             }));
         }
 
@@ -263,10 +315,13 @@ impl CredentialVault {
         value: String,
     ) -> Result<(), CredentialError> {
         let secret = Secret::new(value)?;
+        let identity = SESSION_WRITE_IDENTITY.fetch_add(1, Ordering::Relaxed);
+        let target = target.into();
         self.session
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(target.into(), secret);
+            .insert(target.clone(), (secret, identity));
+        self.reactivate(&target);
         Ok(())
     }
 
@@ -304,6 +359,7 @@ impl CredentialVault {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(target);
+        self.reactivate(target);
         Ok(())
     }
 
@@ -322,15 +378,12 @@ impl CredentialVault {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(target);
+        self.reactivate(target);
         Ok(())
     }
 
-    /// Delete exactly the credential `resolved` names, and only while the vault
-    /// still holds that same value under its source: a replacement written
-    /// during an undo hold is left alone. Session and persistent entries are
-    /// distinct credentials, so a captured session key never deletes a
-    /// persistent one stored meanwhile (and the other way around). A captured
-    /// credential that is already gone is a no-op.
+    /// Delete exactly the credential `resolved` names, and only while the
+    /// vault still holds that same write.
     pub fn delete_resolved(
         &self,
         target: &str,
@@ -343,14 +396,17 @@ impl CredentialVault {
                     .session
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if session.get(target) == Some(&resolved.secret) {
+                if session.get(target).is_some_and(|(secret, identity)| {
+                    secret == &resolved.secret && Some(*identity) == resolved.identity
+                }) {
                     session.remove(target);
                 }
             }
             CredentialSource::Persistent => {
                 if self.secure.is_supported()
-                    && self.read_persistent_unless_pending(target)?.as_ref()
-                        == Some(&resolved.secret)
+                    && let Some((stored, identity)) = self.read_persistent_versioned(target)?
+                    && stored == resolved.secret
+                    && identity == resolved.identity
                 {
                     self.secure.delete(target)?;
                     self.secure.delete(&Self::pending_target(target))?;
@@ -376,19 +432,28 @@ impl CredentialVault {
         format!("markturbo:credential-write-pending:v1:{digest:x}")
     }
 
-    fn read_persistent_unless_pending(
+    fn read_persistent_versioned(
         &self,
         target: &str,
-    ) -> Result<Option<Secret>, CredentialError> {
+    ) -> Result<Option<(Secret, Option<u64>)>, CredentialError> {
         let marker_target = Self::pending_target(target);
         if self.secure.read(&marker_target)?.is_some() {
             return Err(CredentialError::new(CredentialErrorKind::Verify, None));
         }
-        let stored = self.secure.read(target);
+        let stored = self.secure.read_versioned(target);
         if self.secure.read(&marker_target)?.is_some() {
             return Err(CredentialError::new(CredentialErrorKind::Verify, None));
         }
         stored
+    }
+
+    fn read_persistent_unless_pending(
+        &self,
+        target: &str,
+    ) -> Result<Option<Secret>, CredentialError> {
+        Ok(self
+            .read_persistent_versioned(target)?
+            .map(|(secret, _)| secret))
     }
 
     fn write_pending_marker(&self, marker_target: &str) -> Result<(), CredentialError> {
@@ -611,6 +676,13 @@ impl SecureCredentialStore for PlatformCredentialStore {
     }
 
     fn read(&self, target: &str) -> Result<Option<Secret>, CredentialError> {
+        Ok(self.read_versioned(target)?.map(|(secret, _)| secret))
+    }
+
+    fn read_versioned(
+        &self,
+        target: &str,
+    ) -> Result<Option<(Secret, Option<u64>)>, CredentialError> {
         use std::ptr;
         use windows::Win32::Foundation::ERROR_NOT_FOUND;
         use windows::Win32::Security::Credentials::{
@@ -646,11 +718,13 @@ impl SecureCredentialStore for PlatformCredentialStore {
         }
         let guard = CredentialGuard(credential);
         let credential = unsafe { &*guard.0 };
+        let identity = (u64::from(credential.LastWritten.dwHighDateTime) << 32)
+            | u64::from(credential.LastWritten.dwLowDateTime);
         secret_from_credential_blob(
             credential.CredentialBlob,
             credential.CredentialBlobSize as usize,
         )
-        .map(Some)
+        .map(|secret| Some((secret, Some(identity))))
     }
 
     fn write(&self, target: &str, secret: &Secret) -> Result<(), CredentialError> {
@@ -718,6 +792,8 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         values: Mutex<HashMap<String, Secret>>,
+        generations: Mutex<HashMap<String, u64>>,
+        writes: Mutex<u64>,
         fail_read: Mutex<bool>,
         fail_write: Mutex<bool>,
         fail_delete: Mutex<bool>,
@@ -797,7 +873,33 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(target.to_string(), secret.clone());
+            let identity = {
+                let mut writes = self
+                    .writes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *writes += 1;
+                *writes
+            };
+            self.generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(target.to_string(), identity);
             Ok(())
+        }
+
+        fn read_versioned(
+            &self,
+            target: &str,
+        ) -> Result<Option<(Secret, Option<u64>)>, CredentialError> {
+            let secret = self.read(target)?;
+            let identity = self
+                .generations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(target)
+                .copied();
+            Ok(secret.map(|secret| (secret, identity)))
         }
 
         fn delete(&self, target: &str) -> Result<(), CredentialError> {
@@ -809,6 +911,10 @@ mod tests {
                 return Err(CredentialError::new(CredentialErrorKind::Delete, Some(5)));
             }
             self.values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(target);
+            self.generations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(target);
@@ -879,15 +985,12 @@ mod tests {
                 .expect("a credential is stored")
         };
 
-        // A captured persistent key that was replaced during the hold: the
-        // replacement stays.
         vault.replace_persistent(target, "first".into()).unwrap();
         let captured = resolved(&vault);
         vault.replace_persistent(target, "second".into()).unwrap();
         vault.delete_resolved(target, &captured).unwrap();
         assert_eq!(resolved(&vault).secret(), "second");
 
-        // The same persistent key, still there at the commit: it goes.
         let captured = resolved(&vault);
         vault.delete_resolved(target, &captured).unwrap();
         assert!(
@@ -895,8 +998,6 @@ mod tests {
             "the captured credential was not removed"
         );
 
-        // A captured session key never deletes a persistent one stored
-        // meanwhile, and a replaced session key stays.
         vault
             .replace_persistent(target, "persistent".into())
             .unwrap();
@@ -912,6 +1013,32 @@ mod tests {
         vault.delete_resolved(target, &captured).unwrap();
         assert_eq!(resolved(&vault).source(), CredentialSource::Persistent);
         assert_eq!(resolved(&vault).secret(), "persistent");
+    }
+
+    #[test]
+    fn delete_resolved_keeps_a_rewritten_identical_credential() {
+        let store = Arc::new(FakeStore::default());
+        let vault = CredentialVault::with_store(store);
+        let target = "markturbo:model:rewritten";
+        let resolved = |vault: &CredentialVault| {
+            vault
+                .resolve(target, None, false)
+                .unwrap()
+                .expect("a credential is stored")
+        };
+
+        vault.replace_persistent(target, "captured".into()).unwrap();
+        let captured = resolved(&vault);
+        vault.replace_persistent(target, "other".into()).unwrap();
+        vault.replace_persistent(target, "captured".into()).unwrap();
+        vault.delete_resolved(target, &captured).unwrap();
+        assert_eq!(resolved(&vault).secret(), "captured");
+
+        vault.replace_session(target, "session".into()).unwrap();
+        let captured = resolved(&vault);
+        vault.replace_session(target, "session".into()).unwrap();
+        vault.delete_resolved(target, &captured).unwrap();
+        assert_eq!(resolved(&vault).secret(), "session");
     }
 
     #[test]
@@ -1278,6 +1405,7 @@ mod tests {
         let resolved = ResolvedCredential {
             secret,
             source: CredentialSource::Session,
+            identity: None,
         };
 
         let debug = format!("{resolved:?}");

@@ -9,10 +9,7 @@
 //! wired lives here, with the same `test_id`s the tests use: `api-key`,
 //! `usage-counters`, `usage-summary`, `usage-retention`, `usage-details`.
 //!
-//! The page obeys the Afterglow rule: nothing here emits light. A credential is
-//! shown as words (`Credential stored securely for this endpoint`, `No
-//! credential stored`), never as the key; a base URL is validated as it is
-//! typed, and the error is the line under the field.
+//! The page obeys the Afterglow rule: nothing here emits light.
 //!
 //! Reactions: the page is rebuilt when the language or the layout changes
 //! (`app.rs` re-keys the shell), so its labels are read once. Everything that
@@ -33,7 +30,7 @@ use crate::{
     state::{AppState, CredentialStatus},
     ui::{
         fonts::{Companion, CompanionAction, CompanionFailure, CompanionStatus},
-        notices, prims,
+        motion, notices, prims,
         tokens::{
             self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_NARROW, MEASURE_WIDE, RAIL_W,
             SELECTION_UNDERLINE, SETTINGS_HEADER_H, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
@@ -215,8 +212,6 @@ fn field_row(
         .child(view().max_w(px(MEASURE_NARROW)).child(note))
 }
 
-/// The model endpoint: the wire format with its help, the base URL with its
-/// validation line, and the model id.
 fn endpoint_section(state: AppState, language: Language) -> impl IntoElement {
     let base_change_state = state.clone();
     let base_blur_state = state.clone();
@@ -332,8 +327,6 @@ fn provider_choice(settings: &SettingsData) -> ProviderChoice {
     }
 }
 
-/// Write the chosen wire format into the settings, in memory, and persist it
-/// quietly: the choice press is one of the page's save points.
 fn set_provider(state: &AppState, choice: ProviderChoice) {
     let key = match choice {
         ProviderChoice::Best => "",
@@ -527,8 +520,6 @@ fn credential_status_text(state: &AppState, language: Language) -> SharedString 
             };
             SharedString::from(i18n::t(language, key))
         }
-        // Where the secure store cannot hold a key, say so instead of
-        // pretending one could be stored.
         CredentialStatus::Missing if !state.secure_store_supported() => {
             SharedString::from(i18n::t(language, Key::SecureStoreUnavailable))
         }
@@ -543,9 +534,6 @@ fn credential_status_text(state: &AppState, language: Language) -> SharedString 
 }
 
 /// The credential's actions: store (or replace) the typed key, use it for this
-/// session only, and forget the endpoint's key. Store is absent where the
-/// platform has no secure store, and both entry actions wait until a wire
-/// format and endpoint exist.
 fn credential_actions(
     store_state: AppState,
     session_state: AppState,
@@ -646,10 +634,6 @@ fn store_key(state: &AppState, language: Language, session: bool) {
     }
 }
 
-/// Forget the endpoint's key: the settings forget it at once and the status
-/// line offers Undo until the hold commits. This button goes away with the key
-/// it forgot, so the keyboard user lands on the store control instead of
-/// nowhere.
 fn remove_key(state: &AppState, focus_after: ElementRef) {
     match state.remove_credential() {
         Ok(()) => focus_after.focus(),
@@ -1057,22 +1041,20 @@ fn choice_button(
             .on_press(move |_: &PressEvent| on_press()),
     )
     .child(
-        text(label)
-            .font_family(FONT_UI)
-            .text_size(px(TYPE_UI))
-            .line_height(px(TYPE_UI_LINE))
-            .text_color(colour)
-            .transition_colors()
-            .duration(move || duration.get())
-            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
-            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
+        motion::ease_out(
+            text(label)
+                .font_family(FONT_UI)
+                .text_size(px(TYPE_UI))
+                .line_height(px(TYPE_UI_LINE))
+                .text_color(colour)
+                .transition_colors()
+                .duration(move || duration.get()),
+        )
+        .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+        .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
     )
 }
 
-/// A quiet local action whose label follows the state and which stays one
-/// element while that label changes: the credential's store control must keep
-/// the focus a keyboard user put on it when the label flips between
-/// 'Store securely' and 'Replace'.
 fn reactive_action(
     test_id: &'static str,
     label: impl Fn() -> SharedString + Clone + 'static,
@@ -1099,15 +1081,17 @@ fn reactive_action(
                 .on_press(on_press),
         )
         .child(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest)
-                .transition_colors()
-                .duration(move || duration.get())
-                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
-                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
+            motion::ease_out(
+                text(label)
+                    .font_family(FONT_UI)
+                    .text_size(px(TYPE_UI))
+                    .line_height(px(TYPE_UI_LINE))
+                    .text_color(move || tokens::palette().ink_rest)
+                    .transition_colors()
+                    .duration(move || duration.get()),
+            )
+            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
+            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
         ),
     )
 }
@@ -1257,6 +1241,77 @@ mod tests {
     /// A choice's test id names the pressable button itself — the element UI
     /// Automation exposes with that AutomationId — and the button says it is
     /// the current choice.
+    #[component]
+    fn MountedTransitionProbe() -> impl IntoElement {
+        let shown = signal(false);
+        view()
+            .flex_col()
+            .child(prims::primary_action("probe-show", "Show", move || {
+                shown.set(true)
+            }))
+            .child(when(
+                move || shown.get(),
+                move || {
+                    view()
+                        .flex_col()
+                        .child(prims::quiet_action("probe-quiet", "Quiet", || {}))
+                        .child(choice_button("probe-choice", "Choice", || true, || {}))
+                        .into_element()
+                },
+            ))
+    }
+
+    #[test]
+    fn an_actions_label_colour_transition_uses_the_ease_out_curve() {
+        use std::sync::{Arc, Mutex};
+
+        use nsh_core::MountItem;
+
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                MountedTransitionProbe,
+            >()))
+            .expect("start the harness");
+        app.wait_for("id:probe-show").expect("the harness");
+        let batches = Arc::new(Mutex::new(Vec::<MountItem>::new()));
+        app.observe({
+            let batches = batches.clone();
+            move |_, batch| {
+                batches
+                    .lock()
+                    .expect("lock the batch record")
+                    .extend(batch.items.iter().cloned());
+            }
+        });
+        app.press("id:probe-show").expect("mount the labels");
+        app.wait_for("id:probe-choice").expect("the choice");
+        let batches = batches.lock().expect("lock the batch record");
+        for text in ["Quiet", "Choice"] {
+            let label = batches
+                .iter()
+                .find_map(|item| match item {
+                    MountItem::Text {
+                        id, text: content, ..
+                    } if content.text == text => Some(*id),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {text} label's text node"));
+            let transition = batches
+                .iter()
+                .find_map(|item| match item {
+                    MountItem::ViewStyle { id, style } if *id == label => style.transition,
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the {text} label's colour transition"));
+            assert_eq!(
+                transition.easing,
+                [0.23, 1.0, 0.32, 1.0],
+                "{text} must ease out, not ride nsh's default curve"
+            );
+            assert_eq!(transition.duration, motion::HOVER_MS, "{text} hover timing");
+        }
+    }
+
     #[test]
     fn a_choices_test_id_is_on_the_button_itself() {
         let mut app =
@@ -1368,8 +1423,6 @@ mod tests {
         }
     }
 
-    /// A vault with no secure store, as macOS or Linux without keychain
-    /// persistence reports itself.
     struct NoSecureStore;
 
     impl SecureCredentialStore for NoSecureStore {
@@ -1387,8 +1440,6 @@ mod tests {
         }
     }
 
-    /// The three credential-failure lines: the unsupported-store status and
-    /// write refusal, and the failed secure write.
     #[component]
     fn CredentialErrorProbe() -> impl IntoElement {
         let configure = |state: &AppState| {
@@ -1429,11 +1480,21 @@ mod tests {
             .store_persistent_credential("synthetic")
             .expect_err("a failing store reports the write refusal in Chinese");
 
+        let unreadable = Arc::new(CountingStore::default());
+        unreadable.fail_read.store(true, Ordering::Relaxed);
+        let unreadable_state = AppState::with_vault(
+            mt_core::credentials::CredentialVault::with_test_store(unreadable),
+        );
+        configure(&unreadable_state);
+        let read_error = credential_status_text(&unreadable_state, Language::English);
+        let read_error_chinese = credential_status_text(&unreadable_state, Language::Chinese);
+
         view()
             .test_id("credential-errors")
             .child(prims::ink(SharedString::from(format!(
                 "A:{unsupported_status}|B:{unsupported_error}|C:{write_error}\
-                 |D:{unsupported_status_chinese}|E:{unsupported_error_chinese}|F:{write_error_chinese}"
+                 |D:{unsupported_status_chinese}|E:{unsupported_error_chinese}|F:{write_error_chinese}\
+                 |G:{read_error}|H:{read_error_chinese}"
             ))))
     }
 
@@ -1446,10 +1507,6 @@ mod tests {
             .expect("start the probe");
         app.wait_for("id:credential-errors")
             .expect("the probe's line");
-        let unsupported = i18n::t(Language::English, Key::SecureStoreUnavailable);
-        let write = i18n::t(Language::English, Key::CredentialWriteFailed);
-        let unsupported_chinese = i18n::t(Language::Chinese, Key::SecureStoreUnavailable);
-        let write_chinese = i18n::t(Language::Chinese, Key::CredentialWriteFailed);
         let summary = app
             .screen()
             .texts()
@@ -1458,10 +1515,14 @@ mod tests {
             .expect("the probe's line");
         assert_eq!(
             summary,
-            format!(
-                "A:{unsupported}|B:{unsupported}|C:{write}\
-                 |D:{unsupported_chinese}|E:{unsupported_chinese}|F:{write_chinese}"
-            )
+            "A:OS keychain storage is unavailable on this system. Use \"Use for session\" or set an environment variable.\
+             |B:OS keychain storage is unavailable on this system. Use \"Use for session\" or set an environment variable.\
+             |C:Could not save to secure storage. Use \"Use for session\" instead, or check your OS keychain permissions.\
+             |D:当前系统不支持安全凭据存储。请点击“仅本次会话使用”或配置环境变量。\
+             |E:当前系统不支持安全凭据存储。请点击“仅本次会话使用”或配置环境变量。\
+             |F:无法写入系统安全存储。请改用“仅本次会话使用”，或检查系统凭据管理器权限。\
+             |G:The secure credential could not be read. Retry, or use \"Use for session\" or an environment variable.\
+             |H:无法读取安全存储的凭据。请重试，或改用“仅本次会话使用”或环境变量。"
         );
         assert!(
             !summary.contains("synthetic"),
@@ -1704,8 +1765,10 @@ mod tests {
         app.wait_for("id:title-menu-settings").expect("the menu");
         app.press("id:title-menu-settings").expect("open settings");
         app.wait_for("id:settings-page").expect("the page");
-        app.wait_for("text:The secure credential could not be read.")
-            .expect("the failed read is shown");
+        app.wait_for(
+            "text:The secure credential could not be read. Retry, or use \"Use for session\" or an environment variable.",
+        )
+        .expect("the failed read is shown");
 
         // The failure was a moment, not a state: an unrelated change re-reads
         // the vault and the status recovers without the endpoint moving.
@@ -1844,9 +1907,6 @@ mod tests {
             "",
             "the field keeps the key after replacing it"
         );
-        // Remove is Tier 2: the settings forget the key at once, the vault
-        // still holds it through the undo hold, Undo restores it, and the next
-        // Remove commits when the hold ends.
         app.press("text:Remove").expect("forget the stored key");
         app.wait_for("text:No credential stored")
             .expect("status after removal");

@@ -179,6 +179,40 @@ impl UsageDayCounts {
             _ => {}
         }
     }
+
+    fn without(&self, cleared: Option<&UsageDayCounts>) -> UsageDayCounts {
+        let Some(cleared) = cleared else {
+            return self.clone();
+        };
+        UsageDayCounts {
+            events: subtract(&self.events, &cleared.events),
+            review_started: self
+                .review_started
+                .iter()
+                .filter_map(|(scope, lenses)| {
+                    let bare = BTreeMap::new();
+                    let lenses =
+                        subtract(lenses, cleared.review_started.get(scope).unwrap_or(&bare));
+                    (!lenses.is_empty()).then_some((*scope, lenses))
+                })
+                .collect(),
+            review_durations: subtract(&self.review_durations, &cleared.review_durations),
+            accepted_hunks: self.accepted_hunks.saturating_sub(cleared.accepted_hunks),
+            rejected_hunks: self.rejected_hunks.saturating_sub(cleared.rejected_hunks),
+        }
+    }
+}
+
+fn subtract<K: Ord + Copy>(
+    kept: &BTreeMap<K, u64>,
+    cleared: &BTreeMap<K, u64>,
+) -> BTreeMap<K, u64> {
+    kept.iter()
+        .filter_map(|(key, count)| {
+            let left = count.saturating_sub(cleared.get(key).copied().unwrap_or(0));
+            (left > 0).then_some((*key, left))
+        })
+        .collect()
 }
 
 fn increment(count: &mut u64, amount: u64) {
@@ -205,6 +239,23 @@ impl Default for UsageAggregate {
 impl UsageAggregate {
     pub fn days(&self) -> &BTreeMap<u64, UsageDayCounts> {
         &self.days
+    }
+
+    /// The counts left when the counts `cleared` held are removed: per
+    /// counter, saturating subtraction. Days whose events all reach zero are
+    /// dropped.
+    pub fn without(&self, cleared: &UsageAggregate) -> UsageAggregate {
+        UsageAggregate {
+            schema_version: USAGE_SCHEMA_VERSION,
+            days: self
+                .days
+                .iter()
+                .filter_map(|(day, counts)| {
+                    let kept = counts.without(cleared.days.get(day));
+                    (!kept.events.is_empty()).then_some((*day, kept))
+                })
+                .collect(),
+        }
     }
 
     fn prune(&mut self, today: u64) -> bool {
@@ -335,7 +386,18 @@ impl UsageStore {
     /// Deliberate user export. As with Save As, an existing destination is not
     /// overwritten. No destination path is retained in the aggregate or errors.
     pub fn export_to(&self, destination: &Path, now: SystemTime) -> Result<(), UsageError> {
-        let bytes = self.export_json(now)?;
+        let aggregate = self.inspect(now)?;
+        self.export_snapshot_to(destination, &aggregate)
+    }
+
+    /// [`export_to`](Self::export_to) of `aggregate` the caller already holds
+    /// (a pending Clear's kept counts).
+    pub fn export_snapshot_to(
+        &self,
+        destination: &Path,
+        aggregate: &UsageAggregate,
+    ) -> Result<(), UsageError> {
+        let bytes = aggregate.export_json()?;
         let parent = destination
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
@@ -354,6 +416,24 @@ impl UsageStore {
     pub fn clear(&self) -> Result<(), UsageError> {
         let _guard = self.lock_settings_writes()?;
         let path = self.path()?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Self::clear_staging(path.parent().ok_or(UsageError::DataDirectoryUnavailable)?)
+    }
+
+    /// Commit a Clear that was held for undo: remove the counts `cleared`
+    /// held, keep anything recorded since, and delete the file when nothing
+    /// is left — as [`clear`](Self::clear).
+    pub fn clear_keeping(&self, cleared: &UsageAggregate) -> Result<(), UsageError> {
+        let _guard = self.lock_settings_writes()?;
+        let path = self.path()?;
+        let kept = Self::load(path)?.without(cleared);
+        if !kept.days.is_empty() {
+            return Self::save(path, &kept);
+        }
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}

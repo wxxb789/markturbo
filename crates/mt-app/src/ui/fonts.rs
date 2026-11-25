@@ -367,16 +367,12 @@ impl Companion {
         match (self.status.get(), self.on_disk.get()) {
             (CompanionStatus::Downloading(_), _) => Some(CompanionAction::Cancel),
             (CompanionStatus::Applying | CompanionStatus::Removing, _) => None,
-            // A failed install keeps Retry first; when its file is on disk
-            // the page offers Remove beside it (`offers`).
             (CompanionStatus::Failed(_), _) => Some(CompanionAction::Retry),
             (_, true) => Some(CompanionAction::Remove),
             (_, false) => Some(CompanionAction::Download),
         }
     }
 
-    /// Whether `action` is one of the page's controls right now: a failed
-    /// install with the file on disk offers both Retry and Remove.
     pub(super) fn offers(&self, action: CompanionAction) -> bool {
         let status = self.status.get();
         let busy = matches!(
