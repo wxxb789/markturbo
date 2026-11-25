@@ -277,9 +277,13 @@ pub struct AppState {
     /// A Review is in flight on a tab other than the active one: the room's
     /// Review entry points wait for it and say why.
     pub review_busy_elsewhere: Signal<bool>,
-    /// The status generation the waiting notice was published under, so a
-    /// freed Review slot clears exactly that notice and no newer one.
-    review_wait_generation: Rc<Cell<Option<u64>>>,
+    // Whether the shown status line is the Review wait notice, so a freed
+    // Review slot clears exactly that notice and no newer one.
+    review_wait_notice: Rc<Cell<bool>>,
+    // The text a live Undo was published with: clearing a notice that
+    // overwrote it restores the text, so the Undo keeps a visible line until
+    // its deadline.
+    undo_text: Rc<RefCell<SharedString>>,
     /// The source column's camera ([`DocumentFocus`]): the line a docked
     /// surface wants levelled with it. Set it with
     /// [`AppState::focus_document_line`].
@@ -856,7 +860,8 @@ impl AppState {
             review_view: signal(None),
             review_busy: signal(false),
             review_busy_elsewhere: signal(false),
-            review_wait_generation: Rc::new(Cell::new(None)),
+            review_wait_notice: Rc::new(Cell::new(false)),
+            undo_text: Rc::new(RefCell::new(SharedString::default())),
             document_focus: signal(DocumentFocus::default()),
             review_unavailable: signal(None),
             translation_busy: signal(false),
@@ -1030,6 +1035,7 @@ impl AppState {
     }
 
     fn publish(&self, mut surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
+        self.review_wait_notice.set(false);
         // A pending Undo stays on the line: a newer message carries it on
         // until its deadline, when the slot is freed or taken. Its line is
         // the surface the user sees, computed from the UI state, never the
@@ -1091,6 +1097,8 @@ impl AppState {
         let generation = self.undo_generation.get().wrapping_add(1);
         self.undo_generation.set(generation);
         self.pending_undo.borrow_mut().replace(action.clone());
+        let text = text.into();
+        *self.undo_text.borrow_mut() = text.clone();
         self.publish(
             surface,
             StatusKind::Info,
@@ -1141,6 +1149,9 @@ impl AppState {
             self.status.update(|message| message.action = None);
             self.status_generation
                 .set(self.status_generation.get_untracked().wrapping_add(1));
+        }
+        if self.review_wait_notice.get() && !self.review_busy_elsewhere.get_untracked() {
+            self.clear_review_wait_notice();
         }
     }
 
@@ -1611,6 +1622,7 @@ impl AppState {
         if changed && self.context_open.get() {
             self.refresh_context();
         }
+        self.sync_undo_surface();
     }
 
     /// The Revision state the shown signals hold now, as a session.
@@ -1771,11 +1783,15 @@ impl AppState {
     }
 
     fn clear_review_wait_notice(&self) {
-        let Some(generation) = self.review_wait_generation.get() else {
+        if !self.review_wait_notice.replace(false) {
             return;
-        };
-        self.review_wait_generation.set(None);
-        if self.status_generation.get_untracked() == generation {
+        }
+        if self.pending_undo.borrow().is_some() {
+            let text = self.undo_text.borrow().clone();
+            self.status.update(|message| message.text = text);
+            self.status_generation
+                .set(self.status_generation.get_untracked().wrapping_add(1));
+        } else {
             self.clear_status();
         }
     }
@@ -2734,6 +2750,7 @@ impl AppState {
                     self.active.set(None);
                     self.review_view.set(None);
                     *self.review_binding.borrow_mut() = None;
+                    self.show_revision_session(&RevisionSession::default());
                     self.refresh_review_busy();
                     self.refresh_revision_busy();
                     self.reset_context();
@@ -4803,8 +4820,7 @@ impl AppState {
             StatusKind::Info,
             flow_copy::S::ReviewWaitingElsewhere.text(self.settings.get().language),
         );
-        self.review_wait_generation
-            .set(Some(self.status_generation.get_untracked()));
+        self.review_wait_notice.set(true);
     }
 
     pub fn open_settings(&self) {
@@ -6958,6 +6974,122 @@ mod tests {
         assert!(restored, "the Undo did not restore its work");
     }
 
+    const UNDO_TEXT: &str = "Discarded recovered draft";
+
+    fn review_wait_text() -> String {
+        flow_copy::S::ReviewWaitingElsewhere
+            .text(Language::English)
+            .to_owned()
+    }
+
+    /// B waits on A's in-flight Review while a live Undo owns the status
+    /// line: the wait notice carries the Undo's action.
+    fn waiting_with_a_live_undo() -> AppState {
+        let state = AppState::new();
+        state.new_document();
+        let reviewing = state.active.get().expect("the reviewing tab");
+        state.arm_review_in_flight(reviewing);
+        state.new_document();
+        state.notify_undo(
+            StatusSurface::Editor,
+            UNDO_TEXT,
+            UndoNotice {
+                label: SharedString::from("Undo"),
+                reverse: Rc::new(|| Ok(())),
+                commit: Rc::new(|| {}),
+            },
+        );
+        state.start_review();
+        state
+    }
+
+    fn release_the_review_slot(state: &AppState) {
+        *state.review_in_flight.borrow_mut() = None;
+        state.refresh_review_busy();
+    }
+
+    type WaitClearOutcome = (bool, bool, String, bool, bool);
+
+    static WAIT_CLEAR_BEFORE_UNDO: std::sync::Mutex<Option<WaitClearOutcome>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn WaitClearsBeforeUndoProbe() -> impl IntoElement {
+        let state = waiting_with_a_live_undo();
+        let waiting = state.status.get_untracked().text.to_string() == review_wait_text();
+        let carried = state.status.get_untracked().action.is_some();
+
+        release_the_review_slot(&state);
+        let text = state.status.get_untracked().text.to_string();
+        let kept = state.status.get_untracked().action.is_some();
+
+        state.commit_pending_undo();
+        let spent = state.status.get_untracked().action.is_none();
+        *WAIT_CLEAR_BEFORE_UNDO.lock().expect("the outcome") =
+            Some((waiting, carried, text, kept, spent));
+        view()
+    }
+
+    #[test]
+    fn a_freed_review_slot_clears_the_wait_notice_before_the_undo_expires() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                WaitClearsBeforeUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (waiting, carried, text, kept, spent) = WAIT_CLEAR_BEFORE_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(waiting, "B never showed the wait notice");
+        assert!(carried, "the wait notice dropped the live Undo's action");
+        assert_eq!(
+            text, UNDO_TEXT,
+            "a freed Review slot left the wait text on the line"
+        );
+        assert!(kept, "clearing the wait text dropped the live Undo");
+        assert!(spent, "the Undo expiry left its action behind");
+    }
+
+    static WAIT_OUTLIVES_UNDO: std::sync::Mutex<Option<(bool, bool, String)>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn WaitOutlivesUndoProbe() -> impl IntoElement {
+        let state = waiting_with_a_live_undo();
+        state.commit_pending_undo();
+        let wait_kept = state.status.get_untracked().text.to_string() == review_wait_text();
+        let action_gone = state.status.get_untracked().action.is_none();
+
+        release_the_review_slot(&state);
+        let text = state.status.get_untracked().text.to_string();
+        *WAIT_OUTLIVES_UNDO.lock().expect("the outcome") = Some((wait_kept, action_gone, text));
+        view()
+    }
+
+    #[test]
+    fn an_expired_undo_leaves_no_wait_notice_once_the_slot_frees() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                WaitOutlivesUndoProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (wait_kept, action_gone, text) = WAIT_OUTLIVES_UNDO
+            .lock()
+            .expect("the outcome")
+            .take()
+            .expect("the probe ran");
+        assert!(wait_kept, "the expiry cleared a wait still in progress");
+        assert!(action_gone, "the Undo expiry left its action behind");
+        assert!(
+            text.is_empty(),
+            "a freed Review slot left the wait text on the line: {text:?}"
+        );
+    }
+
     static PREPARE_SNAPSHOT: std::sync::Mutex<Option<(bool, bool)>> = std::sync::Mutex::new(None);
 
     #[component]
@@ -7057,6 +7189,84 @@ mod tests {
             "the closed tab's Revision session stayed in the store"
         );
         assert!(active_b, "the other tab became active");
+    }
+
+    type LastTabRevisionOutcome = (bool, bool, bool, bool, bool);
+
+    static LAST_TAB_REVISION: std::sync::Mutex<Option<LastTabRevisionOutcome>> =
+        std::sync::Mutex::new(None);
+
+    #[component]
+    fn LastTabRevisionProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        state.new_document();
+        let tab = state.active_tab().expect("the only tab");
+        tab.text.set(SharedString::from(SOURCE));
+        let snapshot = SourceSnapshot::new(tab.revision.get(), 0);
+        let request = ReviewRequest::document(ArtifactLens::default_lens(), SOURCE, snapshot)
+            .expect("a review request");
+        state.set_revision_context(
+            ReviewOrigin {
+                tab_id: tab.id,
+                snapshot,
+            },
+            request,
+            revision_output("keep the plan", "Which one?"),
+            ReviewLanguage::English,
+        );
+        let start = SOURCE.find("compiles but").expect("in the source") as u64;
+        let range = ByteRange::new(start, start + 12).expect("a range");
+        let change = RevisionChange::new(
+            "Tighten.",
+            vec![RevisionEdit::new(range, "compiles but", "compiles, but")],
+        );
+        let proposal = RevisionProposal::validate(
+            SOURCE,
+            SourceSnapshot::new(0, 0),
+            vec![change],
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision(proposal);
+        let open_before = crate::ui::revision::is_open(&state);
+
+        state.close_tab_now(tab.id);
+        let open_after = crate::ui::revision::is_open(&state);
+        let context_cleared = state.revision_context.borrow().is_none();
+        let hunks_cleared = state.revision_hunks.get_untracked().is_empty();
+        let ledger_cleared = state.revision_ledger.borrow().is_none();
+        *LAST_TAB_REVISION.lock().expect("the outcome") = Some((
+            open_before,
+            open_after,
+            context_cleared,
+            hunks_cleared,
+            ledger_cleared,
+        ));
+        view()
+    }
+
+    #[test]
+    fn closing_the_last_tab_clears_the_shown_revision() {
+        let mut app =
+            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+                LastTabRevisionProbe,
+            >()))
+            .expect("start the probe");
+        app.first_render().expect("render the probe");
+        let (open_before, open_after, context_cleared, hunks_cleared, ledger_cleared) =
+            LAST_TAB_REVISION
+                .lock()
+                .expect("the outcome")
+                .take()
+                .expect("the probe ran");
+        assert!(open_before, "the probe never showed a Revision");
+        assert!(
+            !open_after,
+            "closing the last tab left the Revision field open"
+        );
+        assert!(context_cleared, "the Review's output stayed in memory");
+        assert!(hunks_cleared, "the hunks stayed on screen");
+        assert!(ledger_cleared, "the decision stack stayed in memory");
     }
 }
 
