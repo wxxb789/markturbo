@@ -32,10 +32,6 @@ model-transport = ["mt-core/model-transport"]
 # the platform's. Enabled for integration tests by the dev-dependency on this
 # crate below; a release build does not build dev-dependencies.
 test-vault = ["mt-core/test-support"]
-# Test builds only: the keyboard-hold source can be injected so integration
-# harnesses' synthetic `Ctrl+Enter` events can authorize a hold. Enabled for
-# integration tests by the dev-dependency below.
-test-harness = []
 
 [dependencies]
 mt-core.workspace = true
@@ -68,11 +64,9 @@ nsh-platform-macos = { version = "=0.6.1", default-features = false }
 [target.'cfg(target_os = "windows")'.dependencies]
 # WebView2 is used by the preview; the app has no native media surface.
 nsh-platform-windows = { version = "=0.6.1", default-features = false, features = ["webview"] }
-# The keyboard hold's platform queries and thread hook (`ui/consent.rs`).
-windows.workspace = true
 
 [dev-dependencies]
-mt-app = { path = ".", features = ["test-vault", "test-harness"] }
+mt-app = { path = ".", features = ["test-vault"] }
 nsh-engine = "=0.6.1"
 nsh-testing = "=0.6.1"
 serde_json.workspace = true

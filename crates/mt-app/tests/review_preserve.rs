@@ -38,10 +38,10 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
     let (release_late, late_waiting) = mpsc::channel();
-    let server = std::thread::spawn(move || {
+    let server = std::thread::spawn(move || -> std::io::Result<usize> {
         for request in 0..3 {
             let Ok((mut stream, _)) = listener.accept() else {
-                return;
+                return Ok(0);
             };
             let _ = read_http_body(&mut stream);
             if request == 2 {
@@ -50,7 +50,17 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
                     .expect("release the late review");
             }
             write_review_json(&mut stream, &output);
+            if request == 2 {
+                // The answer was written; the client has read it when it
+                // closes its side of the connection. Waiting for that read
+                // replaces the fixed sleep: the assertions below are about a
+                // response the client consumed, not one still on the wire.
+                stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+                let mut byte = [0_u8; 1];
+                return stream.read(&mut byte);
+            }
         }
+        Ok(0)
     });
 
     let dir = tempfile::tempdir().expect("temp dir");
@@ -199,9 +209,26 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
     // The loopback answer arrives after the cancel and changes nothing, and
     // it cannot be reopened as a result.
     release_late.send(()).expect("release the late answer");
-    server.join().expect("the loopback server finished");
-    app.wait(Duration::from_millis(600))
-        .expect("the late answer lands");
+    let consumed = server.join().expect("the loopback server finished");
+    assert!(
+        matches!(consumed, Ok(0))
+            || matches!(&consumed, Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset),
+        "the client consumed the late response and closed its side: {consumed:?}"
+    );
+    // The answer's client-side transport is done; one engine turn lets the
+    // spawned handler run (the discard writes nothing by design, so the turn
+    // is the observable completion).
+    for _ in 0..2 {
+        let engine = app.engine().control();
+        let (sent, received) = mpsc::channel();
+        engine.flush(move |_| {
+            let _ = sent.send(());
+        });
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the engine turn");
+        app.catch_up();
+    }
     assert!(
         app.screen().matches("id:review-field") == Ok(false),
         "the late result never lands: {:?}",

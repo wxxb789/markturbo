@@ -88,12 +88,23 @@ pub(crate) fn shell_with_status(
 ) -> impl IntoElement {
     hide_system_title_bar();
     let body_state = state.clone();
+    let capture_state = state.clone();
     view()
         .test_id("shell")
         .flex_1()
         .h(relative(1.0))
         .w_full()
         .flex_col()
+        // While a consent card is open it is the topmost layer: Enter and
+        // Space belong to it even if the focus wandered to a control behind
+        // it, so a stray key never presses the dimmed room.
+        .capture_keys(move || {
+            if consent::is_open(&capture_state) {
+                consent::key_capture()
+            } else {
+                nsh_core::KeyCapture::None
+            }
+        })
         .on_layout(|frame: &Bounds<Points>| {
             // The shell measures itself: `window()` keeps the size the window
             // was opened with until the next resize (Windows), so a harness

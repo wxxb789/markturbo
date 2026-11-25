@@ -40,7 +40,7 @@ use crate::{
     ui::{
         glow,
         motion::{EASE_IN_OUT, Heat, IGNITE_MS, LINEAR, REDUCED_CROSSFADE_MS, reduced_motion},
-        prims,
+        prims, titlebar,
         tokens::{
             self, FOCUS_RING, FOCUS_RING_OFFSET, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
             SPACE_XL, TYPE_MODEL, TYPE_MODEL_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MODEL, with_alpha,
@@ -139,15 +139,17 @@ fn focus_step() -> Signal<Option<Spawned<()>>> {
 }
 
 /// A question never takes the keyboard from the source editor the user is
-/// typing in.
+/// typing in — a stale result's `Review again` included: a background result
+/// arriving while the user types must not yank the focus anywhere.
 fn arrival_focus(stale: bool, current: Option<usize>, editor_focused: bool) -> Option<Focus> {
+    if editor_focused {
+        return None;
+    }
     if stale {
         return Some(Focus::ReviewAgain);
     }
     match current {
-        Some(_) if editor_focused => None,
         Some(index) => Some(Focus::Answer(index)),
-        None if editor_focused => None,
         None => Some(Focus::Prepare),
     }
 }
@@ -310,6 +312,9 @@ fn keys(state: &AppState, session: Signal<Session>) {
         {
             let state = state.clone();
             move |_| {
+                if titlebar::escape_closes_menu(&state) {
+                    return;
+                }
                 if state.review_busy.get_untracked() {
                     session.update(|session| session.cancelled = true);
                     state.cancel_review_in_flight();
@@ -3153,7 +3158,16 @@ mod tests {
     fn arrival_focus_never_takes_the_keyboard_from_the_editor() {
         assert_eq!(arrival_focus(false, Some(2), true), None);
         assert_eq!(arrival_focus(false, Some(2), false), Some(Focus::Answer(2)));
-        assert_eq!(arrival_focus(true, Some(2), true), Some(Focus::ReviewAgain));
+        assert_eq!(
+            arrival_focus(true, Some(2), true),
+            None,
+            "a stale background result must not take the keyboard either"
+        );
+        assert_eq!(
+            arrival_focus(true, Some(2), false),
+            Some(Focus::ReviewAgain),
+            "a stale result focuses Review again only without the editor"
+        );
         assert_eq!(
             arrival_focus(false, None, true),
             None,

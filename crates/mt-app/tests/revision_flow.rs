@@ -927,6 +927,7 @@ fn RevisionAcrossDocuments() -> impl IntoElement {
     let revision = state.clone();
     let send_revision = state.clone();
     let other = state.clone();
+    let first = state.clone();
     let approve = state.clone();
     let review_view = state.review_view;
     let hunks = state.revision_hunks;
@@ -942,6 +943,13 @@ fn RevisionAcrossDocuments() -> impl IntoElement {
             other.open_file(
                 std::env::var_os("MARKTURBO_OTHER")
                     .expect("other document path")
+                    .into(),
+            )
+        }))
+        .child(text("Open first").on_press(move || {
+            first.open_file(
+                std::env::var_os("MARKTURBO_OPEN")
+                    .expect("document path")
                     .into(),
             )
         }))
@@ -1054,8 +1062,8 @@ fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
         app.screen().texts()
     );
 
-    // The late answer lands on its own tab: its hunks present, and from the
-    // other tab nothing of them can be applied.
+    // The late answer lands in its own tab's session: the shown tab has no
+    // hunks of it, and nothing of it can be applied from there.
     release.send(()).expect("release the Revision answer");
     answer_sent
         .recv_timeout(Duration::from_secs(20))
@@ -1063,8 +1071,8 @@ fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
     app.wait(Duration::from_millis(1500))
         .expect("the late answer lands");
     assert!(
-        app.shows("Hunks: 2") && app.shows("Busy: false"),
-        "the Revision, not its preparation, is still live: {:?}",
+        app.shows("Hunks: 0") && app.shows("Busy: false"),
+        "a background tab's answer never replaces the shown tab: {:?}",
         app.screen().texts()
     );
     app.press("text:Approve first hunk")
@@ -1079,14 +1087,28 @@ fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
         app.screen().texts()
     );
 
-    // Sending the new Review is what resets the old Revision.
+    // Back on the reviewed tab its own proposal is live, and applying it
+    // writes there.
+    app.press("text:Open first")
+        .expect("back to the reviewed document");
+    app.wait_for("text:Hunks: 2")
+        .expect("the late answer's hunks are on their own tab");
+    app.press("text:Approve first hunk")
+        .expect("accept the first hunk on its own tab");
+    let revised = "[Revised\nUnchanged\n][Original\nUnchanged\nMore\n]";
+    app.wait_for(&format!("text:{revised}"))
+        .expect("the accepted hunk entered the reviewed buffer");
+
+    // Sending a new Review of the reviewed tab is what resets its Revision,
+    // and it writes neither document.
+    app.press("text:Review")
+        .expect("prepare the reviewed tab's next Review");
     app.press("text:Send Review")
-        .expect("send the other document's Review");
+        .expect("send the reviewed tab's Review");
     app.wait_for("text:Hunks: 0")
-        .expect("the sent Review cleared the old Revision");
-    assert!(app.shows("Busy: false"), "the Revision is no longer live");
+        .expect("the sent Review cleared the tab's Revision");
     app.wait(Duration::from_millis(1500))
-        .expect("the other Review's answer lands");
+        .expect("the new Review's answer lands");
     assert_eq!(std::fs::read_to_string(&document).unwrap(), source);
     assert_eq!(std::fs::read_to_string(&other).unwrap(), other_source);
 }

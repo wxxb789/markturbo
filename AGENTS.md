@@ -97,8 +97,9 @@ Performance claims require production-profile measurements; consult existing
   read `tokens::palette()` inside style closures. Keep the overlay layer
   `PointerEvents::BoxNone`. Build editor decoration styles from declarations
   (`Style::default().with(StyleKey::Color, …)`), not typed refinements.
-- Preserve focus-independent card keys (consent sends on held `Ctrl+Enter`).
-  nsh 0.6.1 on Windows also supports focus and key events on ordinary views.
+- The consent card takes keyboard focus when it opens. A held `Ctrl+Enter` (or `Enter`/`Space` on Send) counts only
+  from the card's own `KeyDown`/`KeyUp`; blur or window deactivation cancels the hold. Use no system keyboard hooks.
+  nsh 0.6.1 delivers focus and key events to ordinary views on every platform.
 - On Windows, DirectWrite matches an embedded face only by its legacy family,
   one per instance (`Martian Grotesk Std Lt`/`Std Rg`/`Std Md`,
   `Martian Mono Cn Rg`). Use the `tokens::FONT_*` lists, which put the legacy

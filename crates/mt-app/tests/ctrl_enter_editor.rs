@@ -1,16 +1,23 @@
 //! `Ctrl+Enter` from the focused source editor runs the app's command for the
 //! state on screen — `Review`, the Revision field's `Done`, the consent
 //! card's hold — and never edits the text. The editor binds `mod+enter`
-//! (insert a line below) every time it takes the focus, so these run on
-//! Windows, where the keymap decides the key before the focused field, and
-//! move the focus away and back.
+//! (insert a line below) every time it takes the focus, so the app binds
+//! again after it, and the tests move the focus away and back.
+//!
+//! The hold's keys are the focused card's raw `KeyDown`/`KeyUp` events; the
+//! headless backend delivers those on `Os::Linux`, as the Windows host does
+//! for a focused custom view.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use nsh_core::element::{Idiom, Os};
+use nsh_core::{
+    EventKind, EventPayload, KeyEvent,
+    element::{Idiom, Os, SharedString},
+    keymap::Modifiers,
+};
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
@@ -21,11 +28,11 @@ static TEST_LOCK: Mutex<()> = Mutex::new(());
 const SOURCE: &str = "Original\nUnchanged\n";
 const EDITOR: &str = "label:Markdown source";
 
-/// The app on `SOURCE`, on Windows, with a loopback provider that answers a
-/// Review with no findings and a Revision of two changes; on the system's
-/// clock, or (`held_keys`) on a manual one the test moves, under reduced
-/// motion. The temporary directories live as long as the returned guards.
-fn start(held_keys: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
+/// The app on `SOURCE`, with a loopback provider that answers a Review with
+/// no findings and a Revision of two changes; on the system's clock, or
+/// (`manual_clock`) on a manual one the test moves, under reduced motion. The
+/// temporary directories live as long as the returned guards.
+fn start(manual_clock: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let review = serde_json::json!({
         "schema_version": "review-v1",
         "scope": {"kind": "document"},
@@ -108,13 +115,10 @@ fn start(held_keys: bool) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
         );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
-    // Synthetic keys never reach the platform's key state or thread hook: the
-    // harness drives the hold's keyboard source as physically held.
-    mt_app::ui::consent::test_harness::held_keys();
     let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
-    engine.environment.os = Os::Windows;
+    engine.environment.os = Os::Linux;
     engine.environment.idiom = Idiom::Desktop;
-    if held_keys {
+    if manual_clock {
         engine.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         engine.environment.reduce_motion = true;
     }
@@ -301,48 +305,55 @@ fn ctrl_enter_from_the_focused_editor_is_done_while_hunks_are_docked() {
     );
 }
 
+/// One raw `KeyDown`/`KeyUp` on the focused card, as the platform's
+/// focused-view delivery sends it (the headless source delivers raw keys on
+/// Linux; the Windows host does the same for a focused custom view).
+fn card_key(app: &mut Headless, key: &str, down: bool, modifiers: Modifiers, repeat: bool) {
+    let id = app.screen().id("id:consent-card").expect("the card");
+    let mut event = KeyEvent::default();
+    event.key = SharedString::from(key.to_owned());
+    event.modifiers = modifiers;
+    event.repeat = repeat;
+    let engine = app.engine().control();
+    engine.dispatch_event(
+        id,
+        if down {
+            EventKind::KeyDown
+        } else {
+            EventKind::KeyUp
+        },
+        EventPayload::Key(event),
+    );
+    let (sent, received) = std::sync::mpsc::channel();
+    engine.flush(move |_| {
+        let _ = sent.send(());
+    });
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the key flushed");
+    app.catch_up();
+}
+
+fn ctrl_enter() -> Modifiers {
+    Modifiers {
+        ctrl: true,
+        ..Modifiers::default()
+    }
+}
+
 #[test]
-fn a_held_ctrl_enter_from_the_refocused_editor_charges_the_consent_hold() {
+fn a_held_ctrl_enter_on_the_card_charges_the_consent_hold() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // A manual clock: the hold's watchdogs run only as far as the test moves
-    // it, so presses can arrive inside them as a held key's repeats do (the
-    // harness reports no auto-repeat). Reduced motion keeps the charge's
-    // drawing off the frame clock (the same hold, watchdogs and send: only
-    // its drawing steps), so a key press settles at once.
+    // A manual clock: the charge completes only as far as the test moves it.
+    // The card holds the keyboard focus, as it does when the editor's
+    // `Ctrl+Enter` opened it, so the raw key events reach its handlers.
     let (mut app, _directory, _config) = start(true);
     app.press("id:title-review").expect("start review");
     app.wait_for("id:consent-card").expect("review disclosure");
-    // The editor takes the focus while the card is up (it binds its keys
-    // again then).
-    focus_editor(&mut app);
 
-    // A tap charges and cools: nothing is sent, the card stays.
-    app.press_key("ctrl+enter").expect("tap ctrl+enter");
-    app.run_for(Duration::from_millis(1_200))
-        .expect("past the release watchdog");
-    assert!(
-        app.shows("Nothing was sent."),
-        "a tap charges the hold and its early release says so: {:?}",
-        app.screen().texts()
-    );
-    assert!(app.shows("Send for review?"), "the card stayed up");
-    assert!(
-        !app.screen()
-            .matches("text:/^Sent · /")
-            .expect("the selector"),
-        "a tap authorizes nothing"
-    );
-    assert_eq!(editor_lines(&app), lines(SOURCE), "the tap edited nothing");
-    app.run_for(Duration::from_millis(2_000))
-        .expect("the notice ends");
-
-    // A held key: presses inside the release watchdog (as its auto-repeats
-    // come) carry the charge on until it completes and the Review is sent.
-    for _ in 0..15 {
-        app.press_key("ctrl+enter").expect("held ctrl+enter");
-        app.run_for(Duration::from_millis(100))
-            .expect("the next repeat");
-    }
+    card_key(&mut app, "Enter", true, ctrl_enter(), false);
+    app.run_for(Duration::from_millis(1_000))
+        .expect("the full charge");
     assert!(
         app.screen()
             .matches("text:/^Sent · /")
@@ -350,69 +361,51 @@ fn a_held_ctrl_enter_from_the_refocused_editor_charges_the_consent_hold() {
         "the held key sent the Review: {:?}",
         app.screen().texts()
     );
+    // The send closed the card; nothing is left listening for the release.
     assert_eq!(editor_lines(&app), lines(SOURCE), "the hold edited nothing");
     assert!(!is_dirty(&app), "and the document is still clean");
 }
 
 #[test]
-fn a_refocus_in_the_middle_of_a_ctrl_enter_hold_keeps_one_tap_from_sending() {
+fn a_ctrl_enter_tap_on_the_card_sends_nothing() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // The same manual clock and reduced motion as the held-key test above.
     let (mut app, _directory, _config) = start(true);
     app.press("id:title-review").expect("start review");
     app.wait_for("id:consent-card").expect("review disclosure");
-    focus_editor(&mut app);
 
-    // A press from the editor, then the focus leaves the editor and comes
-    // back while the key would still count as held: the binding that took
-    // the press is bound again.
-    app.press_key("ctrl+enter").expect("press ctrl+enter");
-    app.run_for(Duration::from_millis(100))
-        .expect("inside the release watchdog");
-    blur_and_refocus_editor(&mut app);
-
-    // The press was let go: the hold says so and cools, and the card stays.
+    // A whole press: the charge starts and its release ends it.
+    card_key(&mut app, "Enter", true, ctrl_enter(), false);
+    card_key(&mut app, "Enter", false, ctrl_enter(), false);
     app.run_for(Duration::from_millis(1_200))
-        .expect("past the release watchdog");
+        .expect("past the charge");
     assert!(
         app.shows("Nothing was sent."),
-        "the interrupted press is released as a tap: {:?}",
+        "a tap's early release says so: {:?}",
         app.screen().texts()
     );
-    app.run_for(Duration::from_millis(2_000))
-        .expect("the notice ends");
-
-    // One tap after that authorizes nothing.
-    app.press_key("ctrl+enter").expect("tap ctrl+enter");
-    app.run_for(Duration::from_millis(50)).expect("the tap");
     assert!(
         !app.screen()
             .matches("text:/^Sent · /")
             .expect("the selector"),
-        "one tap sends nothing: {:?}",
-        app.screen().texts()
+        "a tap authorizes nothing"
     );
-    assert!(app.shows("Send for review?"), "the card stayed up");
-    assert_eq!(editor_lines(&app), lines(SOURCE), "nothing edited the text");
+    assert_eq!(editor_lines(&app), lines(SOURCE), "the tap edited nothing");
 }
 
 #[test]
-fn a_ctrl_release_and_repress_mid_hold_sends_nothing_from_the_editor() {
+fn a_ctrl_release_and_repress_mid_hold_on_the_card_sends_nothing() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (mut app, _directory, _config) = start(true);
     app.press("id:title-review").expect("start review");
     app.wait_for("id:consent-card").expect("review disclosure");
-    focus_editor(&mut app);
-    let keys = mt_app::ui::consent::test_harness::held_keys();
 
-    // A held Ctrl+Enter: the control key comes up at 548 ms and back down at
-    // 556 ms while Enter stays down, with the editor's text input focused.
-    app.press_key("ctrl+enter").expect("press ctrl+enter");
+    // Ctrl comes up at 548 ms and back down at 556 ms while Enter stays
+    // down: the hold came apart and may not authorize at its old deadline.
+    card_key(&mut app, "Enter", true, ctrl_enter(), false);
     app.run_for(Duration::from_millis(548)).expect("to 548 ms");
-    keys.transition();
+    card_key(&mut app, "Control", false, Modifiers::default(), false);
     app.run_for(Duration::from_millis(8)).expect("to 556 ms");
-    app.press_key("ctrl+enter")
-        .expect("the repeat after the re-press");
+    card_key(&mut app, "Control", true, Modifiers::default(), false);
     app.run_for(Duration::from_millis(400))
         .expect("past the first hold's 900 ms");
     assert!(

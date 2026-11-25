@@ -278,28 +278,6 @@ fn session() -> Signal<Session> {
     global::<Session>()
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct SessionState(Session);
-
-pub(crate) fn capture_session(hunks: &[RevisionHunkView]) -> SessionState {
-    SessionState(session().get_untracked().synced(hunks))
-}
-
-pub(crate) fn restore_session(hunks: &[RevisionHunkView], state: SessionState) {
-    session().set(state.0.synced(hunks));
-}
-
-#[cfg(test)]
-pub(crate) fn seed_session(hunks: &[RevisionHunkView]) -> SessionState {
-    let mut current = Session::default().synced(hunks);
-    if !hunks.is_empty() {
-        current.record(hunks, 0, true);
-        current.advance(hunks, 0);
-    }
-    session().set(current.clone());
-    SessionState(current)
-}
-
 /// The identity of a proposal: its hunks' content.
 fn proposal_id(hunks: &[RevisionHunkView]) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -1118,6 +1096,9 @@ fn bind_busy_escape(state: &AppState) {
                 ..KeyOptions::default()
             },
             move |_| {
+                if titlebar::escape_closes_menu(&keys) {
+                    return;
+                }
                 review::cancel_revision(&keys);
                 keys.focus_editor();
             },
@@ -1575,38 +1556,53 @@ mod tests {
         assert!(!app.shows(&S::CannotApply.text(Language::English)));
     }
 
-    /// The two-change proposal, then another document comes on screen.
+    /// The two-change proposal, then another document comes on screen: the
+    /// proposal stays in its own tab's session, and returning shows it again.
     #[component]
     fn OtherDocumentProbe() -> impl IntoElement {
         let state = AppState::new();
         open_probe_document(&state, PROBE_TEXT);
+        let first = state.active.get().expect("the first tab");
         present(&state, PROBE_TEXT, TWO_CHANGES);
         open_probe_document(&state, PROBE_TEXT);
-        field(state, Language::English)
+        let other_empty = signal(state.revision_hunks.get_untracked().is_empty());
+        state.set_active(first);
+        let live_again = signal(!state.revision_hunks.get_untracked().is_empty());
+        view()
+            .flex_col()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(
+                text(move || {
+                    format!(
+                        "other empty: {} live again: {}",
+                        other_empty.get(),
+                        live_again.get()
+                    )
+                })
+                .test_id("revision-other-doc-state"),
+            )
+            .child(field(state, Language::English))
     }
 
     #[test]
-    fn a_proposal_for_another_document_says_so_and_disables_accept() {
+    fn a_proposal_stays_with_its_own_document() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<OtherDocumentProbe>()))
             .expect("start the field");
-        app.wait_for("id:revision-stale")
-            .expect("the field says the proposal is not this document's");
-        assert!(app.shows("This Revision belongs to another document"));
+        app.wait_for("text:other empty: true live again: true")
+            .expect("the proposal left the tab it does not belong to");
+        app.wait_for("id:revision-accept")
+            .expect("returning shows the proposal again");
+        assert!(
+            !app.shows(&S::OtherDocument.text(Language::English)),
+            "no cross-document proposal ever shows"
+        );
         assert!(
             !app.shows("Stale — edited after review"),
             "nothing was edited after the review"
         );
-        assert!(
-            app.screen()
-                .matches("id:revision-accept")
-                .expect("the selector"),
-            "Accept stays in the row: {:?}",
-            app.screen().texts()
-        );
-        assert!(
-            app.press("id:revision-accept").is_err(),
-            "the proposal cannot be accepted into another document"
-        );
+        app.press("id:revision-accept")
+            .expect("the proposal accepts on its own document");
     }
 
     #[test]

@@ -47,7 +47,7 @@ use crate::{
     },
     ui::{
         motion::{self, reduced_motion},
-        prims,
+        prims, titlebar,
         tokens::{
             self, CONSENT_BUTTON_H, CONSENT_BUTTON_W, FOCUS_RING, FOCUS_RING_OFFSET, HAIRLINE,
             SPACE_2, SPACE_3, SPACE_4, SPACE_5,
@@ -1064,7 +1064,11 @@ fn bind_guard_keys(state: &AppState) {
             when: When::Always,
             ..KeyOptions::default()
         },
-        move |_| escape.guard_cancel(),
+        move |_| {
+            if !titlebar::escape_closes_menu(&escape) {
+                escape.guard_cancel();
+            }
+        },
     );
     for (key, activate) in [
         ("enter", true),
@@ -1427,7 +1431,11 @@ fn bind_compare_keys(state: &AppState) {
             when: When::Always,
             ..KeyOptions::default()
         },
-        move |_| close_compare(&escape),
+        move |_| {
+            if !titlebar::escape_closes_menu(&escape) {
+                close_compare(&escape);
+            }
+        },
     );
 }
 

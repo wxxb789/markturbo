@@ -215,6 +215,36 @@ These override any conflicting text in the advisor body below.
       - window deactivation with the keys still down sends nothing;
       - a hook that fails to start, or fails to remove, never authorizes and does not leak;
       - a clean continuous hold sends exactly once.
+16. **Consent keys follow focus (owner decision, 2026-11-25; replaces amendments 11 and 15).**
+    - **Why.** Five review rounds found authorization gaps in every focus-independent design: thread hooks, queue
+      checks, and low-level hooks racing the async key state. The owner chose the focus-based mechanism instead.
+    - **Focus.** The consent card takes keyboard focus when it opens. Focus stays inside the card (Send and Cancel)
+      while it is open.
+    - **Hold.** A keyboard hold is measured only from `KeyDown`/`KeyUp` events delivered to the focused card:
+      - `Ctrl+Enter` anywhere in the card;
+      - `Enter`/`Space` on Send.
+    - **Cancel.** Any of these cancels the hold to zero, together with its completion timer, and a new hold starts
+      from 0:
+      - a `KeyUp` of `Enter` or the modifier;
+      - a non-repeat `KeyDown` of either key;
+      - blur, card unmount, or window deactivation;
+      - a press through another input path.
+    - **First press.** The press that opened the card never counts. The card arms only after that key is released, as
+      it does today.
+    - **Removed.**
+      - The system keyboard hook, the hook thread, `GetQueueStatus`, the `GetAsyncKeyState` and foreground polling,
+        and the `test-harness` keyboard source injection.
+      - Headless tests drive real `KeyDown`/`KeyUp` events into the focused card instead.
+    - **Unchanged.** The pointer hold works on every platform, and one input path per hold still applies.
+    - **`AGENTS.md`.** Its consent-key invariant is updated in the same PR.
+    - **Tests:**
+      - continuous hold sends once;
+      - release and re-press mid-hold sends nothing;
+      - blur or window deactivation mid-hold sends nothing;
+      - a mixed pointer/keyboard path sends nothing;
+      - a short press sends nothing;
+      - the opening press does not arm;
+      - the card holds focus when it opens.
 12. **Undo commit boundary (amends Done when 4 and amendment 2).**
     - A Tier 2 action commits when its `UNDO_HOLD_MS` ends, or earlier when a newer Tier 2 action takes the single
       pending slot. When the slot is taken, the older action's Undo ends at the same moment.

@@ -111,11 +111,16 @@ impl S {
     }
 }
 
+/// The localized label, with the app's own English detail in the English
+/// line only: the detail is provider or parser text the app itself produces,
+/// so the Chinese line states the outcome and the next step instead of
+/// splicing it (a provider's English is not the operating system's text; see
+/// the contract's Chinese error scope).
 pub(crate) fn failed(s: S, language: Language, error: &dyn std::fmt::Display) -> String {
     let label = s.text(language);
     match language {
         Language::English => format!("{label} ({error})."),
-        Language::Chinese => format!("{label}（{error}）。"),
+        Language::Chinese => format!("{label}。"),
     }
 }
 
@@ -125,7 +130,7 @@ pub(crate) fn revision_failed(language: Language, error: &dyn std::fmt::Display)
         Language::English => {
             format!("{label} ({error}). Your answers are kept — try again.")
         }
-        Language::Chinese => format!("{label}（{error}）。你的回答已保留——请重试。"),
+        Language::Chinese => format!("{label}。你的回答已保留——请重试。"),
     }
 }
 
@@ -135,7 +140,7 @@ pub(crate) fn revision_task_failed(language: Language, error: &dyn std::fmt::Dis
         Language::English => {
             format!("{label} ({error}). Your answers are kept — try again.")
         }
-        Language::Chinese => format!("{label}（{error}）。你的回答已保留——请重试。"),
+        Language::Chinese => format!("{label}。你的回答已保留——请重试。"),
     }
 }
 
@@ -195,5 +200,34 @@ mod tests {
         );
         assert!(message.contains("翻译失败"), "the localized label stays");
         assert!(message.contains("请重试"), "the next step stays");
+    }
+
+    #[test]
+    fn a_chinese_revision_failure_omits_the_provider_english() {
+        let error = "Revision provider response did not match revision-v1";
+        let message = revision_failed(Language::Chinese, &error);
+        assert!(
+            !message.contains("provider") && !message.contains("revision-v1"),
+            "the provider's English is not spliced: {message}"
+        );
+        assert!(
+            message.contains("修订请求失败"),
+            "the localized label stays"
+        );
+        assert!(message.contains("你的回答已保留"), "the next step stays");
+    }
+
+    #[test]
+    fn a_chinese_generic_failure_omits_the_app_english() {
+        let error = "TranslationError::InvalidTranslationResponse";
+        let message = failed(S::TranslationUnavailable, Language::Chinese, &error);
+        assert!(
+            !message.contains("TranslationError") && !message.contains("Invalid"),
+            "the app's English is not spliced: {message}"
+        );
+        assert!(message.contains("翻译不可用"), "the localized label stays");
+        // The English line keeps the detail.
+        let english = failed(S::TranslationUnavailable, Language::English, &error);
+        assert!(english.contains(error), "the English line keeps the detail");
     }
 }

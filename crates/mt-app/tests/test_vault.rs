@@ -1,22 +1,23 @@
 //! An integration test's app never reaches the platform's secure store: a key
 //! stored through Settings lands in the test build's in-memory store. A test
-//! build is also refused by the shipped binary's start gate.
+//! build is refused by the shipped binary's start gate.
 
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
-/// The start gate refuses a `test-harness` build, exactly as it does a
-/// `test-vault` one: the shipped app can never carry the injectable hold.
+/// The start gate refuses a `test-vault` build: the copy `cargo test` leaves
+/// in `target/<profile>/` keeps keys in memory only, and must never pass for
+/// the shipped app.
 #[test]
-fn the_binary_refuses_the_test_harness_feature() {
+fn the_binary_refuses_the_test_vault_feature() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_markturbo"))
         .output()
         .expect("run the built app");
     assert_eq!(output.status.code(), Some(2), "the gate exits 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("test harness"),
-        "the gate names the test harness: {stderr}"
+        stderr.contains("no secure credential store"),
+        "the gate names the test vault: {stderr}"
     );
 }
 

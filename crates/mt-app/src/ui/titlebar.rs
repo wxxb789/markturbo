@@ -33,7 +33,7 @@ const MENU_W: f32 = 240.0;
 
 #[derive(Clone, Copy)]
 struct MenuMotion {
-    open: Signal<bool>,
+    open: Signal<MenuOpen>,
     visible: Signal<bool>,
     opacity: AnimatedValue,
     scale: AnimatedValue,
@@ -41,7 +41,7 @@ struct MenuMotion {
 
 impl MenuMotion {
     fn new() -> Self {
-        let open = signal(false);
+        let open = menu_open_state();
         let visible = signal(false);
         let opacity = animated_value(0.0);
         let reduced = motion::reduced_motion();
@@ -65,7 +65,7 @@ impl MenuMotion {
                     })
                 })));
             };
-            let is_open = open.get();
+            let is_open = open.get().0;
             let reduced = motion::reduced_motion();
             let open_changed = previous.replace(is_open) != is_open;
             let motion_changed = previous_reduced.replace(reduced) != reduced;
@@ -130,7 +130,7 @@ impl MenuMotion {
     }
 
     fn is_open(self) -> bool {
-        self.open.get()
+        self.open.get().0
     }
 
     fn is_visible(self) -> bool {
@@ -138,12 +138,44 @@ impl MenuMotion {
     }
 
     fn toggle(self) {
-        self.open.update(|open| *open = !*open);
+        self.open.update(|open| open.0 = !open.0);
     }
 
     fn close(self) {
-        self.open.set(false);
+        self.open.set(MenuOpen(false));
     }
+}
+
+/// The titlebar menu's one open flag per surface, kept apart from every other
+/// `bool` global: `global::<G>()` is one signal per type, and the glow's
+/// ticker owns the plain `bool`, so a bare `global::<bool>()` would open the
+/// menu whenever the review column animates.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct MenuOpen(bool);
+
+/// Shared with every other layer's `Escape` handler: nsh fires the newest
+/// matching binding, so the menu's own binding cannot be the only place that
+/// knows it is the topmost layer.
+fn menu_open_state() -> Signal<MenuOpen> {
+    global::<MenuOpen>()
+}
+
+/// Whether the titlebar menu is open ([`escape_closes_menu`]).
+pub(crate) fn menu_is_open() -> bool {
+    menu_open_state().get().0
+}
+
+/// The first step of every `Escape` handler: while the menu is open it is
+/// the topmost layer, whatever binding the keymap picked, so `Escape` closes
+/// it, returns the focus to the document and does nothing else. False when
+/// the menu is not open; the caller handles its own layer.
+pub(crate) fn escape_closes_menu(state: &AppState) -> bool {
+    if !menu_is_open() {
+        return false;
+    }
+    menu_open_state().set(MenuOpen(false));
+    state.focus_editor();
+    true
 }
 
 pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
@@ -169,11 +201,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
                 ..KeyOptions::default()
             },
             move |_| {
-                // Only the newest matching binding fires: this one stands in
-                // for the menu's own Escape while it is open.
-                if menu.is_open() {
-                    menu.close();
-                } else {
+                if !escape_closes_menu(&keys_state) {
                     keys_state.cancel_translation_in_flight();
                 }
             },
@@ -199,6 +227,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     });
     // Escape closes the menu from anywhere. The binding passes the key on, so
     // it takes nothing from the surfaces that bind Escape themselves.
+    let menu_escape_state = state.clone();
     on_key_with(
         "escape",
         KeyOptions {
@@ -207,9 +236,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             ..KeyOptions::default()
         },
         move |_: &str| {
-            if menu.is_open() {
-                menu.close();
-            }
+            escape_closes_menu(&menu_escape_state);
         },
     );
 
@@ -254,19 +281,24 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
 
 /// Binds `Ctrl+Enter` (`mod+enter`; on an Apple keyboard `ctrl+enter` too, the
 /// key the hints name) to [`mod_enter`], the app's one handler for it. Call it
-/// inside an effect: the binding is dropped with the effect's run, and it
-/// reads whether a consent card is up and armed, whose hold takes the key's
-/// auto-repeats (anything else, an unarmed card included, fires once per
-/// press).
+/// inside an effect: the binding is dropped with the effect's run, and it is
+/// not made while a consent card is up, whose own focused handlers measure its
+/// hold.
 ///
 /// The keymap fires the newest binding of a keystroke, and the source editor
 /// binds its own `mod+enter` (insert a line below) every time it takes the
 /// focus. So besides the title row, the source editor binds this again on
 /// each of its `Focus` events (`document`), and the surfaces that
-/// claim the key (the consent card, the Revision field's `Done`) bind it as
-/// they come — every one of them the same binding.
+/// claim the key (the Revision field's `Done`) bind it as they come — every
+/// one of them the same binding.
 pub fn bind_mod_enter(state: &AppState) {
-    let held = consent::is_open(state) && consent::key_armed();
+    // The consent card has the keyboard focus while it is open: its own
+    // `KeyDown`/`KeyUp` handlers measure the hold, and a binding here would
+    // take `Ctrl+Enter` from them before they see it. Not binding also makes
+    // the effects that call this re-run when a card opens or closes.
+    if consent::is_open(state) {
+        return;
+    }
     let keys: &[&str] = if apple_keys() {
         &["mod+enter", "ctrl+enter"]
     } else {
@@ -280,7 +312,6 @@ pub fn bind_mod_enter(state: &AppState) {
                 // `enter` is a key a text input uses: the binding asks for
                 // the focus wherever it is.
                 when: When::Always,
-                repeat: held,
                 ..KeyOptions::default()
             },
             move |_: &str| mod_enter(&state),
@@ -288,16 +319,13 @@ pub fn bind_mod_enter(state: &AppState) {
     }
 }
 
-/// `Ctrl+Enter`: the consent card's hold while one is up, `Done` while a
-/// fresh proposal is docked, else `Review`.
+/// `Ctrl+Enter`: `Done` while a fresh proposal is docked, else `Review`.
+/// While a consent card is up the key belongs to the card's own handlers
+/// ([`consent::card`]), so a binding that fires anyway does nothing.
 fn mod_enter(state: &AppState) {
     if consent::is_open(state) {
-        consent::key_hold();
         return;
     }
-    // A card this press opens must not read the same key's repeats as a
-    // hold: it arms only once the key was let go.
-    consent::note_key_press();
     if revision::done_applies(state) {
         revision::done(state);
         return;
@@ -1356,5 +1384,83 @@ mod tests {
             mounted_mid_exit && !app.screen().matches("id:menu-motion-panel").unwrap(),
             "the menu panel must stay mounted during its exit and unmount after it"
         );
+    }
+
+    /// The row over a document view standing in for the source editor: the
+    /// menu is open and the focus is on another control, so the Escape
+    /// binding must close the menu and put the focus back on the document.
+    #[component]
+    fn MenuEscapeFocusProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let tab = state.active_tab().expect("the tab");
+        let target = element_ref();
+        state.attach_document_view(tab.id, target);
+        let other = element_ref();
+        let target_focused = signal(false);
+        let other_focused = signal(false);
+        view()
+            .flex_col()
+            .w(px(600.0))
+            .h(px(500.0))
+            .child(
+                view()
+                    .test_id("menu-focus-target")
+                    .element_ref(&target)
+                    .focusable(true)
+                    .on_focus(move || target_focused.set(true))
+                    .child(prims::ink("document")),
+            )
+            .child(
+                view()
+                    .test_id("menu-focus-other")
+                    .element_ref(&other)
+                    .focusable(true)
+                    .on_focus(move || other_focused.set(true))
+                    .child(prims::ink("other")),
+            )
+            .child(
+                view()
+                    .test_id("menu-open")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        other.focus();
+                        menu_open_state().set(MenuOpen(true));
+                    })
+                    .child(prims::ink("open the menu")),
+            )
+            .child(
+                text(move || {
+                    format!(
+                        "target: {} other: {}",
+                        target_focused.get(),
+                        other_focused.get()
+                    )
+                })
+                .test_id("menu-focus-state"),
+            )
+            .child(title_row(state, Language::English))
+    }
+
+    #[test]
+    fn escape_closes_the_menu_and_returns_focus_to_the_document() {
+        let mut config = EngineConfig::new(Root::of::<MenuEscapeFocusProbe>());
+        // A platform that gives ordinary views the keyboard focus, as the
+        // Windows host does.
+        config.environment.os = nsh_core::platform::Os::Linux;
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(600.0), Points(500.0)))
+            .expect("viewport");
+        app.wait_for("id:menu-open").expect("the probe renders");
+        app.press("id:menu-open").expect("open the menu");
+        app.wait_for("id:title-menu-open-folder")
+            .expect("the menu is open");
+        app.wait_for("text:target: false other: true")
+            .expect("the other control holds the focus");
+        app.press_key("escape").expect("close the menu");
+        app.wait_for_gone("id:title-menu-open-folder", Duration::from_secs(2))
+            .expect("the menu closed");
+        app.wait_for("text:target: true other: true")
+            .expect("the document view took the focus back");
     }
 }

@@ -20,18 +20,18 @@
 //!   above it, and the request's own framing is disclosed below it as *not
 //!   counted*: nothing here measures the wire request, so nothing here prints
 //!   a figure for it;
-//! * Cancel has the default focus and is a quiet action; Esc always
-//!   cancels; `Enter` and `Space` charge the hold only while the hold control
-//!   itself has the focus — anywhere else they activate the default (Cancel) —
-//!   and a held `Ctrl+Enter` charges the same hold wherever the focus is, so
-//!   the keyboard route exists on every platform; a tap alone authorizes
-//!   nothing;
+//! * the card takes the keyboard focus when it opens (Cancel first, a quiet
+//!   action), and Esc always cancels; `Enter`/`Space` charge the hold only on
+//!   the focused Send control — anywhere else they cancel the card — and a
+//!   held `Ctrl+Enter` charges the same hold anywhere in the card; a tap
+//!   alone authorizes nothing;
 //! * a send needs a deliberate hold: a press-and-release, a keyboard tap, an
 //!   auto-repeat or a handler's second hand never authorize anything, and each
 //!   consent is single-use;
 //! * the `Ctrl+Enter` that opened the card never charges it, however long it
-//!   is held: until the card arms, its binding takes no auto-repeats, and the
-//!   next press — a fresh one, after a release — arms it ([`key_hold`]);
+//!   is held: its `KeyDown` reached the focus before the card existed, and
+//!   the auto-repeats that follow carry `repeat` and are ignored; only a
+//!   fresh press, after a release, charges ([`Hold::key_down`]);
 //! * a rebuilt body drops what went with the old controls: the focus flag and
 //!   any press or key charge in flight, whose release can never arrive;
 //! * a loopback HTTP endpoint keeps its filament and row underlines plain grey
@@ -42,25 +42,18 @@
 //! and a new press starts from zero — the charge never resumes. One input
 //! owns a hold: the pointer, `Ctrl+Enter`, or `Enter`/`Space` on the focused
 //! Send control. A press through another path, or a fresh press on the same
-//! path, cancels the charge and its completion timer. The platform is read
-//! through [`HoldKeyboard`]: a low-level `WH_KEYBOARD_LL` hook on its own
-//! message-pumping thread observes every key-up and fresh key-down of
-//! `Enter`, `Space` or the control key while the hold charges;
-//! `GetAsyncKeyState` must report the owner's keys down and the foreground
-//! window must belong to this process at the authorization moment. A platform
-//! without the hook never authorizes a keyboard hold; the pointer hold
-//! remains. The silence watchdog ([`KEY_ALIVE_MS`]) may still end a hold whose
-//! release went unobserved, but it never authorizes.
+//! path, cancels the charge and its completion timer. A keyboard hold is
+//! measured only from the `KeyDown`/`KeyUp` events nsh delivers to the
+//! focused card ([`Hold::key_down`], [`Hold::key_up`]); a release, a fresh
+//! press, a blur, a window deactivation or an unmount cancels it. Nothing is
+//! read from the platform's key state or the foreground window, so the
+//! pointer hold works on every platform and the card's own focus is the one
+//! authority. The card captures `Enter`, `Space` and their shifted and
+//! `Ctrl+Enter` forms so the platform never presses a control with them.
 //!
 //! The body is a `dynamic` region and `is_open` polls only the two consent
 //! strings: the shell's `when` re-makes its branch when *that* flips, never
 //! when a manifest inside it is replaced.
-//!
-//! The card asks for focus on Cancel. When Tab reaches the hold control,
-//! `Space` or `Enter` charges it; elsewhere those keys cancel. A held
-//! `Ctrl+Enter` still works without moving focus. A text input that keeps
-//! the focus loses these keys to the card (the keys that edit it still reach
-//! it: only the shell can block them).
 
 use std::{
     cell::{Cell, RefCell},
@@ -74,7 +67,8 @@ use mt_core::{
     },
     settings::Language,
 };
-use nsh_core::keymap::When;
+use nsh_core::keymap::Keystroke;
+use nsh_core::platform::Lifecycle;
 use nsh_core::{Color, TransformKind, element::AnimatedValue, prelude::*};
 
 use crate::{
@@ -84,10 +78,6 @@ use crate::{
 };
 
 const FILAMENT_H: f32 = 2.0;
-/// How long a held key may stay silent before it counts as released: longer
-/// than the platform's slowest first auto-repeat, shorter than the charge, so
-/// a tap on its own can never complete a send.
-const KEY_ALIVE_MS: f32 = 700.0;
 /// The row height the height rule counts with (type plus its gap).
 const ROW_H: f32 = 22.0;
 /// What the card may take of the window, and the chrome around its rows.
@@ -100,435 +90,56 @@ const HEADLINE_LINE: f32 = 24.0;
 /// The definition list's term column (`To`, `Transport`, `API`, `Proxy`,
 /// `Scope`).
 const TERM_W: f32 = 96.0;
-/// How recently `Ctrl+Enter` must have arrived for a card to start unarmed
-/// (the key opened it, or is held as it comes): longer than the slowest first
-/// auto-repeat the platforms offer (Windows' keyboard delay tops out at about
-/// 1s), so a key that may still be down never charges a card it did not
-/// press for.
-const ARM_SILENCE_MS: f32 = 1_100.0;
-/// A tap must never complete a hold: the watchdog a key tap charges for stays
-/// short of the charge a send needs.
-const _: () = assert!(KEY_ALIVE_MS < motion::FILAMENT_CHARGE_MS);
-/// A held key's first repeat must never arm the card it opened.
-const _: () = assert!(ARM_SILENCE_MS > KEY_ALIVE_MS);
 
-#[doc(hidden)]
+/// A watched key of a keyboard hold, as the card's `KeyDown`/`KeyUp`
+/// handlers classify the event's logical key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WatchedKey {
+enum KeyRole {
     Enter,
-    Control,
     Space,
+    /// The control key itself: a fresh press cancels the charge, and its
+    /// release ends a `Ctrl+Enter` hold.
+    Control,
+    Other,
 }
 
-/// The platform behind a keyboard hold's authorization: the physical key
-/// state, the window's foreground state, and the low-level hook that observes
-/// every watched-key transition while a hold charges. A platform without the
-/// hook (or one whose hook cannot be installed) never authorizes a keyboard
-/// hold; the pointer hold remains.
-#[doc(hidden)]
-pub trait HoldKeyboard: Send + Sync {
-    fn key_down(&self, key: WatchedKey) -> bool;
-    fn foreground(&self) -> bool;
-    /// Install the low-level hook on its own message-pumping thread. False
-    /// when it cannot start, or a handle kept by a failed removal is still
-    /// installed.
-    fn install(&self) -> bool;
-    /// Remove the hook [`install`](Self::install) installed. False when it
-    /// could not be removed: the handle is kept, and `install` refuses until
-    /// a later removal succeeds.
-    fn remove(&self) -> bool;
-    fn transition(&self) -> bool;
-}
-
-static HOLD_KEYBOARD: std::sync::Mutex<Option<std::sync::Arc<dyn HoldKeyboard>>> =
-    std::sync::Mutex::new(None);
-
-fn keyboard_source() -> std::sync::Arc<dyn HoldKeyboard> {
-    if let Some(source) = HOLD_KEYBOARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-    {
-        return source;
+/// The watched key of a raw event's logical key. Windows reports Space as
+/// `" "` and the modifier as `Control`; other backends spell
+/// `"Space"`/`"ControlLeft"`.
+fn role_of(key: &str) -> KeyRole {
+    if key == "Enter" || key == "NumpadEnter" {
+        KeyRole::Enter
+    } else if key == " " || key == "Space" {
+        KeyRole::Space
+    } else if key == "Control" || key.starts_with("Control") {
+        KeyRole::Control
+    } else {
+        KeyRole::Other
     }
-    #[cfg(any(test, feature = "test-harness"))]
-    {
-        // A harness's synthetic keys never reach the platform's key state or
-        // the hook: stand in a physically-held keyboard, foreground and hook
-        // included, so the hold the harness synthesizes can authorize.
-        let keys = std::sync::Arc::new(test_harness::HeldKeys::default());
-        *HOLD_KEYBOARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(keys.clone());
-        keys
-    }
-    #[cfg(not(any(test, feature = "test-harness")))]
-    platform_keyboard()
 }
 
-/// Point this process's keyboard holds at `source`; `None` restores the
-/// platform's own. Test harnesses only: their synthetic keys never reach the
-/// platform's key state or the thread hook.
-#[cfg(any(test, feature = "test-harness"))]
-#[doc(hidden)]
-pub fn set_hold_keyboard(source: Option<std::sync::Arc<dyn HoldKeyboard>>) {
-    *HOLD_KEYBOARD
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = source;
-}
-
-/// The keyboard source an integration harness installs: every key is held,
-/// the window is foreground and the hook is in place, so a synthetic
-/// `Ctrl+Enter` hold authorizes exactly as a real one does.
-#[cfg(any(test, feature = "test-harness"))]
-#[doc(hidden)]
-pub mod test_harness {
-    use super::{HoldKeyboard, WatchedKey};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+/// The keys the card takes from the platform while it is open: `Enter`,
+/// `Space` and their shifted and `Ctrl+Enter` forms. A capture is a mounted
+/// rule, not a listener: the key still reaches the card's `on_key_down`, and
+/// the platform's own defaults (Return and Space pressing the focused
+/// control) never run.
+pub(crate) fn key_capture() -> KeyCapture {
+    let apple = apple_keys();
+    let mut strokes = Vec::new();
+    let mut bind = |keys: &str| {
+        if let Ok(stroke) = Keystroke::parse_with(keys, apple) {
+            strokes.push(stroke);
+        }
     };
-
-    #[derive(Default)]
-    pub struct HeldKeys {
-        transition: AtomicBool,
+    for keys in ["enter", "shift+enter", "space", "shift+space", "mod+enter"] {
+        bind(keys);
     }
-
-    impl HeldKeys {
-        /// A key-up (or fresh key-down) of a watched key, as the hook would
-        /// report it.
-        pub fn transition(&self) {
-            self.transition.store(true, Ordering::Release);
-        }
+    if apple {
+        // The hint names Ctrl even on an Apple keyboard, where `mod` is
+        // Command: both chords charge.
+        bind("ctrl+enter");
     }
-
-    impl HoldKeyboard for HeldKeys {
-        fn key_down(&self, _: WatchedKey) -> bool {
-            true
-        }
-
-        fn foreground(&self) -> bool {
-            true
-        }
-
-        fn install(&self) -> bool {
-            self.transition.store(false, Ordering::Release);
-            true
-        }
-
-        fn remove(&self) -> bool {
-            true
-        }
-
-        fn transition(&self) -> bool {
-            self.transition.load(Ordering::Acquire)
-        }
-    }
-
-    /// Install [`HeldKeys`] for this process and hand it back, so a harness
-    /// can report a key transition as the hook would.
-    pub fn held_keys() -> Arc<HeldKeys> {
-        let keys = Arc::new(HeldKeys::default());
-        super::set_hold_keyboard(Some(keys.clone()));
-        keys
-    }
-}
-
-#[cfg(target_os = "windows")]
-#[cfg_attr(any(test, feature = "test-harness"), allow(dead_code))]
-fn platform_keyboard() -> std::sync::Arc<dyn HoldKeyboard> {
-    std::sync::Arc::new(windows_keyboard::WindowsKeyboard)
-}
-
-#[cfg(not(target_os = "windows"))]
-#[cfg_attr(any(test, feature = "test-harness"), allow(dead_code))]
-fn platform_keyboard() -> std::sync::Arc<dyn HoldKeyboard> {
-    std::sync::Arc::new(NoKeyboard)
-}
-
-/// The non-Windows compatibility source: no reliable query and no hook, so a
-/// keyboard hold never authorizes; the pointer hold remains.
-#[cfg(not(target_os = "windows"))]
-struct NoKeyboard;
-
-#[cfg(not(target_os = "windows"))]
-impl HoldKeyboard for NoKeyboard {
-    fn key_down(&self, _: WatchedKey) -> bool {
-        false
-    }
-
-    fn foreground(&self) -> bool {
-        false
-    }
-
-    fn install(&self) -> bool {
-        false
-    }
-
-    fn remove(&self) -> bool {
-        true
-    }
-
-    fn transition(&self) -> bool {
-        true
-    }
-}
-
-#[cfg(target_os = "windows")]
-mod windows_keyboard {
-    #![allow(dead_code)]
-    use super::{HoldKeyboard, WatchedKey};
-    use std::{
-        cell::Cell,
-        sync::{
-            Mutex,
-            atomic::{AtomicBool, AtomicIsize, Ordering},
-            mpsc,
-        },
-        thread::{self, JoinHandle},
-        time::Duration,
-    };
-    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-    use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_RETURN, VK_SPACE,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
-        KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-        UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-        WM_SYSKEYUP,
-    };
-
-    /// The thread message that asks the hook thread to unhook and report.
-    const WM_UNHOOK: u32 = WM_APP + 1;
-
-    /// How long `install`/`remove` wait on the hook thread before failing
-    /// closed: installing is microseconds, so only a wedged thread hits it.
-    const HOOK_READY_MS: u64 = 5_000;
-
-    /// Whether the installer gave up before the thread reported ready.
-    static CANCEL: AtomicBool = AtomicBool::new(false);
-    /// A watched-key release or fresh press since the hook was installed.
-    static TRANSITION: AtomicBool = AtomicBool::new(false);
-    /// The installed `HHOOK` as an integer; 0 when none is installed.
-    static HOOK_HANDLE: AtomicIsize = AtomicIsize::new(0);
-    /// The hook thread while one exists; a failed removal keeps its record
-    /// beside the kept handle so a later removal can retry.
-    static HOOK_THREAD: Mutex<Option<HookThread>> = Mutex::new(None);
-    /// Where the hook thread reports the outcome of one removal attempt.
-    static REMOVE_REPLY: Mutex<Option<mpsc::Sender<bool>>> = Mutex::new(None);
-
-    struct HookThread {
-        thread: JoinHandle<()>,
-        thread_id: u32,
-    }
-
-    pub(super) struct WindowsKeyboard;
-
-    impl HoldKeyboard for WindowsKeyboard {
-        fn key_down(&self, key: WatchedKey) -> bool {
-            let key = match key {
-                WatchedKey::Enter => VK_RETURN,
-                WatchedKey::Control => VK_CONTROL,
-                WatchedKey::Space => VK_SPACE,
-            };
-            // SAFETY: `GetAsyncKeyState` has no preconditions.
-            unsafe { GetAsyncKeyState(key.0 as i32) as u16 & 0x8000 != 0 }
-        }
-
-        fn foreground(&self) -> bool {
-            // SAFETY: neither call has preconditions; the handle is only read.
-            unsafe {
-                let foreground = GetForegroundWindow();
-                if foreground.0.is_null() {
-                    return false;
-                }
-                let mut process = 0_u32;
-                GetWindowThreadProcessId(foreground, Some(&mut process));
-                process == std::process::id()
-            }
-        }
-
-        fn install(&self) -> bool {
-            let mut slot = HOOK_THREAD
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if HOOK_HANDLE.load(Ordering::Acquire) != 0 {
-                return false;
-            }
-            if let Some(previous) = slot.take() {
-                let _ = previous.thread.join();
-            }
-            CANCEL.store(false, Ordering::Release);
-            TRANSITION.store(false, Ordering::Release);
-            let (ready, installed) = mpsc::channel();
-            let thread = thread::spawn(move || hook_thread(&ready));
-            match installed.recv_timeout(Duration::from_millis(HOOK_READY_MS)) {
-                Ok(Some(thread_id)) => {
-                    *slot = Some(HookThread { thread, thread_id });
-                    true
-                }
-                Ok(None) => {
-                    let _ = thread.join();
-                    false
-                }
-                Err(_) => {
-                    // The thread never reported: tell it to take down what it
-                    // may have installed and leave nothing behind.
-                    CANCEL.store(true, Ordering::Release);
-                    let _ = thread.join();
-                    false
-                }
-            }
-        }
-
-        fn remove(&self) -> bool {
-            let mut slot = HOOK_THREAD
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let Some(state) = slot.as_ref() else {
-                return HOOK_HANDLE.load(Ordering::Acquire) == 0;
-            };
-            if HOOK_HANDLE.load(Ordering::Acquire) == 0 {
-                let state = slot.take().expect("the hook thread");
-                let _ = state.thread.join();
-                return true;
-            }
-            let (reply, answer) = mpsc::channel();
-            *REMOVE_REPLY
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reply);
-            // SAFETY: the message needs no preconditions; the id is the
-            // thread that installed the hook and pumps the queue.
-            let posted =
-                unsafe { PostThreadMessageW(state.thread_id, WM_UNHOOK, WPARAM(0), LPARAM(0)) }
-                    .is_ok();
-            if !posted {
-                *REMOVE_REPLY
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                return false;
-            }
-            let removed = answer
-                .recv_timeout(Duration::from_millis(HOOK_READY_MS))
-                .unwrap_or(false);
-            if removed {
-                let state = slot.take().expect("the hook thread");
-                let _ = state.thread.join();
-            }
-            removed
-        }
-
-        fn transition(&self) -> bool {
-            TRANSITION.load(Ordering::Acquire)
-        }
-    }
-
-    fn hook_thread(ready: &mpsc::Sender<Option<u32>>) {
-        let thread_id = unsafe { GetCurrentThreadId() };
-        // SAFETY: the queue is this thread's, so a removal can post to it
-        // before the loop below waits on it.
-        let mut message = MSG::default();
-        let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
-        // SAFETY: the procedure matches `HOOKPROC`; a low-level hook needs no
-        // module and runs on this thread.
-        let hook = match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), None, 0) } {
-            Ok(hook) => hook,
-            Err(_) => {
-                let _ = ready.send(None);
-                return;
-            }
-        };
-        if CANCEL.load(Ordering::Acquire) {
-            // SAFETY: the handle came from `SetWindowsHookExW` above.
-            let _ = unsafe { UnhookWindowsHookEx(hook) };
-            let _ = ready.send(None);
-            return;
-        }
-        HOOK_HANDLE.store(hook.0 as isize, Ordering::Release);
-        if ready.send(Some(thread_id)).is_err() {
-            if unsafe { UnhookWindowsHookEx(hook) }.is_ok() {
-                HOOK_HANDLE.store(0, Ordering::Release);
-            }
-            return;
-        }
-        // SAFETY: `GetMessageW` fills `message`; thread messages need no
-        // window and are not dispatched.
-        while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
-            if message.message == WM_UNHOOK {
-                let removed = unsafe { UnhookWindowsHookEx(hook) }.is_ok();
-                if removed {
-                    HOOK_HANDLE.store(0, Ordering::Release);
-                }
-                if let Some(reply) = REMOVE_REPLY
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                {
-                    let _ = reply.send(removed);
-                }
-                if removed {
-                    break;
-                }
-            }
-        }
-        if HOOK_HANDLE.load(Ordering::Acquire) == hook.0 as isize
-            && unsafe { UnhookWindowsHookEx(hook) }.is_ok()
-        {
-            HOOK_HANDLE.store(0, Ordering::Release);
-        }
-    }
-
-    /// The low-level hook's procedure: record every release and every fresh
-    /// press of a watched key, then pass the message on. A low-level hook
-    /// runs on the installing thread, so the down-set travels with it.
-    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if code == 0 {
-            // SAFETY: a `WH_KEYBOARD_LL` callback passes a `KBDLLHOOKSTRUCT`.
-            let key = unsafe { (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode } as u16;
-            let bit = watched_bit(key);
-            if bit != 0 {
-                let message = wparam.0 as u32;
-                let released = message == WM_KEYUP || message == WM_SYSKEYUP;
-                let pressed = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-                KEY_DOWN.with(|down| {
-                    let current = down.get();
-                    if released {
-                        if current & bit != 0 {
-                            TRANSITION.store(true, Ordering::Release);
-                        }
-                        down.set(current & !bit);
-                    } else if pressed {
-                        // A fresh press, not an auto-repeat: the platform
-                        // repeats a key-down without a key-up between them.
-                        if current & bit == 0 {
-                            TRANSITION.store(true, Ordering::Release);
-                        }
-                        down.set(current | bit);
-                    }
-                });
-            }
-        }
-        // SAFETY: the arguments the platform passed to this procedure.
-        unsafe { CallNextHookEx(None, code, wparam, lparam) }
-    }
-
-    thread_local! {
-        static KEY_DOWN: Cell<u8> = const { Cell::new(0) };
-    }
-
-    fn watched_bit(key: u16) -> u8 {
-        if key == VK_RETURN.0 {
-            1
-        } else if key == VK_CONTROL.0 || key == VK_LCONTROL.0 || key == VK_RCONTROL.0 {
-            2
-        } else if key == VK_SPACE.0 {
-            4
-        } else {
-            0
-        }
-    }
+    KeyCapture::keys(strokes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +216,13 @@ fn waiting(state: &AppState) -> Waiting {
     }
 }
 
+/// The pending one-shot focus of an open card, kept alive until it fires: an
+/// effect runs before the commit that carries the card's node is in, so its
+/// ref reaches it only at the next step.
+fn card_focus_step() -> Signal<Option<Spawned<()>>> {
+    global::<Option<Spawned<()>>>()
+}
+
 /// The consent card.
 pub fn card(state: AppState, language: Language) -> impl IntoElement {
     // The card owns Enter, Escape and the hold: the source editor gives up
@@ -612,13 +230,27 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     state.blur_source_editor();
     let kind = kind_of_untracked(&state).unwrap_or(ConsentKind::Review);
     let shadow = shadow();
-    // One hold for as long as the card lives, shared with the keyboard
-    // bindings below: the body resets it whenever it is built again.
+    // One hold for as long as the card lives: the body resets it whenever it
+    // is built again.
     let hold = Hold::new(state.clone(), kind, language);
-    // The keyboard: Esc cancels; Enter and Space charge the hold while it has
-    // the focus and cancel anywhere else. The bindings live under the card's
-    // own owner (`run_owner`), so they go when the card does.
-    keyboard(state.clone(), kind, hold.clone());
+    // Esc is a keymap binding; the hold's keys are the card's own raw
+    // handlers below, so they measure only what the focused card hears.
+    keyboard(state.clone(), kind);
+    // A card that leaves drops its charge and its completion timer with it.
+    cleanup({
+        let hold = hold.clone();
+        move || hold.cancel_hold()
+    });
+    // The window leaving the foreground cancels any hold: neither a stuck
+    // key nor a pointer already down may matter once the room is not ours.
+    effect({
+        let hold = hold.clone();
+        move || {
+            if lifecycle() != Lifecycle::Active {
+                hold.release();
+            }
+        }
+    });
     let body_state = state.clone();
     let body_hold = hold.clone();
     let presented = signal_with(None, SignalEquals::Never);
@@ -633,12 +265,40 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
             }
         }
     });
+    let down = hold.clone();
+    let up = hold.clone();
+    let blur = hold.clone();
+    let focus = element_ref();
+    // The card takes the keyboard focus when it opens: Cancel stays the
+    // first control Tab reaches, but the card itself owns the keys until
+    // then, so `Ctrl+Enter` from before it opened can never charge it. The
+    // focus fires after the commit that mounts the card (a ref reaches its
+    // node only then).
+    let focus_step = card_focus_step();
+    effect(move || {
+        focus_step.set(Some(set_timeout(Duration::from_millis(0), move || {
+            focus.focus();
+        })));
+    });
     view()
         .test_id("consent-card")
         .w(px(tokens::CONSENT_CARD_MAX_W))
         .flex_col()
         .gap(px(tokens::SPACE_4))
         .p(px(tokens::SPACE_5))
+        .focusable(true)
+        .element_ref(&focus)
+        .on_focus(|| {
+            #[cfg(test)]
+            tests::record_focus(tests::FocusStop::Card);
+        })
+        // The card takes the keyboard focus when it opens; these handlers
+        // see the keys wherever inside the card the focus is, because the
+        // events bubble to the card.
+        .capture_keys(key_capture())
+        .on_key_down(move |event: &KeyEvent| down.key_down(event))
+        .on_key_up(move |event: &KeyEvent| up.key_up(event))
+        .on_blur(move || blur.release())
         // In dark mode the card's ground is lifted a hair off the room and a
         // hairline draws its edge: the shadow alone does not show on graphite.
         .bg(move || tokens::palette().card_ground)
@@ -692,6 +352,7 @@ fn card_body(state: &AppState, language: Language, hold: &Hold, waiting: &Waitin
             .child(disclosure_body(
                 state,
                 language,
+                hold,
                 waiting,
                 consent,
                 rows.as_ref().expect("a manifest has its rows"),
@@ -718,6 +379,7 @@ fn card_body(state: &AppState, language: Language, hold: &Hold, waiting: &Waitin
 fn disclosure_body(
     state: &AppState,
     language: Language,
+    hold: &Hold,
     waiting: &Waiting,
     consent: &OutboundConsent,
     rows: &Rows,
@@ -736,7 +398,7 @@ fn disclosure_body(
                 .flex_col()
                 .gap(px(tokens::SPACE_1))
                 .child(destination_list(language, consent.disclosure.endpoint()))
-                .child(scope_row(scope_state, language, waiting)),
+                .child(scope_row(scope_state, language, hold, waiting)),
         )
         .child(
             // Every row is on the card: a long manifest scrolls in place, so
@@ -811,7 +473,12 @@ fn term_view(term: &'static str) -> impl IntoElement {
 /// a quiet switch (choosing a scope is your action, never warm), and one that
 /// cannot be bound not drawn. A switch rebinds the consent; it authorizes
 /// nothing.
-fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl IntoElement {
+fn scope_row(
+    state: AppState,
+    language: Language,
+    hold: &Hold,
+    waiting: &Waiting,
+) -> impl IntoElement {
     let kind = waiting
         .consent
         .as_ref()
@@ -840,9 +507,11 @@ fn scope_row(state: AppState, language: Language, waiting: &Waiting) -> impl Int
         let state = state.clone();
         offered.then(|| {
             let enabled = state.clone();
+            let blur = hold.clone();
             let action = prims::quiet_action(test_id, label, move || {
                 state.set_review_consent_scope(choice)
-            });
+            })
+            .on_blur(move || blur.release());
             #[cfg(test)]
             let action = action.on_focus(|| tests::record_focus(tests::FocusStop::Scope));
             view()
@@ -1060,10 +729,10 @@ fn buttons(
         .flex_row()
         .items_center()
         .gap(px(tokens::SPACE_3))
-        .child(cancel_button(state, kind, language))
+        .child(cancel_button(state, kind, language, hold.clone()))
         .child(send_button(hold, language, total))
-        // The keyboard route that needs no focus anywhere: Cancel is where the
-        // card asks for it, and this hold works without it.
+        // The keyboard route that needs no focus anywhere: the card holds
+        // the focus, and this hold works from anywhere inside it.
         .child(
             view()
                 .test_id("consent-key-hint")
@@ -1077,15 +746,18 @@ fn buttons(
         )
 }
 
-fn cancel_button(state: AppState, kind: ConsentKind, language: Language) -> impl IntoElement {
-    let reference = element_ref();
-    // Initial focus lands on Cancel, which authorizes nothing.
-    effect(move || reference.focus());
+fn cancel_button(
+    state: AppState,
+    kind: ConsentKind,
+    language: Language,
+    hold: Hold,
+) -> impl IntoElement {
     let enabled = state.clone();
+    let blur = hold.clone();
     view().test_id("consent-cancel").child(cancel_action(
         i18n::t(language, Key::Cancel),
         move || cancel(&state, kind),
-        reference,
+        move || blur.release(),
         move || !is_open(&enabled),
     ))
 }
@@ -1093,14 +765,12 @@ fn cancel_button(state: AppState, kind: ConsentKind, language: Language) -> impl
 /// `prims::quiet_action`'s look, as the Cancel control itself: resting ink
 /// that steps to full ink, underlined, on hover or keyboard focus (drawn by
 /// the text, which a style on the control would not reach). The control is
-/// one focusable view with the ref *on it*: a component's element is a
-/// boundary the platforms cannot focus, so `Enter` would otherwise land
-/// nowhere (`nsh_base`'s button keeps its own pressable view inside it, out
-/// of the ref's reach).
+/// one focusable view of its own: focus reaches it directly, and losing that
+/// focus cancels a `Ctrl+Enter` charge in flight.
 fn cancel_action(
     label: &'static str,
     on_press: impl Fn() + 'static,
-    reference: ElementRef,
+    on_blur: impl Fn() + 'static,
     disabled: impl Fn() -> bool + 'static,
 ) -> AnyElement {
     let duration = prims::press_color_duration();
@@ -1117,11 +787,12 @@ fn cancel_action(
         .disabled(disabled)
         .role(AccessibilityRole::Button)
         .label(SharedString::from(label))
-        .on_press(move |_: &PressEvent| on_press());
+        .on_press(move |_: &PressEvent| on_press())
+        .on_blur(on_blur);
     #[cfg(test)]
     let control = control.on_focus(|| tests::record_focus(tests::FocusStop::Cancel));
     prims::press_feedback_with_duration(
-        control.element_ref(&reference).child(
+        control.child(
             text(label)
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
@@ -1223,134 +894,25 @@ fn send_button(hold: Hold, language: Language, total: u64) -> impl IntoElement {
     )
 }
 
-/// The keyboard routes: Esc always cancels; a held `Enter` or `Space` charges
-/// the hold while the hold control itself has the focus, and activates the
-/// card's default (Cancel) anywhere else. The two keys are consumed wherever
-/// the focus is, so a stray press can never edit the document behind the card
-/// or charge a control the user never reached. `Ctrl+Enter` is the
-/// focus-independent hold: it charges the same filament wherever the keyboard
-/// is, which is the only keyboard route on a platform that focuses no views.
-/// It is the app's one `Ctrl+Enter` binding ([`titlebar::bind_mod_enter`]),
-/// which reaches this card's hold through [`key_hold`].
-fn keyboard(state: AppState, kind: ConsentKind, hold: Hold) {
-    let slot = open_hold();
-    *slot.borrow_mut() = Some(hold.clone());
-    let mine = hold.spent.clone();
-    cleanup(move || {
-        let mut open = slot.borrow_mut();
-        if open
-            .as_ref()
-            .is_some_and(|hold| Rc::ptr_eq(&hold.spent, &mine))
-        {
-            // The card is going: a keyboard hold that never released must
-            // not leave the thread hook behind.
-            if let Some(hold) = open.as_ref() {
-                hold.remove_hook();
-            }
-            *open = None;
-        }
-    });
-    // Bound as the card comes, so it is newer than any binding made before.
-    let ctrl_enter_state = state.clone();
-    effect(move || {
-        if is_open(&ctrl_enter_state) {
-            titlebar::bind_mod_enter(&ctrl_enter_state);
-        }
-    });
+/// The card's keymap keys: Esc always cancels, from wherever the card's
+/// focus is. The hold's keys are not bindings: they are the card's own raw
+/// `KeyDown`/`KeyUp` handlers ([`Hold::key_down`]), so only what the focused
+/// card hears moves the charge and the keymap can never measure a key the
+/// card did not receive.
+fn keyboard(state: AppState, kind: ConsentKind) {
     effect(move || {
         if !is_open(&state) {
             return;
         }
         on_key_with("escape", KeyOptions::default(), {
             let state = state.clone();
-            move |_| cancel(&state, kind)
+            move |_| {
+                if !titlebar::escape_closes_menu(&state) {
+                    cancel(&state, kind);
+                }
+            }
         });
-        for (key, unmodified, path) in [
-            ("enter", true, HoldPath::SendEnter),
-            ("shift+enter", false, HoldPath::SendEnter),
-            ("space", true, HoldPath::SendSpace),
-            ("shift+space", false, HoldPath::SendSpace),
-        ] {
-            let state = state.clone();
-            let hold = hold.clone();
-            on_key_with(
-                key,
-                KeyOptions {
-                    repeat: true,
-                    when: When::Always,
-                    // Enter and Space must use the card's hold gate, not a
-                    // synthesized press on whichever view has native focus.
-                    for_focus: true,
-                    ..KeyOptions::default()
-                },
-                move |_| {
-                    if !unmodified || !is_open(&state) {
-                        return;
-                    }
-                    if hold.focused.get() {
-                        hold.key_press(path);
-                    } else {
-                        cancel(&state, kind);
-                    }
-                },
-            );
-        }
     });
-}
-
-/// The open card's hold, for `Ctrl+Enter`: the card puts it here as it comes
-/// and takes it out as it goes.
-#[derive(Default)]
-struct OpenHold(Rc<RefCell<Option<Hold>>>);
-
-fn open_hold() -> Rc<RefCell<Option<Hold>>> {
-    global::<OpenHold>().with_untracked(|open| open.0.clone())
-}
-
-/// One `Ctrl+Enter` press, or one of its auto-repeats, on the open card's
-/// hold ([`titlebar::bind_mod_enter`]); nothing without a card.
-///
-/// It runs under the card's owner: the binding that fired belongs to
-/// whichever effect run bound it last (a focus-in rebinds it, a tab switch
-/// unmounts it), and the hold's timers must not go with that run, or a press
-/// would never be released and the next tap would find the charge full.
-///
-/// A card that opened on `Ctrl+Enter` is not armed, and while it is not the
-/// binding takes no auto-repeats ([`key_armed`]): the platform swallows the
-/// opening press's repeats however long it is held. A press that reaches an
-/// unarmed card is therefore a fresh one, after a release, and it arms the
-/// card and charges at once.
-pub fn key_hold() {
-    last_key().set(Some(nsh_core::time::now()));
-    let hold = open_hold().borrow().clone();
-    if let Some(hold) = hold {
-        hold.armed.set(true);
-        hold.owner.run(|| hold.ctrl_press());
-    }
-}
-
-/// Whether the open card's hold takes `Ctrl+Enter`'s auto-repeats
-/// ([`titlebar::bind_mod_enter`]): only once armed. Reading it subscribes, so
-/// the binding is made again as the card arms.
-pub fn key_armed() -> bool {
-    open_hold()
-        .borrow()
-        .as_ref()
-        .is_some_and(|hold| hold.armed.get())
-}
-
-/// A `Ctrl+Enter` press with no card up ([`titlebar::bind_mod_enter`]): a
-/// card it opens starts unarmed.
-pub fn note_key_press() {
-    last_key().set(Some(nsh_core::time::now()));
-}
-
-/// When `Ctrl+Enter` last reached the app, on the engine's clock.
-#[derive(Default)]
-struct LastKey(Rc<Cell<Option<Instant>>>);
-
-fn last_key() -> Rc<Cell<Option<Instant>>> {
-    global::<LastKey>().with_untracked(|last| last.0.clone())
 }
 
 /// Cancel the waiting consent, whatever it is.
@@ -1660,32 +1222,14 @@ struct Hold {
     /// or `Enter`/`Space` on the focused Send control. A press through
     /// another path (or a fresh press on the same one) cancels it.
     path: Rc<Cell<Option<HoldPath>>>,
-    /// Whether the platform still holds a hook handle from this or an earlier
-    /// charge: a removal that failed keeps it, and no install may happen until
-    /// a removal succeeds.
-    hook: Rc<Cell<bool>>,
-    /// Whether this charge installed the hook and it is confirmed in place.
-    hook_ready: Rc<Cell<bool>>,
     /// The timer that completes the charge in progress.
     completion: Rc<RefCell<Option<Spawned<()>>>>,
-    /// The watchdog that decides a held key was let go.
-    key_alive: Rc<RefCell<Option<Spawned<()>>>>,
-    /// The timer that watches the hook's transitions and the foreground while
-    /// a hold charges, so a release or a deactivation cancels at once.
-    watch: Rc<RefCell<Option<Spawned<()>>>>,
     /// The reduced-motion steps of a charge in progress.
     steps: Rc<RefCell<Vec<Spawned<()>>>>,
     /// The timer that ends the 'Nothing was sent.' notice.
     notice: Rc<RefCell<Option<Spawned<()>>>>,
     /// The send fired: this consent is spent.
     spent: Rc<Cell<bool>>,
-    /// `Ctrl+Enter` may charge: false while the press that opened the card
-    /// may still be down, when the binding takes no auto-repeats
-    /// ([`key_armed`]). The pointer and a focused control's `Enter`/`Space`
-    /// never wait for it. A rebuilt body keeps it: a held key is still held.
-    armed: Signal<bool>,
-    /// The card's owner: the hold's timers live under it, whoever presses.
-    owner: Owner,
 }
 
 impl Hold {
@@ -1702,20 +1246,10 @@ impl Hold {
             charging: Rc::new(Cell::new(None)),
             released: Rc::new(Cell::new(None)),
             path: Rc::new(Cell::new(None)),
-            hook: Rc::new(Cell::new(false)),
-            hook_ready: Rc::new(Cell::new(false)),
             completion: Rc::new(RefCell::new(None)),
-            key_alive: Rc::new(RefCell::new(None)),
-            watch: Rc::new(RefCell::new(None)),
             steps: Rc::new(RefCell::new(Vec::new())),
             notice: Rc::new(RefCell::new(None)),
             spent: Rc::new(Cell::new(false)),
-            armed: signal(
-                last_key()
-                    .get()
-                    .is_none_or(|at| elapsed_ms(at) >= ARM_SILENCE_MS),
-            ),
-            owner: Owner::current(),
         }
     }
 
@@ -1733,16 +1267,12 @@ impl Hold {
         };
         self.total.set(total);
         self.cancel_completion();
-        self.cancel_key_alive();
-        self.cancel_watch();
         self.cancel_steps();
         self.charging.set(None);
         self.released.set(None);
         self.heat.stop();
         self.focused.set(false);
         self.path.set(None);
-        self.hook_ready.set(false);
-        self.remove_hook();
         if self.spent.get() {
             // The send already left: its label and full charge stay until the
             // card unmounts.
@@ -1772,30 +1302,16 @@ impl Hold {
     }
 
     /// Starts a charge from zero for `path` and schedules the completion a
-    /// full [`motion::FILAMENT_CHARGE_MS`] later. A keyboard path installs the
-    /// low-level hook; a removal that keeps its handle refuses the install,
-    /// and the charge then fails closed.
+    /// full [`motion::FILAMENT_CHARGE_MS`] later. A charge already in flight
+    /// ends with this call: a fresh press always starts over.
     fn begin(&self, path: HoldPath) {
-        self.remove_hook();
+        self.end_notice();
         self.cancel_completion();
-        self.cancel_key_alive();
-        self.cancel_watch();
         self.cancel_steps();
         self.path.set(Some(path));
         self.charging.set(Some(nsh_core::time::now()));
         self.released.set(None);
         self.heat.stop();
-        if path.is_keyboard() {
-            if !self.hook.get() {
-                self.hook.set(keyboard_source().install());
-                self.hook_ready.set(self.hook.get());
-            } else {
-                // A removal that failed keeps its handle: this charge cannot
-                // install one and never authorizes.
-                self.hook_ready.set(false);
-            }
-        }
-        self.watch_hold();
         let hold = self.clone();
         let slot = self.completion.clone();
         if motion::reduced_motion() {
@@ -1824,8 +1340,8 @@ impl Hold {
 
     /// The reduced-motion charge: the filament jumps to a third and then two
     /// thirds (labelled `1/3`, `2/3`), and [`Hold::complete`] reads `Sending`.
-    /// The charge itself is the same, so the hold length, the watchdogs and
-    /// every authorization are unchanged.
+    /// The charge itself is the same, so the hold length and every
+    /// authorization are unchanged.
     fn press_reduced(&self, value: f32) {
         self.cancel_steps();
         let third = motion::FILAMENT_CHARGE_MS / 3.0;
@@ -1860,24 +1376,19 @@ impl Hold {
         });
     }
 
-    /// The press ended before the charge was full — or a keyboard hold came
-    /// apart: cool back and say so. The authorization is zero, whatever the
-    /// filament drew.
+    /// The press ended before the charge was full: cool back and say so. The
+    /// authorization is zero, whatever the filament drew.
     fn release(&self) {
         if self.spent.get() {
             return;
         }
         self.path.set(None);
-        self.hook_ready.set(false);
-        self.remove_hook();
-        self.cancel_watch();
         let Some(at) = self.charging.take() else {
             return;
         };
         let value = charged(0.0, elapsed_ms(at));
         self.released.set(Some((value, nsh_core::time::now())));
         self.cancel_completion();
-        self.cancel_key_alive();
         self.cancel_steps();
         self.cool(value);
         self.label.set(HoldLabel::Released);
@@ -1894,126 +1405,92 @@ impl Hold {
         ));
     }
 
-    /// One focused `Enter`/`Space` press or auto-repeat: a repeat on the same
-    /// path keeps the charge; a fresh press, a press another path owns, or a
-    /// hold the hook saw come apart starts over from zero. The charge faces
-    /// the same hook-plus-key-state proof as `Ctrl+Enter`.
-    fn key_press(&self, path: HoldPath) {
+    /// Drops the charge and its completion timer without a notice: the card
+    /// is leaving, so nothing it said would be seen.
+    fn cancel_hold(&self) {
         if self.spent.get() {
             return;
         }
+        self.path.set(None);
+        self.charging.set(None);
+        self.released.set(None);
+        self.cancel_completion();
+        self.cancel_steps();
         self.end_notice();
-        if self.repeats(path) {
-            self.arm_key_alive();
-            return;
-        }
-        self.begin(path);
-        self.arm_key_alive();
+        self.heat.stop();
+        self.heat.set(0.0);
+        self.label.set(HoldLabel::Idle);
     }
 
-    /// One `Ctrl+Enter` press or auto-repeat ([`key_hold`]): a repeat on its
-    /// own path keeps the charge; anything else starts over, and the hold is
-    /// continuous or it authorizes nothing.
-    fn ctrl_press(&self) {
+    /// One raw `KeyDown` on the focused card. A watched key (Enter, Space or
+    /// the modifier) is the card's; an auto-repeat neither charges nor
+    /// cancels. A fresh press of Enter/Space on the focused Send control
+    /// begins from zero; anywhere else in the card it cancels the card, as
+    /// the focused default (Cancel) does. A fresh modifier press cancels the
+    /// charge and starts nothing; `Ctrl+Enter` begins the charge wherever the
+    /// focus is inside the card.
+    fn key_down(&self, event: &KeyEvent) {
         if self.spent.get() {
             return;
         }
-        self.end_notice();
-        if !self.repeats(HoldPath::CtrlEnter) {
-            self.begin(HoldPath::CtrlEnter);
+        let role = role_of(&event.key);
+        if role == KeyRole::Other || event.repeat {
+            return;
         }
-        self.arm_key_alive();
-    }
-
-    /// Whether one press continues the charge in progress: the same path owns
-    /// it and the hook has seen no release or fresh press since it began.
-    fn repeats(&self, path: HoldPath) -> bool {
-        self.charging.get().is_some() && self.path.get() == Some(path) && !self.break_seen()
-    }
-
-    /// Watches the hold while it charges: a keyboard hold ends when the hook
-    /// sees a transition, and any hold ends when the window loses the
-    /// foreground.
-    fn watch_hold(&self) {
-        self.cancel_watch();
-        let hold = self.clone();
-        let slot = self.watch.clone();
-        *slot.borrow_mut() = Some(set_interval(
-            Duration::from_millis(motion::HEAT_TICK_MS),
-            move || {
-                if hold.spent.get() || hold.charging.get().is_none() {
-                    return;
+        match role {
+            KeyRole::Control => self.release(),
+            KeyRole::Enter => {
+                if event.modifiers.ctrl || event.modifiers.cmd {
+                    self.begin(HoldPath::CtrlEnter);
+                } else if event.modifiers.shift || event.modifiers.alt {
+                    // A shifted Enter is not the hold: it sits in the capture
+                    // so the platform does not press the focused control.
+                } else if self.focused.get() {
+                    self.begin(HoldPath::SendEnter);
+                } else {
+                    cancel(&self.state, self.kind);
                 }
-                let source = keyboard_source();
-                if !source.foreground() {
-                    hold.release();
-                    return;
-                }
-                if hold.path.get().is_some_and(HoldPath::is_keyboard)
-                    && hold.hook_ready.get()
-                    && source.transition()
+            }
+            KeyRole::Space => {
+                if event.modifiers.ctrl
+                    || event.modifiers.cmd
+                    || event.modifiers.shift
+                    || event.modifiers.alt
                 {
-                    hold.release();
+                } else if self.focused.get() {
+                    self.begin(HoldPath::SendSpace);
+                } else {
+                    cancel(&self.state, self.kind);
                 }
-            },
-        ));
-    }
-
-    /// Whether the hook saw a transition the charge in progress does not
-    /// stand for: the keyboard hold came apart and nothing may resume it.
-    fn break_seen(&self) -> bool {
-        self.hook_ready.get() && keyboard_source().transition()
-    }
-
-    /// Re-arms the watchdog that ends a keyboard hold whose release went
-    /// unobserved. It never authorizes.
-    fn arm_key_alive(&self) {
-        self.cancel_key_alive();
-        let hold = self.clone();
-        let slot = self.key_alive.clone();
-        *slot.borrow_mut() = Some(set_timeout(
-            Duration::from_millis(KEY_ALIVE_MS as u64),
-            move || {
-                hold.key_alive.borrow_mut().take();
-                hold.release();
-            },
-        ));
-    }
-
-    /// Remove this hold's hook. A removal that fails keeps the platform's
-    /// handle for a later retry and refuses the next install until it is gone.
-    fn remove_hook(&self) {
-        if self.hook.get() && keyboard_source().remove() {
-            self.hook.set(false);
+            }
+            KeyRole::Other => {}
         }
     }
 
-    /// The charge is full: authorize exactly once, after the platform confirms
-    /// this process is foreground and a keyboard hold is still intact.
+    /// One raw `KeyUp` on the focused card: the release of a watched key
+    /// ends the keyboard charge in progress. A pointer hold is the pointer's
+    /// to end, so an unrelated release never breaks it.
+    fn key_up(&self, event: &KeyEvent) {
+        if self.spent.get() || role_of(&event.key) == KeyRole::Other {
+            return;
+        }
+        if self.path.get().is_some_and(HoldPath::is_keyboard) {
+            self.release();
+        }
+    }
+
+    /// The charge is full: authorize exactly once. The focused card heard
+    /// every transition that could have ended the hold; nothing else is
+    /// queried.
     fn complete(&self) {
         if self.spent.get() {
             return;
         }
-        let source = keyboard_source();
-        if !source.foreground() {
-            self.release();
-            return;
-        }
-        if self.path.get().is_some_and(HoldPath::is_keyboard)
-            && (!self.hook_ready.get() || source.transition() || !self.keys_down())
-        {
-            self.release();
-            return;
-        }
         self.spent.set(true);
         self.path.set(None);
-        self.hook_ready.set(false);
-        self.remove_hook();
-        self.cancel_watch();
         self.charging.set(None);
         self.released.set(None);
         self.cancel_completion();
-        self.cancel_key_alive();
         self.cancel_steps();
         self.end_notice();
         self.heat.stop();
@@ -2035,18 +1512,6 @@ impl Hold {
             self.state.send_translation();
         } else {
             self.state.send_review();
-        }
-    }
-
-    fn keys_down(&self) -> bool {
-        let source = keyboard_source();
-        match self.path.get() {
-            Some(HoldPath::CtrlEnter) => {
-                source.key_down(WatchedKey::Enter) && source.key_down(WatchedKey::Control)
-            }
-            Some(HoldPath::SendEnter) => source.key_down(WatchedKey::Enter),
-            Some(HoldPath::SendSpace) => source.key_down(WatchedKey::Space),
-            _ => true,
         }
     }
 
@@ -2073,18 +1538,6 @@ impl Hold {
 
     fn cancel_completion(&self) {
         if let Some(task) = self.completion.borrow_mut().take() {
-            task.cancel();
-        }
-    }
-
-    fn cancel_key_alive(&self) {
-        if let Some(task) = self.key_alive.borrow_mut().take() {
-            task.cancel();
-        }
-    }
-
-    fn cancel_watch(&self) {
-        if let Some(task) = self.watch.borrow_mut().take() {
             task.cancel();
         }
     }
@@ -2285,18 +1738,17 @@ impl S {
 mod tests {
     use super::*;
     use mt_core::model::{ModelOperation, ModelRequestDisclosure, OutboundScope, Provider};
+    use nsh_core::keymap::Modifiers;
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default, Clone, Debug, PartialEq, Eq)]
     pub(super) struct FocusTrace(Vec<FocusStop>);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum FocusStop {
+        Card,
         Scope,
         Cancel,
         Hold,
@@ -2433,9 +1885,9 @@ mod tests {
 
     #[test]
     fn a_tap_can_never_complete_a_hold() {
-        // A keyboard tap charges for one watchdog at most; that must stay short
-        // of the charge a send needs.
-        let tapped = charged(0.0, KEY_ALIVE_MS);
+        // A tap is orders shorter than the charge a send needs: whatever it
+        // leaves, it cannot reach the completion.
+        let tapped = charged(0.0, 50.0);
         assert!(
             remaining_ms(tapped) > 0.0,
             "a single tap leaves charge to hold for"
@@ -2666,9 +2118,13 @@ mod tests {
     }
 
     pub(super) fn start_harness() -> Headless {
-        // A late frame once ran hold completion before its watchdog; manual time orders them.
+        // A late frame once ran hold completion before its timer; manual time orders them.
         let mut config = EngineConfig::new(Root::of::<Harness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
+        // A platform that focuses ordinary views and delivers focused-view
+        // keys, as the Windows host does: the card takes the focus and its
+        // raw handlers hear the tests' key events.
+        config.environment.os = nsh_core::element::Os::Linux;
         let mut app = Headless::start(config).expect("start the harness");
         app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
             .expect("viewport");
@@ -2814,7 +2270,7 @@ mod tests {
         );
         assert!(
             app.wait_for("id:consent-key-hint >> text:Enter").is_ok(),
-            "the focus-independent hold is on the card"
+            "the card's hint names the hold's keys"
         );
         assert!(
             app.wait_for("id:consent-destination >> text:/^Remote · /")
@@ -3048,7 +2504,7 @@ mod tests {
     #[test]
     fn reduced_motion_steps_the_hold_and_still_sends() {
         // Under reduced motion the charge is the same hold with the same
-        // watchdogs and the same send; only its drawing steps. The steps
+        // completion and the same send; only its drawing steps. The steps
         // themselves are [`reduced_step`]'s unit test, the pointer hold here
         // cannot be sampled mid-press.
         let mut app = start_harness();
@@ -3081,7 +2537,7 @@ mod tests {
             "the three Tab stops were {:?}",
             app.screen().texts()
         );
-        app.press_key("space").expect("start the hold");
+        dispatch_key(&mut app, " ", true, Modifiers::default(), false);
         app.wait(Duration::from_millis(350))
             .expect("the first third of the hold");
         assert!(app.shows("1/3"), "the hold reached its first third");
@@ -3089,13 +2545,14 @@ mod tests {
         app.set_environment("motion enabled", |env| env.reduce_motion = false)
             .expect("enable motion");
         let progress_kept = app.shows("1/3");
-        app.press_key("space")
-            .expect("the focused hold still owns Space");
-        let focus_kept = app.shows("Send for review?");
+        dispatch_key(&mut app, " ", true, Modifiers::default(), true);
+        let focus_kept = app.shows("1/3");
         assert!(
             progress_kept && focus_kept,
             "progress kept: {progress_kept}; hold kept focus: {focus_kept}"
         );
+        key_up(&mut app, " ", Modifiers::default());
+        assert!(!app.shows("Sent"), "the released hold sent nothing");
     }
 
     #[test]
@@ -3117,7 +2574,7 @@ mod tests {
         for _ in 0..3 {
             app.press_key("tab").expect("tab");
         }
-        app.press_key("space").expect("start the hold");
+        dispatch_key(&mut app, " ", true, Modifiers::default(), false);
         app.wait(Duration::from_millis(350))
             .expect("the first third of the hold");
         let progress_before = app.shows("1/3");
@@ -3127,14 +2584,15 @@ mod tests {
         })
         .expect("dark appearance");
         let progress_kept = app.shows("1/3");
-        app.press_key("space")
-            .expect("the focused hold still owns Space");
-        let hold_responds = app.shows("Send for review?");
+        dispatch_key(&mut app, " ", true, Modifiers::default(), true);
+        let hold_responds = app.shows("1/3");
 
         assert!(
             progress_before && progress_kept && hold_responds,
             "charged before theme change: {progress_before}; charge kept: {progress_kept}; hold responds: {hold_responds}"
         );
+        key_up(&mut app, " ", Modifiers::default());
+        assert!(!app.shows("Sent"), "the released hold sent nothing");
     }
 
     #[test]
@@ -3159,9 +2617,9 @@ mod tests {
 
     #[test]
     fn two_enter_taps_send_nothing_and_cancel() {
-        // The blocker: two accidental presses within the keyboard watchdog
-        // must not carry a charge over the line — there is no charge at all
-        // while the hold control is not focused.
+        // The blocker: two accidental presses must not carry a charge over
+        // the line — there is no charge at all while the hold control is not
+        // focused.
         let mut app = start_harness();
         app.press_key("enter").expect("enter");
         app.press_key("enter").expect("enter again");
@@ -3200,7 +2658,17 @@ mod tests {
         let background_focused = signal(false);
         let background = element_ref();
         effect(move || on_key_with("f6", KeyOptions::default(), move |_| background.focus()));
+        let capture_state = state.clone();
         view()
+            // The shell captures Enter/Space while a consent card is open, so
+            // a stray key never presses the dimmed room.
+            .capture_keys(move || {
+                if is_open(&capture_state) {
+                    key_capture()
+                } else {
+                    KeyCapture::None
+                }
+            })
             .child(
                 view()
                     .test_id("open-consent")
@@ -3231,7 +2699,7 @@ mod tests {
 
     fn shifted_key_keeps_consent_open_without_pressing_the_background(key: &str) {
         let mut config = EngineConfig::new(Root::of::<BackgroundFocusHarness>());
-        config.environment.os = nsh_core::platform::Os::Windows;
+        config.environment.os = nsh_core::platform::Os::Linux;
         config.environment.idiom = nsh_core::platform::Idiom::Desktop;
         let mut app = Headless::start(config).expect("start the harness");
         app.wait_for("id:open-consent").expect("background control");
@@ -3353,9 +2821,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_enter_charges_without_any_focus_and_an_early_release_sends_nothing() {
-        // The focus-independent route: the watchdog ends the charge after
-        // an early release, with nothing authorized.
+    fn ctrl_enter_charges_the_focused_card_and_an_early_release_sends_nothing() {
+        // `Ctrl+Enter` anywhere in the focused card charges; the release ends
+        // the charge at once, with nothing authorized.
         let mut app = start_harness();
         app.press_key("ctrl+enter").expect("ctrl+enter");
         assert!(
@@ -3390,122 +2858,6 @@ mod tests {
         app.wait_for_gone("id:consent-card", Duration::from_secs(2))
             .expect("Enter cancelled: the stale focus was dropped");
         assert!(!app.shows("Sent"), "nothing was sent");
-    }
-
-    /// Serializes the tests that install a scripted keyboard source: the
-    /// source is process-wide, and the engine reads it from another thread.
-    static KEYBOARD_TESTS: Mutex<()> = Mutex::new(());
-
-    /// A scripted [`HoldKeyboard`]: the test thread sets what the engine
-    /// thread's hold reads, standing in for the platform's physical key
-    /// state, its foreground check and the low-level hook.
-    #[derive(Default)]
-    struct ScriptedKeys {
-        keys_down: AtomicBool,
-        foreground: AtomicBool,
-        install_ok: AtomicBool,
-        remove_ok: AtomicBool,
-        installed: AtomicBool,
-        installs: AtomicUsize,
-        transition: AtomicBool,
-    }
-
-    impl ScriptedKeys {
-        fn held() -> Arc<Self> {
-            let keys = Arc::new(Self::default());
-            keys.keys_down.store(true, Ordering::Release);
-            keys.foreground.store(true, Ordering::Release);
-            keys.install_ok.store(true, Ordering::Release);
-            keys.remove_ok.store(true, Ordering::Release);
-            keys
-        }
-
-        fn release_and_repress(&self) {
-            self.transition.store(true, Ordering::Release);
-        }
-
-        fn key_up(&self) {
-            self.keys_down.store(false, Ordering::Release);
-        }
-
-        fn deactivate(&self) {
-            self.foreground.store(false, Ordering::Release);
-        }
-
-        fn fail_install(&self) {
-            self.install_ok.store(false, Ordering::Release);
-        }
-
-        fn fail_remove(&self) {
-            self.remove_ok.store(false, Ordering::Release);
-        }
-
-        fn allow_remove(&self) {
-            self.remove_ok.store(true, Ordering::Release);
-        }
-    }
-
-    impl HoldKeyboard for ScriptedKeys {
-        fn key_down(&self, _: WatchedKey) -> bool {
-            self.keys_down.load(Ordering::Acquire)
-        }
-
-        fn foreground(&self) -> bool {
-            self.foreground.load(Ordering::Acquire)
-        }
-
-        fn install(&self) -> bool {
-            if self.installed.load(Ordering::Acquire) {
-                return false;
-            }
-            self.transition.store(false, Ordering::Release);
-            if !self.install_ok.load(Ordering::Acquire) {
-                return false;
-            }
-            self.installs.fetch_add(1, Ordering::AcqRel);
-            self.installed.store(true, Ordering::Release);
-            true
-        }
-
-        fn remove(&self) -> bool {
-            if !self.installed.load(Ordering::Acquire) {
-                return true;
-            }
-            if !self.remove_ok.load(Ordering::Acquire) {
-                return false;
-            }
-            self.installed.store(false, Ordering::Release);
-            true
-        }
-
-        fn transition(&self) -> bool {
-            self.transition.load(Ordering::Acquire)
-        }
-    }
-
-    struct InstalledKeys(Arc<ScriptedKeys>);
-
-    impl std::ops::Deref for InstalledKeys {
-        type Target = ScriptedKeys;
-
-        fn deref(&self) -> &ScriptedKeys {
-            &self.0
-        }
-    }
-
-    impl Drop for InstalledKeys {
-        fn drop(&mut self) {
-            set_hold_keyboard(None);
-        }
-    }
-
-    fn scripted_hold() -> (std::sync::MutexGuard<'static, ()>, InstalledKeys) {
-        let guard = KEYBOARD_TESTS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let keys = ScriptedKeys::held();
-        set_hold_keyboard(Some(keys.clone()));
-        (guard, InstalledKeys(keys))
     }
 
     /// The card over a state, with the status generation drawn so a hold's
@@ -3555,18 +2907,29 @@ mod tests {
                 text(move || format!("sends: {}", sends_state.status_generation.get()))
                     .test_id("hold-sends"),
             )
+            .child(text(move || {
+                let trace = global::<FocusTrace>();
+                SharedString::from(format!("focus order: {:?}", trace.get().0))
+            }))
     }
 
     fn start_keyboard_harness() -> Headless {
         let mut config = EngineConfig::new(Root::of::<KeyboardHarness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
-        // Reduced motion keeps the charge's drawing off the frame clock, so a
-        // synthetic key press settles without running the charge out.
+        // A platform that focuses ordinary views, as the Windows host does:
+        // the card takes the focus and its controls are Tab stops.
+        config.environment.os = nsh_core::element::Os::Linux;
+        // Reduced motion keeps the charge's drawing off the frame clock, so
+        // synthetic key events settle without running the charge out.
         config.environment.reduce_motion = true;
         let mut app = Headless::start(config).expect("start the harness");
         app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
             .expect("viewport");
         app.wait_for("id:consent-card").expect("the card");
+        app.wait_until("the card's focus", Duration::from_secs(5), |screen| {
+            screen.matches("text:focus order: [Card]") == Ok(true)
+        })
+        .expect("the card takes the keyboard focus");
         app
     }
 
@@ -3583,79 +2946,119 @@ mod tests {
             .expect("the send count")
     }
 
-    fn hold_ctrl_enter(app: &mut Headless, steps: usize) {
-        for _ in 0..steps {
-            app.press_key("ctrl+enter").expect("ctrl+enter");
-            app.run_for(Duration::from_millis(100)).expect("a repeat");
+    /// One raw `KeyDown`/`KeyUp` on the focused card, as the platform's
+    /// focused-view delivery sends it: a harness holds a key by sending the
+    /// down and, later, the up.
+    fn dispatch_key(app: &mut Headless, key: &str, down: bool, modifiers: Modifiers, repeat: bool) {
+        let id = app.screen().id("id:consent-card").expect("the card");
+        let mut event = KeyEvent::default();
+        event.key = SharedString::from(key.to_owned());
+        event.modifiers = modifiers;
+        event.repeat = repeat;
+        let engine = app.engine().control();
+        engine.dispatch_event(
+            id,
+            if down {
+                EventKind::KeyDown
+            } else {
+                EventKind::KeyUp
+            },
+            EventPayload::Key(event),
+        );
+        let (sent, received) = std::sync::mpsc::channel();
+        engine.flush(move |_| {
+            let _ = sent.send(());
+        });
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the key flushed");
+        app.catch_up();
+    }
+
+    fn ctrl_enter() -> Modifiers {
+        Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
         }
+    }
+
+    fn key_down(app: &mut Headless, key: &str, modifiers: Modifiers) {
+        dispatch_key(app, key, true, modifiers, false);
+    }
+
+    fn key_up(app: &mut Headless, key: &str, modifiers: Modifiers) {
+        dispatch_key(app, key, false, modifiers, false);
+    }
+
+    #[test]
+    fn the_card_holds_focus_when_it_opens() {
+        let mut app = start_keyboard_harness();
+        app.wait_until("the card's focus", Duration::from_secs(5), |screen| {
+            screen.matches("text:focus order: [Card]") == Ok(true)
+        })
+        .expect("the card takes the keyboard focus as it opens");
     }
 
     #[test]
     fn a_short_keyboard_press_sends_nothing() {
-        let (_guard, _keys) = scripted_hold();
         let mut app = start_keyboard_harness();
-        app.press_key("ctrl+enter").expect("a tap");
-        app.run_for(Duration::from_millis(1_200))
-            .expect("past the watchdog");
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(100)).expect("held");
+        key_up(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(1_000))
+            .expect("past the charge");
         assert_eq!(send_count(&app), 0, "a tap authorizes nothing");
         assert!(app.shows("Send for review?"), "the card stayed up");
     }
 
     #[test]
     fn a_continuous_keyboard_hold_sends_exactly_once() {
-        let (_guard, _keys) = scripted_hold();
         let mut app = start_keyboard_harness();
-        hold_ctrl_enter(&mut app, 10);
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(1_000))
+            .expect("the full charge");
         assert_eq!(send_count(&app), 1, "the full hold sent once");
-        hold_ctrl_enter(&mut app, 5);
+        key_up(&mut app, "Enter", ctrl_enter());
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(1_000)).expect("again");
         assert_eq!(send_count(&app), 1, "the spent hold never sends again");
     }
 
     #[test]
     fn a_keyup_at_550_ms_sends_nothing() {
-        let (_guard, keys) = scripted_hold();
         let mut app = start_keyboard_harness();
-        app.press_key("ctrl+enter").expect("press at 0 ms");
-        app.run_for(Duration::from_millis(500)).expect("a repeat");
-        app.press_key("ctrl+enter").expect("repeat at 500 ms");
-        app.run_for(Duration::from_millis(50)).expect("to 550 ms");
-        keys.release_and_repress();
-        app.run_for(Duration::from_millis(400))
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(550)).expect("held");
+        key_up(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(500))
             .expect("past 900 ms");
         assert_eq!(send_count(&app), 0, "the release cancelled the hold");
     }
 
     #[test]
     fn a_keyup_before_the_deadline_resets_the_charge_at_once() {
-        let (_guard, keys) = scripted_hold();
         let mut app = start_keyboard_harness();
-        app.press_key("ctrl+enter").expect("press at 0 ms");
-        app.run_for(Duration::from_millis(100)).expect("held");
-        app.press_key("ctrl+enter").expect("a repeat");
-        app.run_for(Duration::from_millis(448)).expect("to 548 ms");
-        keys.release_and_repress();
-        app.run_for(Duration::from_millis(100))
-            .expect("the poll sees the transition");
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(548)).expect("held");
+        key_up(&mut app, "Enter", ctrl_enter());
         assert!(
             app.shows("Nothing was sent."),
             "the release reset the charge before the deadline: {:?}",
             app.screen().texts()
         );
-        app.run_for(Duration::from_millis(300))
+        app.run_for(Duration::from_millis(400))
             .expect("past the first charge's 900 ms");
         assert_eq!(send_count(&app), 0, "nothing was sent");
     }
 
     #[test]
-    fn ctrl_released_and_pressed_again_sends_nothing() {
-        let (_guard, keys) = scripted_hold();
+    fn ctrl_released_and_pressed_again_mid_hold_sends_nothing() {
         let mut app = start_keyboard_harness();
-        app.press_key("ctrl+enter").expect("press at 0 ms");
+        key_down(&mut app, "Enter", ctrl_enter());
         app.run_for(Duration::from_millis(548)).expect("to 548 ms");
-        keys.release_and_repress();
+        dispatch_key(&mut app, "Control", false, Modifiers::default(), false);
         app.run_for(Duration::from_millis(8)).expect("to 556 ms");
-        app.press_key("ctrl+enter")
-            .expect("the repeat after the re-press");
+        dispatch_key(&mut app, "Control", true, Modifiers::default(), false);
         app.run_for(Duration::from_millis(400))
             .expect("past the first hold's 900 ms");
         assert_eq!(
@@ -3666,74 +3069,84 @@ mod tests {
     }
 
     #[test]
-    fn a_hook_that_fails_to_install_sends_nothing() {
-        let (_guard, keys) = scripted_hold();
-        keys.fail_install();
+    fn a_fresh_enter_repress_restarts_the_charge_from_zero() {
         let mut app = start_keyboard_harness();
-        hold_ctrl_enter(&mut app, 10);
-        assert_eq!(send_count(&app), 0, "no hook, no authorization");
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(600)).expect("to 600 ms");
+        key_up(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(50)).expect("a beat");
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(400))
+            .expect("past the first hold's 900 ms");
+        assert_eq!(send_count(&app), 0, "the old hold never authorized");
+        app.run_for(Duration::from_millis(600))
+            .expect("the second hold's full charge");
+        assert_eq!(send_count(&app), 1, "the new hold starts from zero");
     }
 
     #[test]
-    fn a_hook_that_fails_to_remove_never_authorizes_and_does_not_leak() {
-        let (_guard, keys) = scripted_hold();
-        keys.fail_remove();
+    fn an_opening_press_repeat_never_arms_the_card() {
         let mut app = start_keyboard_harness();
-
-        app.press_key("ctrl+enter").expect("press at 0 ms");
-        app.run_for(Duration::from_millis(800))
-            .expect("past the watchdog");
-        assert_eq!(send_count(&app), 0, "the short hold sent nothing");
-        assert_eq!(
-            keys.installs.load(Ordering::Acquire),
-            1,
-            "the hook installs once"
-        );
-        assert!(
-            keys.installed.load(Ordering::Acquire),
-            "the failed removal keeps the handle"
-        );
-
-        // A new hold cannot install while the handle is kept: it never
-        // authorizes, however long it is held.
-        hold_ctrl_enter(&mut app, 10);
+        // The `Ctrl+Enter` that opened the card never reached its handlers;
+        // the auto-repeats that follow carry `repeat` and must not charge.
+        dispatch_key(&mut app, "Enter", true, ctrl_enter(), true);
+        app.run_for(Duration::from_millis(1_000))
+            .expect("a long opening hold");
+        assert_eq!(send_count(&app), 0, "a repeat never arms the card");
+        // The release, then a fresh press: the card arms and the hold sends.
+        key_up(&mut app, "Enter", ctrl_enter());
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(1_000))
+            .expect("the fresh hold");
         assert_eq!(
             send_count(&app),
-            0,
-            "a retained hook refuses the next install"
-        );
-        assert_eq!(
-            keys.installs.load(Ordering::Acquire),
             1,
-            "no new install happened"
+            "the fresh press after the release charges"
         );
+    }
 
-        // Once a removal succeeds, the next hold installs and sends.
-        keys.allow_remove();
-        // Let the refused batch's last charge end, so the next batch starts a
-        // fresh one rather than continuing it.
-        app.run_for(Duration::from_millis(800))
-            .expect("past the refused charge");
-        hold_ctrl_enter(&mut app, 10);
-        assert_eq!(send_count(&app), 1, "the clean hold sent once");
-        assert_eq!(
-            keys.installs.load(Ordering::Acquire),
-            2,
-            "the kept handle was removed before a new install"
-        );
-        assert!(
-            !keys.installed.load(Ordering::Acquire),
-            "nothing is left installed"
-        );
+    #[test]
+    fn blur_mid_hold_sends_nothing() {
+        let mut app = start_keyboard_harness();
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(400)).expect("held");
+        // Tab leaves the card: the focus it had is gone, and with it the hold.
+        app.press_key("tab").expect("leave the card");
+        app.run_for(Duration::from_millis(600))
+            .expect("past 900 ms");
+        assert_eq!(send_count(&app), 0, "a blurred card sends nothing");
+    }
+
+    #[test]
+    fn window_deactivation_mid_hold_sends_nothing() {
+        let mut app = start_keyboard_harness();
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(300)).expect("held");
+        app.set_environment("the window lost the foreground", |env| {
+            env.lifecycle = nsh_core::platform::Lifecycle::Inactive;
+        })
+        .expect("deactivation");
+        app.run_for(Duration::from_millis(700))
+            .expect("past 900 ms");
+        assert_eq!(send_count(&app), 0, "a deactivated window sends nothing");
+        // Back in front, a fresh hold still works.
+        app.set_environment("the window is foreground again", |env| {
+            env.lifecycle = nsh_core::platform::Lifecycle::Active;
+        })
+        .expect("activation");
+        key_up(&mut app, "Enter", ctrl_enter());
+        key_down(&mut app, "Enter", ctrl_enter());
+        app.run_for(Duration::from_millis(1_000))
+            .expect("the fresh hold");
+        assert_eq!(send_count(&app), 1, "the card works again in front");
     }
 
     #[test]
     fn a_pointer_press_during_a_keyboard_hold_sends_nothing() {
         use nsh_core::geometry::point;
 
-        let (_guard, _keys) = scripted_hold();
         let mut app = start_keyboard_harness();
-        app.press_key("ctrl+enter").expect("keyboard press at 0 ms");
+        key_down(&mut app, "Enter", ctrl_enter());
         app.run_for(Duration::from_millis(600)).expect("to 600 ms");
         // The pointer takes over: the keyboard charge ends with its timer,
         // and the pointer's own charge starts from zero at 600 ms.
@@ -3756,21 +3169,14 @@ mod tests {
 
     #[test]
     fn two_short_enter_presses_on_send_send_nothing() {
-        let (_guard, keys) = scripted_hold();
         let mut app = start_keyboard_harness();
-        app.set_environment("a platform that focuses views", |env| {
-            env.os = nsh_core::element::Os::Linux;
-        })
-        .expect("the environment");
-        // Tab's stops: the scope switch, Cancel, then the hold control.
         for _ in 0..3 {
             app.press_key("tab").expect("tab to Send");
         }
-        app.press_key("enter").expect("press at 0 ms");
+        key_down(&mut app, "Enter", Modifiers::default());
         app.run_for(Duration::from_millis(500)).expect("to 500 ms");
-        // The key came up between the two short presses.
-        keys.release_and_repress();
-        app.press_key("enter").expect("press again at 500 ms");
+        key_up(&mut app, "Enter", Modifiers::default());
+        key_down(&mut app, "Enter", Modifiers::default());
         app.run_for(Duration::from_millis(400))
             .expect("past the first press's 900 ms");
         assert_eq!(
@@ -3781,78 +3187,22 @@ mod tests {
     }
 
     #[test]
-    fn window_deactivation_with_the_keys_down_sends_nothing() {
-        let (_guard, keys) = scripted_hold();
+    fn space_on_the_focused_send_charges_and_its_release_cancels() {
         let mut app = start_keyboard_harness();
-        app.press_key("ctrl+enter").expect("press at 0 ms");
-        app.run_for(Duration::from_millis(300)).expect("held");
-        keys.deactivate();
-        app.run_for(Duration::from_millis(700))
+        for _ in 0..3 {
+            app.press_key("tab").expect("tab to Send");
+        }
+        key_down(&mut app, " ", Modifiers::default());
+        app.run_for(Duration::from_millis(500)).expect("held");
+        key_up(&mut app, " ", Modifiers::default());
+        app.run_for(Duration::from_millis(500))
             .expect("past 900 ms");
-        assert_eq!(send_count(&app), 0, "a deactivated window sends nothing");
-        hold_ctrl_enter(&mut app, 10);
-        assert_eq!(send_count(&app), 0, "the foreground check is a gate");
-    }
-
-    #[test]
-    fn hook_install_and_remove_are_paired_on_every_path() {
-        let (_guard, keys) = scripted_hold();
-        let mut app = start_keyboard_harness();
-
-        // Cancel: a charge in flight is removed as the card goes.
-        app.press_key("ctrl+enter").expect("start a charge");
-        assert!(keys.installed.load(Ordering::Acquire), "the hook is in");
-        app.press_key("escape").expect("cancel");
-        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
-            .expect("the card closed");
-        assert!(
-            !keys.installed.load(Ordering::Acquire),
-            "the cancel removed the hook"
-        );
-        assert_eq!(keys.installs.load(Ordering::Acquire), 1);
-
-        app.press("id:hold-reopen").expect("reopen the card");
-        app.press_key("ctrl+enter").expect("start a charge");
-        assert!(keys.installed.load(Ordering::Acquire), "the hook is in");
-        app.press("id:hold-swap").expect("swap the scope");
-        app.wait_for("text:600 B").expect("the swap landed");
-        assert!(
-            !keys.installed.load(Ordering::Acquire),
-            "the rebuild removed the hook"
-        );
-        assert_eq!(keys.installs.load(Ordering::Acquire), 2);
-
-        app.press("id:hold-reopen").expect("reopen the card");
-        hold_ctrl_enter(&mut app, 10);
-        assert_eq!(send_count(&app), 1, "the full hold sent once");
-        assert!(
-            !keys.installed.load(Ordering::Acquire),
-            "the send removed its hook"
-        );
-        assert_eq!(keys.installs.load(Ordering::Acquire), 3);
-    }
-
-    #[test]
-    fn a_key_reported_up_at_the_authorization_moment_sends_nothing() {
-        let (_guard, keys) = scripted_hold();
-        let mut app = start_keyboard_harness();
-        app.press_key("ctrl+enter").expect("press at 0 ms");
-        app.run_for(Duration::from_millis(250)).expect("held");
-        app.press_key("ctrl+enter").expect("a repeat");
-        app.run_for(Duration::from_millis(250)).expect("to 500 ms");
-        keys.key_up();
-        app.press_key("ctrl+enter").expect("a final repeat");
-        app.run_for(Duration::from_millis(400))
-            .expect("past 900 ms");
-        assert_eq!(
-            send_count(&app),
-            0,
-            "the key-state query must confirm the hold"
-        );
-        // Without repeats the watchdog ends it; it never authorizes.
-        app.run_for(Duration::from_millis(800))
-            .expect("past the watchdog");
-        assert_eq!(send_count(&app), 0, "nothing was ever sent");
+        assert_eq!(send_count(&app), 0, "a released Space sends nothing");
+        // A full hold of the same key sends once.
+        key_down(&mut app, " ", Modifiers::default());
+        app.run_for(Duration::from_millis(1_000))
+            .expect("the full charge");
+        assert_eq!(send_count(&app), 1, "a full Space hold sends once");
     }
 
     #[test]
