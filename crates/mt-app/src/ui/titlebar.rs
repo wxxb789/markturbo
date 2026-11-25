@@ -17,7 +17,7 @@ use nsh_core::{
 
 use crate::{
     i18n::{self, Key},
-    state::{AppState, Pane},
+    state::{AppState, Pane, flow_copy},
     ui::{
         consent, motion, notices, prims, revision, shell,
         tokens::{
@@ -439,8 +439,12 @@ fn file_name(state: AppState) -> impl IntoElement {
 fn review_action(state: AppState, language: Language) -> impl IntoElement {
     let enabled_state = state.clone();
     let enabled = move || {
-        enabled_state.active.get().is_some() && enabled_state.revision_hunks.get().is_empty()
+        enabled_state.active.get().is_some()
+            && enabled_state.revision_hunks.get().is_empty()
+            && !enabled_state.review_start_waiting()
     };
+    let press_enabled = enabled.clone();
+    let waiting_state = state.clone();
     let start = state;
     row_action(
         "title-review",
@@ -448,7 +452,7 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
         true,
         enabled,
         move || {
-            if enabled() && !start.reopen_review() {
+            if press_enabled() && !start.reopen_review() {
                 // A newly opened consent card keeps focus; focus_editor
                 // only restores it when Review did not open a modal.
                 start.start_review();
@@ -456,6 +460,11 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
             }
         },
     )
+    .optional_accessibility_description(move || {
+        waiting_state
+            .review_start_waiting()
+            .then(|| SharedString::from(flow_copy::S::ReviewWaitingElsewhere.text(language)))
+    })
 }
 
 /// `Settings`, the word that opens the row's menu: quieter than `Review`,
@@ -515,6 +524,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 "title-menu-open-folder",
                 s(S::OpenFolder, language),
                 Some(shortcut(false, "O")),
+                || true,
                 move || {
                     menu.close();
                     welcome::choose_folder(open_state.clone());
@@ -531,6 +541,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 "title-menu-new-file",
                 s(S::NewFile, language),
                 Some(shortcut(false, "N")),
+                || true,
                 move || {
                     menu.close();
                     new_state.new_document();
@@ -544,6 +555,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 "title-menu-paste",
                 s(S::PasteAsNew, language),
                 None,
+                || true,
                 move || {
                     menu.close();
                     paste_state.new_from_clipboard();
@@ -565,10 +577,17 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                            hint: Option<SharedString>,
                            run: fn(&AppState)| {
                     let state = state.clone();
-                    menu_row(menu, test_id, label, hint, move || {
-                        menu.close();
-                        run(&state);
-                    })
+                    menu_row(
+                        menu,
+                        test_id,
+                        label,
+                        hint,
+                        || true,
+                        move || {
+                            menu.close();
+                            run(&state);
+                        },
+                    )
                     .into_element()
                 };
                 let pane = |test_id: &'static str, label: &'static str, pane: Pane| {
@@ -614,12 +633,30 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                         None,
                         |state| state.translate_active(),
                     ))
-                    .child(row(
-                        "title-menu-review-selection",
-                        s(S::ReviewSelection, language),
-                        None,
-                        |state| state.start_review_selection(),
-                    ))
+                    .child({
+                        let enabled_state = state.clone();
+                        let waiting_state = state.clone();
+                        let review_state = state.clone();
+                        menu_row(
+                            menu,
+                            "title-menu-review-selection",
+                            s(S::ReviewSelection, language),
+                            None,
+                            move || !enabled_state.review_busy_elsewhere.get(),
+                            move || {
+                                menu.close();
+                                review_state.start_review_selection();
+                            },
+                        )
+                        .optional_accessibility_description(move || {
+                            waiting_state.review_busy_elsewhere.get().then(|| {
+                                SharedString::from(
+                                    flow_copy::S::ReviewWaitingElsewhere.text(language),
+                                )
+                            })
+                        })
+                        .into_element()
+                    })
                     .into_element()
             }
         }))
@@ -686,10 +723,17 @@ fn menu_item(
     run: fn(&AppState),
 ) -> impl IntoElement {
     let state = state.clone();
-    menu_row(menu, test_id, label, None, move || {
-        menu.close();
-        run(&state);
-    })
+    menu_row(
+        menu,
+        test_id,
+        label,
+        None,
+        || true,
+        move || {
+            menu.close();
+            run(&state);
+        },
+    )
 }
 
 fn pane_row(
@@ -703,12 +747,19 @@ fn pane_row(
     let on_screen = move || pane_selection.get() == Some(pane);
     let current = on_screen;
     let state = state.clone();
-    menu_row(menu, test_id, label, None, move || {
-        menu.close();
-        if let Some(tab) = state.active_tab() {
-            state.set_pane(tab.id, pane);
-        }
-    })
+    menu_row(
+        menu,
+        test_id,
+        label,
+        None,
+        || true,
+        move || {
+            menu.close();
+            if let Some(tab) = state.active_tab() {
+                state.set_pane(tab.id, pane);
+            }
+        },
+    )
     .accessibility_state(move || AccessibilityState {
         current: current().then_some(AccessibilityCurrent::True),
         ..AccessibilityState::default()
@@ -766,9 +817,11 @@ fn menu_row(
     test_id: &'static str,
     label: &'static str,
     hint: Option<SharedString>,
+    enabled: impl Fn() -> bool + Clone + 'static,
     on_press: impl Fn() + 'static,
 ) -> View {
     let duration = prims::press_color_duration();
+    let label_opacity = enabled.clone();
     prims::press_feedback_with_duration(
         view()
             .test_id(test_id)
@@ -784,7 +837,7 @@ fn menu_row(
             .px(px(SPACE_3))
             .py(px(SPACE_2))
             .group()
-            .disabled(move || !menu.is_open())
+            .disabled(move || !menu.is_open() || !enabled())
             .focusable(move || menu.is_open())
             .on_press(on_press),
         duration,
@@ -794,7 +847,13 @@ fn menu_row(
             .font_family(tokens::FONT_UI)
             .text_size(px(TYPE_UI))
             .line_height(px(TYPE_UI_LINE))
-            .text_color(move || tokens::palette().ink_rest)
+            .text_color(move || {
+                if label_opacity() {
+                    tokens::palette().ink_rest
+                } else {
+                    tokens::with_alpha(tokens::palette().ink_rest, 0.45)
+                }
+            })
             .flex_1()
             .min_w(px(0.0))
             .truncate()
@@ -1481,5 +1540,59 @@ mod tests {
             .expect("the menu closed");
         app.wait_for("text:target: true other: true")
             .expect("the document view took the focus back");
+    }
+
+    /// The row over two documents with a Review in flight on the first: the
+    /// Review entry points wait and say why.
+    #[component]
+    fn ReviewWaitProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.new_document();
+        let first = state.active.get().expect("the first document");
+        state.arm_review_in_flight(first);
+        state.new_document();
+        title_row(state, Language::English)
+    }
+
+    #[test]
+    fn review_entry_points_wait_for_another_documents_review() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewWaitProbe>()))
+            .expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(600.0), Points(900.0)))
+            .expect("viewport");
+        app.wait_for("id:title-review").expect("the row");
+        assert!(
+            app.screen()
+                .accessibility_state("id:title-review")
+                .expect("Review's state")
+                .disabled,
+            "the Review action waits"
+        );
+        assert_eq!(
+            app.screen()
+                .accessibility_description("id:title-review")
+                .expect("Review's description")
+                .as_deref(),
+            Some("Waiting for Review on another document."),
+            "the Review action says why"
+        );
+        app.press("id:title-settings").expect("open the menu");
+        app.wait_for("id:title-menu-review-selection")
+            .expect("the menu's Review row");
+        assert!(
+            app.screen()
+                .accessibility_state("id:title-menu-review-selection")
+                .expect("Review selection's state")
+                .disabled,
+            "the menu's Review waits"
+        );
+        assert_eq!(
+            app.screen()
+                .accessibility_description("id:title-menu-review-selection")
+                .expect("Review selection's description")
+                .as_deref(),
+            Some("Waiting for Review on another document."),
+            "the menu's Review says why"
+        );
     }
 }

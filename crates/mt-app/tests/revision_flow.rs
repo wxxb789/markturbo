@@ -1882,9 +1882,14 @@ fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
     app.press_key("escape").expect("cancel B's Review");
     app.wait_for_gone("id:review-field", Duration::from_secs(2))
         .expect("B's cancelled wait closed");
+    let (b_checked_tx, b_checked_rx) = std::sync::mpsc::channel::<()>();
+    mt_app::test_vault::on_review_generation_checked(move || {
+        let _ = b_checked_tx.send(());
+    });
     release_b_review.send(()).expect("release B's answer");
-    app.wait(Duration::from_millis(300))
-        .expect("B's late answer lands");
+    b_checked_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("B's late answer reached its generation check");
     app.catch_up();
     let ids: Vec<String> = app
         .screen()
@@ -1896,6 +1901,20 @@ fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
         !ids.iter().any(|id| id == "review-prepare"),
         "the cancelled Review must never land: {ids:?}"
     );
+    // Nor is it stored: `Review` starts a new request instead of reopening a
+    // result the cancel discarded.
+    app.press("id:title-review")
+        .expect("Review after B's late answer");
+    app.wait_for_within("id:consent-card", Duration::from_secs(5))
+        .expect("the discarded result cannot be reopened; a new Review starts instead");
+    assert!(
+        !app.shows("keep the document intent"),
+        "nothing of the late result is shown"
+    );
+    app.press("id:consent-cancel-button")
+        .expect("cancel the new consent");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the consent closed");
 
     // A's release must still land on A, under its own name.
     release_revision
@@ -1914,6 +1933,159 @@ fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
     server_done_rx
         .recv_timeout(Duration::from_secs(20))
         .expect("the server finished");
+    let _ = server.join();
+}
+
+// A Revision on one document blocks `Prepare revision` on another, with the
+// reason visible; closing the first tab cancels its request and frees the
+// slot for the next one.
+#[test]
+fn a_revision_on_another_document_waits_and_closing_its_tab_frees_it() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let (review_output, revision_output) = two_change_outputs(source);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (revision_started_tx, revision_started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_revision, revision_waits) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        // A's Review answers at once.
+        let Some(mut stream) = accept_within(&listener, Duration::from_secs(20)) else {
+            return;
+        };
+        read_http_body(&mut stream);
+        write_review_json(&mut stream, &review_output);
+        // A's Revision is held open.
+        let Some(mut stream) = accept_within(&listener, Duration::from_secs(20)) else {
+            return;
+        };
+        read_http_body(&mut stream);
+        let _ = revision_started_tx.send(());
+        let revision = std::thread::spawn(move || {
+            let _ = revision_waits.recv_timeout(Duration::from_secs(60));
+            write_sse(&mut stream, &revision_output);
+        });
+        // B's Review answers while the Revision still waits.
+        let Some(mut stream) = accept_within(&listener, Duration::from_secs(20)) else {
+            return;
+        };
+        read_http_body(&mut stream);
+        write_review_json(&mut stream, &review_output);
+        let _ = revision.join();
+    });
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    let other = directory.path().join("other.md");
+    std::fs::write(&document, source).expect("write document");
+    std::fs::write(&other, source).expect("write other document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    // A's Review, then A's Revision: the server holds the Revision open.
+    app.press("id:title-review").expect("prepare A's Review");
+    app.wait_for("id:consent-card").expect("A's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("A's result");
+    app.press("label:Prepare revision")
+        .expect("prepare A's Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("A's Revision card");
+    support::hold_send(&mut app);
+    app.wait_for("id:revision-busy")
+        .expect("A's Revision is in flight");
+    revision_started_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("A's Revision reached the server");
+
+    // B gets its own Review result; `Prepare revision` waits, with the reason.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    app.press("id:title-review").expect("prepare B's Review");
+    app.wait_for("id:consent-card").expect("B's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("B's result");
+    app.wait_for_within(
+        "text:Waiting for Revision on another document.",
+        Duration::from_secs(5),
+    )
+    .expect("the reason is shown");
+    assert!(
+        app.screen()
+            .accessibility_state("id:review-prepare")
+            .expect("Prepare revision's state")
+            .disabled,
+        "Prepare revision is disabled while another document's Revision is in flight"
+    );
+
+    // Closing A cancels its Revision and frees the slot for B.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter back to plan.md");
+    app.press("id:palette-row").expect("back to A");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("A's tab");
+    app.press_key("mod+w").expect("close A");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B is active again");
+    app.wait_for_gone(
+        "text:Waiting for Revision on another document.",
+        Duration::from_secs(2),
+    )
+    .expect("the reason is gone");
+    assert!(
+        !app.screen()
+            .accessibility_state("id:review-prepare")
+            .expect("Prepare revision's state")
+            .disabled,
+        "the closed tab freed the slot"
+    );
+    app.press("label:Prepare revision")
+        .expect("prepare B's Revision");
+    app.wait_for_within("text:Ask for a revision?", Duration::from_secs(5))
+        .expect("the slot is free");
+    app.press("id:consent-cancel-button")
+        .expect("cancel the Revision consent");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the consent closed");
+    release_revision
+        .send(())
+        .expect("release A's Revision answer");
     let _ = server.join();
 }
 

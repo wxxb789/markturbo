@@ -207,6 +207,9 @@ pub struct AppState {
     pub review_manifest: Signal<Option<OutboundConsent>>,
     pub review_view: Signal<Option<ReviewView>>,
     pub review_busy: Signal<bool>,
+    /// A Review is in flight on a tab other than the active one: the room's
+    /// Review entry points wait for it and say why.
+    pub review_busy_elsewhere: Signal<bool>,
     /// The source column's camera ([`DocumentFocus`]): the line a docked
     /// surface wants levelled with it. Set it with
     /// [`AppState::focus_document_line`].
@@ -237,6 +240,9 @@ pub struct AppState {
     pub revision_status: Signal<Option<SharedString>>,
     pub(crate) revision_status_error: Signal<bool>,
     pub revision_busy: Signal<bool>,
+    /// A Revision is in flight on a tab other than the active one: another
+    /// tab's `Prepare revision` waits for it and says why.
+    pub revision_busy_elsewhere: Signal<bool>,
     /// How many hunks the last `Done` discarded undecided (never written);
     /// zero when there is nothing to report.
     pub revision_not_applied: Signal<usize>,
@@ -742,6 +748,7 @@ impl AppState {
             review_manifest: signal(None),
             review_view: signal(None),
             review_busy: signal(false),
+            review_busy_elsewhere: signal(false),
             document_focus: signal(DocumentFocus::default()),
             review_unavailable: signal(None),
             translation_busy: signal(false),
@@ -756,6 +763,7 @@ impl AppState {
             revision_status: signal(None),
             revision_status_error: signal(false),
             revision_busy: signal(false),
+            revision_busy_elsewhere: signal(false),
             revision_not_applied: signal(0),
             preview_slot: signal(None),
             vault,
@@ -1491,8 +1499,11 @@ impl AppState {
             .borrow()
             .as_ref()
             .map(|origin| origin.tab_id);
+        let active = self.active.get();
         self.review_busy
-            .set(owner.is_some_and(|owner| self.active.get() == Some(owner)));
+            .set(owner.is_some_and(|owner| active == Some(owner)));
+        self.review_busy_elsewhere
+            .set(owner.is_some_and(|owner| active != Some(owner)));
     }
 
     fn refresh_revision_busy(&self) {
@@ -1501,8 +1512,11 @@ impl AppState {
             .borrow()
             .as_ref()
             .map(|(tab_id, _)| *tab_id);
+        let active = self.active.get();
         self.revision_busy
-            .set(owner.is_some_and(|owner| self.active.get() == Some(owner)));
+            .set(owner.is_some_and(|owner| active == Some(owner)));
+        self.revision_busy_elsewhere
+            .set(owner.is_some_and(|owner| active != Some(owner)));
     }
 
     fn review_result(&self, id: u64) -> Option<ReviewView> {
@@ -2211,6 +2225,10 @@ impl AppState {
     }
 
     fn close_tab_now(&self, id: u64) {
+        // The tab's live model work goes with it: the cancel frees the
+        // app-wide Review and Revision slots for the remaining tabs.
+        self.cancel_review_owned_by(id);
+        self.cancel_revision_owned_by(id);
         if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() {
             self.retire_tab_recovery(&tab);
         }
@@ -2674,7 +2692,12 @@ impl AppState {
     /// Prepare one Review: bind the frozen document request, resolve the
     /// configured endpoint and credential, and show the exact disclosure.
     /// Nothing leaves the machine until [`send_review`](Self::send_review).
+    /// A Review in flight on another document waits its turn, and says so.
     pub fn start_review(&self) {
+        if self.review_busy_elsewhere.get_untracked() {
+            self.notify_review_waiting();
+            return;
+        }
         self.prepare_review(false);
     }
 
@@ -2682,6 +2705,10 @@ impl AppState {
     /// the request, the disclosure and the bytes are the selected text's
     /// alone. Without a non-empty selection nothing is prepared.
     pub fn start_review_selection(&self) {
+        if self.review_busy_elsewhere.get_untracked() {
+            self.notify_review_waiting();
+            return;
+        }
         self.prepare_review(true);
     }
 
@@ -2795,13 +2822,22 @@ impl AppState {
     /// [`start_review`](Self::start_review) for the whole document, or for
     /// the selection with `selection`.
     fn prepare_review(&self, selection: bool) {
-        // A review that is prepared replaces any review still in flight: its
-        // task writes nothing when it comes back, and the loading state it
-        // left is not this run's to show — the early returns below must not
-        // leave the field saying `Reviewing…`.
-        self.review_generation.update(|generation| *generation += 1);
-        self.review_in_flight.borrow_mut().take();
-        self.refresh_review_busy();
+        // One Review is in flight app-wide. This tab's own request is
+        // replaced, so its generation goes first; another document's request
+        // is not this tab's to touch (the entry points wait and say why).
+        let active = self.active.get_untracked();
+        let owner = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .map(|origin| origin.tab_id);
+        if let Some(owner) = owner {
+            if Some(owner) == active {
+                self.cancel_review_owned_by(owner);
+            } else {
+                return;
+            }
+        }
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -3521,6 +3557,13 @@ impl AppState {
     /// text that is gone, and Review again is the only next step.
     pub fn start_revision(&self) {
         if self.revision_cancellation.borrow().is_some() {
+            if self.revision_busy_elsewhere.get_untracked() {
+                self.notify_at(
+                    StatusSurface::Review,
+                    StatusKind::Info,
+                    flow_copy::S::RevisionWaitingElsewhere.text(self.settings.get().language),
+                );
+            }
             return;
         }
         let context = self.revision_context.borrow().as_ref().map(|context| {
@@ -4113,21 +4156,35 @@ impl AppState {
         }
     }
 
-    /// Withdraw a review whose request is already in flight: the task's
-    /// generation becomes stale, so when the model answers it writes nothing
-    /// — no view, no revision context, no busy flag. What the user cancelled
-    /// stays cancelled, and the notice says so without claiming a recall.
-    pub fn cancel_review_in_flight(&self) {
+    fn cancel_review_owned_by(&self, tab_id: u64) {
         let owned = self
             .review_in_flight
             .borrow()
             .as_ref()
-            .is_some_and(|origin| self.active.get_untracked() == Some(origin.tab_id));
+            .is_some_and(|origin| origin.tab_id == tab_id);
         if !owned {
             return;
         }
         self.review_generation.update(|generation| *generation += 1);
         self.review_in_flight.borrow_mut().take();
+        self.refresh_review_busy();
+    }
+
+    /// Withdraw the Review request the tab on screen owns: the task's
+    /// generation becomes stale, so when the model answers it writes nothing
+    /// — no view, no revision context, no busy flag. What the user cancelled
+    /// stays cancelled, and the notice says so without claiming a recall.
+    pub fn cancel_review_in_flight(&self) {
+        let Some(tab_id) = self
+            .review_in_flight
+            .borrow()
+            .as_ref()
+            .filter(|origin| self.active.get_untracked() == Some(origin.tab_id))
+            .map(|origin| origin.tab_id)
+        else {
+            return;
+        };
+        self.cancel_review_owned_by(tab_id);
         self.cancel_review();
         self.notify_at(
             StatusSurface::Editor,
@@ -4150,21 +4207,43 @@ impl AppState {
         }
     }
 
-    /// Reopen the hidden Review result for the active tab, if there is one:
+    /// Whether the active tab's hidden Review result could be reopened:
     /// closing the field is not a discard, so the titlebar Review brings the
     /// result back before it prepares a new one.
+    pub fn can_reopen_review(&self) -> bool {
+        !self.review_open.get()
+            && self
+                .review_view
+                .get()
+                .is_some_and(|view| view.tab_id.is_none_or(|tab| self.active.get() == Some(tab)))
+    }
+
+    /// Reopen the hidden Review result for the active tab, if there is one.
     pub fn reopen_review(&self) -> bool {
-        if self.review_open.get_untracked() {
-            return false;
-        }
-        let Some(view) = self.review_view.get_untracked() else {
-            return false;
-        };
-        if view.tab_id.is_some() && view.tab_id != self.active.get() {
+        if !self.can_reopen_review() {
             return false;
         }
         self.review_open.set(true);
         true
+    }
+
+    /// Whether a Review entry point must wait: a Review is in flight on
+    /// another document, and this tab has no hidden result to reopen.
+    pub fn review_start_waiting(&self) -> bool {
+        self.review_busy_elsewhere.get() && !self.can_reopen_review()
+    }
+
+    fn notify_review_waiting(&self) {
+        let surface = if self.review_open.get_untracked() {
+            StatusSurface::Review
+        } else {
+            StatusSurface::Editor
+        };
+        self.notify_at(
+            surface,
+            StatusKind::Info,
+            flow_copy::S::ReviewWaitingElsewhere.text(self.settings.get().language),
+        );
     }
 
     pub fn open_settings(&self) {

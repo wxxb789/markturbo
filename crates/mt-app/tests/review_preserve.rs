@@ -266,6 +266,140 @@ fn a_preserved_review_reopens_and_escapes_the_wait() {
         .expect("the consent closed");
 }
 
+// A Review on one document blocks the Review entry points of another: no
+// consent card opens, the reason is visible, and the first document's answer
+// still lands on its own tab.
+#[test]
+fn a_review_in_flight_elsewhere_blocks_a_second_review() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let output = serde_json::json!({
+        "schema_version": "review-v1",
+        "scope": {"kind": "document"},
+        "understood_intent": {
+            "stated_goal": RESULT,
+            "relevant_context": [],
+            "constraints": [],
+            "non_goals": [],
+            "expected_deliverable": "a reviewed document",
+            "success_evidence": [],
+            "inferred_assumptions": [],
+            "unresolved_decisions": []
+        },
+        "findings": [],
+        "clarification_questions": []
+    })
+    .to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (started_tx, started_rx) = mpsc::sync_channel::<()>(1);
+    let (release, waiting) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let Some(mut stream) = accept_within(&listener, Duration::from_secs(20)) else {
+            return;
+        };
+        let _ = read_http_body(&mut stream);
+        let _ = started_tx.send(());
+        let _ = waiting.recv_timeout(Duration::from_secs(60));
+        write_review_json(&mut stream, &output);
+    });
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = dir.path().join("plan.md");
+    let other = dir.path().join("other.md");
+    std::fs::write(&document, "# Plan\nA document under review.\n").expect("write fixture");
+    std::fs::write(&other, "# Other\n").expect("write other fixture");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target().to_string();
+    std::fs::write(
+        config.path().join("settings.toml"),
+        format!(
+            "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\n"
+        ),
+    )
+    .expect("write settings");
+
+    // SAFETY: this binary serializes app lifetimes and environment changes
+    // behind `TEST_LOCK`.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    // A's Review goes out; the server holds the answer.
+    app.press("id:title-review").expect("open A's Review");
+    app.wait_for("id:consent-card").expect("A's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for("id:review-cancel").expect("A's waiting line");
+    started_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("A's Review reached the server");
+
+    // On B the entry point is disabled and says why: no card, no request.
+    app.press_key("mod+p").expect("open the file palette");
+    app.wait_for("id:palette-input").expect("the palette input");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    assert!(
+        app.screen()
+            .accessibility_state("id:title-review")
+            .expect("Review's state")
+            .disabled,
+        "Review is disabled while another document's Review is in flight"
+    );
+    app.press_key("mod+enter").expect("Ctrl+Enter on B");
+    app.wait_for_within(
+        "text:Waiting for Review on another document.",
+        Duration::from_secs(5),
+    )
+    .expect("the reason is shown");
+    assert_eq!(
+        app.screen().matches("id:consent-card"),
+        Ok(false),
+        "no consent card opens: {:?}",
+        app.screen().texts()
+    );
+
+    // A's answer still lands on A.
+    release.send(()).expect("release A's answer");
+    app.press_key("mod+p").expect("open the palette again");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter back to plan.md");
+    app.press("id:palette-row").expect("back to A");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("A's tab again");
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("A's result landed on A");
+    app.wait_for(&format!("text:{RESULT}"))
+        .expect("A's result text");
+    let _ = server.join();
+}
+
 // A late Review result never takes the keyboard from an open consent card:
 // the card keeps the focus, a character never reaches the answer field
 // behind it, and the card's own handlers still measure `Ctrl+Enter`.
@@ -393,6 +527,28 @@ fn a_late_review_result_leaves_the_card_its_focus() {
     app.press_key("ctrl+enter").expect("a tap on the card");
     app.wait_for("text:Nothing was sent.")
         .expect("the card measured the press");
+}
+
+fn accept_within(listener: &TcpListener, timeout: Duration) -> Option<TcpStream> {
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).expect("blocking stream");
+                return Some(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {

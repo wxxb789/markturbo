@@ -16,6 +16,8 @@ pub(crate) enum S {
     RevisionFailed,
     RevisionTaskFailed,
     RevisionOtherTab,
+    ReviewWaitingElsewhere,
+    RevisionWaitingElsewhere,
     RevisionUnknownChange,
     RevisionCannotApply,
     RevisionCannotUndo,
@@ -70,6 +72,14 @@ impl S {
             (S::RevisionOtherTab, Language::Chinese) => {
                 "此修订属于另一个标签页。请切回该标签页以接受或拒绝修改。"
             }
+            (S::ReviewWaitingElsewhere, Language::English) => {
+                "Waiting for Review on another document."
+            }
+            (S::ReviewWaitingElsewhere, Language::Chinese) => "正在等待另一个文档的审查。",
+            (S::RevisionWaitingElsewhere, Language::English) => {
+                "Waiting for Revision on another document."
+            }
+            (S::RevisionWaitingElsewhere, Language::Chinese) => "正在等待另一个文档的修订。",
             (S::RevisionUnknownChange, Language::English) => {
                 "This change is not part of the revision."
             }
@@ -205,6 +215,26 @@ mod tests {
         model::{EndpointIdentity, Provider},
         translate::provider::TranslationError,
     };
+
+    #[test]
+    fn waiting_elsewhere_names_the_kind_in_both_languages() {
+        assert_eq!(
+            S::ReviewWaitingElsewhere.text(Language::English),
+            "Waiting for Review on another document."
+        );
+        assert_eq!(
+            S::ReviewWaitingElsewhere.text(Language::Chinese),
+            "正在等待另一个文档的审查。"
+        );
+        assert_eq!(
+            S::RevisionWaitingElsewhere.text(Language::English),
+            "Waiting for Revision on another document."
+        );
+        assert_eq!(
+            S::RevisionWaitingElsewhere.text(Language::Chinese),
+            "正在等待另一个文档的修订。"
+        );
+    }
 
     #[test]
     fn a_prepare_failure_says_the_next_step_in_both_languages() {

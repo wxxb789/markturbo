@@ -35,7 +35,7 @@ use crate::{
     i18n::{self, Key},
     state::{
         AppState, ReviewFailure, ReviewFindingView, ReviewQuestionView, ReviewUnavailable,
-        ReviewView, Tab,
+        ReviewView, Tab, flow_copy,
     },
     ui::{
         consent, glow,
@@ -1155,6 +1155,8 @@ fn footer(
     let done =
         review.questions_detail.is_empty() || current_question(&session_now, &order).is_none();
     let stale = review.stale;
+    let waiting = state.revision_busy_elsewhere.get();
+    let waiting_state = state.clone();
     let prepare_state = state.clone();
     let prepare_session = session;
     let close_state = state.clone();
@@ -1242,6 +1244,8 @@ fn footer(
                             prepare_state.start_revision();
                         },
                     )
+                    .disabled(move || waiting)
+                    .disabled_style(|s| s.opacity(0.45))
                     .element_ref(&reference)
                     .into_element()
                 } else {
@@ -1250,8 +1254,17 @@ fn footer(
                         s(S::PrepareRevision, language),
                         move || prepare_revision(&prepare_state, prepare_session),
                     )
+                    .disabled(move || waiting)
+                    .disabled_style(|s| s.opacity(0.45))
                     .into_element()
                 })
+                .child(when(
+                    move || waiting_state.revision_busy_elsewhere.get() && !stale,
+                    move || {
+                        prims::faint(flow_copy::S::RevisionWaitingElsewhere.text(language))
+                            .into_element()
+                    },
+                ))
                 .child(prims::quiet_action(
                     "review-close",
                     s(S::Close, language),
