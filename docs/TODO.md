@@ -157,3 +157,10 @@
     finishes. Clear it when the slot frees.
   - While a Review is in flight elsewhere, "Review with context" in the Context panel closes the panel and opens no
     card. Disable it with the same reason instead.
+- [ ] **Pre-existing layout P2: in narrow Split windows the preview covers the editor status line's Undo.**
+  - Seen at 1000 px wide: the opaque preview panel (`crates/mt-app/src/ui/shell.rs`, from x=540 to the right edge)
+    covers the right end of the editor status line, where the live Undo button renders.
+  - The user cannot press Undo before the 5 s deadline commits the action. The layout is unchanged by PR #72; the
+    PR #72 round-12 review found it.
+  - Fix in a follow-up: keep the status line's action inside the visible editor column. Add a Headless test at 1000 px
+    in Split.
