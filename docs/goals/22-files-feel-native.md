@@ -89,7 +89,8 @@ app must never lock files while picking up other editors' changes promptly, with
    - **Motion.**
      - Spatial and continuous: ease-out with a slight settle, from `ui::motion` tokens. The divider uses the camera
        duration; the sidebar uses the rail widen duration.
-     - Every movement can be interrupted and reverses from its current value.
+     - Every movement can be interrupted. It retargets from its current value toward the new stop without a jump, and
+       it moves backwards only when the new stop is behind it.
      - With reduced motion, movement becomes an opacity change.
      - This goal owns the sidebar and divider motion. Goal 21 later tunes it, and does not redo it.
    - **Every open tab stays one click away.** The titlebar tab strip remains and lists every open tab, expanded or
@@ -105,7 +106,9 @@ app must never lock files while picking up other editors' changes promptly, with
        identifies them as folders. It shows "Open plan.md" for one, or "Open 3 files" for several.
      - When nothing can be confirmed (no names, or only inferred types), it says "Drop to open". Skipped items are
        reported after the drop, by decision 3's count notice.
-     - When every known name is an unsupported type, it says "Can't open this file type" instead.
+     - It says "Can't open this file type" only when every item is confirmed to be a file of an unsupported type. An
+       item that might be a folder, because the event carries only a name and an inferred MIME, is never treated as
+       unsupported.
      - The prototype's "side being dragged over" is not required.
      - The screen clears on leave or drop.
    - **Clean reload.** The changed text slips about 6 px as the old text leaves and the new text arrives. It never
