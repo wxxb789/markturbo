@@ -1732,6 +1732,119 @@ fn a_background_reviews_answer_leaves_a_sent_revisions_result_alone() {
     let _ = server.join();
 }
 
+#[test]
+fn sending_another_tabs_review_leaves_a_sent_revision_alone() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let (review_output, revision_output) = two_change_outputs(source);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let (revision_started_tx, revision_started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let (release_revision, revision_waits) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        read_http_body(&mut stream);
+        write_review_json(&mut stream, &review_output);
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        read_http_body(&mut stream);
+        let _ = revision_started_tx.send(());
+        let _ = revision_waits.recv();
+        write_sse(&mut stream, &revision_output);
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        read_http_body(&mut stream);
+        write_review_json(&mut stream, &review_output);
+    });
+    let directory = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = directory.path().join("plan.md");
+    let other = directory.path().join("other.md");
+    std::fs::write(&document, source).expect("write document");
+    std::fs::write(&other, source).expect("write other document");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target();
+    std::fs::write(config.path().join("settings.toml"), format!(
+        "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+    )).expect("write settings");
+    // SAFETY: the tests in this binary serialize app lifetimes and environment changes.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+
+    // A's Revision goes out first; the server holds its stream open.
+    app.press("id:title-review").expect("prepare A's Review");
+    app.wait_for("id:consent-card").expect("A's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("A's result");
+    app.press("label:Prepare revision")
+        .expect("prepare A's Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("A's Revision card");
+    support::hold_send(&mut app);
+    app.wait_for("id:revision-busy")
+        .expect("A's Revision is in flight");
+    revision_started_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("A's Revision reached the server");
+
+    // B sends its Review while A's Revision still waits.
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "other")
+        .expect("filter to other.md");
+    app.press("id:palette-row").expect("open other.md");
+    app.wait_for("id:title-file >> text:other.md")
+        .expect("B's tab");
+    app.press("id:title-review").expect("prepare B's Review");
+    app.wait_for("id:consent-card").expect("B's disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("B's Review is out");
+
+    // A's release must still land on A, under its own name.
+    release_revision
+        .send(())
+        .expect("release A's Revision answer");
+    app.press_key("mod+p").expect("open the palette");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter back to plan.md");
+    app.press("id:palette-row").expect("back to A");
+    app.wait_for("id:title-file >> text:plan.md")
+        .expect("A's tab");
+    app.wait_for_within("id:revision-accept", Duration::from_secs(20))
+        .expect("A's Revision still lands");
+    app.wait_for("text:0 of 2 decided")
+        .expect("A's hunks arrived");
+    let _ = server.join();
+}
+
 /// Whether the buffer line reads `text` exactly (`shows` trims the final
 /// newline the buffer keeps).
 fn buffer_shows(app: &Headless, text: &str) -> bool {

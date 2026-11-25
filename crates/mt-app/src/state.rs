@@ -3488,9 +3488,7 @@ impl AppState {
         if self.active.get_untracked() == Some(tab_id) {
             self.show_revision_session(&RevisionSession::default());
         }
-        self.cancel_revision();
-        self.revision_consent.set(None);
-        self.revision_manifest.set(None);
+        self.cancel_revision_for(tab_id);
     }
 
     /// Build a Revision request from the frozen Review output and the answer
@@ -3587,27 +3585,21 @@ impl AppState {
     }
 
     pub fn cancel_revision(&self) {
-        self.revision_generation
-            .set(self.revision_generation.get().wrapping_add(1));
-        if let Some((_, cancelled)) = self.revision_cancellation.borrow_mut().take() {
-            cancelled.store(true, Ordering::Release);
-            if self.status_surface.get_untracked() == StatusSurface::Review {
-                self.status.set(StatusMessage::default());
-            }
-        }
-        *self.pending_revision.borrow_mut() = None;
-        self.revision_consent.set(None);
-        self.revision_manifest.set(None);
-        self.revision_busy.set(false);
+        self.cancel_revision_owned_by(None);
     }
 
     fn cancel_revision_for(&self, tab_id: u64) {
-        let pending = self
+        self.cancel_revision_owned_by(Some(tab_id));
+    }
+
+    fn cancel_revision_owned_by(&self, tab_id: Option<u64>) {
+        let owns = |owner: u64| tab_id.is_none_or(|active| active == owner);
+        if self
             .pending_revision
             .borrow()
             .as_ref()
-            .is_some_and(|(id, _)| *id == tab_id);
-        if pending {
+            .is_some_and(|(owner, _)| owns(*owner))
+        {
             *self.pending_revision.borrow_mut() = None;
             self.revision_consent.set(None);
             self.revision_manifest.set(None);
@@ -3616,8 +3608,8 @@ impl AppState {
             .revision_cancellation
             .borrow()
             .as_ref()
-            .is_some_and(|(id, _)| *id == tab_id);
-        if !in_flight {
+            .is_some_and(|(owner, _)| owns(*owner));
+        if tab_id.is_some() && !in_flight {
             return;
         }
         self.revision_generation
