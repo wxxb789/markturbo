@@ -122,3 +122,11 @@
   capture), and add consent-card and title-menu states if before/after
   captures of them are still wanted. See
   [goal-16-acceptance.md](goal-16-acceptance.md#desktop-acceptance-2026-11-24).
+
+- [ ] **nextest gate follow-ups (PR #75 review, P3)**:
+  - `.config/nextest.toml` is not in the PR workflow's `rust` path filter, so a PR that changes only the nextest
+    config skips the jobs that use it.
+  - The `serial` test group keeps the mt-core timing tests off each other, but they can still run beside other test
+    binaries. `crates/mt-core/tests/performance.rs` asserts wall-clock bounds, so give those tests the whole pool.
+  - The doctest guard in `scripts/tests/test_checks.py` checks only that `--doc` appears. If doctests are enabled
+    again, verify which crates the command actually covers.
