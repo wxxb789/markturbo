@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch, tag or SHA to build; defaults to the dispatching ref
+        description: Branch, tag or SHA to build; defaults to the dispatched commit
         required: false
         type: string
 
@@ -14,33 +14,37 @@ permissions:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 90
+    # No rust-cache: this build must not write the cache release.yml restores.
+    timeout-minutes: 180
     defaults:
       run:
         shell: pwsh
     steps:
+      - name: Reject pull-request refs
+        env:
+          REQUESTED_REF: ${{ inputs.ref }}
+        run: |
+          if ($env:REQUESTED_REF -like 'refs/pull/*') {
+            throw "refs/pull/* refs are not accepted; build only reviewed commits"
+          }
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: markturbo-windows
-          save-if: false
-
-      - name: Build the release executable
+      - name: Build the raw Cargo release binary
         run: cargo build --release --locked -p mt-app --bin markturbo
 
       - name: Hash the executable
         id: hash
         env:
-          REQUESTED_REF: ${{ inputs.ref || github.ref }}
+          REQUESTED_REF: ${{ inputs.ref || github.sha }}
         run: |
           $commit = (git rev-parse HEAD | Out-String).Trim()
           $short = (git rev-parse --short HEAD | Out-String).Trim()
@@ -66,7 +70,7 @@ jobs:
           [IO.File]::WriteAllText(
             $checksum,
             "$digest  $name`n# ref: $env:REQUESTED_REF`n# commit: $commit`n# size: $size`n",
-            [Text.Encoding]::ASCII
+            [Text.UTF8Encoding]::new($false)
           )
 
           "short=$short" | Add-Content -LiteralPath $env:GITHUB_OUTPUT
