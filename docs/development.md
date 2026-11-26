@@ -242,6 +242,23 @@ the tagged revision (building and privacy-scanning the release binary),
 smoke-tests install and uninstall, and publishes the release. There is no draft or manual approval step: a pushed tag
 that passes these checks is public.
 
+## On-demand acceptance executable
+
+`.github/workflows/acceptance-exe.yml` builds the shipped release-profile
+`markturbo.exe` on a `windows-2022` runner for native acceptance without
+publishing anything: it creates no release, tag or asset, and uploads only the
+executable and its `SHA256SUMS.txt` as a workflow artifact.
+
+```sh
+gh workflow run acceptance-exe.yml -f ref=<branch>
+gh run download <id>
+```
+
+The summary of the run and the downloaded `SHA256SUMS.txt` record the ref, the
+resolved commit, the executable name, its size and its SHA-256. Pass the
+summary's hash to `scripts/mt.py accept all` as `--expect-exe-sha256`. Without
+`-f ref` the run builds the ref that dispatched it.
+
 ## Implementation and acceptance are separate
 
 Use two fields in the existing PR or goal report, not a new tracking system:
