@@ -492,18 +492,11 @@ pub const FONT_SOURCE: &str = concat!(
     mono_fallback!()
 );
 /// The downloadable companion CJK face's family, first in the CJK position of
-/// every list above but not in the Windows [`FONT_INPUT`].
+/// every list above.
 pub const FONT_CJK_COMPANION: &str = cjk_companion!();
-/// Text inputs. nsh 0.6.1's Windows input takes only the first nonempty family of
-/// a list and only from the system's fonts — never a registered one, with no
-/// fallback through the rest — so a list led by Martian left its placeholder
-/// in DirectWrite's last-resort serif. There it leads with Bahnschrift, the
-/// shipped face nearest Martian. macOS and Linux inputs resolve the whole
-/// list, so they keep Martian.
-#[cfg(target_os = "windows")]
-pub const FONT_INPUT: &str = "Bahnschrift, DengXian, Microsoft YaHei UI, sans-serif";
-/// Text inputs: the UI list, which this platform's inputs resolve in full.
-#[cfg(not(target_os = "windows"))]
+/// Text inputs: the UI list. Every platform's input resolves the whole list;
+/// nsh 0.7.1's Windows input finds registered faces too (its
+/// `text::resolve_family` walks the list and the registered collection).
 pub const FONT_INPUT: &str = FONT_UI;
 
 /// The model's voice: Martian Grotesk 300, the only large type in the app.
@@ -716,22 +709,17 @@ mod tests {
         }
     }
 
-    /// nsh 0.6.1's Windows text input resolves only the first nonempty family of a
-    /// list, from the system's fonts alone: it must name a face Windows
-    /// ships, never a registered Martian one (which left its placeholder in
-    /// a serif). Elsewhere inputs resolve the whole list and keep Martian.
+    /// nsh 0.7.1's Windows input resolves the whole family list and finds
+    /// registered faces (nsh-platform-windows `text::resolve_family`), so the
+    /// input list is the UI list on every platform, Martian first.
     #[test]
-    fn the_input_list_leads_with_a_face_its_platform_input_can_load() {
-        let first = FONT_INPUT.split(',').next().map(str::trim);
-        if cfg!(target_os = "windows") {
-            assert_eq!(first, Some("Bahnschrift"), "{FONT_INPUT}");
-            // A registered face never loads there, so the companion is not
-            // named.
-            assert!(!FONT_INPUT.contains(FONT_CJK_COMPANION), "{FONT_INPUT}");
-        } else {
-            assert_eq!(first, Some("Martian Grotesk Std Rg"), "{FONT_INPUT}");
-            assert_eq!(FONT_INPUT, FONT_UI);
-        }
+    fn the_input_list_is_the_ui_list() {
+        assert_eq!(FONT_INPUT, FONT_UI);
+        assert_eq!(
+            FONT_INPUT.split(',').next().map(str::trim),
+            Some("Martian Grotesk Std Rg"),
+            "{FONT_INPUT}"
+        );
     }
 
     /// WCAG contrast of `ink` drawn over the opaque `ground` (its alpha

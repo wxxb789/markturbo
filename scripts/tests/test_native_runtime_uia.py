@@ -286,7 +286,7 @@ class FakeEditorWin32:
     def send_shortcut(self, hwnd: int, key: int) -> None:
         self.shortcuts.append((hwnd, key))
         if key == runtime.VK_C:
-            # nsh-base 0.6.1 copies an empty selection line-wise, so an empty
+            # nsh-base 0.7.1 copies an empty selection line-wise, so an empty
             # document copies as its one empty line (`editor/commands.rs` `copy`).
             copied = self.copies.pop(0) if self.copies else (self.document or "\n")
             if copied is not None:
@@ -990,7 +990,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "DISCARD_EDITOR_ABSENCE_UIA_CONTRACT_MISMATCH")
 
     def test_editor_text_is_copied_by_select_all_and_read_once_it_lands(self) -> None:
-        # An empty document copies line-wise as "\n" (nsh-base 0.6.1
+        # An empty document copies line-wise as "\n" (nsh-base 0.7.1
         # `editor/commands.rs` `copy`), like a document of one line break: a
         # read cannot tell them apart and reports exactly what was copied.
         for value, copied in (
@@ -1398,7 +1398,7 @@ class AlertWin32:
 
 
 class SystemAlertTests(unittest.TestCase):
-    """nsh 0.6.1 alerts are outside UIA: Enter answers them, effects prove them."""
+    """nsh 0.7.1 alerts are outside UIA: Enter answers them, effects prove them."""
 
     def harness(self, win32: AlertWin32) -> object:
         harness = native_harness(FreshRootFactory([FakeRoot()]))
