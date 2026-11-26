@@ -511,6 +511,11 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
         }
     });
     let document = move || document_rows.get();
+    // The document and context groups are optional: with both empty (the
+    // welcome screen) only one divider may separate the start rows from
+    // Settings and Quit.
+    let middle_state = state.clone();
+    let middle = move || middle_state.root.get().is_some() || document_rows.get();
     let panel = menu_panel_frame(menu, "title-menu");
     panel
         .child({
@@ -584,6 +589,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
         }))
         .child(
             view()
+                .test_id("title-menu-divider")
                 .px(px(SPACE_3))
                 .py(px(SPACE_2))
                 .child(prims::hairline())
@@ -715,13 +721,16 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                 }
             },
         ))
-        .child(
-            view()
-                .px(px(SPACE_3))
-                .py(px(SPACE_2))
-                .child(prims::hairline())
-                .into_element(),
-        )
+        .child(when(middle, {
+            move || {
+                view()
+                    .test_id("title-menu-divider")
+                    .px(px(SPACE_3))
+                    .py(px(SPACE_2))
+                    .child(prims::hairline())
+                    .into_element()
+            }
+        }))
         .child(menu_item(
             &state,
             menu,
@@ -1546,6 +1555,9 @@ mod tests {
         let other = element_ref();
         let target_focused = signal(false);
         let other_focused = signal(false);
+        // Opening the menu starts a fresh observation: the document took the
+        // focus when it was created, and the menu hands it to `other`.
+        let menu_target = target_focused;
         view()
             .flex_col()
             .w(px(600.0))
@@ -1571,6 +1583,7 @@ mod tests {
                     .test_id("menu-open")
                     .focusable(false)
                     .on_press(move |_: &PressEvent| {
+                        menu_target.set(false);
                         other.focus();
                         menu_state.title_menu_open.set(true);
                     })
@@ -1599,6 +1612,9 @@ mod tests {
         app.set_viewport(nsh_core::Size::new(Points(600.0), Points(500.0)))
             .expect("viewport");
         app.wait_for("id:menu-open").expect("the probe renders");
+        // The new document's focus retry settles before the menu takes the
+        // keyboard; a late retry would take it back mid-observation.
+        app.settle();
         app.press("id:menu-open").expect("open the menu");
         app.wait_for("id:title-menu-open-folder")
             .expect("the menu is open");

@@ -39,6 +39,7 @@ use nsh_base::{button, checkbox};
 use nsh_core::{
     Color,
     element::{AdaptiveColor, AnimatedNode, AnimatedValue, animated_value},
+    keymap::When,
     prelude::*,
 };
 
@@ -69,6 +70,23 @@ pub fn is_open(state: &AppState) -> bool {
 
 /// The context field.
 pub fn field(state: AppState, language: Language) -> impl IntoElement {
+    // Escape backs out of at most one layer: a menu, guard, consent card or
+    // palette above the field closes first, and only then the field itself.
+    let escape_state = state.clone();
+    on_key_with(
+        "escape",
+        KeyOptions {
+            when: When::Always,
+            ..KeyOptions::default()
+        },
+        move |_| {
+            if escape_state.escape_top_layer() {
+                return;
+            }
+            escape_state.close_context();
+            escape_state.focus_editor();
+        },
+    );
     let rows_state = state.clone();
     let refresh_state = state.clone();
     let close_state = state.clone();
@@ -121,6 +139,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
         .child(
             view()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap(px(SPACE_4))
                 .pt(px(SPACE_4))
@@ -1057,7 +1076,8 @@ fn review_action(state: AppState, language: Language) -> impl IntoElement {
         .flex_row()
         .items_center()
         .gap(px(SPACE_2))
-        .flex_shrink_0()
+        .min_w(px(0.0))
+        .flex_shrink(1.0)
         .child(
             when(
                 move || !count_state.context_selected.get().is_empty(),
@@ -1936,5 +1956,65 @@ mod tests {
             "no consent card opened under the wait: {:?}",
             app.screen().texts()
         );
+    }
+
+    #[component]
+    fn NarrowWaitingFieldProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let root = PathBuf::from(std::env::var_os("MT_CONTEXT_FIXTURE").expect("fixture root"));
+        state.root.set(Some(root.clone()));
+        state.open_file(root.join("docs").join("plan.md"));
+        state.toggle_context();
+        let armed = state.clone();
+        effect(move || {
+            if armed.context_resolved.get().is_none() {
+                return;
+            }
+            if armed.context_selected.get().is_empty() {
+                armed.context_selected.set(vec![2]);
+                return;
+            }
+            let active = armed.active.get_untracked().expect("a document");
+            armed.arm_review_in_flight(active + 1);
+            armed.review_with_context();
+        });
+        let field_state = state.clone();
+        let open_state = state.context_open;
+        view().flex_col().child(view().w(px(388.0)).child(when(
+            move || open_state.get(),
+            move || crate::ui::context::field(field_state.clone(), Language::English),
+        )))
+    }
+
+    #[test]
+    fn the_waiting_footer_keeps_close_inside_the_narrow_field() {
+        let _fixture = Fixture::new();
+        let mut app = Headless::start(EngineConfig::new(Root::of::<NarrowWaitingFieldProbe>()))
+            .expect("start");
+        app.set_viewport(nsh_core::Size::new(Points(1000.0), Points(800.0)))
+            .expect("the narrow field's width");
+        app.wait_for("id:context-review-wait")
+            .expect("the wait hint widens the footer");
+        app.wait_for("id:context-close").expect("Close");
+        app.settle();
+
+        let nodes = app.screen().layout_nodes();
+        let bounds = |id: &str| {
+            nodes
+                .iter()
+                .find(|node| node.test_id.as_deref() == Some(id))
+                .map(|node| node.bounds)
+                .unwrap_or_else(|| panic!("`{id}` on screen"))
+        };
+        let field = bounds("context-field");
+        let close = bounds("context-close");
+        assert!(
+            close.origin.x.0 + close.size.width.0 <= field.origin.x.0 + field.size.width.0 + 0.5,
+            "Close leaves the field at the narrow width: field={field:?} close={close:?}"
+        );
+        app.press("id:context-close")
+            .expect("Close is pressable inside the field");
+        app.wait_for_gone("id:context-close", std::time::Duration::from_secs(5))
+            .expect("Close closed the field");
     }
 }

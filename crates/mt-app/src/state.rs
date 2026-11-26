@@ -158,6 +158,9 @@ pub(crate) enum StatusKind {
 #[derive(Clone)]
 pub(crate) struct UndoNotice {
     pub(crate) label: SharedString,
+    /// Rebuilds what the Undo undoes in `language`, so a live Undo survives a
+    /// language switch without keeping the old language's text.
+    pub(crate) retext: Rc<dyn Fn(Language) -> SharedString>,
     /// Returns a localized failure notice when the reversal could not happen,
     /// so the caller can keep the action live for a retry.
     pub(crate) reverse: Rc<dyn Fn() -> Result<(), SharedString>>,
@@ -239,6 +242,9 @@ pub struct AppState {
     pub search_truncated: Signal<bool>,
     pub search_busy: Signal<bool>,
     pub(crate) palette_open: Signal<bool>,
+    /// The Settings page's scroll offset: a language or layout rebuild
+    /// restores it instead of snapping back to the top.
+    pub(crate) settings_scroll_offset: Rc<Cell<f32>>,
     /// Whether the titlebar menu is open: the first layer of the fixed
     /// Escape order.
     pub title_menu_open: Signal<bool>,
@@ -913,6 +919,7 @@ impl AppState {
             guard_view: Rc::new(Cell::new(None)),
             compare_view: Rc::new(Cell::new(None)),
             palette_view: Rc::new(Cell::new(None)),
+            settings_scroll_offset: Rc::new(Cell::new(0.0)),
             folder_request: Rc::new(Cell::new(0)),
             #[cfg(test)]
             focus_last: signal(None),
@@ -1254,6 +1261,9 @@ impl AppState {
             crate::i18n::t(language, crate::i18n::Key::UsageCleared),
             UndoNotice {
                 label: SharedString::from(crate::i18n::t(language, crate::i18n::Key::Undo)),
+                retext: Rc::new(|language| {
+                    SharedString::from(crate::i18n::t(language, crate::i18n::Key::UsageCleared))
+                }),
                 reverse: Rc::new(reverse),
                 commit: Rc::new(commit),
             },
@@ -1381,6 +1391,7 @@ impl AppState {
     pub fn open_file(&self, path: PathBuf) {
         if let Some(tab) = self.tabs.get().iter().find(|tab| tab.path == path) {
             self.set_active(tab.id);
+            self.focus_editor();
             return;
         }
 
@@ -1401,6 +1412,7 @@ impl AppState {
             state.add_tab(loaded);
             state.record_usage(UsageEvent::ArtifactOpened);
             state.notify_named(crate::i18n::Key::Opened, &opened);
+            state.focus_editor();
         });
     }
 
@@ -1529,6 +1541,7 @@ impl AppState {
             self.note_edit(id);
         }
         self.set_active(id);
+        self.focus_editor();
     }
 
     fn add_tab(&self, loaded: LoadedFile) -> u64 {
@@ -2265,6 +2278,7 @@ impl AppState {
             s::discarded_draft(language),
             UndoNotice {
                 label: SharedString::from(s::undo(language)),
+                retext: Rc::new(|language| SharedString::from(s::discarded_draft(language))),
                 reverse,
                 commit,
             },
@@ -4824,6 +4838,7 @@ impl AppState {
     }
 
     pub fn open_settings(&self) {
+        self.settings_scroll_offset.set(0.0);
         self.refresh_usage_counts();
         self.settings_open.set(true);
         self.sync_undo_surface();
@@ -4967,7 +4982,45 @@ impl AppState {
     pub fn set_language(&self, language: Language) {
         self.settings
             .update(|settings| settings.language = language);
+        // A switch is not a new outcome: the old notice would keep the old
+        // language. Drop a plain notice and re-render a live Undo in the
+        // new language instead of dropping it.
+        self.set_settings_notice("", false);
+        if self.pending_undo.borrow().is_some() {
+            self.relocalize_pending_undo(language);
+        } else {
+            self.clear_status();
+        }
         self.save_settings();
+    }
+
+    fn relocalize_pending_undo(&self, language: Language) {
+        let label = SharedString::from(crate::i18n::t(language, crate::i18n::Key::Undo));
+        let retext = {
+            let pending = self.pending_undo.borrow();
+            let Some(action) = pending.as_ref() else {
+                return;
+            };
+            (action.retext)(language)
+        };
+        {
+            let mut pending = self.pending_undo.borrow_mut();
+            if let Some(action) = pending.as_mut() {
+                action.label = label.clone();
+            }
+        }
+        let own_text = self.status.get_untracked().text == *self.undo_text.borrow();
+        *self.undo_text.borrow_mut() = retext.clone();
+        self.status.update(|message| {
+            if own_text {
+                message.text = retext.clone();
+            }
+            if let Some(action) = message.action.as_mut() {
+                action.label = label.clone();
+            }
+        });
+        self.status_generation
+            .set(self.status_generation.get_untracked().wrapping_add(1));
     }
 
     pub fn set_theme(&self, theme: ThemePreference) {
@@ -5163,6 +5216,12 @@ impl AppState {
             crate::i18n::t(language, crate::i18n::Key::CredentialDeleted),
             UndoNotice {
                 label: SharedString::from(crate::i18n::t(language, crate::i18n::Key::Undo)),
+                retext: Rc::new(|language| {
+                    SharedString::from(crate::i18n::t(
+                        language,
+                        crate::i18n::Key::CredentialDeleted,
+                    ))
+                }),
                 reverse: Rc::new(reverse),
                 commit: Rc::new(commit),
             },
@@ -6941,6 +7000,7 @@ mod tests {
             SharedString::from("Discarded recovered draft"),
             UndoNotice {
                 label: SharedString::from("Undo"),
+                retext: Rc::new(|_| SharedString::from("Discarded recovered draft")),
                 reverse: Rc::new(move || {
                     reverse.set(true);
                     Ok(())
@@ -6995,6 +7055,7 @@ mod tests {
             UNDO_TEXT,
             UndoNotice {
                 label: SharedString::from("Undo"),
+                retext: Rc::new(|_| SharedString::from(UNDO_TEXT)),
                 reverse: Rc::new(|| Ok(())),
                 commit: Rc::new(|| {}),
             },

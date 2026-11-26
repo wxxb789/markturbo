@@ -145,7 +145,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     assert!(!store.exists(), "Clear did not commit at press");
     app.press("id:status-undo").expect("undo the clear");
     app.wait_for(
-        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 2 total events",
+        "text:Last 180 days: 1 day active · 0 Reviews · 0 revision decisions · 2 total events",
     )
     .expect("the summary is back");
     assert!(store.exists(), "Undo left the store deleted");
@@ -161,7 +161,7 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     app.press("id:title-menu-paste")
         .expect("paste during the hold");
     app.wait_for(
-        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 1 total events",
+        "text:Last 180 days: 1 day active · 0 Reviews · 0 revision decisions · 1 total event",
     )
     .expect("an event recorded during the hold belongs to the cleared state");
     app.press("id:usage-inspect")
@@ -226,13 +226,13 @@ fn usage_metrics_consent_inspection_export_clear_and_localization() {
     app.press("id:title-menu-paste")
         .expect("paste during the hold again");
     app.wait_for(
-        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 1 total events",
+        "text:Last 180 days: 1 day active · 0 Reviews · 0 revision decisions · 1 total event",
     )
     .expect("the pasted event shows during the hold");
     app.press("id:status-undo")
         .expect("undo the cleared counts");
     app.wait_for(
-        "text:Last 180 days: 1 days active · 0 Reviews · 0 revision decisions · 2 total events",
+        "text:Last 180 days: 1 day active · 0 Reviews · 0 revision decisions · 2 total events",
     )
     .expect("Undo restores the old counts plus the event recorded during the hold");
     app.press("id:usage-clear")

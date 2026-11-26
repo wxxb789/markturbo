@@ -56,7 +56,7 @@ pub fn opaque(color: Color) -> Color {
 
 /// Body ink at the UI size and line height: your own text and the labels that
 /// are not quiet.
-pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))

@@ -47,7 +47,7 @@ use crate::{
     },
     ui::{
         motion::{self, reduced_motion},
-        prims,
+        prims, shell,
         tokens::{
             self, CONSENT_BUTTON_H, CONSENT_BUTTON_W, FOCUS_RING, FOCUS_RING_OFFSET, HAIRLINE,
             SPACE_2, SPACE_3, SPACE_4, SPACE_5,
@@ -88,11 +88,13 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
             }
         }
     });
+    let inset_state = state.clone();
     view()
         .test_id("recovery-banner")
         .w_full()
         .flex_col()
         .pt(px(SPACE_4))
+        .pr(move || px(field_overlay_inset(&inset_state)))
         .child(when(move || rows.get().len() > 1, {
             let restore_all_state = state.clone();
             let discard_all_state = state.clone();
@@ -146,7 +148,12 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                     .items_center()
                     .gap(px(SPACE_3))
                     .pb(px(SPACE_3))
-                    .child(view().flex_1().child(prims::ink(label)));
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(prims::ink(label).truncate()),
+                    );
                 // One ringed action at a time: the first record's Restore,
                 // unless the conflict banner owns the ring.
                 if index == 0 {
@@ -1288,25 +1295,38 @@ fn documents_line(state: &AppState, tab: Option<u64>, language: Language) -> Str
         // the card lists exactly that, as it changes.
         None => tabs.iter().filter(|tab| tab.dirty.get()).collect(),
     };
-    let names: Vec<String> = listed.iter().map(|tab| listed_name(tab, &listed)).collect();
+    // A name is decorated against every open tab, not just the listed ones:
+    // the single-tab close guard must not show a bare `plan.md` while a
+    // second `plan.md` is open in another folder.
+    let names: Vec<String> = listed.iter().map(|tab| listed_name(tab, &tabs)).collect();
     names_line(&names, language)
 }
 
-fn listed_name(tab: &Tab, listed: &[&Tab]) -> String {
+fn listed_name(tab: &Tab, open: &[Tab]) -> String {
     let name = tab.title.to_string();
     if tab.untitled {
         return name;
     }
-    let shared = listed
-        .iter()
-        .filter(|other| other.title == tab.title)
-        .count();
+    let shared = open.iter().filter(|other| other.title == tab.title).count();
     if shared > 1
         && let Some(folder) = tab.path.parent().and_then(|parent| parent.file_name())
     {
         return format!("{}/{name}", folder.to_string_lossy());
     }
     name
+}
+
+/// How far the narrow field's overlay eats into the column's content: a
+/// banner inside the covered strip would sit under a preview and take no
+/// press. Zero while the field is in the row or absent.
+fn field_overlay_inset(state: &AppState) -> f32 {
+    let width = shell::client_width_now();
+    let layout = tokens::Layout::of(width);
+    if !layout.field_overlays() || shell::surface(state) == shell::FieldSurface::None {
+        return 0.0;
+    }
+    let content_right = tokens::RAIL_W + tokens::COLUMN_GAP + layout.measure();
+    (content_right - layout.field_left(width)).max(0.0)
 }
 
 /// [`documents_line`]'s shape for a list of names.
@@ -2409,6 +2429,7 @@ mod tests {
                     "Cleared the counts",
                     crate::state::UndoNotice {
                         label: SharedString::from("Undo"),
+                        retext: std::rc::Rc::new(|_| SharedString::from("Cleared the counts")),
                         reverse: std::rc::Rc::new(|| Ok(())),
                         commit: std::rc::Rc::new(|| {}),
                     },

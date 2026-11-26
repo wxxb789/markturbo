@@ -2728,6 +2728,7 @@ mod tests {
         state.review_open.set(true);
         load_result(state.clone());
         keys(&state, session());
+        let blur_state = state.clone();
         view()
             .test_id("keyboard-camera-probe")
             .flex_col()
@@ -2735,6 +2736,13 @@ mod tests {
             .h(px(700.0))
             .child(camera_tab(&state))
             .child(camera_request(&state))
+            .child(
+                view()
+                    .test_id("camera-blur")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| blur_state.blur_source_editor())
+                    .child(prims::rest("Blur the editor")),
+            )
             .child(crate::ui::document::column(state, Language::English))
     }
 
@@ -2836,6 +2844,10 @@ mod tests {
             .expect("enable motion");
         app.wait_for("label:Markdown source")
             .expect("the source editor renders");
+        app.settle();
+        // An open file takes the editor focus; J steps only while the
+        // editor is not editing.
+        app.press("id:camera-blur").expect("blur the editor");
         app.settle();
 
         let tab = text_of(&app, "camera-tab");

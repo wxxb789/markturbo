@@ -150,6 +150,11 @@
     disk.
   - The usage-failure notice is matched by its translated text. If the UI language changes between a failed and a
     successful Undo, the red Settings notice stays. Match on a notice key instead of the text.
+- [ ] **Should a Tier 2 Undo name what it undoes?** The status line offers a
+  bare `Undo` beside the outcome text, so its target has to be read from the
+  message it sits on (for example `Discarded recovered draft · Undo`). Decide
+  whether it should name its target (for example `Undo discard of plan.md`),
+  from the Goal 20 walk-through observation O3.
 - [ ] **Goal 20 lane 20-B wait-state polish (PR #72 review P3s)**:
   - The disabled titlebar Review and the menu Review selection state their wait reason only in the accessible
     description, so pointer users never see it. Show it visibly.

@@ -224,9 +224,24 @@ pub fn usage_summary(language: Language, counts: &mt_core::usage::UsageAggregate
         .flat_map(|day| day.events.values())
         .fold(0_u64, |sum, count| sum.saturating_add(*count));
     match language {
-        Language::English => format!(
-            "Last 180 days: {days} days active · {reviews} Reviews · {decisions} revision decisions · {events} total events"
-        ),
+        Language::English => {
+            let plural = |count: u64, one: &str, many: &str| {
+                if count == 1 {
+                    one.to_owned()
+                } else {
+                    many.to_owned()
+                }
+            };
+            let (day, review, decision, event) = (
+                plural(days as u64, "day", "days"),
+                plural(reviews, "Review", "Reviews"),
+                plural(decisions, "revision decision", "revision decisions"),
+                plural(events, "total event", "total events"),
+            );
+            format!(
+                "Last 180 days: {days} {day} active · {reviews} {review} · {decisions} {decision} · {events} {event}"
+            )
+        }
         Language::Chinese => format!(
             "近 180 天：活跃 {days} 天 · 完成审查 {reviews} 次 · 修订决定 {decisions} 次 · 共 {events} 条记录"
         ),
@@ -979,7 +994,7 @@ fn chinese(key: Key) -> &'static str {
         Key::ClipboardTextUnavailable => "剪贴板中没有文本，或剪贴板当前不可用。",
         Key::Translate => "翻译",
         Key::Review => "审查",
-        Key::ReviewLensPrompt => "Prompt",
+        Key::ReviewLensPrompt => "提示词",
         Key::ReviewLensAgentInstructions => "Agent Instructions",
         Key::ReviewLensAgentSkill => "Agent Skill",
         Key::ReviewWaiting => "正在等待审查请求授权…",
@@ -1316,6 +1331,44 @@ mod tests {
             "{details}"
         );
         assert!(!details.contains("20410"), "{details}");
+    }
+
+    #[test]
+    fn usage_summary_uses_singulars_for_one() {
+        let one_event: mt_core::usage::UsageAggregate = serde_json::from_str(
+            r#"{"schema_version":1,"days":{"20410":{"events":{"artifact_opened":1},"review_started":{},"review_durations":{},"accepted_hunks":0,"rejected_hunks":0}}}"#,
+        )
+        .expect("the aggregate parses");
+        let summary = usage_summary(Language::English, &one_event);
+        assert!(summary.contains("1 day active ·"), "{summary}");
+        assert!(summary.contains("1 total event"), "{summary}");
+
+        let one_each: mt_core::usage::UsageAggregate = serde_json::from_str(
+            r#"{"schema_version":1,"days":{"20410":{"events":{"review_completed":1,"revision_decision":1},"review_started":{},"review_durations":{},"accepted_hunks":0,"rejected_hunks":0}}}"#,
+        )
+        .expect("the aggregate parses");
+        let summary = usage_summary(Language::English, &one_each);
+        assert!(summary.contains("1 Review ·"), "{summary}");
+        assert!(summary.contains("1 revision decision ·"), "{summary}");
+    }
+
+    #[test]
+    fn usage_summary_keeps_plurals_for_many() {
+        let aggregate: mt_core::usage::UsageAggregate = serde_json::from_str(
+            r#"{"schema_version":1,"days":{"20410":{"events":{"review_completed":2,"revision_decision":2},"review_started":{},"review_durations":{},"accepted_hunks":0,"rejected_hunks":0},"20411":{"events":{},"review_started":{},"review_durations":{},"accepted_hunks":0,"rejected_hunks":0}}}"#,
+        )
+        .expect("the aggregate parses");
+        let summary = usage_summary(Language::English, &aggregate);
+        assert!(summary.contains("2 days active ·"), "{summary}");
+        assert!(summary.contains("2 Reviews ·"), "{summary}");
+        assert!(summary.contains("2 revision decisions ·"), "{summary}");
+        assert!(summary.contains("4 total events"), "{summary}");
+    }
+
+    #[test]
+    fn the_prompt_lens_is_localized() {
+        assert_eq!(t(Language::English, Key::ReviewLensPrompt), "Prompt");
+        assert_eq!(t(Language::Chinese, Key::ReviewLensPrompt), "提示词");
     }
 
     #[test]

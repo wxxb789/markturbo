@@ -765,3 +765,140 @@ fn a_failed_undo_keeps_the_counts_for_a_retry() {
         "the retry did not restore the captured counts"
     );
 }
+
+#[test]
+fn a_language_switch_clears_the_english_settings_notice() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start();
+    open_settings(&mut app);
+    app.press("id:usage-on").expect("enable the usage counters");
+    app.wait_for("text:Usage-counter preference saved.")
+        .expect("the English notice");
+    app.press("id:settings-language-chinese")
+        .expect("switch the language");
+    app.wait_for("text:界面语言").expect("the Chinese page");
+    assert!(
+        !app.shows("Usage-counter preference saved."),
+        "the stale English notice survived the switch: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_language_switch_relocalizes_a_live_undo() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start();
+    app.set_viewport(Size::new(Points(1400.0), Points(900.0)))
+        .expect("the walk's viewport");
+    open_settings(&mut app);
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.press("id:usage-on").expect("enable the counters");
+    app.press("id:usage-clear").expect("clear the counts");
+    app.wait_for("id:settings-page >> id:status-undo")
+        .expect("the Undo");
+    app.scroll("id:settings-scroll", Points(-2_000.0))
+        .expect("back to the language row");
+    app.settle();
+
+    app.press("id:settings-language-chinese")
+        .expect("switch the language");
+    app.wait_for("text:界面语言").expect("the Chinese page");
+    app.wait_for("id:settings-page >> text:撤销")
+        .expect("the Undo label in the new language");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo stayed on exactly one status line"
+    );
+    app.press("id:status-action").expect("the Undo still works");
+    app.wait_for_gone("id:status-action", Duration::from_secs(5))
+        .expect("the Undo is spent");
+}
+
+fn y_of(app: &Headless, id: &str) -> f32 {
+    app.screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| node.test_id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("`{id}` on screen"))
+        .bounds
+        .origin
+        .y
+        .0
+}
+
+#[test]
+fn a_language_switch_keeps_the_settings_scroll_offset() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start();
+    app.set_viewport(Size::new(Points(1400.0), Points(900.0)))
+        .expect("the walk's viewport");
+    open_settings(&mut app);
+    app.settle();
+    let before = y_of(&app, "usage-counters");
+    app.scroll("id:settings-scroll", Points(200.0))
+        .expect("scroll down the page");
+    app.settle();
+    let scrolled = y_of(&app, "usage-counters");
+    assert!(
+        before - scrolled > 150.0,
+        "the scroll did not move the page: {before} -> {scrolled}"
+    );
+
+    app.press("id:settings-language-chinese")
+        .expect("switch the language");
+    app.wait_for("text:界面语言").expect("the Chinese page");
+    app.settle();
+    let after = y_of(&app, "usage-counters");
+    assert!(
+        (after - scrolled).abs() < 80.0,
+        "the language switch reset the scroll offset: {scrolled} -> {after}"
+    );
+}
+
+#[test]
+fn the_settings_status_line_clears_the_usage_actions() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start();
+    app.set_viewport(Size::new(Points(1400.0), Points(900.0)))
+        .expect("the walk's viewport");
+    open_settings(&mut app);
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll the usage actions into view");
+    app.settle();
+
+    let node = |id: &str| {
+        app.screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.test_id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("`{id}` on screen"))
+            .bounds
+    };
+    let actions_bottom = ["usage-inspect", "usage-export", "usage-clear"]
+        .iter()
+        .map(|id| {
+            let bounds = node(id);
+            bounds.origin.y.0 + bounds.size.height.0
+        })
+        .fold(0.0_f32, f32::max);
+    let status = node("status");
+    assert!(
+        actions_bottom <= status.origin.y.0 + 0.5,
+        "the status line overlaps the usage actions: actions end at {actions_bottom}, status starts at {}",
+        status.origin.y.0
+    );
+
+    app.press_at(
+        "id:usage-inspect",
+        nsh_core::geometry::Point {
+            x: Points(8.0),
+            y: Points(6.0),
+        },
+    )
+    .expect("the first press reaches the action");
+    app.wait_for("text:Hide details")
+        .expect("the first Show details press registered");
+}
