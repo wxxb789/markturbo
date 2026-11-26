@@ -807,6 +807,13 @@ fn a_language_switch_relocalizes_a_live_undo() {
     app.wait_for("text:界面语言").expect("the Chinese page");
     app.wait_for("id:settings-page >> text:撤销")
         .expect("the Undo label in the new language");
+    app.wait_for("text:已删除本地计数。记录偏好和已导出的副本不变。")
+        .expect("the Undo's own text in the new language");
+    assert!(
+        !app.shows("设置已保存。"),
+        "the save notice replaced the live Undo's text: {:?}",
+        app.screen().texts()
+    );
     assert_eq!(
         app.screen().count("id:status-action").expect("selector"),
         1,

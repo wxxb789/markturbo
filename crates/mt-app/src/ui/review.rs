@@ -170,6 +170,12 @@ fn session() -> Signal<Session> {
     global::<Session>()
 }
 
+/// The wait was cancelled: the review field shows its cancelled state when
+/// no result replaced it.
+pub(crate) fn mark_wait_cancelled() {
+    session().update(|session| session.cancelled = true);
+}
+
 fn prepare_revision(state: &AppState, session: Signal<Session>) {
     session.update(|session| {
         session.showing_finding_before_revision = Some(session.showing_finding);
@@ -335,11 +341,7 @@ fn keys(state: &AppState, session: Signal<Session>) {
                 if state.escape_top_layer() {
                     return;
                 }
-                if state.review_busy.get_untracked() {
-                    session.update(|session| session.cancelled = true);
-                    state.cancel_review_in_flight();
-                    state.focus_editor();
-                } else if state.review_consent.get_untracked().is_none()
+                if state.review_consent.get_untracked().is_none()
                     && state.translation_consent.get_untracked().is_none()
                 {
                     state.close_review();

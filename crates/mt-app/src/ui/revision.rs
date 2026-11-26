@@ -1110,11 +1110,7 @@ fn bind_busy_escape(state: &AppState) {
                 ..KeyOptions::default()
             },
             move |_| {
-                if keys.escape_top_layer() {
-                    return;
-                }
-                review::cancel_active_revision(&keys);
-                keys.focus_editor();
+                keys.escape_top_layer();
             },
         );
     });

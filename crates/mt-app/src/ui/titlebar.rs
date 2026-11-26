@@ -169,10 +169,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
                 ..KeyOptions::default()
             },
             move |_| {
-                if keys_state.escape_top_layer() {
-                    return;
-                }
-                keys_state.cancel_translation_in_flight();
+                keys_state.escape_top_layer();
             },
         );
     });
@@ -1617,9 +1614,6 @@ mod tests {
         app.set_viewport(nsh_core::Size::new(Points(600.0), Points(500.0)))
             .expect("viewport");
         app.wait_for("id:menu-open").expect("the probe renders");
-        // The new document's focus retry settles before the menu takes the
-        // keyboard; a late retry would take it back mid-observation.
-        app.settle();
         app.press("id:menu-open").expect("open the menu");
         app.wait_for("id:title-menu-open-folder")
             .expect("the menu is open");

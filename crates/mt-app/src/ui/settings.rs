@@ -61,9 +61,7 @@ pub(crate) fn page(
             ..KeyOptions::default()
         },
         move |_| {
-            if !escape_state.escape_top_layer() {
-                escape_state.close_settings();
-            }
+            escape_state.escape_top_layer();
         },
     );
     let close_state = state.clone();

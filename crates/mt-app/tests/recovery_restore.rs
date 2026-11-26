@@ -18,6 +18,10 @@ const ON_DISK: &str = "# Notes\n";
 /// The unsaved text: CJK and a surrogate-pair emoji, as the native recovery
 /// case types.
 const CHECKPOINT: &str = "# Notes\n恢复的草稿 🦀 survives.\n";
+/// The two recovery drafts differ, so a restored document proves which row
+/// its Restore opened.
+const FIRST_DRAFT: &str = "Recovered first draft alpha.";
+const SECOND_DRAFT: &str = "Recovered second draft beta.";
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -125,7 +129,7 @@ fn seed_two(dir: &std::path::Path) -> tempfile::TempDir {
             std::process::id().to_string(),
         );
     }
-    for name in ["first.md", "second.md"] {
+    for (name, draft) in [("first.md", FIRST_DRAFT), ("second.md", SECOND_DRAFT)] {
         let path = dir.join(name);
         std::fs::write(&path, ON_DISK).expect("write seed");
         let key = RecoveryKey::for_path(&path);
@@ -135,7 +139,7 @@ fn seed_two(dir: &std::path::Path) -> tempfile::TempDir {
             .checkpoint(
                 &RecoveryCheckpoint {
                     key,
-                    text: loaded.text.clone(),
+                    text: draft.to_owned(),
                     metadata: RecoveryMetadata::from_loaded_file(&loaded),
                     revision: None,
                 },
@@ -156,7 +160,8 @@ fn bounds(app: &Headless, id: &str) -> nsh_core::geometry::Bounds<Points> {
 }
 
 /// The row text truncates before the actions; the hit test presses Restore
-/// and Discard at 1000 (Source and Split) and 1100 px.
+/// and Discard at 1000 (Source and Split) and 1100 px, and the Restore
+/// opens the row's own draft.
 #[test]
 fn recovery_actions_stay_pressable_at_narrow_widths() {
     if !cfg!(windows) {
@@ -172,10 +177,12 @@ fn recovery_actions_stay_pressable_at_narrow_widths() {
             .expect("viewport");
         app.wait_for("id:recovery-banner")
             .expect("the recovery banner");
+        // A document first: the Source state with a document is what the
+        // walk found the actions clipped in.
+        app.press("id:title-settings").expect("open the title menu");
+        app.press("id:title-menu-new-file").expect("new document");
+        app.wait_for(EDITOR).expect("the editor");
         if split {
-            app.press("id:title-settings").expect("open the title menu");
-            app.press("id:title-menu-new-file").expect("new document");
-            app.wait_for(EDITOR).expect("the editor");
             app.press("id:title-settings").expect("open the title menu");
             app.press("id:title-menu-split").expect("split pane");
             app.wait_for("id:preview-field").expect("the preview");
@@ -200,12 +207,33 @@ fn recovery_actions_stay_pressable_at_narrow_widths() {
             );
         }
 
+        let names = ["first.md", "second.md"];
+        let first_row = app
+            .screen()
+            .texts()
+            .into_iter()
+            .find_map(|text| names.iter().find(|name| text.contains(**name)).copied())
+            .expect("the first row names its file");
+        let (expected, other) = if first_row == "first.md" {
+            (FIRST_DRAFT, SECOND_DRAFT)
+        } else {
+            (SECOND_DRAFT, FIRST_DRAFT)
+        };
+
         app.press("id:recovery-discard-0")
             .expect("Discard is hit at its visible position");
         app.wait_for("id:status-action")
             .expect("the discarded row leaves");
         app.press("label:Restore")
             .expect("Restore is hit at its visible position");
-        app.wait_for(EDITOR).expect("the restored document");
+        app.wait_for_gone("id:recovery-banner", Duration::from_secs(5))
+            .expect("the restored row leaves the banner");
+        app.wait_for(&format!("id:source-editor >> text:{expected}"))
+            .expect("the restored document shows its row's draft");
+        assert!(
+            !app.shows(other),
+            "the other row's draft was restored: {:?}",
+            app.screen().texts()
+        );
     }
 }

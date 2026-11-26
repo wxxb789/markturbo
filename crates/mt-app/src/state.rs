@@ -3281,6 +3281,9 @@ impl AppState {
     }
 
     fn focus_open_layer(&self) -> bool {
+        if self.title_menu_open.get() {
+            return true;
+        }
         if self.guard.get().is_some() {
             if let Some(view) = self.guard_view.get() {
                 view.focus();
@@ -4883,9 +4886,10 @@ impl AppState {
     }
 
     /// Escape closes at most one layer, in the contract's fixed order — the
-    /// title menu, the guard or consent card, then the palette. Every Escape
-    /// binding runs this, so which layer closes never depends on which
-    /// binding the keymap offered the key to. Returns whether one closed.
+    /// title menu, the guard or consent card, the palette, Settings, a
+    /// request in flight, the disk comparison. Every Escape binding runs
+    /// this, so which layer closes never depends on which binding the
+    /// keymap offered the key to. Returns whether one closed.
     pub fn escape_top_layer(&self) -> bool {
         if self.title_menu_open.get() {
             self.close_title_menu();
@@ -4912,6 +4916,29 @@ impl AppState {
         }
         if self.palette_open.get() {
             self.close_palette();
+            return true;
+        }
+        if self.settings_open.get() {
+            self.close_settings();
+            return true;
+        }
+        if self.review_busy.get() {
+            crate::ui::review::mark_wait_cancelled();
+            self.cancel_review_in_flight();
+            self.focus_editor();
+            return true;
+        }
+        if self.revision_busy.get() {
+            crate::ui::review::cancel_active_revision(self);
+            self.focus_editor();
+            return true;
+        }
+        if self.translation_busy.get() {
+            self.cancel_translation_in_flight();
+            return true;
+        }
+        if crate::ui::notices::compare_is_open(self) {
+            crate::ui::notices::close_compare(self);
             return true;
         }
         false
@@ -5000,15 +5027,16 @@ impl AppState {
         self.settings
             .update(|settings| settings.language = language);
         // A switch is not a new outcome: the old notice would keep the old
-        // language. Drop a plain notice and re-render a live Undo in the
-        // new language instead of dropping it.
+        // language. A live Undo re-renders in the new language and keeps
+        // its own text; the save stays silent rather than replacing it.
         self.set_settings_notice("", false);
         if self.pending_undo.borrow().is_some() {
             self.relocalize_pending_undo(language);
+            self.save_settings_quietly();
         } else {
             self.clear_status();
+            self.save_settings();
         }
-        self.save_settings();
     }
 
     fn relocalize_pending_undo(&self, language: Language) {

@@ -1998,8 +1998,10 @@ mod tests {
     #[test]
     fn the_waiting_footer_keeps_close_inside_the_narrow_field() {
         let _fixture = Fixture::new();
-        let mut app = Headless::start(EngineConfig::new(Root::of::<NarrowWaitingFieldProbe>()))
-            .expect("start");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            NarrowWaitingFieldProbe,
+        >()))
+        .expect("start");
         app.set_viewport(nsh_core::Size::new(Points(1000.0), Points(800.0)))
             .expect("the narrow field's width");
         app.wait_for("id:context-review-wait")

@@ -507,7 +507,7 @@ fn disk_text(state: &AppState, tab: &Tab) -> Option<String> {
         .map(|(_, text)| text)
 }
 
-fn close_compare(state: &AppState) {
+pub(crate) fn close_compare(state: &AppState) {
     state.conflict_compare.set(None);
     state.focus_editor();
 }
@@ -1699,9 +1699,7 @@ fn bind_compare_keys(state: &AppState) {
             ..KeyOptions::default()
         },
         move |_| {
-            if !escape.escape_top_layer() {
-                close_compare(&escape);
-            }
+            escape.escape_top_layer();
         },
     );
 }
