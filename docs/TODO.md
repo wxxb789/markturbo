@@ -158,3 +158,9 @@
     finishes. Clear it when the slot frees.
   - While a Review is in flight elsewhere, "Review with context" in the Context panel closes the panel and opens no
     card. Disable it with the same reason instead.
+- [ ] **Settings 4 px grid after a provider is set (PR #77 review P3).**
+  - At 1280 pt, switching from `Best available` to a configured provider, with secure storage available and no saved
+    credential, turns the 36 pt `Unconfigured` hint into an 18 pt `Missing` one. The API key field and the sections
+    below it then sit 2 pt off the 4 px grid.
+  - Size single-line status variants to a 4 px multiple.
+  - Extend the `goal17_settings` grid test to cover that switch.
