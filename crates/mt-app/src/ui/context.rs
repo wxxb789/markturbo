@@ -1453,7 +1453,7 @@ fn s(key: S, language: Language) -> &'static str {
 mod tests {
     use std::time::Duration;
 
-    use nsh_engine::{EngineConfig, Points, Root};
+    use nsh_engine::{EngineConfig, Points};
     use nsh_testing::Headless;
 
     use super::*;
@@ -1477,8 +1477,10 @@ mod tests {
     /// Automation's AutomationId — which carries its own accessible name.
     #[test]
     fn a_named_actions_test_id_is_on_the_button_itself() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<NamedActionHarness>()))
-            .expect("start the harness");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            NamedActionHarness,
+        >()))
+        .expect("start the harness");
         app.wait_for("text:0 presses").expect("the harness");
         let node = app
             .screen()
@@ -1597,8 +1599,10 @@ mod tests {
     #[test]
     fn renders_the_applied_chain_and_the_inventory() {
         let _fixture = Fixture::new();
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<ContextProbe>())).expect("start the app");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<ContextProbe>(),
+        ))
+        .expect("start the app");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("wide viewport");
         app.wait_for("id:context-field").expect("the context field");
@@ -1709,7 +1713,8 @@ mod tests {
     fn toggles_refreshes_opens_and_closes() {
         let fixture = Fixture::new();
         let mut app =
-            Headless::start(EngineConfig::new(Root::of::<FieldProbe>())).expect("start the app");
+            Headless::start(EngineConfig::new(nsh_testing::windowed_root::<FieldProbe>()))
+                .expect("start the app");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("wide viewport");
         app.wait_for("id:context-include-2")
@@ -1888,8 +1893,10 @@ mod tests {
     #[test]
     fn review_is_disabled_with_no_document_open() {
         let _fixture = Fixture::new();
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<NoDocumentFieldProbe>())).expect("start");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            NoDocumentFieldProbe,
+        >()))
+        .expect("start");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("wide viewport");
         app.wait_for("id:context-review")
@@ -1931,8 +1938,10 @@ mod tests {
     #[test]
     fn a_review_elsewhere_disables_review_with_context_and_keeps_the_panel() {
         let _fixture = Fixture::new();
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<WaitingFieldProbe>())).expect("start");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            WaitingFieldProbe,
+        >()))
+        .expect("start");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("wide viewport");
         app.wait_for("id:context-review >> text:Review with selected context")

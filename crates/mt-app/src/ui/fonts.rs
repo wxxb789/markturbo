@@ -117,7 +117,7 @@ pub enum CompanionStatus {
     Installed,
     /// Deleting the stored file.
     Removing,
-    /// Removed this session. nsh 0.6.1 cannot unregister a face, so the
+    /// Removed this session. nsh 0.7.1 cannot unregister a face, so the
     /// registered one stays until the app restarts.
     Removed,
     /// The last operation failed.
@@ -515,7 +515,7 @@ mod tests {
 
     use mt_core::settings::Language;
     use nsh_core::prelude::*;
-    use nsh_engine::{EngineConfig, Root};
+    use nsh_engine::EngineConfig;
     use nsh_testing::Headless;
 
     use super::{Companion, CompanionFailure, CompanionFont, CompanionStatus, DownloadError};
@@ -581,13 +581,13 @@ mod tests {
     fn start_with<T: IntoElement + 'static>(
         render: impl Fn() -> T + Clone + Send + Sync + 'static,
     ) -> Headless {
-        Headless::start(EngineConfig::new(Root::new::<FontHarness>(move || {
-            FontHarnessProps {
-                content: Some(Renderer::new({
-                    let render = render.clone();
-                    move |_| render()
-                })),
-            }
+        Headless::start(EngineConfig::new(nsh_testing::windowed_root_with::<
+            FontHarness,
+        >(move || FontHarnessProps {
+            content: Some(Renderer::new({
+                let render = render.clone();
+                move |_| render()
+            })),
         })))
         .unwrap()
     }

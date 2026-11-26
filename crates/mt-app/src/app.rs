@@ -8,7 +8,12 @@
 use std::{cell::Cell, path::PathBuf, rc::Rc, time::Duration};
 
 use mt_core::settings::Language;
-use nsh_core::{desktop::WindowAttributes, element::desktop::main_window, prelude::*};
+use nsh_core::{
+    Points,
+    desktop::{QuitMode, TitleBarOptions, TitleBarStyle, WindowAttributes},
+    element::desktop::{set_quit_mode, window},
+    prelude::*,
+};
 
 use crate::{
     state::AppState,
@@ -23,13 +28,13 @@ pub fn App() -> impl IntoElement {
     // render); this covers the hosts that build the root themselves, and nsh
     // ignores a font it has already seen.
     ui::fonts::register();
+    // The app ends when its last window closes on every platform; the
+    // platform default would leave it in the macOS Dock.
+    set_quit_mode(QuitMode::LastWindowClosed);
     let state = AppState::new();
     // A downloaded companion CJK face is read, verified and registered on a
     // blocking thread, after the first frame is on its way.
     state.companion_font.restore();
-    if ui::cjk_optics::capture_requested() {
-        return ui::cjk_optics::capture(state.companion_font.clone());
-    }
     if let Some(path) = startup_path() {
         log::debug!("startup: opening {}", path.display());
         if path.is_dir() {
@@ -41,7 +46,6 @@ pub fn App() -> impl IntoElement {
             state.open_file(path);
         }
     }
-    guard_window_close(&state);
     let tick_state = state.clone();
     let ticker_alive = Rc::new(Cell::new(true));
     let ticker_flag = ticker_alive.clone();
@@ -51,8 +55,31 @@ pub fn App() -> impl IntoElement {
         }
     }));
     let _ticker_guard = stored(TickerGuard(ticker_alive));
-    let shell_state = state.clone();
     let status = ui::notices::StatusPresence::new(state.clone());
+    let close_state = state.clone();
+    let content_state = state.clone();
+    window()
+        .id("main")
+        .title("MarkTurbo")
+        .default_size(size(px(1280.0), px(800.0)))
+        .attributes(main_window_attributes())
+        .on_close_press(move |_| close_state.request_quit())
+        .content(move || {
+            let state = content_state.clone();
+            state
+                .main_window
+                .borrow_mut()
+                .replace(nsh_core::element::desktop::current_window());
+            if ui::cjk_optics::capture_requested() {
+                return ui::cjk_optics::capture(state.companion_font.clone()).into_element();
+            }
+            shell(state, status).into_element()
+        })
+}
+
+/// The shell as the main window's content.
+fn shell(state: AppState, status: ui::notices::StatusPresence) -> impl IntoElement {
+    let shell_state = state.clone();
     view()
         .flex_1()
         .h(relative(1.0))
@@ -99,19 +126,19 @@ fn startup_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Routes every user close of the main window (its close button, Alt+F4, the
-/// taskbar, the system menu) through the same guard as Quit: the window no
-/// longer closes by itself, and [`AppState::request_quit`] closes it at once
-/// when nothing is dirty, else raises the 'Close without saving?' guard.
-fn guard_window_close(state: &AppState) {
-    let window = main_window();
+/// The main window's attributes: the app draws its own title row
+/// (`ui::shell`), and a close press reaches `AppState::request_quit` instead
+/// of closing the window by itself.
+fn main_window_attributes() -> WindowAttributes {
     // The option structs are `#[non_exhaustive]`: built from their defaults,
     // then set field by field.
+    let mut title_bar = TitleBarOptions::default();
+    title_bar.style = TitleBarStyle::Hidden;
+    title_bar.height = Some(Points(ui::tokens::TITLE_ROW_H));
     let mut attributes = WindowAttributes::default();
     attributes.close_on_press = Some(false);
-    window.set(attributes);
-    let state = state.clone();
-    window.on_close_press(move |_| state.request_quit());
+    attributes.title_bar = Some(title_bar);
+    attributes
 }
 
 fn language_code(language: Language) -> u8 {

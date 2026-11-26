@@ -202,13 +202,14 @@ fn section(label: &'static str, rows: impl IntoElement) -> impl IntoElement {
     view()
         .flex_col()
         .gap(px(SPACE_3))
-        .child(prims::rest(label))
+        .child(prims::rest(label).h(px(prims::UI_TEXT_BOX_H)))
         .child(rows)
 }
 
 /// One labelled field: its visible label, the field itself (an input over a
 /// hairline) and the line under it — the validation error while invalid, the
-/// hint otherwise.
+/// hint otherwise. Its boxes are pinned so the row keeps the 4px rhythm
+/// whatever the platform measures its text and controls at.
 fn field_row(
     label: &'static str,
     field: impl IntoElement,
@@ -217,10 +218,25 @@ fn field_row(
     view()
         .flex_col()
         .gap(px(SPACE_2))
-        .child(prims::rest(label))
-        .child(view().max_w(px(MEASURE_NARROW)).child(field))
-        .child(view().max_w(px(MEASURE_NARROW)).child(note))
+        .child(prims::rest(label).h(px(prims::UI_TEXT_BOX_H)))
+        .child(
+            view()
+                .max_w(px(MEASURE_NARROW))
+                .h(px(FIELD_BOX_H))
+                .child(field),
+        )
+        .child(
+            view()
+                .max_w(px(MEASURE_NARROW))
+                .h(px(NOTE_BOX_H))
+                .child(note),
+        )
 }
+
+/// The field's box: its text line, its rule and the rule's clearance.
+const FIELD_BOX_H: f32 = SPACE_5 / 2.0;
+/// A note's box: two UI line boxes.
+const NOTE_BOX_H: f32 = 2.0 * TYPE_UI_LINE;
 
 fn endpoint_section(state: AppState, language: Language) -> impl IntoElement {
     let base_change_state = state.clone();
@@ -462,6 +478,7 @@ fn credential_section(state: AppState, language: Language) -> impl IntoElement {
                 view()
                     .max_w(px(MEASURE_NARROW))
                     .flex_col()
+                    .h(px(FIELD_BOX_H))
                     .pb(px(SPACE_1 - HAIRLINE))
                     .child(
                         input()
@@ -493,11 +510,13 @@ fn credential_section(state: AppState, language: Language) -> impl IntoElement {
 /// The credential as words: where the key comes from, never the key.
 fn credential_status_line(state: AppState, language: Language) -> impl IntoElement {
     let colour_state = state.clone();
+    let height_state = state.clone();
     text(move || credential_status_text(&state, language))
         .test_id("settings-credential-status")
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
+        .min_h(move || px(credential_status_height(&height_state)))
         .text_color(move || {
             if current_credential_status(&colour_state) == CredentialStatus::Unavailable {
                 tokens::palette().danger
@@ -505,6 +524,14 @@ fn credential_status_line(state: AppState, language: Language) -> impl IntoEleme
                 tokens::palette().ink_rest
             }
         })
+}
+
+fn credential_status_height(state: &AppState) -> f32 {
+    match current_credential_status(state) {
+        CredentialStatus::Unconfigured | CredentialStatus::Unavailable => NOTE_BOX_H,
+        CredentialStatus::Missing if !state.secure_store_supported() => NOTE_BOX_H,
+        _ => TYPE_UI_LINE,
+    }
 }
 
 /// The vault's answer for the configured endpoint, memoised on the endpoint and
@@ -1054,7 +1081,7 @@ fn choice_button(
             text(label)
                 .font_family(FONT_UI)
                 .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
+                .line_height(px(prims::UI_TEXT_BOX_H))
                 .text_color(colour)
                 .transition_colors()
                 .duration(move || duration.get()),
@@ -1095,6 +1122,7 @@ fn reactive_action(
                     .font_family(FONT_UI)
                     .text_size(px(TYPE_UI))
                     .line_height(px(TYPE_UI_LINE))
+                    .h(px(prims::UI_TEXT_BOX_H))
                     .text_color(move || tokens::palette().ink_rest)
                     .transition_colors()
                     .duration(move || duration.get()),
@@ -1273,11 +1301,10 @@ mod tests {
 
         use nsh_core::MountItem;
 
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                MountedTransitionProbe,
-            >()))
-            .expect("start the harness");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<MountedTransitionProbe>(),
+        ))
+        .expect("start the harness");
         app.wait_for("id:probe-show").expect("the harness");
         let batches = Arc::new(Mutex::new(Vec::<MountItem>::new()));
         app.observe({
@@ -1320,11 +1347,10 @@ mod tests {
 
     #[test]
     fn a_choices_test_id_is_on_the_button_itself() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                ChoiceHarness,
-            >()))
-            .expect("start the harness");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<ChoiceHarness>(),
+        ))
+        .expect("start the harness");
         app.wait_for("id:harness-presses").expect("the harness");
         let node = app
             .screen()
@@ -1506,11 +1532,10 @@ mod tests {
 
     #[test]
     fn credential_failures_are_localized_with_a_next_step() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                CredentialErrorProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<CredentialErrorProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("id:credential-errors")
             .expect("the probe's line");
         let summary = app
@@ -1707,7 +1732,7 @@ mod tests {
         }
 
         let mut config = nsh_engine::EngineConfig::new(
-            nsh_engine::Root::of::<SettingsProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<SettingsProbe>().tokens(tokens::theme()),
         );
         config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
         let mut app = nsh_testing::Headless::start(config).expect("start Settings");
@@ -1756,11 +1781,10 @@ mod tests {
         // The store fails until the probe has seen the failure: a contended
         // store must show up and must not be remembered.
         PROBE_STORE.fail_read.store(true, Ordering::Relaxed);
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                SettingsProbe,
-            >()))
-            .expect("start the app");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<SettingsProbe>(),
+        ))
+        .expect("start the app");
         app.set_viewport(nsh_core::Size::new(
             nsh_core::Points(1440.0),
             nsh_core::Points(900.0),

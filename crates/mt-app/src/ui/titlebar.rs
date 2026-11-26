@@ -1230,7 +1230,7 @@ mod tests {
 
     #[test]
     fn review_stays_visible_and_disabled_without_a_document() {
-        let mut app = manual_app(Root::of::<ReviewProbe>());
+        let mut app = manual_app(nsh_testing::windowed_root::<ReviewProbe>());
         app.wait_for("id:title-review")
             .expect("Review stays in the row");
 
@@ -1254,7 +1254,8 @@ mod tests {
     fn hovered_titlebar_text_tracks_the_current_theme() {
         use nsh_core::{platform::ColorScheme, tailwind::state::HOVERED};
 
-        let mut config = EngineConfig::new(Root::of::<ReviewProbe>().tokens(tokens::theme()));
+        let mut config =
+            EngineConfig::new(nsh_testing::windowed_root::<ReviewProbe>().tokens(tokens::theme()));
         config.environment.color_scheme = ColorScheme::Light;
         config.environment.reduce_motion = true;
         let mut app = Headless::start(config).expect("start the titlebar");
@@ -1315,7 +1316,7 @@ mod tests {
 
     #[test]
     fn closing_the_welcome_menu_keeps_its_items_frozen_during_exit() {
-        let mut app = manual_app(Root::of::<WelcomeMenuProbe>());
+        let mut app = manual_app(nsh_testing::windowed_root::<WelcomeMenuProbe>());
         app.wait_for("id:welcome")
             .expect("the welcome page before opening a document");
         press_without_settling(&app, "id:title-settings");
@@ -1347,7 +1348,7 @@ mod tests {
 
     #[test]
     fn pane_dot_stays_with_the_selection_when_the_menu_fades() {
-        let mut app = manual_app(Root::of::<PaneMenuProbe>());
+        let mut app = manual_app(nsh_testing::windowed_root::<PaneMenuProbe>());
         app.wait_for("id:title-settings")
             .expect("the title settings action");
         press_without_settling(&app, "id:title-settings");
@@ -1375,7 +1376,7 @@ mod tests {
 
     #[test]
     fn a_fading_menu_leaves_the_underlay_pressable() {
-        let mut app = manual_app(Root::of::<MenuUnderlayProbe>());
+        let mut app = manual_app(nsh_testing::windowed_root::<MenuUnderlayProbe>());
         let settings = "id:title-settings";
         let row = "id:title-menu-split";
         app.wait_for(settings).expect("the settings action");
@@ -1412,12 +1413,14 @@ mod tests {
     #[test]
     fn closing_and_reopening_the_menu_retargets_its_live_opacity_and_scale() {
         let (sent, samples) = mpsc::channel();
-        let mut app = manual_app(Root::new::<MenuMotionProbe>(move || {
-            let sent = sent.clone();
-            MenuMotionProbeProps {
-                content: Some(Renderer::new(move |_| menu_motion_contents(sent.clone()))),
-            }
-        }));
+        let mut app = manual_app(nsh_testing::windowed_root_with::<MenuMotionProbe>(
+            move || {
+                let sent = sent.clone();
+                MenuMotionProbeProps {
+                    content: Some(Renderer::new(move |_| menu_motion_contents(sent.clone()))),
+                }
+            },
+        ));
         app.wait_for("id:menu-motion-toggle")
             .expect("the menu control");
 
@@ -1504,12 +1507,14 @@ mod tests {
     #[test]
     fn disabling_reduced_motion_during_menu_exit_still_unmounts_the_panel() {
         let (sent, _samples) = mpsc::channel();
-        let mut app = manual_app(Root::new::<MenuMotionProbe>(move || {
-            let sent = sent.clone();
-            MenuMotionProbeProps {
-                content: Some(Renderer::new(move |_| menu_motion_contents(sent.clone()))),
-            }
-        }));
+        let mut app = manual_app(nsh_testing::windowed_root_with::<MenuMotionProbe>(
+            move || {
+                let sent = sent.clone();
+                MenuMotionProbeProps {
+                    content: Some(Renderer::new(move |_| menu_motion_contents(sent.clone()))),
+                }
+            },
+        ));
         app.wait_for("id:menu-motion-toggle")
             .expect("the menu control");
         app.set_environment("reduced motion", |env| env.reduce_motion = true)
@@ -1604,7 +1609,7 @@ mod tests {
 
     #[test]
     fn escape_closes_the_menu_and_returns_focus_to_the_document() {
-        let mut config = EngineConfig::new(Root::of::<MenuEscapeFocusProbe>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<MenuEscapeFocusProbe>());
         // A platform that gives ordinary views the keyboard focus, as the
         // Windows host does.
         config.environment.os = nsh_core::platform::Os::Linux;
@@ -1641,8 +1646,10 @@ mod tests {
 
     #[test]
     fn review_entry_points_wait_for_another_documents_review() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewWaitProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ReviewWaitProbe,
+        >()))
+        .expect("start the probe");
         app.set_viewport(nsh_core::Size::new(Points(600.0), Points(900.0)))
             .expect("viewport");
         app.wait_for("id:title-review").expect("the row");

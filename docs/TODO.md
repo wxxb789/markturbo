@@ -2,7 +2,7 @@
 
 ## Deferred
 
-- [ ] **Keyboard press feedback on Win32**: nsh 0.6.1 dispatches only `Press`
+- [ ] **Keyboard press feedback on Win32**: nsh 0.7.1 dispatches only `Press`
   for keyboard activation, so pressables show no press-down visual for keyboard
   use. Revisit when nsh exposes keyboard press-down and release events.
 - [ ] **First-time-user and screen-reader evidence for the shipped UI** — Goal
@@ -103,24 +103,25 @@
   inventory (`scripts/markturbo_tools/release.py:281-285,771`). Either stage it
   with the payload so the inventory covers every installed file, or document the
   exclusion in the release-notes template; decide before the next candidate.
-- [ ] **Upgrade nsh for the Goal 15 WebView2 popup fix** — the 2026-11-23
-  native run failed goal-07 (`WEB_SECURITY_APP_WINDOW_COUNT_UNEXPECTED`, case
-  `revision_session`): the fixture's `window.open` leaves a visible WebView2
-  popup, and nsh 0.6.1 handles `NewWindowRequested` only after the page
-  closes. Upgrade every nsh crate to the first release containing
+- [ ] **Re-run goal-07 for the WebView2 popup fix** — every nsh crate is now
+  0.7.1, the first release containing
   [longbridge/nsh#2423](https://github.com/longbridge/nsh/pull/2423) (issue
-  [#2785](https://github.com/longbridge/nsh/issues/2785) closed 2026-11-23),
-  then re-run goal-07. See
+  [#2785](https://github.com/longbridge/nsh/issues/2785) closed 2026-11-23):
+  a `window.open` no longer opens a WebView2 popup, so the goal-07
+  `revision_session` case should pass. The upgrade has landed; only the
+  native goal-07 re-run remains. See
   [goal-15-acceptance.md](goal-15-acceptance.md#native-acceptance-2026-11-23).
 - [ ] **Visual harness observation channel for the WebView states** — the
-  2026-11-24 visual matrix captured 20 of 22 cells; both
-  `web-compatibility-preview` cells failed with
+  2026-11-24 visual matrix (commit `32f324d`, nsh 0.6.1) captured 20 of 22
+  cells; both `web-compatibility-preview` cells failed with
   `WEB_COMPATIBILITY_PREVIEW_WEB_VIEW_MISSING_UIA_CONTRACT_MISMATCH` because
   the harness looks for the WebView through UIA, and nsh 0.6.1 hosts WebView2
-  in a composition controller with no automation provider. Rebuild that proof
-  on an observation channel nsh 0.6.1 exposes (for example pixels from a window
-  capture), and add consent-card and title-menu states if before/after
-  captures of them are still wanted. See
+  in a composition controller with no automation provider. A source reading of
+  nsh 0.7.1 suggests the composition-controller hosting is unchanged, but
+  that is unverified natively. Rebuild that proof on an observation channel
+  nsh 0.7.1 exposes (for example pixels from a window capture), and add
+  consent-card and title-menu states if before/after captures of them are
+  still wanted. See
   [goal-16-acceptance.md](goal-16-acceptance.md#desktop-acceptance-2026-11-24).
 
 - [ ] **nextest gate follow-ups (PR #75 review, P3)**:
@@ -134,7 +135,7 @@
   - The nightly runs plain `cargo test --workspace`, so `recovery_undo.rs`, `folder_open_token.rs` and
     `reload_edit_race.rs` share one process. Cases in one binary race on `MARKTURBO_CONFIG_DIR`, `MARKTURBO_DATA_DIR`
     and `MARKTURBO_OPEN`. Move the nightly to nextest, or give these fixtures per-test isolation.
-  - `nsh-testing` 0.6.1 `Headless::react()` answers a `SaveDialog` at once. The Quit test in `translation_flow.rs` can
+  - `nsh-testing` 0.7.1 `Headless::react()` answers a `SaveDialog` at once. The Quit test in `translation_flow.rs` can
     gate only the app's read of the answer, not the platform's reply, so it does not prove the translation lands while
     the picker is unanswered.
   - The Chinese Save As guard formats a raw OS error through `io::Error::Display`, which appends the English
@@ -162,3 +163,9 @@
     finishes. Clear it when the slot frees.
   - While a Review is in flight elsewhere, "Review with context" in the Context panel closes the panel and opens no
     card. Disable it with the same reason instead.
+- [ ] **Settings 4 px grid after a provider is set (PR #77 review P3).**
+  - At 1280 pt, switching from `Best available` to a configured provider, with secure storage available and no saved
+    credential, turns the 36 pt `Unconfigured` hint into an 18 pt `Missing` one. The API key field and the sections
+    below it then sit 2 pt off the 4 px grid.
+  - Size single-line status variants to a 4 px multiple.
+  - Extend the `goal17_settings` grid test to cover that switch.

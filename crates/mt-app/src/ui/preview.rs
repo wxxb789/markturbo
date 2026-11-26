@@ -463,7 +463,7 @@ mod tests {
     };
 
     use nsh_core::{EventKind, EventPayload, MountItem, NativeProps, WebSource};
-    use nsh_engine::{EngineConfig, Root};
+    use nsh_engine::EngineConfig;
     use nsh_testing::Headless;
 
     use super::*;
@@ -730,7 +730,8 @@ mod tests {
     #[test]
     fn an_empty_preview_has_a_designed_state() {
         let mut app =
-            Headless::start(EngineConfig::new(Root::of::<EmptyProbe>())).expect("start the probe");
+            Headless::start(EngineConfig::new(nsh_testing::windowed_root::<EmptyProbe>()))
+                .expect("start the probe");
         app.wait_for("id:preview").expect("the preview exists");
         app.settle();
         assert!(
@@ -744,8 +745,10 @@ mod tests {
 
     #[test]
     fn an_empty_web_preview_has_a_designed_state() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<EmptyWebProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<EmptyWebProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("id:web-pane").expect("the web pane renders");
         app.settle();
         assert!(
@@ -759,7 +762,7 @@ mod tests {
 
     #[test]
     fn a_web_preview_delays_loading_for_every_navigation() {
-        let mut config = EngineConfig::new(Root::of::<PendingWebProbe>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<PendingWebProbe>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
         let mut app = Headless::start(config).expect("start the probe");
         app.settle();
@@ -825,7 +828,7 @@ mod tests {
     #[test]
     fn a_failed_diagram_is_labelled_and_keeps_its_source() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<DiagramFailureProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<DiagramFailureProbe>().tokens(tokens::theme()),
         ))
         .expect("start the probe");
         app.wait_for("id:preview").expect("the preview exists");
@@ -842,8 +845,10 @@ mod tests {
 
     #[test]
     fn a_failed_web_diagram_is_labelled_and_keeps_its_source() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<WebDiagramFailureProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            WebDiagramFailureProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:preview-empty").expect("empty web preview");
         let (sent, received) = std::sync::mpsc::channel();
         app.observe(move |_, batch| {
@@ -875,7 +880,7 @@ mod tests {
     #[test]
     fn the_preview_renders_the_document() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<ColumnProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<ColumnProbe>().tokens(tokens::theme()),
         ))
         .expect("start the probe");
         app.wait_for("id:preview").expect("the preview renders");
@@ -926,7 +931,7 @@ mod tests {
     #[test]
     fn the_preview_typography_is_calm() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<ColumnProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<ColumnProbe>().tokens(tokens::theme()),
         ))
         .expect("start the probe");
         app.wait_for("id:preview").expect("the preview renders");
@@ -991,7 +996,8 @@ mod tests {
     #[test]
     fn the_field_shows_the_preview() {
         let mut app =
-            Headless::start(EngineConfig::new(Root::of::<FieldProbe>())).expect("start the probe");
+            Headless::start(EngineConfig::new(nsh_testing::windowed_root::<FieldProbe>()))
+                .expect("start the probe");
         app.wait_for("id:preview-field").expect("the field renders");
         // The fixture opens on a task: wait for the document itself.
         app.wait_for("id:preview").expect("the preview renders");
@@ -1004,15 +1010,17 @@ mod tests {
     /// it, the document is there.
     #[test]
     fn the_field_content_renders_alone() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ContentProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<ContentProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("id:preview").expect("the preview renders");
         assert!(texts(&app).contains("Release plan"), "{}", dump(&app));
     }
 
     #[test]
     fn the_field_web_pane_follows_the_active_tab() {
-        let mut config = EngineConfig::new(Root::of::<SplitWebProbe>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<SplitWebProbe>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
         let mut app = Headless::start(config).expect("start the probe");
         let sources = Arc::new(Mutex::new(HashMap::new()));
@@ -1091,8 +1099,8 @@ mod tests {
 
     #[test]
     fn a_link_message_opens_once_and_the_preview_page_stays() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<LinkProbe>())).expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<LinkProbe>()))
+            .expect("start the probe");
         let pages = Arc::new(Mutex::new(Vec::new()));
         let observed_pages = Arc::clone(&pages);
         app.observe(move |_, batch| {
@@ -1152,8 +1160,10 @@ mod tests {
 
     #[test]
     fn web_pane_mounts_with_scripts_enabled() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<WebPaneProbe>()))
-            .expect("start the web pane probe");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<WebPaneProbe>(),
+        ))
+        .expect("start the web pane probe");
         let javascript_enabled = Arc::new(Mutex::new(Vec::new()));
         let observed_javascript_enabled = Arc::clone(&javascript_enabled);
         app.observe(move |_, batch| {
@@ -1225,8 +1235,10 @@ mod tests {
     /// not just its label.
     #[test]
     fn the_shell_shows_the_preview_in_the_field() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<SplitShellProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            SplitShellProbe,
+        >()))
+        .expect("start the probe");
         app.set_viewport(nsh_core::Size::new(
             nsh_core::Points(1000.0),
             nsh_core::Points(900.0),
