@@ -242,6 +242,31 @@ the tagged revision (building and privacy-scanning the release binary),
 smoke-tests install and uninstall, and publishes the release. There is no draft or manual approval step: a pushed tag
 that passes these checks is public.
 
+## On-demand acceptance executable
+
+`.github/workflows/acceptance-exe.yml` builds the raw Cargo release-profile
+`markturbo.exe` on a `windows-2022` runner for native acceptance without
+publishing anything: it creates no release, tag or asset, and uploads only the
+executable and its `SHA256SUMS.txt` as a workflow artifact. The artifact is for
+acceptance of reviewed commits only; the run rejects `refs/pull/*` refs.
+
+```sh
+gh workflow run acceptance-exe.yml -f ref=<branch-or-sha>
+gh run download <id> -n markturbo-exe-<short-sha> -D <dir>
+uv run --locked --project scripts scripts/mt.py accept all \
+    --exe "<dir>/markturbo.exe" --expect-exe-sha256 <sha256>
+```
+
+The summary of the run and the downloaded `SHA256SUMS.txt` record the requested
+ref (or the dispatched commit), the resolved commit, the executable name, its
+size and its SHA-256. Without `-f ref` the run builds the commit that dispatched
+it.
+
+This artifact is the raw Cargo binary. The installer's executable also gets icon
+resources and, when configured, a signature
+(`scripts/markturbo_tools/release.py`), so its bytes differ; the acceptance hash
+is not the shipped file's hash.
+
 ## Implementation and acceptance are separate
 
 Use two fields in the existing PR or goal report, not a new tracking system:

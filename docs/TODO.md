@@ -158,6 +158,10 @@
     finishes. Clear it when the slot frees.
   - While a Review is in flight elsewhere, "Review with context" in the Context panel closes the panel and opens no
     card. Disable it with the same reason instead.
+- [ ] **`acceptance-exe.yml` pull-ref guard (PR #78 review P3).** The PowerShell `Trim()` does not strip a leading
+  U+FEFF, but `actions/checkout` does, so a dispatcher can still check out a `refs/pull/*` ref. With
+  `cache-mode: none`, no cache path remains. Harden the guard (for example, reject any input not matching
+  `^[A-Za-z0-9._/-]+$`) if the workflow gains more trust.
 - [ ] **Settings 4 px grid after a provider is set (PR #77 review P3).**
   - At 1280 pt, switching from `Best available` to a configured provider, with secure storage available and no saved
     credential, turns the 36 pt `Unconfigured` hint into an 18 pt `Missing` one. The API key field and the sections
