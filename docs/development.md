@@ -48,11 +48,11 @@ in about two minutes instead of after the workspace has compiled. Windows 11 x64
 run --locked --cargo-profile ci -p mt-app --lib --bins --test suite`, plus
 `-p mt-core --features model-transport,test-support`); the separate
 `macos-15` arm64 job
-builds the release executable, verifies the Mach-O arm64 slice and runs
-`cargo test --locked --profile ci -p mt-core`. The macOS workspace suite and the
-release-profile app suite no longer run per PR: `.github/workflows/nightly.yml`
-(schedule plus manual dispatch) reruns the combined `check ci` on
-`ubuntu-24.04`, `cargo test --locked --profile ci --workspace` and
+builds the release executable and verifies the Mach-O arm64 slice only. The
+macOS behavior suite and the release-profile app suite no longer run per PR:
+`.github/workflows/nightly.yml` (schedule plus manual dispatch) reruns the
+combined `check ci` on `ubuntu-24.04`, the workspace suites under
+`cargo nextest` and
 `cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
 suite` on `macos-15` and `windows-2022`, as a non-blocking safety net
 rather than a PR gate. `suite` links every `crates/mt-app/tests/*.rs`

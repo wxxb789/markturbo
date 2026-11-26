@@ -183,12 +183,12 @@ fn translation_requires_consent_and_quit_saves_updates_received_during_its_dialo
         },
     )
     .expect("the Save As reached its picker before the translation returns");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the Save As to hold before its answer",
         Duration::from_secs(10),
         |_| mt_app::test_vault::save_gate_reached(),
-    )
-    .expect("the Save As holds before reading the picker's answer");
+    );
 
     release_response.send(()).expect("release translation");
     app.wait_for_within("text:# 你好，再见", Duration::from_secs(20))
