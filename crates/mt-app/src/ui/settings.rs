@@ -510,7 +510,7 @@ fn credential_status_line(state: AppState, language: Language) -> impl IntoEleme
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
-        .h(move || px(credential_status_height(&height_state)))
+        .min_h(move || px(credential_status_height(&height_state)))
         .text_color(move || {
             if current_credential_status(&colour_state) == CredentialStatus::Unavailable {
                 tokens::palette().danger
@@ -522,9 +522,9 @@ fn credential_status_line(state: AppState, language: Language) -> impl IntoEleme
 
 fn credential_status_height(state: &AppState) -> f32 {
     match current_credential_status(state) {
-        CredentialStatus::Unavailable => NOTE_BOX_H,
+        CredentialStatus::Unconfigured | CredentialStatus::Unavailable => NOTE_BOX_H,
         CredentialStatus::Missing if !state.secure_store_supported() => NOTE_BOX_H,
-        _ => prims::UI_TEXT_BOX_H,
+        _ => TYPE_UI_LINE,
     }
 }
 
@@ -1075,8 +1075,7 @@ fn choice_button(
             text(label)
                 .font_family(FONT_UI)
                 .text_size(px(TYPE_UI))
-                .line_height(px(TYPE_UI_LINE))
-                .h(px(prims::UI_TEXT_BOX_H))
+                .line_height(px(prims::UI_TEXT_BOX_H))
                 .text_color(colour)
                 .transition_colors()
                 .duration(move || duration.get()),

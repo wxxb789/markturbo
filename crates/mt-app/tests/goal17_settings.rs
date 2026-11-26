@@ -142,6 +142,35 @@ fn the_usage_disclosure_wraps_to_its_full_text() {
 }
 
 #[test]
+fn the_unconfigured_credential_hint_wraps_at_a_640pt_window() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start_settings();
+    app.set_viewport(Size::new(Points(640.0), Points(900.0)))
+        .expect("640pt window");
+    app.settle();
+    let expected = mt_app::i18n::t(
+        mt_core::settings::Language::English,
+        mt_app::i18n::Key::ChooseProviderForCredential,
+    );
+    let node = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == expected)
+        })
+        .expect("the Unconfigured credential hint");
+    assert!(
+        node.bounds.size.height.0 >= 2.0 * mt_app::ui::tokens::TYPE_UI_LINE,
+        "the hint lays out at least two lines at 640pt: {:?}",
+        node.bounds
+    );
+    assert!(app.screen().shows(expected), "the full hint is present");
+}
+
+#[test]
 fn selected_theme_uses_an_ink_two_pixel_underline() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (app, _config, _codex_home) = start_settings();
