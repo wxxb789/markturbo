@@ -34,7 +34,7 @@ use crate::{
         tokens::{
             self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_NARROW, MEASURE_WIDE, RAIL_W,
             SELECTION_UNDERLINE, SETTINGS_HEADER_H, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
-            SPACE_6, TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MEDIUM,
+            TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MEDIUM,
         },
     },
 };
@@ -230,7 +230,7 @@ fn field_row(
 /// The field's box: its text line, its rule and the rule's clearance.
 const FIELD_BOX_H: f32 = SPACE_5 / 2.0;
 /// A note's box: two UI line boxes.
-const NOTE_BOX_H: f32 = SPACE_6 / 2.0;
+const NOTE_BOX_H: f32 = 2.0 * TYPE_UI_LINE;
 
 fn endpoint_section(state: AppState, language: Language) -> impl IntoElement {
     let base_change_state = state.clone();
@@ -504,12 +504,13 @@ fn credential_section(state: AppState, language: Language) -> impl IntoElement {
 /// The credential as words: where the key comes from, never the key.
 fn credential_status_line(state: AppState, language: Language) -> impl IntoElement {
     let colour_state = state.clone();
+    let height_state = state.clone();
     text(move || credential_status_text(&state, language))
         .test_id("settings-credential-status")
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
-        .h(px(prims::UI_TEXT_BOX_H))
+        .h(move || px(credential_status_height(&height_state)))
         .text_color(move || {
             if current_credential_status(&colour_state) == CredentialStatus::Unavailable {
                 tokens::palette().danger
@@ -517,6 +518,14 @@ fn credential_status_line(state: AppState, language: Language) -> impl IntoEleme
                 tokens::palette().ink_rest
             }
         })
+}
+
+fn credential_status_height(state: &AppState) -> f32 {
+    match current_credential_status(state) {
+        CredentialStatus::Unavailable => NOTE_BOX_H,
+        CredentialStatus::Missing if !state.secure_store_supported() => NOTE_BOX_H,
+        _ => prims::UI_TEXT_BOX_H,
+    }
 }
 
 /// The vault's answer for the configured endpoint, memoised on the endpoint and

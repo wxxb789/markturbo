@@ -2026,6 +2026,24 @@ mod tests {
     }
 
     #[test]
+    fn a_long_all_fields_entry_wraps_instead_of_clipping() {
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ReviewFieldsWrapProbe,
+        >()))
+        .expect("start the Review fields probe");
+        app.wait_for("id:review-all-fields")
+            .expect("the All fields control");
+        app.press("id:review-all-fields").expect("open All fields");
+        app.wait_for("id:review-fields").expect("the fields scroll");
+        let (top, bottom) = text_extent(&app, WRAPPING_FIELD_ITEM);
+        assert!(
+            bottom - top >= 2.0 * TYPE_UI_LINE,
+            "the long entry lays out at least two lines: {:.1}pt",
+            bottom - top
+        );
+    }
+
+    #[test]
     fn production_cjk_optics_step_the_size_and_weight_of_cjk_only() {
         let optics = tokens::CJK_OPTICS;
         assert_eq!(optics.size(TYPE_MODEL, false), TYPE_MODEL);
@@ -2457,6 +2475,34 @@ mod tests {
                 title: "Intent".to_owned(),
                 items: vec!["Review voice: Latin, 中文.".to_owned()],
             }],
+            ..ReviewView::default()
+        }));
+        view()
+            .w(px(760.0))
+            .h(px(720.0))
+            .child(field(state, Language::English))
+    }
+
+    /// One Review section's entry long enough to wrap in the field's column.
+    const WRAPPING_FIELD_ITEM: &str = "The scope covers the endpoint, the credential, the request body, the response body, \
+         the retry policy, and every header the client sends; each stays inside the line of \
+         responsibility its own review names, and none of it reaches the document.";
+
+    #[component]
+    fn ReviewFieldsWrapProbe() -> impl IntoElement {
+        let state = AppState::new();
+        state.review_view.set(Some(ReviewView {
+            status: "Review ready".to_owned(),
+            sections: vec![
+                crate::state::ReviewSection {
+                    title: "Intent".to_owned(),
+                    items: vec!["The document's intent".to_owned()],
+                },
+                crate::state::ReviewSection {
+                    title: "Scope".to_owned(),
+                    items: vec![WRAPPING_FIELD_ITEM.to_owned()],
+                },
+            ],
             ..ReviewView::default()
         }));
         view()

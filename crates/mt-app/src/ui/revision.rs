@@ -1471,6 +1471,49 @@ mod tests {
         state.present_revision(proposal);
     }
 
+    /// A rationale long enough to wrap at the docked proposal's width.
+    const WRAPPING_RATIONALE: &str = "Make the promise keep its subject and its verb: the first clause reads as two \
+         sentences joined without a mark, so name the condition the compile relies on and \
+         keep the promise to one line for a reader who arrives without the diff in front of \
+         them.";
+
+    #[component]
+    fn LongRationaleProbe() -> impl IntoElement {
+        let state = AppState::new();
+        open_probe_document(&state, PROBE_TEXT);
+        present(
+            &state,
+            PROBE_TEXT,
+            &[(WRAPPING_RATIONALE, "compiles but", "compiles, but")],
+        );
+        field(state, Language::English)
+    }
+
+    #[test]
+    fn a_long_revision_rationale_wraps_instead_of_clipping() {
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            LongRationaleProbe,
+        >()))
+        .expect("start the long rationale probe");
+        app.wait_for("id:revision-proposal")
+            .expect("the docked proposal");
+        let node = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == WRAPPING_RATIONALE)
+            })
+            .expect("the rationale's line");
+        assert!(
+            node.bounds.size.height.0 >= 2.0 * tokens::TYPE_UI_LINE,
+            "the rationale lays out at least two lines: {:?}",
+            node.bounds
+        );
+    }
+
     #[test]
     fn decisions_advance_undo_and_reset_with_the_proposal() {
         // The hunks carry signals; the model below never reads them, but
