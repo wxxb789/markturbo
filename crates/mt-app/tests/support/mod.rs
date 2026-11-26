@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use nsh_testing::{DragOptions, Headless};
+use nsh_testing::{DragOptions, Headless, Screen};
 
 /// How long one pumped frame waits for the app before the loop looks again.
 const STEP: Duration = Duration::from_millis(25);
@@ -60,6 +60,27 @@ pub fn wait_for_file(
 pub fn wait_for_pending_dialog(app: &mut Headless, what: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while app.pending_dialog().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {:?} on screen",
+            app.screen().texts()
+        );
+        pump(app);
+    }
+}
+
+/// Waits until `done` holds for what the app shows, advancing it between
+/// looks: `Headless::wait_until()` only looks again after a batch, so on the
+/// system clock a marker a background thread sets without scheduling UI work
+/// can time out while the condition already holds.
+pub fn wait_for_marker(
+    app: &mut Headless,
+    what: &str,
+    timeout: Duration,
+    done: impl Fn(&Screen) -> bool,
+) {
+    let deadline = Instant::now() + timeout;
+    while !done(app.screen()) {
         assert!(
             Instant::now() < deadline,
             "{what}: {:?} on screen",

@@ -8,6 +8,8 @@ use mt_core::recovery::RecoveryKey;
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 fn editor_text(app: &Headless) -> String {
     app.screen()
         .input_text("label:Markdown source")
@@ -153,24 +155,24 @@ fn a_stale_reload_answer_does_not_reconflict_a_synced_tab() {
     app.wait_for("id:guard-reload").expect("the reload guard");
     app.press("id:guard-reload")
         .expect("confirm the first reload");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the first reload's read to reach its gate",
         Duration::from_secs(5),
         |_| mt_app::test_vault::gate_reads_started(&path) == 1,
-    )
-    .expect("the first reload waits on the disk");
+    );
     app.press("id:conflict-use-disk")
         .expect("ask to reload from disk again");
     app.wait_for("id:guard-reload")
         .expect("the second reload guard");
     app.press("id:guard-reload")
         .expect("confirm the second reload");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the second reload's read to reach its gate",
         Duration::from_secs(5),
         |_| mt_app::test_vault::gate_reads_started(&path) == 2,
-    )
-    .expect("the second reload waits on the disk");
+    );
 
     // The second request's answer arrives first and syncs the tab.
     std::fs::write(&second_release, "go").expect("release the second reload");
@@ -185,12 +187,12 @@ fn a_stale_reload_answer_does_not_reconflict_a_synced_tab() {
     // The first request's answer arrives last. It is stale: the tab is
     // already synced, so no conflict may come back and the buffer stays.
     std::fs::write(&first_release, "go").expect("release the first reload");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the stale reload answer to be handled",
         Duration::from_secs(10),
         |_| mt_app::test_vault::reload_superseded(&path),
-    )
-    .expect("the stale reload answer was handled");
+    );
     assert!(
         !app.screen()
             .matches("id:conflict-banner")
@@ -253,24 +255,24 @@ fn a_stale_reload_failure_writes_no_notice() {
     app.wait_for("id:guard-reload").expect("the reload guard");
     app.press("id:guard-reload")
         .expect("confirm the first reload");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the first reload's read to reach its gate",
         Duration::from_secs(5),
         |_| mt_app::test_vault::gate_reads_started(&path) == 1,
-    )
-    .expect("the first reload waits on the disk");
+    );
     app.press("id:conflict-use-disk")
         .expect("ask to reload from disk again");
     app.wait_for("id:guard-reload")
         .expect("the second reload guard");
     app.press("id:guard-reload")
         .expect("confirm the second reload");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the second reload's read to reach its gate",
         Duration::from_secs(5),
         |_| mt_app::test_vault::gate_reads_started(&path) == 2,
-    )
-    .expect("the second reload waits on the disk");
+    );
 
     // The second request's answer arrives first and syncs the tab.
     std::fs::write(&second_release, "go").expect("release the second reload");
@@ -281,12 +283,12 @@ fn a_stale_reload_failure_writes_no_notice() {
     // and its handling is the only proof the failure was processed.
     std::fs::remove_file(&path).expect("remove the source of the stale read");
     std::fs::write(&first_release, "go").expect("release the first reload");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the stale reload failure to be handled",
         Duration::from_secs(10),
         |_| mt_app::test_vault::reload_superseded(&path),
-    )
-    .expect("the stale failure was handled");
+    );
     assert!(
         !app.screen()
             .texts()

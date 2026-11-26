@@ -2,8 +2,9 @@
 //! keyboard focus must land on that editor, proven by where the next key
 //! types, never on the document container in between.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use nsh_core::Command;
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
@@ -15,6 +16,34 @@ fn editor_text(app: &Headless) -> String {
         .expect("read editor text")
         .unwrap_or_default()
         .to_owned()
+}
+
+/// Whether the app's own last focus move gave the mounted source editor the
+/// keyboard.
+fn editor_focused(app: &Headless) -> bool {
+    let Ok(editor) = app.screen().id("label:Markdown source") else {
+        return false;
+    };
+    app.screen()
+        .commands()
+        .iter()
+        .any(|(id, command)| *id == editor && matches!(command, Command::Focus))
+}
+
+/// Waits until the mounted source editor holds the keyboard: a close or a
+/// rail switch mounts the next editor a commit later and retries the focus
+/// for a few frames, so a key typed before that lands nowhere.
+fn wait_for_editor_focus(app: &mut Headless) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !editor_focused(app) {
+        assert!(
+            Instant::now() < deadline,
+            "the app never focused the mounted editor: {:?}",
+            app.screen().texts()
+        );
+        app.next_change(Duration::from_millis(25))
+            .expect("wait for the editor focus");
+    }
 }
 
 #[test]
@@ -59,8 +88,8 @@ fn focus_lands_on_the_editor_the_next_tab_mounts() {
     open(&mut app, "second", "text:# Second heading");
 
     // Dirty the second tab, close it through the guard's Don't save chosen
-    // with the keyboard (Left off Cancel, Enter), and type at once: the key
-    // can only land if the fallback tab's editor took the focus, not the
+    // with the keyboard (Left off Cancel, Enter), and type once the fallback
+    // tab's editor has the focus: the key can only land there, not on the
     // document container it mounts inside. The guard closes on the Enter
     // binding, whose owner dies with the card; the focus retry must outlive
     // it.
@@ -69,11 +98,13 @@ fn focus_lands_on_the_editor_the_next_tab_mounts() {
     app.press_key("mod+w").expect("close the dirty tab");
     app.wait_for("id:guard-dont-save").expect("the close guard");
     app.press_key("left").expect("select Don't save");
+    app.clear_commands();
     app.press_key("enter").expect("confirm with the keyboard");
     app.wait_for_gone("id:guard-card", TIMEOUT)
         .expect("the guard closes");
     app.wait_for("text:# First heading")
         .expect("the fallback document");
+    wait_for_editor_focus(&mut app);
     app.press_key("z").expect("type after the close");
     assert!(
         editor_text(&app).contains('z'),
@@ -84,9 +115,11 @@ fn focus_lands_on_the_editor_the_next_tab_mounts() {
     // The same path through a rail switch: first.md's dot rebuilds its
     // editor, and the next key must land there.
     open(&mut app, "third", "text:# Third heading");
+    app.clear_commands();
     app.press("label:first.md").expect("switch to first.md");
     app.wait_for("id:title-file >> text:first.md")
         .expect("first.md is active again");
+    wait_for_editor_focus(&mut app);
     app.press_key("y").expect("type after the switch");
     assert!(
         editor_text(&app).contains('y'),

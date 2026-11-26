@@ -6,8 +6,10 @@ name: Nightly
 # request. The combinations that no longer run per pull request run here once
 # a day as a non-blocking safety net: they are not a pull-request check and
 # never gate a merge.
-# It is also the plain `cargo test` backstop: the per-pull-request app suites
-# use `cargo nextest`, which does not run doctests.
+# The workspace suites run under `cargo nextest` here too, one process per
+# test. nextest runs no doctests and both workspace libraries set
+# `doctest = false`, so none exist to run; `check fast` fails when one enables
+# them without a gate step.
 on:
   schedule:
     # Off-peak and off the top of the hour, away from GitHub's cron peak.
@@ -101,12 +103,17 @@ jobs:
         with:
           shared-key: markturbo-${{ matrix.cache }}
 
-      - name: Test the workspace
-        run: cargo test --locked --profile ci --workspace
-
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: nextest
+
+      - name: Test the workspace
+        # `--test suite` links the mt-app files once but filters out mt-core's
+        # per-file tests, so mt-core runs separately; nextest gives each test
+        # its own process, which the environment-variable tests need.
+        run: |
+          cargo nextest run --locked --cargo-profile ci -p mt-core --features model-transport,test-support
+          cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite
 
       - name: Test the app in the release profile
         # The shipped codegen (thin LTO, one codegen unit) re-optimizes the

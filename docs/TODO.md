@@ -132,16 +132,11 @@
   - The doctest guard in `scripts/tests/test_checks.py` checks only that `--doc` appears. If doctests are enabled
     again, verify which crates the command actually covers.
 - [ ] **Goal 20 lane 20-A test hardening (PR #71 review P3s)**:
-  - The nightly runs plain `cargo test --workspace`, so `recovery_undo.rs`, `folder_open_token.rs` and
-    `reload_edit_race.rs` share one process. Cases in one binary race on `MARKTURBO_CONFIG_DIR`, `MARKTURBO_DATA_DIR`
-    and `MARKTURBO_OPEN`. Move the nightly to nextest, or give these fixtures per-test isolation.
   - `nsh-testing` 0.7.1 `Headless::react()` answers a `SaveDialog` at once. The Quit test in `translation_flow.rs` can
     gate only the app's read of the answer, not the platform's reply, so it does not prove the translation lands while
     the picker is unanswered.
   - The Chinese Save As guard formats a raw OS error through `io::Error::Display`, which appends the English
     ` (os error N)`.
-  - `wait_until()` gates on test markers that schedule no UI batch (`folder_open_token.rs`, `reload_edit_race.rs`,
-    `translation_flow.rs`). Under the system clock they can time out after the condition already holds.
 - [ ] **Goal 20 lane 20-C follow-ups (PR #74 review)**:
   - Accepted residual: on Windows, `delete_resolved()` (`crates/mt-core/src/credentials.rs`) compares the secret and
     `LastWritten`, then calls `CredDeleteW` by target name. If the Credential Manager replaces the entry between the

@@ -10,6 +10,8 @@ use std::time::Duration;
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
+mod support;
+
 #[test]
 fn a_slow_first_open_never_commits_over_a_fast_second() {
     let slow = tempfile::tempdir().expect("slow workspace");
@@ -30,7 +32,7 @@ fn a_slow_first_open_never_commits_over_a_fast_second() {
     let slow_name = name(&slow);
     let fast_name = name(&fast);
 
-    // SAFETY: this binary has one test.
+    // SAFETY: nextest runs each test in its own process.
     unsafe {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
@@ -90,12 +92,12 @@ fn a_slow_first_open_never_commits_over_a_fast_second() {
     // only proof the stale scan ran at all (contract amendment 7).
     std::fs::remove_dir_all(slow.path()).expect("remove the superseded workspace");
     std::fs::write(&release, "go").expect("release the slow scan");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the superseded slow open to return",
         Duration::from_secs(10),
         |_| mt_app::test_vault::open_superseded(slow.path()),
-    )
-    .expect("the slow first open returned after its release");
+    );
 
     // Now that it returned, none of the stale result's surfaces moved: root
     // and files, Context, Recents and status still name the fast folder, and
@@ -223,12 +225,12 @@ fn a_superseded_successful_open_commits_nothing() {
     // screen, so its token check is the only proof the stale scan ran at
     // all (contract amendment 7).
     std::fs::write(&release, "go").expect("release the slow scan");
-    app.wait_until(
+    support::wait_for_marker(
+        &mut app,
         "the superseded slow open to return",
         Duration::from_secs(10),
         |_| mt_app::test_vault::open_superseded(slow.path()),
-    )
-    .expect("the slow first open returned after its release");
+    );
 
     // None of the stale result's surfaces moved: root and files, Context,
     // Recents and status still name the fast folder.
