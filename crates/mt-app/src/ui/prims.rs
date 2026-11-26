@@ -63,7 +63,8 @@ pub fn opaque(color: Color) -> Color {
 
 /// The UI text box the page's 4px rhythm was built with: nsh 0.7 typesets
 /// text at its declared line height, two points over the box the layout
-/// used, so UI text boxes are pinned to it.
+/// used, so UI text boxes are pinned to it. [`faint`] declares it as its
+/// line height instead, so a wrapped caption keeps the rhythm.
 pub(crate) const UI_TEXT_BOX_H: f32 = TYPE_UI_LINE - 2.0;
 
 /// Body ink at the UI size and line height: your own text and the labels that
@@ -93,8 +94,7 @@ pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement + Sty
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
-        .line_height(px(TYPE_UI_LINE))
-        .h(px(UI_TEXT_BOX_H))
+        .line_height(px(UI_TEXT_BOX_H))
         .text_color(move || tokens::palette().ink_caption)
 }
 

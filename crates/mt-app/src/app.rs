@@ -10,8 +10,8 @@ use std::{cell::Cell, path::PathBuf, rc::Rc, time::Duration};
 use mt_core::settings::Language;
 use nsh_core::{
     Points,
-    desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes},
-    element::desktop::window,
+    desktop::{QuitMode, TitleBarOptions, TitleBarStyle, WindowAttributes},
+    element::desktop::{set_quit_mode, window},
     prelude::*,
 };
 
@@ -28,6 +28,9 @@ pub fn App() -> impl IntoElement {
     // render); this covers the hosts that build the root themselves, and nsh
     // ignores a font it has already seen.
     ui::fonts::register();
+    // The app ends when its last window closes on every platform; the
+    // platform default would leave it in the macOS Dock.
+    set_quit_mode(QuitMode::LastWindowClosed);
     let state = AppState::new();
     // A downloaded companion CJK face is read, verified and registered on a
     // blocking thread, after the first frame is on its way.

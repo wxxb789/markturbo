@@ -58,6 +58,8 @@ mod language_switch;
 mod palette_folder;
 #[path = "paste_document.rs"]
 mod paste_document;
+#[path = "quit_exits_macos.rs"]
+mod quit_exits_macos;
 #[path = "quit_guard.rs"]
 mod quit_guard;
 #[path = "quit_untitled.rs"]

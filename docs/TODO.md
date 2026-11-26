@@ -112,14 +112,16 @@
   native goal-07 re-run remains. See
   [goal-15-acceptance.md](goal-15-acceptance.md#native-acceptance-2026-11-23).
 - [ ] **Visual harness observation channel for the WebView states** — the
-  2026-11-24 visual matrix captured 20 of 22 cells; both
-  `web-compatibility-preview` cells failed with
+  2026-11-24 visual matrix (commit `32f324d`, nsh 0.6.1) captured 20 of 22
+  cells; both `web-compatibility-preview` cells failed with
   `WEB_COMPATIBILITY_PREVIEW_WEB_VIEW_MISSING_UIA_CONTRACT_MISMATCH` because
-  the harness looks for the WebView through UIA, and nsh 0.7.1 hosts WebView2
-  in a composition controller with no automation provider. Rebuild that proof
-  on an observation channel nsh 0.7.1 exposes (for example pixels from a window
-  capture), and add consent-card and title-menu states if before/after
-  captures of them are still wanted. See
+  the harness looks for the WebView through UIA, and nsh 0.6.1 hosts WebView2
+  in a composition controller with no automation provider. A source reading of
+  nsh 0.7.1 suggests the composition-controller hosting is unchanged, but
+  that is unverified natively. Rebuild that proof on an observation channel
+  nsh 0.7.1 exposes (for example pixels from a window capture), and add
+  consent-card and title-menu states if before/after captures of them are
+  still wanted. See
   [goal-16-acceptance.md](goal-16-acceptance.md#desktop-acceptance-2026-11-24).
 
 - [ ] **nextest gate follow-ups (PR #75 review, P3)**:

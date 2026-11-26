@@ -2988,9 +2988,10 @@ impl AppState {
         self.open_guard(GuardKind::QuitApp);
     }
 
-    /// Closes the app's declared main window; the platform's quit mode ends
-    /// the app when its last window closes. Falls back to quitting when the
-    /// window never rendered (a headless close before the first frame).
+    /// Closes the app's declared main window; the app's quit mode
+    /// (`LastWindowClosed`, set in `app.rs`) ends the app when its last
+    /// window closes. Falls back to quitting when the window never rendered
+    /// (a headless close before the first frame).
     fn close_main_window(&self) {
         if let Some(window) = self.main_window.borrow().clone() {
             window.close();
