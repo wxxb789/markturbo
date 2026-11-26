@@ -110,10 +110,11 @@ jobs:
       - name: Test the workspace
         # `--test suite` links the mt-app files once but filters out mt-core's
         # per-file tests, so mt-core runs separately; nextest gives each test
-        # its own process, which the environment-variable tests need.
+        # its own process, which the environment-variable tests need, and
+        # `--no-fail-fast` keeps the rest of a suite running after one fails.
         run: |
-          cargo nextest run --locked --cargo-profile ci -p mt-core --features model-transport,test-support
-          cargo nextest run --locked --cargo-profile ci -p mt-app --lib --bins --test suite
+          cargo nextest run --locked --cargo-profile ci --no-fail-fast -p mt-core --features model-transport,test-support
+          cargo nextest run --locked --cargo-profile ci --no-fail-fast -p mt-app --lib --bins --test suite
 
       - name: Test the app in the release profile
         # The shipped codegen (thin LTO, one codegen unit) re-optimizes the

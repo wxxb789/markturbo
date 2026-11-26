@@ -18,27 +18,30 @@ fn editor_text(app: &Headless) -> String {
         .to_owned()
 }
 
-/// Whether the app's own last focus move gave the mounted source editor the
-/// keyboard.
-fn editor_focused(app: &Headless) -> bool {
+/// Whether the first focus the app gave after the command history was
+/// cleared went to the mounted source editor: a focus that reached the
+/// document container or anything else first would swallow the next key.
+fn editor_focused_first(app: &Headless) -> bool {
     let Ok(editor) = app.screen().id("label:Markdown source") else {
         return false;
     };
     app.screen()
         .commands()
         .iter()
-        .any(|(id, command)| *id == editor && matches!(command, Command::Focus))
+        .find(|(_, command)| matches!(command, Command::Focus))
+        .is_some_and(|(id, _)| *id == editor)
 }
 
-/// Waits until the mounted source editor holds the keyboard: a close or a
-/// rail switch mounts the next editor a commit later and retries the focus
-/// for a few frames, so a key typed before that lands nowhere.
+/// Waits until the app's focus command history shows the mounted source
+/// editor taking the keyboard before any other view: a close or a rail
+/// switch mounts the next editor a commit later and retries the focus for a
+/// few frames, so a key typed before that lands nowhere.
 fn wait_for_editor_focus(app: &mut Headless) {
     let deadline = Instant::now() + TIMEOUT;
-    while !editor_focused(app) {
+    while !editor_focused_first(app) {
         assert!(
             Instant::now() < deadline,
-            "the app never focused the mounted editor: {:?}",
+            "the mounted editor never took the focus first: {:?}",
             app.screen().texts()
         );
         app.next_change(Duration::from_millis(25))
