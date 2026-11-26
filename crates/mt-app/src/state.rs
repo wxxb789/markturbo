@@ -3242,7 +3242,7 @@ impl AppState {
     }
 
     /// Frames a pending editor focus waits for a tab switch to mount it.
-    const FOCUS_RETRY_FRAMES: u8 = 6;
+    pub const FOCUS_RETRY_FRAMES: u8 = 6;
 
     fn retry_editor_focus(&self, active: u64, frames_left: u8) {
         if self.focus_mounted_editor(active) {
