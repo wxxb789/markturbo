@@ -48,11 +48,11 @@ in about two minutes instead of after the workspace has compiled. Windows 11 x64
 run --locked --cargo-profile ci -p mt-app --lib --bins --test suite`, plus
 `-p mt-core --features model-transport,test-support`); the separate
 `macos-15` arm64 job
-builds the release executable, verifies the Mach-O arm64 slice and runs
-`cargo test --locked --profile ci -p mt-core`. The macOS workspace suite and the
-release-profile app suite no longer run per PR: `.github/workflows/nightly.yml`
-(schedule plus manual dispatch) reruns the combined `check ci` on
-`ubuntu-24.04`, `cargo test --locked --profile ci --workspace` and
+builds the release executable and verifies the Mach-O arm64 slice only. The
+macOS behavior suite and the release-profile app suite no longer run per PR:
+`.github/workflows/nightly.yml` (schedule plus manual dispatch) reruns the
+combined `check ci` on `ubuntu-24.04`, the workspace suites under
+`cargo nextest` and
 `cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
 suite` on `macos-15` and `windows-2022`, as a non-blocking safety net
 rather than a PR gate. `suite` links every `crates/mt-app/tests/*.rs`
@@ -241,6 +241,31 @@ The release workflow runs `check fast` and the formatting check, then packages
 the tagged revision (building and privacy-scanning the release binary),
 smoke-tests install and uninstall, and publishes the release. There is no draft or manual approval step: a pushed tag
 that passes these checks is public.
+
+## On-demand acceptance executable
+
+`.github/workflows/acceptance-exe.yml` builds the raw Cargo release-profile
+`markturbo.exe` on a `windows-2022` runner for native acceptance without
+publishing anything: it creates no release, tag or asset, and uploads only the
+executable and its `SHA256SUMS.txt` as a workflow artifact. The artifact is for
+acceptance of reviewed commits only; the run rejects `refs/pull/*` refs.
+
+```sh
+gh workflow run acceptance-exe.yml -f ref=<branch-or-sha>
+gh run download <id> -n markturbo-exe-<short-sha> -D <dir>
+uv run --locked --project scripts scripts/mt.py accept all \
+    --exe "<dir>/markturbo.exe" --expect-exe-sha256 <sha256>
+```
+
+The summary of the run and the downloaded `SHA256SUMS.txt` record the requested
+ref (or the dispatched commit), the resolved commit, the executable name, its
+size and its SHA-256. Without `-f ref` the run builds the commit that dispatched
+it.
+
+This artifact is the raw Cargo binary. The installer's executable also gets icon
+resources and, when configured, a signature
+(`scripts/markturbo_tools/release.py`), so its bytes differ; the acceptance hash
+is not the shipped file's hash.
 
 ## Implementation and acceptance are separate
 

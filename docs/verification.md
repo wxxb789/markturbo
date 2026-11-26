@@ -76,9 +76,8 @@ doctests; both libraries set `doctest = false` and `cargo test --doc --workspace
 compiles a separate unit set for zero tests (measured 11m33s), so no gate pays
 for it today. `check fast` reads the workspace manifests and fails when a
 library enables doctests, so a new doctest has to arrive with the gate step that
-runs it; the nightly `cargo test --workspace` job stays the plain-`cargo test`
-backstop, and the `mt-core` shard would still run mt-core doctests per pull
-request.
+runs it; the `mt-core` shard's plain `cargo test` runner would still run
+mt-core doctests per pull request.
 
 The three Linux Rust jobs are the pieces of `check ci`, split so the wall clock
 is the slowest shard instead of the sum: `check fast` and formatting in
@@ -98,16 +97,15 @@ invalidated the build fingerprint and produced no comparable measurement.
 Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
 app/UI headless suite on the public-quality platform, and macOS the arm64 release
 artifact. macOS behavior runs in the nightly instead of per pull request: a
-per-pull-request `cargo test -p mt-core` on that runner failed eight
-`document::io::tests::skill_save_*` concurrent-save tests in both feature
-configurations (runs 43630038928 and 43631880761) while the nightly-form
-`cargo test --workspace` run passed the same tests (job 132527749238 printed
-`... ok`). That difference is recorded in `docs/TODO.md` as a question about the
-tests and the shared commit path, not as a platform flake, and the per-pull-request
-job keeps only the evidence its name claims. The
-combinations that used to repeat on every platform run once a day in
-`.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
-`cargo test --locked --profile ci --workspace` and
+per-pull-request `cargo test -p mt-core` on that runner reported eight
+`document::io::tests::skill_save_*` concurrent-save failures in both feature
+configurations (runs 43630038928 and 43631880761). macOS 15's `linkat`
+rejected `AT_SYMLINK_NOFOLLOW_ANY` before the save's concurrency checks; the
+runner's macOS version, not the test invocation, was the difference, and #42
+(commit `950bf6b`) fixed it. The per-pull-request job keeps only the evidence
+its name claims. The combinations that used to repeat on every platform run
+once a day in `.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
+the workspace suites under `cargo nextest` and
 `cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
 suite` on `macos-15` and `windows-2022`);
 the scheduled run is a non-blocking safety net and never gates a merge. It is
