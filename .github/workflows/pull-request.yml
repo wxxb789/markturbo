@@ -258,10 +258,11 @@ jobs:
 
   # Compatibility evidence for the arm64 build: the release binary and its Mach-O
   # arm64 slice. Behavior on macOS runs in the nightly workflow, under `cargo
-  # nextest`; the historical `--workspace` run is the configuration with passing
-  # evidence on that runner (a per-pull-request `-p mt-core` variant failed eight
-  # concurrent-save tests: runs 43630038928 and 43631880761, recorded in
-  # docs/TODO.md). The nightly also keeps this job's cache warm.
+  # nextest`; the eight concurrent-save failures the former per-pull-request
+  # macOS test job reported (runs 43630038928 and 43631880761) were macOS 15's
+  # `linkat` rejecting `AT_SYMLINK_NOFOLLOW_ANY`, fixed in #42 (commit 950bf6b),
+  # not a difference in test invocation. The nightly also keeps this job's cache
+  # warm.
   macos-arm64-compatibility:
     name: macOS arm64 compatibility
     needs: [classify, preflight]

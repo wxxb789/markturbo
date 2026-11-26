@@ -97,16 +97,15 @@ invalidated the build fingerprint and produced no comparable measurement.
 Each platform owns one tier: Ubuntu the authoritative Rust gate, Windows the
 app/UI headless suite on the public-quality platform, and macOS the arm64 release
 artifact. macOS behavior runs in the nightly instead of per pull request: a
-per-pull-request `cargo test -p mt-core` on that runner failed eight
-`document::io::tests::skill_save_*` concurrent-save tests in both feature
-configurations (runs 43630038928 and 43631880761) while the then-nightly
-`cargo test --workspace` run passed the same tests (job 132527749238 printed
-`... ok`). That difference is recorded in `docs/TODO.md` as a question about the
-tests and the shared commit path, not as a platform flake, and the per-pull-request
-job keeps only the evidence its name claims. The
-combinations that used to repeat on every platform run once a day in
-`.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`, the workspace
-suites under `cargo nextest` and
+per-pull-request `cargo test -p mt-core` on that runner reported eight
+`document::io::tests::skill_save_*` concurrent-save failures in both feature
+configurations (runs 43630038928 and 43631880761). macOS 15's `linkat`
+rejected `AT_SYMLINK_NOFOLLOW_ANY` before the save's concurrency checks; the
+runner's macOS version, not the test invocation, was the difference, and #42
+(commit `950bf6b`) fixed it. The per-pull-request job keeps only the evidence
+its name claims. The combinations that used to repeat on every platform run
+once a day in `.github/workflows/nightly.yml` (`check ci` on `ubuntu-24.04`,
+the workspace suites under `cargo nextest` and
 `cargo nextest run --locked --cargo-profile release -p mt-app --lib --test
 suite` on `macos-15` and `windows-2022`);
 the scheduled run is a non-blocking safety net and never gates a merge. It is

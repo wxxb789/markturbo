@@ -2,8 +2,9 @@
 //! keyboard focus must land on that editor, proven by where the next key
 //! types, never on the document container in between.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use mt_app::state::AppState;
 use nsh_core::Command;
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
@@ -33,20 +34,27 @@ fn editor_focused_first(app: &Headless) -> bool {
 }
 
 /// Waits until the app's focus command history shows the mounted source
-/// editor taking the keyboard before any other view: a close or a rail
-/// switch mounts the next editor a commit later and retries the focus for a
-/// few frames, so a key typed before that lands nowhere.
+/// editor taking the keyboard before any other view, within the app's own
+/// focus-retry window of the first screen the editor is on: a close or a
+/// rail switch mounts the next editor a commit later and retries the focus
+/// for [`AppState::FOCUS_RETRY_FRAMES`] frames, so a focus after that window
+/// is no retry at all.
 fn wait_for_editor_focus(app: &mut Headless) {
-    let deadline = Instant::now() + TIMEOUT;
-    while !editor_focused_first(app) {
-        assert!(
-            Instant::now() < deadline,
-            "the mounted editor never took the focus first: {:?}",
-            app.screen().texts()
-        );
+    app.wait_for("label:Markdown source")
+        .expect("the mounted source editor");
+    for _ in 0..AppState::FOCUS_RETRY_FRAMES {
+        if editor_focused_first(app) {
+            return;
+        }
         app.next_change(Duration::from_millis(25))
             .expect("wait for the editor focus");
     }
+    assert!(
+        editor_focused_first(app),
+        "the mounted editor took longer than {} frames to take the focus: {:?}",
+        AppState::FOCUS_RETRY_FRAMES,
+        app.screen().texts()
+    );
 }
 
 #[test]

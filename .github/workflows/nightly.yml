@@ -112,9 +112,14 @@ jobs:
         # per-file tests, so mt-core runs separately; nextest gives each test
         # its own process, which the environment-variable tests need, and
         # `--no-fail-fast` keeps the rest of a suite running after one fails.
+        # Both commands run even when the first fails, and the step reports
+        # that failure at the end, so one suite never hides the other's
+        # results.
         run: |
-          cargo nextest run --locked --cargo-profile ci --no-fail-fast -p mt-core --features model-transport,test-support
-          cargo nextest run --locked --cargo-profile ci --no-fail-fast -p mt-app --lib --bins --test suite
+          fail=0
+          cargo nextest run --locked --cargo-profile ci --no-fail-fast -p mt-app --lib --bins --test suite || fail=1
+          cargo nextest run --locked --cargo-profile ci --no-fail-fast -p mt-core --features model-transport,test-support || fail=1
+          exit "$fail"
 
       - name: Test the app in the release profile
         # The shipped codegen (thin LTO, one codegen unit) re-optimizes the

@@ -72,10 +72,11 @@ pub fn wait_for_pending_dialog(app: &mut Headless, what: &str, timeout: Duration
 /// Waits until `done` holds for what the app shows, advancing it between
 /// looks: `Headless::wait_until()` only looks again after a batch, so on the
 /// system clock a marker a background thread sets without scheduling UI work
-/// can time out while the condition already holds. The pump runs before the
-/// first look, as `wait_until` drains and checks before its own, so queued
-/// work (and the app's errors) cannot be skipped when the marker already
-/// reads true.
+/// can time out while the condition already holds. Every look drains the
+/// whole queued batch backlog first (`Headless::catch_up`, what `wait_until`
+/// does before its first check), so a marker that reads true cannot leave a
+/// batch that was already queued unapplied; the pump then waits for the next
+/// one.
 pub fn wait_for_marker(
     app: &mut Headless,
     what: &str,
@@ -84,7 +85,7 @@ pub fn wait_for_marker(
 ) {
     let deadline = Instant::now() + timeout;
     loop {
-        pump(app);
+        app.catch_up();
         if done(app.screen()) {
             return;
         }
@@ -93,6 +94,7 @@ pub fn wait_for_marker(
             "{what}: {:?} on screen",
             app.screen().texts()
         );
+        pump(app);
     }
 }
 
