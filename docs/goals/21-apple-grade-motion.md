@@ -104,6 +104,9 @@ These override any conflicting text in the motion direction below.
    - Goal 21 starts after Goal 22, because Goal 22 replaces the dot rail with a persistent file sidebar.
    - Before any lane starts, the owner picks one of three distinct interactive HTML motion prototypes (owner rule,
      2026-11-24). The chosen direction refines the motion spec below.
+   - On 2026-11-26 the owner chose **B, Crisp**: the motion spec below as written, with entries at 200 ms, exits at
+     150 ms, a scale floor of 0.96 and a 4 px rise. Rejected: A (opacity-only fades of 90–140 ms, the camera jumps
+     instead of gliding) and C (surfaces grow from their source and travel back, critically damped, 220–320 ms).
    - Fixes 4 and 11 and lane 21-C's rail widen and collapse apply to the sidebar's collapse and expand.
    - The frame scenario "rail widen and collapse" becomes "sidebar collapse and expand".
    - If a scenario is instant in the baseline, it has no animation-window frames to compare. Two measures replace the
