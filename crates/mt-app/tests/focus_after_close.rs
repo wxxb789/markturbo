@@ -2,7 +2,7 @@
 //! keyboard focus must land on that editor, proven by where the next key
 //! types, never on the document container in between.
 
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 use mt_app::state::AppState;
 use nsh_core::Command;
@@ -10,6 +10,8 @@ use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn editor_text(app: &Headless) -> String {
     app.screen()
@@ -59,6 +61,7 @@ fn wait_for_editor_focus(app: &mut Headless) {
 
 #[test]
 fn focus_lands_on_the_editor_the_next_tab_mounts() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().expect("temp dir");
     let config = tempfile::tempdir().expect("config dir");
     let first = dir.path().join("first.md");
@@ -68,7 +71,7 @@ fn focus_lands_on_the_editor_the_next_tab_mounts() {
     std::fs::write(&second, "# Second heading\n").expect("write second");
     std::fs::write(&third, "# Third heading\n").expect("write third");
 
-    // SAFETY: this binary has one test.
+    // SAFETY: TEST_LOCK serializes app lifetimes and environment changes.
     unsafe {
         std::env::set_var("MARKTURBO_OPEN", &first);
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
@@ -135,6 +138,48 @@ fn focus_lands_on_the_editor_the_next_tab_mounts() {
     assert!(
         editor_text(&app).contains('y'),
         "the rail switch left the keyboard off the new editor: {:?}",
+        editor_text(&app)
+    );
+}
+
+#[test]
+fn ctrl_n_after_escape_focuses_the_new_editor() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let config = tempfile::tempdir().expect("config dir");
+
+    // SAFETY: TEST_LOCK serializes app lifetimes and environment changes.
+    unsafe {
+        std::env::remove_var("MARKTURBO_OPEN");
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+    }
+
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
+        .expect("wide viewport");
+    app.wait_for("id:welcome").expect("the welcome page");
+    app.press("id:welcome-new-file").expect("new document");
+    app.wait_for("label:Markdown source").expect("the editor");
+    app.type_text("label:Markdown source", "seed")
+        .expect("type into the draft");
+
+    // Escape blurs the editor; the next new tab must still take the
+    // keyboard when it mounts.
+    app.press_key("escape").expect("escape");
+    app.press_key("mod+n").expect("Ctrl+N");
+    app.wait_until("a second tab", TIMEOUT, |screen| {
+        screen.count("id:rail-file-row").unwrap_or(0) == 2
+    })
+    .expect("Ctrl+N starts another document");
+    app.press_key("q").expect("type into the new document");
+    assert!(
+        editor_text(&app).contains('q'),
+        "Ctrl+N left the keyboard off the new editor: {:?}",
         editor_text(&app)
     );
 }

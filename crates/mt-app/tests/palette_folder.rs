@@ -1,18 +1,22 @@
 //! The palette with no folder names the next step instead of pretending a
-//! search ran, and Escape returns the keyboard to the editor.
+//! search ran, Escape returns the keyboard to the editor, and a chosen file
+//! takes it too.
 
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
 
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::Headless;
 
 const HINT: &str = "Open a folder first to search its files.";
 
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn the_palette_without_a_folder_says_so_and_escape_returns_focus() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let config = tempfile::tempdir().expect("config dir");
 
-    // SAFETY: this binary has one test.
+    // SAFETY: TEST_LOCK serializes app lifetimes and environment changes.
     unsafe {
         std::env::remove_var("MARKTURBO_OPEN");
         std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
@@ -80,4 +84,128 @@ fn the_palette_without_a_folder_says_so_and_escape_returns_focus() {
         },
     )
     .expect("the keystroke landed in the editor");
+}
+
+#[test]
+fn choosing_a_palette_file_focuses_the_opened_editor() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let work = tempfile::tempdir().expect("workspace");
+    std::fs::write(work.path().join("plan.md"), "# Plan\n").expect("write plan");
+    std::fs::write(work.path().join("notes.md"), "# Notes\n").expect("write notes");
+    let config = tempfile::tempdir().expect("config dir");
+
+    // SAFETY: TEST_LOCK serializes app lifetimes and environment changes.
+    unsafe {
+        std::env::remove_var("MARKTURBO_OPEN");
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+    }
+
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
+        .expect("wide viewport");
+    app.wait_for("id:welcome").expect("the welcome page");
+    app.on_pick_paths(vec![work.path().to_path_buf()])
+        .expect("answer the folder picker");
+    app.press("id:welcome-open-folder")
+        .expect("open the folder");
+    app.wait_for("id:workspace-home").expect("the workspace");
+
+    // Enter opens the highlighted file; the next plain key lands in it.
+    app.press_key("mod+p").expect("open the palette");
+    app.wait_for("id:palette-input").expect("the palette");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter to plan.md");
+    app.submit("id:palette-input").expect("open plan.md");
+    app.wait_for("text:# Plan").expect("the plan document");
+    app.press_key("x").expect("type without clicking");
+    assert!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the editor")
+            .is_some_and(|text| text.contains('x')),
+        "Enter left the keyboard off the opened editor: {:?}",
+        app.screen().input_text("label:Markdown source")
+    );
+
+    // A click on a row does the same.
+    app.press_key("mod+p").expect("open the palette again");
+    app.wait_for("id:palette-input").expect("the palette");
+    app.type_text("id:palette-input", "notes")
+        .expect("filter to notes.md");
+    app.press("id:palette-row").expect("choose the row");
+    app.wait_for("text:# Notes").expect("the notes document");
+    app.press_key("y").expect("type without clicking");
+    assert!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the editor")
+            .is_some_and(|text| text.contains('y')),
+        "the click left the keyboard off the opened editor: {:?}",
+        app.screen().input_text("label:Markdown source")
+    );
+}
+
+#[test]
+fn an_open_title_menu_keeps_the_keyboard_from_a_finishing_load() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let work = tempfile::tempdir().expect("workspace");
+    std::fs::write(work.path().join("plan.md"), "# Plan\n").expect("write plan");
+    let config = tempfile::tempdir().expect("config dir");
+
+    // SAFETY: TEST_LOCK serializes app lifetimes and environment changes.
+    unsafe {
+        std::env::remove_var("MARKTURBO_OPEN");
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+    }
+
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
+        .expect("wide viewport");
+    app.wait_for("id:welcome").expect("the welcome page");
+    app.on_pick_paths(vec![work.path().to_path_buf()])
+        .expect("answer the folder picker");
+    app.press("id:welcome-open-folder")
+        .expect("open the folder");
+    app.wait_for("id:workspace-home").expect("the workspace");
+
+    // The menu is open when the not-yet-open file's load finishes: the
+    // load's focus request must not hand the keyboard to the editor under
+    // the menu.
+    app.press("id:title-settings").expect("open the title menu");
+    app.wait_for("id:title-menu").expect("the menu");
+    app.press_key("mod+p")
+        .expect("open the palette over the menu");
+    app.wait_for("id:palette-input").expect("the palette");
+    app.type_text("id:palette-input", "plan")
+        .expect("filter to plan.md");
+    app.submit("id:palette-input").expect("open plan.md");
+    app.wait_for("text:# Plan").expect("the plan document");
+    app.settle();
+
+    app.press_key("x").expect("type at the open menu");
+    assert!(
+        app.screen()
+            .input_text("label:Markdown source")
+            .expect("read the editor")
+            .is_none_or(|text| !text.contains('x')),
+        "a finishing load handed the keyboard to the editor under the menu: {:?}",
+        app.screen().input_text("label:Markdown source")
+    );
+    assert!(
+        app.screen().matches("id:title-menu").expect("selector"),
+        "the load closed the menu: {:?}",
+        app.screen().texts()
+    );
 }

@@ -58,9 +58,7 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
                         ..KeyOptions::default()
                     },
                     move |_| {
-                        if !press_state.escape_top_layer() {
-                            palette.close(&press_state);
-                        }
+                        press_state.escape_top_layer();
                     },
                 );
             }

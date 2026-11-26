@@ -65,7 +65,7 @@ pub(crate) const UI_TEXT_BOX_H: f32 = TYPE_UI_LINE - 2.0;
 
 /// Body ink at the UI size and line height: your own text and the labels that
 /// are not quiet.
-pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styled {
     text(content)
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))

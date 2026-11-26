@@ -355,6 +355,16 @@ impl Layout {
         }
     }
 
+    /// How wide the column draws at `client_width`: the band the overlay
+    /// leaves visible below 1040, its whole box when the field sits beside it.
+    pub fn column_width(self, client_width: f32) -> f32 {
+        if self.field_overlays() {
+            (self.field_left(client_width) - RAIL_W).max(0.0)
+        } else {
+            self.measure() + 2.0 * COLUMN_GAP
+        }
+    }
+
     /// How much the field takes of the width when it overlays the column.
     pub const OVERLAY_FRACTION: f32 = 0.46;
 

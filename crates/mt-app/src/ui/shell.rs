@@ -157,6 +157,8 @@ fn workspace(
     layout: Layout,
     status: notices::StatusPresence,
 ) -> impl IntoElement {
+    let field_open = state.clone();
+    let field_state = state.clone();
     view()
         .test_id("workspace")
         .flex_1()
@@ -165,7 +167,12 @@ fn workspace(
         .flex_row()
         .child(rail::rail(state.clone(), language))
         .child(column(state.clone(), language, layout, status))
-        .child(field(state, language, layout, status))
+        // No surface, no field: an empty field below 1040 would otherwise
+        // lay an opaque overlay over the column and dim it for nothing.
+        .child(when(
+            move || surface(&field_open) != FieldSurface::None,
+            move || field(field_state.clone(), language, layout, status),
+        ))
 }
 
 /// The text column: the document's ground, its measure, its two 40px insets,
@@ -214,6 +221,7 @@ fn column(
             }
         }
     });
+    let dim_state = state.clone();
     view()
         .test_id("column")
         .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
@@ -222,8 +230,13 @@ fn column(
         .px(px(tokens::COLUMN_GAP))
         .pt(move || Length::from(px(snap_offset.get())))
         .bg(move || tokens::palette().column_ground)
-        .when(layout.field_overlays(), |column| {
-            column.opacity(Layout::DIMMED)
+        // Only a field that is actually drawn dims the column under it.
+        .opacity(move || {
+            if layout.field_overlays() && surface(&dim_state) != FieldSurface::None {
+                Layout::DIMMED
+            } else {
+                1.0
+            }
         })
         .child(banner_slot(
             "recovery-banner-slot",
@@ -267,10 +280,7 @@ fn column(
                 .w_full()
                 .max_w(move || {
                     px(if layout.field_overlays() {
-                        (layout.field_left(client_width_now())
-                            - tokens::RAIL_W
-                            - tokens::COLUMN_GAP)
-                            .max(0.0)
+                        (layout.column_width(client_width_now()) - tokens::COLUMN_GAP).max(0.0)
                     } else {
                         layout.measure()
                     })
@@ -381,7 +391,9 @@ fn field_surface(
                     FieldSurface::Review | FieldSurface::Revision
                 )
             },
-            move || notices::status_line_at(notice.clone(), status, StatusSurface::Review),
+            move || {
+                notices::status_line_at(notice.clone(), language, status, StatusSurface::Review)
+            },
         ));
     for want in [
         FieldSurface::Revision,

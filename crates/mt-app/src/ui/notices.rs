@@ -47,7 +47,7 @@ use crate::{
     },
     ui::{
         motion::{self, reduced_motion},
-        prims,
+        prims, shell,
         tokens::{
             self, CONSENT_BUTTON_H, CONSENT_BUTTON_W, FOCUS_RING, FOCUS_RING_OFFSET, HAIRLINE,
             SPACE_2, SPACE_3, SPACE_4, SPACE_5,
@@ -88,11 +88,13 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
             }
         }
     });
+    let inset_state = state.clone();
     view()
         .test_id("recovery-banner")
         .w_full()
         .flex_col()
         .pt(px(SPACE_4))
+        .pr(move || px(field_overlay_inset(&inset_state)))
         .child(when(move || rows.get().len() > 1, {
             let restore_all_state = state.clone();
             let discard_all_state = state.clone();
@@ -146,7 +148,12 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                     .items_center()
                     .gap(px(SPACE_3))
                     .pb(px(SPACE_3))
-                    .child(view().flex_1().child(prims::ink(label)));
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(prims::ink(label).truncate()),
+                    );
                 // One ringed action at a time: the first record's Restore,
                 // unless the conflict banner owns the ring.
                 if index == 0 {
@@ -500,7 +507,7 @@ fn disk_text(state: &AppState, tab: &Tab) -> Option<String> {
         .map(|(_, text)| text)
 }
 
-fn close_compare(state: &AppState) {
+pub(crate) fn close_compare(state: &AppState) {
     state.conflict_compare.set(None);
     state.focus_editor();
 }
@@ -1288,25 +1295,38 @@ fn documents_line(state: &AppState, tab: Option<u64>, language: Language) -> Str
         // the card lists exactly that, as it changes.
         None => tabs.iter().filter(|tab| tab.dirty.get()).collect(),
     };
-    let names: Vec<String> = listed.iter().map(|tab| listed_name(tab, &listed)).collect();
+    // A name is decorated against every open tab, not just the listed ones:
+    // the single-tab close guard must not show a bare `plan.md` while a
+    // second `plan.md` is open in another folder.
+    let names: Vec<String> = listed.iter().map(|tab| listed_name(tab, &tabs)).collect();
     names_line(&names, language)
 }
 
-fn listed_name(tab: &Tab, listed: &[&Tab]) -> String {
+fn listed_name(tab: &Tab, open: &[Tab]) -> String {
     let name = tab.title.to_string();
     if tab.untitled {
         return name;
     }
-    let shared = listed
-        .iter()
-        .filter(|other| other.title == tab.title)
-        .count();
+    let shared = open.iter().filter(|other| other.title == tab.title).count();
     if shared > 1
         && let Some(folder) = tab.path.parent().and_then(|parent| parent.file_name())
     {
         return format!("{}/{name}", folder.to_string_lossy());
     }
     name
+}
+
+/// How far the narrow field's overlay eats into the column's content: a
+/// banner inside the covered strip would sit under a preview and take no
+/// press. Zero while the field is in the row or absent.
+fn field_overlay_inset(state: &AppState) -> f32 {
+    let width = shell::client_width_now();
+    let layout = tokens::Layout::of(width);
+    if !layout.field_overlays() || shell::surface(state) == shell::FieldSurface::None {
+        return 0.0;
+    }
+    let content_right = tokens::RAIL_W + tokens::COLUMN_GAP + layout.measure();
+    (content_right - layout.field_left(width)).max(0.0)
 }
 
 /// [`documents_line`]'s shape for a list of names.
@@ -1430,14 +1450,20 @@ impl StatusPresence {
 
 pub(crate) fn status_line(
     state: AppState,
-    _language: Language,
+    language: Language,
     presence: StatusPresence,
 ) -> impl IntoElement {
-    status_line_at(state, presence, crate::state::StatusSurface::Editor)
+    status_line_at(
+        state,
+        language,
+        presence,
+        crate::state::StatusSurface::Editor,
+    )
 }
 
 pub(crate) fn status_line_at(
     state: AppState,
+    language: Language,
     presence: StatusPresence,
     surface: crate::state::StatusSurface,
 ) -> impl IntoElement {
@@ -1458,11 +1484,10 @@ pub(crate) fn status_line_at(
             .gap(px(SPACE_2))
             .child(
                 text(move || {
-                    if owner.get() == surface {
-                        message.get().text
-                    } else {
-                        SharedString::default()
+                    if owner.get() != surface {
+                        return SharedString::default();
                     }
+                    message.get().text_in(language)
                 })
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
@@ -1490,12 +1515,16 @@ pub(crate) fn status_line_at(
             )
             .child(when(
                 move || owner.get() == surface && undo_message.get().action.is_some(),
-                move || status_undo(undo_state.clone()),
+                move || status_undo(undo_state.clone(), language, surface),
             )),
     )
 }
 
-fn status_undo(state: AppState) -> impl IntoElement {
+fn status_undo(
+    state: AppState,
+    language: Language,
+    surface: crate::state::StatusSurface,
+) -> impl IntoElement {
     let duration = prims::press_color_duration();
     let label_state = state.clone();
     let press_state = state;
@@ -1503,6 +1532,7 @@ fn status_undo(state: AppState) -> impl IntoElement {
         .flex_row()
         .items_center()
         .gap(px(SPACE_2))
+        .max_w(move || px(undo_max_width(surface)))
         .child(prims::faint("\u{00b7}"))
         .child(
             prims::press_feedback(
@@ -1511,12 +1541,19 @@ fn status_undo(state: AppState) -> impl IntoElement {
                     .role(AccessibilityRole::Button)
                     .optional_label({
                         let label_state = label_state.clone();
-                        move || label_state.status.get().action.map(|action| action.label)
+                        move || {
+                            label_state
+                                .status
+                                .get()
+                                .action
+                                .map(|action| SharedString::from((action.label)(language)))
+                        }
                     })
                     .window_drag(false)
                     .cursor_pointer()
                     .bg(Color::TRANSPARENT)
                     .group()
+                    .flex_shrink(1.0)
                     .on_press(move |_: &PressEvent| press_state.undo_last()),
             )
             .child(
@@ -1525,13 +1562,15 @@ fn status_undo(state: AppState) -> impl IntoElement {
                         .status
                         .get()
                         .action
-                        .map(|action| action.label)
+                        .map(|action| SharedString::from((action.label)(language)))
                         .unwrap_or_default()
                 })
                 .test_id("status-action")
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
+                .number_of_lines(1)
+                .text_overflow(EllipsizeMode::Tail)
                 .text_color(move || tokens::palette().ink_rest)
                 .transition_colors()
                 .duration(move || duration.get())
@@ -1539,6 +1578,15 @@ fn status_undo(state: AppState) -> impl IntoElement {
                 .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
             ),
         )
+}
+
+fn undo_max_width(surface: crate::state::StatusSurface) -> f32 {
+    let width = shell::client_width_now();
+    if surface == crate::state::StatusSurface::Editor {
+        tokens::Layout::of(width).column_width(width)
+    } else {
+        width
+    }
 }
 
 fn observe_status(watched: AppState, presence: StatusPresence) {
@@ -1607,8 +1655,10 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
         opacity.stop();
         rise.stop();
         if message.is_empty() {
-            opacity.set(0.0);
-            rise.set(motion::CARD_RISE_PX);
+            if message.action.is_none() {
+                opacity.set(0.0);
+                rise.set(motion::CARD_RISE_PX);
+            }
             return;
         }
         let enter_ms = if reduced {
@@ -1679,9 +1729,7 @@ fn bind_compare_keys(state: &AppState) {
             ..KeyOptions::default()
         },
         move |_| {
-            if !escape.escape_top_layer() {
-                close_compare(&escape);
-            }
+            escape.escape_top_layer();
         },
     );
 }
@@ -2408,9 +2456,9 @@ mod tests {
             .child(prims::primary_action("probe-notify", "Notify", move || {
                 notify_state.notify_undo(
                     crate::state::StatusSurface::Editor,
-                    "Cleared the counts",
+                    |_| "Cleared the counts",
                     crate::state::UndoNotice {
-                        label: SharedString::from("Undo"),
+                        label: |_| "Undo clear counts",
                         reverse: std::rc::Rc::new(|| Ok(())),
                         commit: std::rc::Rc::new(|| {}),
                     },
@@ -2418,11 +2466,13 @@ mod tests {
             }))
             .child(view().test_id("probe-editor").child(status_line_at(
                 editor_state,
+                Language::English,
                 presence,
                 crate::state::StatusSurface::Editor,
             )))
             .child(view().test_id("probe-review").child(status_line_at(
                 review_state,
+                Language::English,
                 presence,
                 crate::state::StatusSurface::Review,
             )))

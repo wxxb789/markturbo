@@ -23,7 +23,7 @@ use mt_core::{
     settings::{Language, SettingsData, ThemePreference},
 };
 use nsh_base::{button, input};
-use nsh_core::{Color, keymap::When, prelude::*};
+use nsh_core::{Color, element::ScrollEvent, keymap::When, prelude::*};
 
 use crate::{
     i18n::{self, Key},
@@ -61,12 +61,12 @@ pub(crate) fn page(
             ..KeyOptions::default()
         },
         move |_| {
-            if !escape_state.escape_top_layer() {
-                escape_state.close_settings();
-            }
+            escape_state.escape_top_layer();
         },
     );
     let close_state = state.clone();
+    let scroll_state = state.clone();
+    let scroll_offset = state.settings_scroll_offset.get();
     view()
         .test_id("settings-page")
         .flex_1()
@@ -110,11 +110,16 @@ pub(crate) fn page(
                 .w_full()
                 .flex_col()
                 .pt(px(SPACE_3))
+                .content_offset(point(Points(0.0), Points(scroll_offset)))
+                .on_scroll(move |event: &ScrollEvent| {
+                    scroll_state.settings_scroll_offset.set(event.offset.y.0);
+                })
                 .child(content(state.clone(), language)),
         )
         .child(notice_line(state.clone()))
         .child(notices::status_line_at(
             state,
+            language,
             presence,
             crate::state::StatusSurface::Settings,
         ))

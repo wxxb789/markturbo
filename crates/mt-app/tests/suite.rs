@@ -30,6 +30,8 @@ mod conflict;
 mod conflict_compare;
 #[path = "conflict_compare_missing.rs"]
 mod conflict_compare_missing;
+#[path = "context_escape.rs"]
+mod context_escape;
 #[path = "context_new_root.rs"]
 mod context_new_root;
 #[path = "ctrl_enter_editor.rs"]
