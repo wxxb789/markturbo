@@ -157,3 +157,7 @@
     finishes. Clear it when the slot frees.
   - While a Review is in flight elsewhere, "Review with context" in the Context panel closes the panel and opens no
     card. Disable it with the same reason instead.
+- [ ] **`acceptance-exe.yml` pull-ref guard (PR #78 review P3).** The PowerShell `Trim()` does not strip a leading
+  U+FEFF, but `actions/checkout` does, so a dispatcher can still check out a `refs/pull/*` ref. With
+  `cache-mode: none`, no cache path remains. Harden the guard (for example, reject any input not matching
+  `^[A-Za-z0-9._/-]+$`) if the workflow gains more trust.
