@@ -253,7 +253,8 @@ acceptance of reviewed commits only; the run rejects `refs/pull/*` refs.
 ```sh
 gh workflow run acceptance-exe.yml -f ref=<branch-or-sha>
 gh run download <id> -n markturbo-exe-<short-sha> -D <dir>
-scripts/mt.py accept all --exe <dir>\markturbo.exe --expect-exe-sha256 <sha256>
+uv run --locked --project scripts scripts/mt.py accept all \
+    --exe "<dir>/markturbo.exe" --expect-exe-sha256 <sha256>
 ```
 
 The summary of the run and the downloaded `SHA256SUMS.txt` record the requested

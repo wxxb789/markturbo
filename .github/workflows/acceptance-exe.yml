@@ -11,10 +11,11 @@ on:
 permissions:
   contents: read
 
+cache-mode: none
+
 jobs:
   build:
     runs-on: windows-2022
-    # No rust-cache: this build must not write the cache release.yml restores.
     timeout-minutes: 180
     defaults:
       run:
@@ -24,7 +25,8 @@ jobs:
         env:
           REQUESTED_REF: ${{ inputs.ref }}
         run: |
-          if ($env:REQUESTED_REF -like 'refs/pull/*') {
+          $requested_ref = "$env:REQUESTED_REF".Trim()
+          if ($requested_ref -like 'refs/pull/*') {
             throw "refs/pull/* refs are not accepted; build only reviewed commits"
           }
 
