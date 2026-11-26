@@ -1226,7 +1226,7 @@ pub(crate) fn done(state: &AppState) {
 /// the editor, not the dirty flag, not the file.
 fn copy_approved(state: &AppState, language: Language) {
     if let Some(text) = state.revision_approved_text() {
-        set_clipboard(text.to_string());
+        drop(set_clipboard(text.to_string()));
         state.notify_at(
             crate::state::StatusSurface::Review,
             crate::state::StatusKind::Success,
@@ -1358,7 +1358,7 @@ fn digest(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nsh_engine::{EngineConfig, Root};
+    use nsh_engine::EngineConfig;
     use nsh_testing::Headless;
 
     fn hunk(
@@ -1551,8 +1551,10 @@ mod tests {
 
     #[test]
     fn a_changed_base_refuses_the_hunk() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ChangedBaseProbe>()))
-            .expect("start the field");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ChangedBaseProbe,
+        >()))
+        .expect("start the field");
         app.wait_for("id:revision-proposal-blocked")
             .expect("the edited hunk says it cannot apply");
         assert!(app.shows(&S::CannotApply.text(Language::English)));
@@ -1609,8 +1611,10 @@ mod tests {
 
     #[test]
     fn a_proposal_stays_with_its_own_document() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<OtherDocumentProbe>()))
-            .expect("start the field");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            OtherDocumentProbe,
+        >()))
+        .expect("start the field");
         app.wait_for("text:other empty: true live again: true")
             .expect("the proposal left the tab it does not belong to");
         app.wait_for("id:revision-accept")
@@ -1667,8 +1671,10 @@ mod tests {
 
     #[test]
     fn decisions_stay_with_the_tab_that_made_them() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<CrossTabDecisionsProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            CrossTabDecisionsProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:revision-field").expect("the field");
         app.wait_for("text:0 of 2 decided").expect("A's hunks");
         app.press_key("a").expect("accept the docked hunk on A");
@@ -1726,8 +1732,10 @@ mod tests {
 
     #[test]
     fn revision_keys_wait_for_a_consent_card_and_come_back() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ConsentGatedKeysProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ConsentGatedKeysProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:revision-field").expect("the field");
         app.wait_for("text:0 of 2 decided").expect("the hunks");
 
@@ -1798,8 +1806,10 @@ mod tests {
 
     #[test]
     fn the_keys_decide_the_docked_hunk_and_advance() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ProposalProbe>()))
-            .expect("start the field");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<ProposalProbe>(),
+        ))
+        .expect("start the field");
         app.wait_for("id:revision-field").expect("the field");
         app.wait_for("text:Accept").expect("the docked proposal");
 
@@ -1952,8 +1962,10 @@ mod tests {
 
     #[test]
     fn copy_reports_its_status() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<CopyStatusProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            CopyStatusProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:revision-copy").expect("the copy action");
         app.press("id:revision-copy").expect("press Copy");
         app.wait_for("text:Approved result copied to the clipboard.")
@@ -1978,8 +1990,10 @@ mod tests {
 
     #[test]
     fn escape_cancels_a_busy_revision_and_its_row_shows_the_hint() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<BusyEscapeProbe>())).expect("start");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            BusyEscapeProbe,
+        >()))
+        .expect("start");
         app.wait_for("id:revision-busy").expect("the busy row");
         assert!(app.shows("Esc"), "the busy row carries the Esc hint");
         app.press_key("escape").expect("press Esc");
@@ -2028,8 +2042,10 @@ mod tests {
 
     #[test]
     fn a_busy_revision_shows_only_on_the_tab_that_owns_it() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionBusyProjectionProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            RevisionBusyProjectionProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:revision-busy").expect("A's busy row");
         app.press("id:probe-open-b").expect("switch to B");
         app.wait_for_gone("id:revision-busy", Duration::from_secs(2))
@@ -2161,7 +2177,8 @@ mod tests {
     #[test]
     fn the_docked_proposal_sits_near_the_fields_middle_with_the_rows_around_it() {
         let mut app =
-            Headless::start(EngineConfig::new(Root::of::<ShellProbe>())).expect("start the room");
+            Headless::start(EngineConfig::new(nsh_testing::windowed_root::<ShellProbe>()))
+                .expect("start the room");
         app.set_viewport(Size {
             width: Points(1440.0),
             height: Points(900.0),
@@ -2221,8 +2238,10 @@ mod tests {
 
     #[test]
     fn dismissing_done_returns_keyboard_focus_to_the_editor() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<DismissFocusProbe>()))
-            .expect("start the shell");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            DismissFocusProbe,
+        >()))
+        .expect("start the shell");
         app.set_viewport(Size {
             width: Points(1440.0),
             height: Points(900.0),
@@ -2255,8 +2274,10 @@ mod tests {
 
     #[test]
     fn a_dismissed_outcome_never_hides_the_next_one() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<OutcomeProbe>())).expect("start");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<OutcomeProbe>(),
+        ))
+        .expect("start");
         app.wait_for("text:Revision failed: Timed out after 60 s")
             .expect("the failure is on screen");
         app.wait_for("id:revision-dismiss").expect("a way out");
@@ -2284,8 +2305,10 @@ mod tests {
 
     #[test]
     fn done_key_stays_unbound_where_nothing_applies() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<OutcomeProbe>())).expect("start");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<OutcomeProbe>(),
+        ))
+        .expect("start");
         app.wait_for("text:Revision failed: Timed out after 60 s")
             .expect("the failure is on screen");
         // `Ctrl+Enter` is `Done` only while a proposal could apply: with none
@@ -2307,8 +2330,8 @@ mod tests {
 
     #[test]
     fn a_second_proposal_starts_the_decisions_over() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<SwapProbe>())).expect("start the field");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<SwapProbe>()))
+            .expect("start the field");
         app.wait_for("id:revision-field").expect("the field");
         app.press_key("a").expect("press A");
         app.wait_for("text:1 of 2 decided").expect("one decided");
@@ -2343,8 +2366,10 @@ mod tests {
 
     #[test]
     fn a_tall_hunk_shows_every_line() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<TallHunkProbe>()))
-            .expect("start the field");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<TallHunkProbe>(),
+        ))
+        .expect("start the field");
         app.wait_for("id:revision-proposal-text")
             .expect("the docked text region");
         // Nothing is cut out of an Accept: the whole side is on screen (the
@@ -2360,8 +2385,10 @@ mod tests {
 
     #[test]
     fn a_huge_proposal_keeps_the_decision_row_in_the_field() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ManyHunksProbe>()))
-            .expect("start the field");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ManyHunksProbe,
+        >()))
+        .expect("start the field");
         app.set_viewport(Size {
             width: Points(1440.0),
             height: Points(900.0),
@@ -2504,8 +2531,10 @@ mod tests {
 
     #[test]
     fn the_column_strikes_the_undecided_hunks_old_words_cold() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ColumnMarksProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ColumnMarksProbe,
+        >()))
+        .expect("start the probe");
         // `compiles but no check`: both hunks wait, both old texts struck.
         app.wait_for("text:marks: 0:0-0:12 0:13-0:21")
             .expect("each undecided hunk's old words are struck cold");
@@ -2545,8 +2574,10 @@ mod tests {
 
     #[test]
     fn the_docked_proposal_reads_as_a_labelled_group_of_lines() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<TallHunkProbe>()))
-            .expect("start the field");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<TallHunkProbe>(),
+        ))
+        .expect("start the field");
         app.wait_for("id:revision-proposal-after")
             .expect("the proposal's lines");
         let screen = app.screen();
@@ -2685,8 +2716,10 @@ mod tests {
         std::fs::write(&path, CONFLICT_SOURCE).expect("the file on disk");
         *CONFLICT_DOCUMENT.lock().expect("the document path") = Some(path.clone());
 
-        let mut app = Headless::start(EngineConfig::new(Root::of::<SaveConflictProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            SaveConflictProbe,
+        >()))
+        .expect("start the probe");
         let opened = format!("Buffer: {CONFLICT_SOURCE:?} dirty=false");
         app.wait_for(&format!("text:{opened}"))
             .expect("the file is open");

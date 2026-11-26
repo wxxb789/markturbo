@@ -23,11 +23,7 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use mt_core::settings::Language;
-use nsh_core::{
-    Points,
-    desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes},
-    prelude::*,
-};
+use nsh_core::{Points, prelude::*};
 
 use crate::{
     state::AppState,
@@ -86,7 +82,6 @@ pub(crate) fn shell_with_status(
     layout: Layout,
     status: notices::StatusPresence,
 ) -> impl IntoElement {
-    hide_system_title_bar();
     let body_state = state.clone();
     let capture_state = state.clone();
     view()
@@ -552,24 +547,6 @@ fn surface_pointer(open: bool) -> PointerEvents {
     }
 }
 
-/// Hides the system title bar: the room runs to the window's top edge, and the
-/// native caption controls stay in the area [`prims::caption_insets`] reports.
-///
-/// It is set once, after the first commit, so the window may show the system
-/// bar for a frame while the app starts.
-fn hide_system_title_bar() {
-    effect(move || {
-        // The option structs are `#[non_exhaustive]`: they are built from
-        // their defaults and then set field by field.
-        let mut title_bar = TitleBarOptions::default();
-        title_bar.style = TitleBarStyle::Hidden;
-        title_bar.height = Some(Points(tokens::TITLE_ROW_H));
-        let mut attributes = WindowAttributes::default();
-        attributes.title_bar = Some(title_bar);
-        nsh_core::element::desktop::current_window().set(attributes);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
@@ -789,8 +766,9 @@ mod tests {
     }
 
     fn file_probe() -> Headless {
-        let mut config =
-            EngineConfig::new(Root::of::<ConflictBannerProbe>().tokens(tokens::theme()));
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<ConflictBannerProbe>().tokens(tokens::theme()),
+        );
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
         let mut app = Headless::start(config).expect("start the probe");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
@@ -1102,7 +1080,7 @@ mod tests {
         use std::sync::mpsc;
 
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<GuardDiscardProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<GuardDiscardProbe>().tokens(tokens::theme()),
         ))
         .expect("start the probe");
         app.wait_for("id:probe-close").expect("close control");
@@ -1149,7 +1127,8 @@ mod tests {
     }
 
     fn open_guard() -> Headless {
-        let mut config = EngineConfig::new(Root::of::<GuardProbe>().tokens(tokens::theme()));
+        let mut config =
+            EngineConfig::new(nsh_testing::windowed_root::<GuardProbe>().tokens(tokens::theme()));
         config.environment.os = nsh_core::platform::Os::Windows;
         config.environment.idiom = nsh_core::platform::Idiom::Desktop;
         let mut app = Headless::start(config).expect("start the probe");
@@ -1214,8 +1193,9 @@ mod tests {
 
     #[test]
     fn cancel_after_a_failed_guard_save_keeps_the_notice_and_geometry_during_exit() {
-        let mut config =
-            EngineConfig::new(Root::of::<GuardSaveFailureProbe>().tokens(tokens::theme()));
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<GuardSaveFailureProbe>().tokens(tokens::theme()),
+        );
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the failed-save probe");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
@@ -1291,7 +1271,8 @@ mod tests {
 
         use nsh_core::{MountItem, platform::ColorScheme};
 
-        let mut config = EngineConfig::new(Root::of::<WideProbe>().tokens(tokens::theme()));
+        let mut config =
+            EngineConfig::new(nsh_testing::windowed_root::<WideProbe>().tokens(tokens::theme()));
         config.environment.color_scheme = ColorScheme::Light;
         config.environment.reduce_motion = false;
         let mut app = Headless::start(config).expect("start");
@@ -1326,8 +1307,9 @@ mod tests {
     }
 
     fn recovery_probe() -> Headless {
-        let mut config =
-            EngineConfig::new(Root::of::<RecoveryBannerProbe>().tokens(tokens::theme()));
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<RecoveryBannerProbe>().tokens(tokens::theme()),
+        );
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
         let mut app = Headless::start(config).expect("start the probe");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
@@ -1370,7 +1352,7 @@ mod tests {
     /// the pane never changes (contract amendment 5).
     #[test]
     fn a_close_hands_focus_to_the_layer_left_open_or_the_document() {
-        let mut app = start(Root::of::<WideProbe>(), 1440.0);
+        let mut app = start(nsh_testing::windowed_root::<WideProbe>(), 1440.0);
 
         // Preview: the palette closes onto the document view, not the editor.
         press(&mut app, "probe-preview");
@@ -1528,7 +1510,9 @@ mod tests {
                 "consent-motion-card",
             ),
         ] {
-            let mut config = EngineConfig::new(Root::of::<GuardProbe>().tokens(tokens::theme()));
+            let mut config = EngineConfig::new(
+                nsh_testing::windowed_root::<GuardProbe>().tokens(tokens::theme()),
+            );
             config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
             let mut app = Headless::start(config).expect("start the probe");
             app.wait_for(&format!("id:{open}")).expect("open control");
@@ -1840,7 +1824,7 @@ mod tests {
     /// for the review and the preview alike.
     #[test]
     fn every_field_surface_starts_one_field_gap_from_the_column() {
-        let mut app = start(Root::of::<WideProbe>(), 1440.0);
+        let mut app = start(nsh_testing::windowed_root::<WideProbe>(), 1440.0);
         let column = node(&app, "column").bounds;
         let field_x = column.origin.x.0 + column.size.width.0 + tokens::FIELD_GAP;
 
@@ -1862,7 +1846,7 @@ mod tests {
     #[test]
     fn the_overlay_field_keeps_the_field_gap() {
         let width = 1000.0;
-        let mut app = start(Root::of::<NarrowProbe>(), width);
+        let mut app = start(nsh_testing::windowed_root::<NarrowProbe>(), width);
         press(&mut app, "probe-review-open");
         app.wait_for("id:review-lens").expect("the review's lens");
         let lens = node(&app, "review-lens").bounds.origin.x.0;
@@ -1878,7 +1862,7 @@ mod tests {
     /// included.
     #[test]
     fn opening_a_review_does_not_move_the_text() {
-        let mut app = start(Root::of::<WideProbe>(), 1440.0);
+        let mut app = start(nsh_testing::windowed_root::<WideProbe>(), 1440.0);
         let first = "# Release plan";
         let before = text_x(&app, first);
         let column = node(&app, "column").bounds;
@@ -1941,7 +1925,7 @@ mod tests {
     #[test]
     fn the_welcome_draws_no_caret() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<WelcomeProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<WelcomeProbe>().tokens(tokens::theme()),
         ))
         .expect("start the probe");
         app.wait_for("id:welcome").expect("the welcome");
@@ -1973,8 +1957,9 @@ mod tests {
     }
 
     fn status_settings_app() -> Headless {
-        let mut config =
-            EngineConfig::new(Root::of::<StatusSettingsProbe>().tokens(tokens::theme()));
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<StatusSettingsProbe>().tokens(tokens::theme()),
+        );
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
         config.environment.reduce_motion = false;
         let mut app = Headless::start(config).expect("start the status-settings probe");
@@ -2083,7 +2068,7 @@ mod tests {
     }
 
     fn routed_status_app() -> Headless {
-        let mut config = EngineConfig::new(Root::of::<RoutedStatusProbe>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<RoutedStatusProbe>());
         config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
         let mut app = Headless::start(config).expect("status surfaces");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
@@ -2187,8 +2172,9 @@ mod tests {
 
     #[test]
     fn review_status_reserves_its_row_without_a_message() {
-        let mut config =
-            EngineConfig::new(Root::of::<ReviewStatusRowProbe>().tokens(tokens::theme()));
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<ReviewStatusRowProbe>().tokens(tokens::theme()),
+        );
         config.environment.color_scheme = nsh_core::platform::ColorScheme::Light;
         let mut app = Headless::start(config).expect("Review status row");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
@@ -2214,7 +2200,9 @@ mod tests {
 
     #[test]
     fn revision_receipt_and_body_position_survive_the_proposal_arrival() {
-        let config = EngineConfig::new(Root::of::<ReviewStatusRowProbe>().tokens(tokens::theme()));
+        let config = EngineConfig::new(
+            nsh_testing::windowed_root::<ReviewStatusRowProbe>().tokens(tokens::theme()),
+        );
         let mut app = Headless::start(config).expect("Review status row");
         app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
             .expect("wide viewport");

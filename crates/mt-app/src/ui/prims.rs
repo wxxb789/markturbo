@@ -39,7 +39,14 @@ use crate::ui::{
 /// widths they take at the window's left and right edges. Zero while the
 /// system title bar is shown; reading it subscribes.
 pub fn caption_insets() -> Edges<Points> {
-    nsh_core::element::desktop::title_bar()
+    let area = nsh_core::element::desktop::title_bar();
+    if area == Edges::default() {
+        // The host's own channel for the main window's area, the
+        // environment's: the window's own report wins where there is one.
+        nsh_core::element::desktop::main_window().title_bar()
+    } else {
+        area
+    }
 }
 
 /// The same colour, fully opaque (a gradient stop, where the plate's opacity
@@ -54,6 +61,11 @@ pub fn opaque(color: Color) -> Color {
     )
 }
 
+/// The UI text box the page's 4px rhythm was built with: nsh 0.7 typesets
+/// text at its declared line height, two points over the box the layout
+/// used, so UI text boxes are pinned to it.
+pub(crate) const UI_TEXT_BOX_H: f32 = TYPE_UI_LINE - 2.0;
+
 /// Body ink at the UI size and line height: your own text and the labels that
 /// are not quiet.
 pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
@@ -61,6 +73,7 @@ pub fn ink(content: impl IntoReactive<SharedString>) -> impl IntoElement {
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
+        .h(px(UI_TEXT_BOX_H))
         .text_color(move || tokens::palette().ink)
 }
 
@@ -70,6 +83,7 @@ pub fn rest(content: impl IntoReactive<SharedString>) -> impl IntoElement + Styl
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
+        .h(px(UI_TEXT_BOX_H))
         .text_color(move || tokens::palette().ink_rest)
 }
 
@@ -80,6 +94,7 @@ pub fn faint(content: impl IntoReactive<SharedString>) -> impl IntoElement + Sty
         .font_family(FONT_UI)
         .text_size(px(TYPE_UI))
         .line_height(px(TYPE_UI_LINE))
+        .h(px(UI_TEXT_BOX_H))
         .text_color(move || tokens::palette().ink_caption)
 }
 
@@ -199,6 +214,7 @@ fn ink_action(
                     .font_family(FONT_UI)
                     .text_size(px(TYPE_UI))
                     .line_height(px(TYPE_UI_LINE))
+                    .h(px(UI_TEXT_BOX_H))
                     .text_color(move || tokens::palette().ink_rest)
                     .transition_colors()
                     .duration(move || duration.get()),
@@ -259,7 +275,7 @@ fn press_target(test_id: &str, label: SharedString) -> View {
 }
 
 /// Pointer press-down snaps the plate; release eases ink over [`PRESS_RELEASE_MS`].
-/// Win32 nsh 0.6.1 keyboard activation dispatches `Press`, not `PressDown` or `PressUp`.
+/// Win32 nsh 0.7.1 keyboard activation dispatches `Press`, not `PressDown` or `PressUp`.
 pub(crate) fn press_feedback<T: PressControl<Kind>, Kind>(control: T) -> T {
     press_feedback_with_duration(control, press_color_duration())
 }
@@ -366,6 +382,9 @@ pub fn text_field(
                 .placeholder(placeholder)
                 .font_family(FONT_INPUT)
                 .text_size(px(TYPE_UI))
+                // The field is one UI line box, its rule included; the
+                // intrinsic height is the platform's.
+                .h(px(TYPE_UI_LINE - HAIRLINE))
                 .bg(Color::TRANSPARENT)
                 .on_change(move |text: &str| on_change(text))
                 .on_blur(on_blur)
@@ -462,8 +481,8 @@ pub fn heat_levels(heat: Heat, cold: f32, ember: f32, hot: f32) -> AnimatedNode 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nsh_engine::{EngineConfig, Root};
-    use nsh_testing::Headless;
+    use nsh_engine::EngineConfig;
+    use nsh_testing::{DragOptions, Headless};
 
     #[test]
     fn a_hovered_actions_label_steps_to_its_hover_ink() {
@@ -472,7 +491,8 @@ mod tests {
             tailwind::state::{FOCUSED, HOVERED},
         };
 
-        let mut config = EngineConfig::new(Root::of::<Harness>().tokens(tokens::theme()));
+        let mut config =
+            EngineConfig::new(nsh_testing::windowed_root::<Harness>().tokens(tokens::theme()));
         config.environment.color_scheme = ColorScheme::Light;
         config.environment.reduce_motion = true;
         let mut app = Headless::start(config).expect("start the harness");
@@ -580,8 +600,8 @@ mod tests {
     /// reads at 4.5:1 on the room, not in the non-text faint ink.
     #[test]
     fn a_caption_reads_at_4_5_to_1() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<Harness>()))
+            .expect("start the harness");
         app.wait_for("text:A caption").expect("the caption");
         let color = app
             .screen()
@@ -614,8 +634,8 @@ mod tests {
     /// that no accessibility tree shows.
     #[test]
     fn an_actions_test_id_is_on_the_button_itself() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<Harness>()))
+            .expect("start the harness");
         app.wait_for("id:harness-presses").expect("the harness");
         for (id, name) in [("harness-quiet", "Quiet"), ("harness-primary", "Primary")] {
             let node = node_with(&app, id);
@@ -646,7 +666,9 @@ mod tests {
         use nsh_core::geometry::point;
 
         for id in ["harness-quiet", "harness-primary", "harness-row"] {
-            let mut app = Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start");
+            let mut app =
+                Headless::start(EngineConfig::new(nsh_testing::windowed_root::<Harness>()))
+                    .expect("start");
             let selector = format!("id:{id}");
             app.wait_for(&selector).expect("control");
             assert_eq!(
@@ -657,7 +679,7 @@ mod tests {
                     .background_color,
                 None
             );
-            app.drag_and_hold(&selector, point(px(0.0), px(0.0)))
+            app.drag_and_hold(&selector, point(px(0.0), px(0.0)), DragOptions::default())
                 .expect("pointer down");
             // Headless sends the gesture, but the platform normally reports
             // the native active state separately.
@@ -692,7 +714,8 @@ mod tests {
 
         use nsh_core::{MountItem, platform::ColorScheme};
 
-        let mut config = EngineConfig::new(Root::of::<Harness>().tokens(tokens::theme()));
+        let mut config =
+            EngineConfig::new(nsh_testing::windowed_root::<Harness>().tokens(tokens::theme()));
         config.environment.color_scheme = ColorScheme::Light;
         config.environment.reduce_motion = false;
         let mut app = Headless::start(config).expect("start the harness");
@@ -754,12 +777,13 @@ mod tests {
 
         use nsh_core::MountItem;
 
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<Harness>())).expect("start the harness");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<Harness>()))
+            .expect("start the harness");
         app.wait_for("id:harness-presses").expect("the harness");
         app.drag_and_hold(
             "id:harness-quiet",
             nsh_core::geometry::point(px(0.0), px(0.0)),
+            DragOptions::default(),
         )
         .expect("pointer down");
         let node = node_with(&app, "harness-quiet");

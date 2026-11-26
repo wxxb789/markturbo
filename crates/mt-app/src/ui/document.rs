@@ -994,7 +994,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn mono_counts_keep_equal_width_for_ones_and_zeroes() {
-        let app = font_app(Root::of::<CountWidths>(), "id:count-widths");
+        let app = font_app(
+            nsh_testing::windowed_root::<CountWidths>(),
+            "id:count-widths",
+        );
         let [(_, ones)] = ruler_widths(&app, "111")[..] else {
             panic!("expected one text node for 111");
         };
@@ -1061,7 +1064,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_editor_draws_the_registered_source_font() {
-        let app = font_app(Root::of::<FontProbe>(), "id:font-probe");
+        let app = font_app(nsh_testing::windowed_root::<FontProbe>(), "id:font-probe");
         let m = widths_by_label(&app, &LATIN_TRIALS, &"M".repeat(RULER));
         let i = ruler_widths(&app, &"i".repeat(RULER));
         assert_eq!(i.len(), 1, "the mono's second ruler: {i:?}");
@@ -1103,7 +1106,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_ui_and_model_lists_resolve_to_martian() {
-        let app = font_app(Root::of::<FontProbe>(), "id:font-probe");
+        let app = font_app(nsh_testing::windowed_root::<FontProbe>(), "id:font-probe");
         let table = widths_by_label(&app, &LATIN_TRIALS, &"M".repeat(RULER));
         println!("ruler widths: {}", table_text(&table));
 
@@ -1143,7 +1146,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_cjk_fallback_takes_the_first_available_face() {
-        let app = font_app(Root::of::<CjkProbe>(), "id:cjk-probe");
+        let app = font_app(nsh_testing::windowed_root::<CjkProbe>(), "id:cjk-probe");
         let dash = widths_by_label(&app, &CJK_TRIALS, &"―".repeat(DASH_RULER));
         let pinyin = widths_by_label(&app, &PINYIN_TRIALS, &"ǔ".repeat(PINYIN_RULER));
         println!("dash widths: {}", table_text(&dash));
@@ -1310,7 +1313,7 @@ mod tests {
     /// The probe on a manual clock, the camera's glide stepped by the test,
     /// with the column laid out and nothing asked of the camera yet.
     fn glide_probe(reduced: bool) -> Headless {
-        let mut config = EngineConfig::new(Root::of::<CameraProbe>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<CameraProbe>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the probe");
         if reduced {
@@ -1516,8 +1519,10 @@ mod tests {
     /// the Markdown punctuation at 34% ink.
     #[test]
     fn the_source_is_set_in_the_specs_ink() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<CameraProbe>())).expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<CameraProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("label:Markdown source")
             .expect("source editor");
         app.settle();

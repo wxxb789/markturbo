@@ -83,7 +83,7 @@ pub(crate) fn capture(companion: Companion) -> View {
 
 #[cfg(test)]
 mod tests {
-    use nsh_engine::{EngineConfig, Root};
+    use nsh_engine::EngineConfig;
     use nsh_testing::Headless;
 
     use super::*;
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn the_size_and_next_weight_variant_reaches_cjk_spans_only() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<OpticalRunProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<OpticalRunProbe>().tokens(tokens::theme()),
         ))
         .expect("start the CJK optics probe");
         app.wait_for("text:Latin 42e\u{301} 中文かな한글")
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn the_production_default_steps_cjk_runs_on_the_system_fallback_list() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<ProductionOpticsProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<ProductionOpticsProbe>().tokens(tokens::theme()),
         ))
         .expect("start the production optics probe");
         app.wait_for("text:Latin 中文かな한글")
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn primary_scripts_and_graphemes_control_optical_styles() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<ScriptBoundaryProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<ScriptBoundaryProbe>().tokens(tokens::theme()),
         ))
         .expect("start the script-boundary probe");
         app.wait_for("text:A·B | e\u{0305} | 中\u{05B0} | 中文·中文 | 中文, Latin | Latin, 中文")
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn capture_view_renders_all_variants_with_the_shared_paragraph() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<CaptureViewProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<CaptureViewProbe>().tokens(tokens::theme()),
         ))
         .expect("start the capture view");
         app.wait_for("text:CJK optical sizing")
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn capture_view_reports_the_registered_companion_status() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<CaptureViewProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<CaptureViewProbe>().tokens(tokens::theme()),
         ))
         .expect("start the capture view");
         app.wait_for("text:CJK companion font loaded")

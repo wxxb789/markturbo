@@ -1804,7 +1804,7 @@ mod tests {
         time::{Duration, SystemTime},
     };
 
-    use nsh_engine::{EngineConfig, Environment, Points, Root};
+    use nsh_engine::{EngineConfig, Environment, Points};
     use nsh_testing::Headless;
 
     #[derive(Clone, PartialEq, Props)]
@@ -1918,7 +1918,7 @@ mod tests {
     }
 
     fn status_app(samples: mpsc::Sender<f32>) -> Headless {
-        let root = Root::new::<StatusProbe>(move || {
+        let root = nsh_testing::windowed_root_with::<StatusProbe>(move || {
             let samples = samples.clone();
             StatusProbeProps {
                 content: Some(Renderer::new(move |_| {
@@ -2240,8 +2240,10 @@ mod tests {
 
     #[test]
     fn an_old_status_clear_does_not_remove_a_newer_notice() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<StatusClearProbe>()))
-            .expect("start the status-clear probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            StatusClearProbe,
+        >()))
+        .expect("start the status-clear probe");
         app.wait_for("id:status-clear-trigger")
             .expect("the status-clear control");
         press_without_settling(&mut app, "id:status-clear-trigger");
@@ -2427,8 +2429,10 @@ mod tests {
 
     #[test]
     fn an_undo_renders_on_only_the_routed_surface() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<StatusSurfacesProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            StatusSurfacesProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:probe-notify").expect("the probe");
         app.press("id:probe-notify").expect("offer the Undo");
         app.wait_for("id:probe-editor >> id:status-undo")

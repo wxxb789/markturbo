@@ -38,9 +38,10 @@ fn start_settings() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     engine.environment.os = Os::Windows;
     engine.environment.idiom = Idiom::Desktop;
     engine.environment.color_scheme = ColorScheme::Light;
+    // The viewport before the window opens: the declared window sizes
+    // itself from it, so the page lays out at this size.
+    engine.viewport = Size::new(Points(1280.0), Points(900.0));
     let mut app = Headless::start(engine).expect("start app");
-    app.set_viewport(Size::new(Points(1280.0), Points(900.0)))
-        .expect("900px viewport");
     app.wait_for("id:shell").expect("shell");
     app.press("id:title-settings").expect("open title menu");
     app.press("id:title-menu-settings").expect("open settings");

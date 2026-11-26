@@ -87,7 +87,7 @@ Performance claims require production-profile measurements; consult existing
 ## Invariants and delivery
 
 - `mt-core` stays UI-framework-free. Keep `panic = "unwind"` and the vendored
-  RaTeX allocation clamp (0.1.15, matching nsh-base 0.6.1). Content failures become
+  RaTeX allocation clamp (0.1.15, matching nsh-base 0.7.1). Content failures become
   diagnostics; preserve editable text.
 - Never mutate a WebView from render; mark it dirty (`web_dirty`) and defer the
   update, as `ui/preview.rs` does by writing the page from an effect into the
@@ -99,13 +99,14 @@ Performance claims require production-profile measurements; consult existing
   (`Style::default().with(StyleKey::Color, …)`), not typed refinements.
 - The consent card takes keyboard focus when it opens. A held `Ctrl+Enter` (or `Enter`/`Space` on Send) counts only
   from the card's own `KeyDown`/`KeyUp`; blur or window deactivation cancels the hold. Use no system keyboard hooks.
-  nsh 0.6.1 delivers focus and key events to ordinary views on every platform.
+  nsh 0.7.1 delivers focus and key events to ordinary views on every platform.
 - On Windows, DirectWrite matches an embedded face only by its legacy family,
   one per instance (`Martian Grotesk Std Lt`/`Std Rg`/`Std Md`,
   `Martian Mono Cn Rg`). Use the `tokens::FONT_*` lists, which put the legacy
   name first, then the typographic name, then CJK fallbacks. Weight alone does
-  not select a Grotesk instance. Windows `FONT_INPUT` is the exception: nsh
-  0.6.1 inputs load only the first nonempty family, from system fonts.
+  not select a Grotesk instance. Inputs resolve the whole list on every
+  platform, so `FONT_INPUT` is `FONT_UI` (Windows since nsh 0.7.1 finds
+  registered faces in the list).
 - Preserve consent, credential confidentiality and content-free native evidence.
   Do not log test text, user documents, secrets or local paths into that evidence.
 - Ship required fonts (KaTeX, Martian)/sample inside the executable. Windows 11

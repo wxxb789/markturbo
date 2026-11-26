@@ -799,7 +799,7 @@ mod tests {
         MountItem, Points,
         platform::{ColorScheme, Idiom, Os},
     };
-    use nsh_engine::{EngineConfig, Root};
+    use nsh_engine::EngineConfig;
     use nsh_testing::Headless;
 
     use super::*;
@@ -838,7 +838,8 @@ mod tests {
 
     #[test]
     fn hovered_rail_and_focused_actions_track_the_current_theme() {
-        let mut config = EngineConfig::new(Root::of::<PaletteProbe>().tokens(tokens::theme()));
+        let mut config =
+            EngineConfig::new(nsh_testing::windowed_root::<PaletteProbe>().tokens(tokens::theme()));
         config.environment.color_scheme = ColorScheme::Light;
         config.environment.idiom = Idiom::Desktop;
         config.environment.os = Os::Windows;

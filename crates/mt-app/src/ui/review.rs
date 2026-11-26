@@ -1782,7 +1782,7 @@ fn model_line(language: Language) -> f32 {
 #[cfg(test)]
 mod tests {
     use mt_core::review::SourceLocation;
-    use nsh_engine::{EngineConfig, Root};
+    use nsh_engine::EngineConfig;
     use nsh_testing::Headless;
 
     use super::*;
@@ -1890,8 +1890,10 @@ mod tests {
 
     #[test]
     fn an_idle_review_field_has_an_empty_state() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<EmptyReviewProbe>()))
-            .expect("start the empty review probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            EmptyReviewProbe,
+        >()))
+        .expect("start the empty review probe");
         app.wait_for("id:review-empty-copy")
             .expect("the empty state copy");
         let nodes = app.screen().layout_nodes();
@@ -1910,8 +1912,10 @@ mod tests {
 
     #[test]
     fn an_empty_review_result_uses_the_empty_state() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<EmptyReviewResultProbe>()))
-            .expect("start the empty result probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            EmptyReviewResultProbe,
+        >()))
+        .expect("start the empty result probe");
         app.wait_for("id:review-empty-copy")
             .expect("the empty state copy");
         let nodes = app.screen().layout_nodes();
@@ -1933,8 +1937,10 @@ mod tests {
 
     #[test]
     fn zero_findings_hide_the_step_hint_and_controls() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ZeroFindingsStepperProbe>()))
-            .expect("start the zero-findings probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ZeroFindingsStepperProbe,
+        >()))
+        .expect("start the zero-findings probe");
         app.wait_for("id:review-findings-count")
             .expect("the zero count");
         let nodes = app.screen().layout_nodes();
@@ -1958,8 +1964,10 @@ mod tests {
 
     #[test]
     fn findings_count_uses_the_mono_family() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewLayoutProbe>()))
-            .expect("start the review layout probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ReviewLayoutProbe,
+        >()))
+        .expect("start the review layout probe");
         app.wait_for("id:review-findings-count")
             .expect("the findings count");
         assert_eq!(
@@ -1977,7 +1985,7 @@ mod tests {
     #[test]
     fn review_voice_emits_model_styles_for_latin_and_cjk() {
         let mut app = Headless::start(EngineConfig::new(
-            Root::of::<ReviewVoiceProbe>().tokens(tokens::theme()),
+            nsh_testing::windowed_root::<ReviewVoiceProbe>().tokens(tokens::theme()),
         ))
         .expect("start the Review voice probe");
         app.wait_for("text:Review voice: Latin, 中文.")
@@ -2029,8 +2037,10 @@ mod tests {
 
     #[test]
     fn review_sections_share_left_edges_without_large_gaps() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewLayoutProbe>()))
-            .expect("start the review layout probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ReviewLayoutProbe,
+        >()))
+        .expect("start the review layout probe");
         app.wait_for("id:review-findings-step")
             .expect("the findings stepper");
 
@@ -2149,8 +2159,10 @@ mod tests {
 
     #[test]
     fn review_section_gaps_include_notice_padding_in_each_state() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewSpacingProbe>()))
-            .expect("start the review spacing probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ReviewSpacingProbe,
+        >()))
+        .expect("start the review spacing probe");
         app.wait_for("id:review-intent")
             .expect("the intent section");
         let intent_label = s(S::Understood, Language::English);
@@ -2280,8 +2292,10 @@ mod tests {
 
     #[test]
     fn prepare_revision_and_close_share_the_action_row() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ReviewLayoutProbe>()))
-            .expect("start the review layout probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ReviewLayoutProbe,
+        >()))
+        .expect("start the review layout probe");
         app.wait_for("id:review-prepare")
             .expect("the prepare action");
         let nodes = app.screen().layout_nodes();
@@ -2307,8 +2321,10 @@ mod tests {
 
     #[test]
     fn review_failures_use_danger_while_cancellation_stays_neutral() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<FailureColorProbe>()))
-            .expect("start the review failure probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            FailureColorProbe,
+        >()))
+        .expect("start the review failure probe");
         app.set_environment("light mode", |env| {
             env.color_scheme = nsh_core::platform::ColorScheme::Light
         })
@@ -2802,8 +2818,8 @@ mod tests {
     /// finding's line, and not another tab's.
     #[test]
     fn stepping_asks_the_camera_for_the_findings_line() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<StepProbe>())).expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<StepProbe>()))
+            .expect("start the probe");
         app.wait_for("id:camera-step").expect("the probe renders");
         wait_for_text(&mut app, "camera-tab", "the fixture's tab lands", |tab| {
             !tab.is_empty()
@@ -2829,7 +2845,7 @@ mod tests {
 
     #[test]
     fn keyboard_finding_step_levels_the_line_on_the_next_frame() {
-        let mut config = EngineConfig::new(Root::of::<KeyboardCameraProbe>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<KeyboardCameraProbe>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the probe");
         app.set_environment("motion enabled", |env| env.reduce_motion = false)
@@ -2887,8 +2903,10 @@ mod tests {
 
     #[test]
     fn the_arrival_levels_the_first_finding() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ArrivalProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<ArrivalProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("id:camera-loaded")
             .expect("the fixture's tab lands");
         // Tab ids start at 1: a request for tab 0 is the default, none yet.
@@ -2946,8 +2964,10 @@ mod tests {
 
     #[test]
     fn an_open_consent_card_leaves_the_arrival_focus_empty() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ConsentArrivalProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ConsentArrivalProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:consent-arrival-probe").expect("the probe");
         app.wait_for("text:arrived: true").expect("the arrival ran");
         assert!(
@@ -2998,8 +3018,10 @@ mod tests {
 
     #[test]
     fn review_step_keys_wait_for_a_consent_card_and_come_back() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ConsentGatedReviewKeysProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ConsentGatedReviewKeysProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:consent-review-keys-probe")
             .expect("the probe");
         wait_for_text(&mut app, "camera-tab", "the fixture's tab lands", |tab| {
@@ -3058,8 +3080,10 @@ mod tests {
     /// pressing `K`'s takes the previous one back.
     #[test]
     fn the_pointer_steps_the_findings_both_ways() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<StepperProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(
+            nsh_testing::windowed_root::<StepperProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("id:review-findings-step")
             .expect("the stepper renders");
         wait_for_text(&mut app, "camera-tab", "the fixture's tab lands", |tab| {
@@ -3220,8 +3244,10 @@ mod tests {
 
     #[test]
     fn an_arriving_result_does_not_steal_the_keyboard_from_the_editor() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<ArrivalDuringTypingProbe>()))
-            .expect("start the shell");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ArrivalDuringTypingProbe,
+        >()))
+        .expect("start the shell");
         app.set_viewport(Size {
             width: Points(1440.0),
             height: Points(900.0),
@@ -3278,8 +3304,10 @@ mod tests {
 
     #[test]
     fn escape_cancels_the_card_after_the_review_field_mounts() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<EscapeAfterTheCardProbe>()))
-            .expect("start the shell");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            EscapeAfterTheCardProbe,
+        >()))
+        .expect("start the shell");
         app.set_viewport(Size {
             width: Points(1440.0),
             height: Points(900.0),
@@ -3344,9 +3372,10 @@ mod tests {
 
     #[test]
     fn an_arriving_result_without_questions_does_not_steal_the_keyboard() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<ArrivalWithoutQuestionsProbe>()))
-                .expect("start the shell");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            ArrivalWithoutQuestionsProbe,
+        >()))
+        .expect("start the shell");
         app.set_viewport(Size {
             width: Points(1440.0),
             height: Points(900.0),
@@ -3417,8 +3446,8 @@ mod tests {
     /// saying `Reviewing…` with nothing in flight.
     #[test]
     fn preparing_a_review_clears_the_loading_state_it_supersedes() {
-        let mut app =
-            Headless::start(EngineConfig::new(Root::of::<BusyProbe>())).expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<BusyProbe>()))
+            .expect("start the probe");
         app.wait_for("id:busy-state").expect("the probe renders");
         app.settle();
         assert_eq!(text_of(&app, "busy-state"), "false:0");
@@ -3452,8 +3481,10 @@ mod tests {
 
     #[test]
     fn no_model_set_up_offers_try_again_and_settings() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<NotSetUpReviewProbe>()))
-            .expect("start the probe");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            NotSetUpReviewProbe,
+        >()))
+        .expect("start the probe");
         app.wait_for("id:review-open-settings")
             .expect("the Settings action");
         app.wait_for("id:review-again")
@@ -3500,8 +3531,10 @@ mod tests {
 
     #[test]
     fn escape_closes_the_result_and_returns_focus_to_the_editor() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<EscapeFocusProbe>()))
-            .expect("start the shell");
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            EscapeFocusProbe,
+        >()))
+        .expect("start the shell");
         app.set_viewport(Size {
             width: Points(1440.0),
             height: Points(900.0),
