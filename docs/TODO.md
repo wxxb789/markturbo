@@ -159,3 +159,8 @@
     below it then sit 2 pt off the 4 px grid.
   - Size single-line status variants to a 4 px multiple.
   - Extend the `goal17_settings` grid test to cover that switch.
+- [ ] **`focus_after_close` strictness (PR #80 review).**
+  - The test asserts that the new editor's first focus arrives within the app's own retry window
+    (`FOCUS_RETRY_FRAMES`), not that a key typed at the exact frame the editor appears lands.
+  - `reload_edit_race`'s no-notice assertion can still read the screen before a post-marker notice batch.
+  - Tighten both only if nsh-testing gains a frame-exact or task-completion hook.
