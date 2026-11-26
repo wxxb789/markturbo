@@ -1515,12 +1515,16 @@ pub(crate) fn status_line_at(
             )
             .child(when(
                 move || owner.get() == surface && undo_message.get().action.is_some(),
-                move || status_undo(undo_state.clone(), language),
+                move || status_undo(undo_state.clone(), language, surface),
             )),
     )
 }
 
-fn status_undo(state: AppState, language: Language) -> impl IntoElement {
+fn status_undo(
+    state: AppState,
+    language: Language,
+    surface: crate::state::StatusSurface,
+) -> impl IntoElement {
     let duration = prims::press_color_duration();
     let label_state = state.clone();
     let press_state = state;
@@ -1528,6 +1532,7 @@ fn status_undo(state: AppState, language: Language) -> impl IntoElement {
         .flex_row()
         .items_center()
         .gap(px(SPACE_2))
+        .max_w(move || px(undo_max_width(surface)))
         .child(prims::faint("\u{00b7}"))
         .child(
             prims::press_feedback(
@@ -1548,6 +1553,7 @@ fn status_undo(state: AppState, language: Language) -> impl IntoElement {
                     .cursor_pointer()
                     .bg(Color::TRANSPARENT)
                     .group()
+                    .flex_shrink(1.0)
                     .on_press(move |_: &PressEvent| press_state.undo_last()),
             )
             .child(
@@ -1563,6 +1569,8 @@ fn status_undo(state: AppState, language: Language) -> impl IntoElement {
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
                 .line_height(px(tokens::TYPE_UI_LINE))
+                .number_of_lines(1)
+                .text_overflow(EllipsizeMode::Tail)
                 .text_color(move || tokens::palette().ink_rest)
                 .transition_colors()
                 .duration(move || duration.get())
@@ -1570,6 +1578,15 @@ fn status_undo(state: AppState, language: Language) -> impl IntoElement {
                 .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
             ),
         )
+}
+
+fn undo_max_width(surface: crate::state::StatusSurface) -> f32 {
+    let width = shell::client_width_now();
+    if surface == crate::state::StatusSurface::Editor {
+        tokens::Layout::of(width).column_width(width)
+    } else {
+        width
+    }
 }
 
 fn observe_status(watched: AppState, presence: StatusPresence) {

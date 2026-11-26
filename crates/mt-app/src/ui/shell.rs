@@ -280,10 +280,7 @@ fn column(
                 .w_full()
                 .max_w(move || {
                     px(if layout.field_overlays() {
-                        (layout.field_left(client_width_now())
-                            - tokens::RAIL_W
-                            - tokens::COLUMN_GAP)
-                            .max(0.0)
+                        (layout.column_width(client_width_now()) - tokens::COLUMN_GAP).max(0.0)
                     } else {
                         layout.measure()
                     })
