@@ -1450,14 +1450,20 @@ impl StatusPresence {
 
 pub(crate) fn status_line(
     state: AppState,
-    _language: Language,
+    language: Language,
     presence: StatusPresence,
 ) -> impl IntoElement {
-    status_line_at(state, presence, crate::state::StatusSurface::Editor)
+    status_line_at(
+        state,
+        language,
+        presence,
+        crate::state::StatusSurface::Editor,
+    )
 }
 
 pub(crate) fn status_line_at(
     state: AppState,
+    language: Language,
     presence: StatusPresence,
     surface: crate::state::StatusSurface,
 ) -> impl IntoElement {
@@ -1510,12 +1516,12 @@ pub(crate) fn status_line_at(
             )
             .child(when(
                 move || owner.get() == surface && undo_message.get().action.is_some(),
-                move || status_undo(undo_state.clone()),
+                move || status_undo(undo_state.clone(), language),
             )),
     )
 }
 
-fn status_undo(state: AppState) -> impl IntoElement {
+fn status_undo(state: AppState, language: Language) -> impl IntoElement {
     let duration = prims::press_color_duration();
     let label_state = state.clone();
     let press_state = state;
@@ -1531,7 +1537,13 @@ fn status_undo(state: AppState) -> impl IntoElement {
                     .role(AccessibilityRole::Button)
                     .optional_label({
                         let label_state = label_state.clone();
-                        move || label_state.status.get().action.map(|action| action.label)
+                        move || {
+                            label_state
+                                .status
+                                .get()
+                                .action
+                                .map(|action| SharedString::from((action.label)(language)))
+                        }
                     })
                     .window_drag(false)
                     .cursor_pointer()
@@ -1545,7 +1557,7 @@ fn status_undo(state: AppState) -> impl IntoElement {
                         .status
                         .get()
                         .action
-                        .map(|action| action.label)
+                        .map(|action| SharedString::from((action.label)(language)))
                         .unwrap_or_default()
                 })
                 .test_id("status-action")
@@ -1627,8 +1639,10 @@ fn observe_status(watched: AppState, presence: StatusPresence) {
         opacity.stop();
         rise.stop();
         if message.is_empty() {
-            opacity.set(0.0);
-            rise.set(motion::CARD_RISE_PX);
+            if message.action.is_none() {
+                opacity.set(0.0);
+                rise.set(motion::CARD_RISE_PX);
+            }
             return;
         }
         let enter_ms = if reduced {
@@ -2428,8 +2442,7 @@ mod tests {
                     crate::state::StatusSurface::Editor,
                     "Cleared the counts",
                     crate::state::UndoNotice {
-                        label: SharedString::from("Undo"),
-                        retext: std::rc::Rc::new(|_| SharedString::from("Cleared the counts")),
+                        label: |_| "Undo clear counts",
                         reverse: std::rc::Rc::new(|| Ok(())),
                         commit: std::rc::Rc::new(|| {}),
                     },
@@ -2437,11 +2450,13 @@ mod tests {
             }))
             .child(view().test_id("probe-editor").child(status_line_at(
                 editor_state,
+                Language::English,
                 presence,
                 crate::state::StatusSurface::Editor,
             )))
             .child(view().test_id("probe-review").child(status_line_at(
                 review_state,
+                Language::English,
                 presence,
                 crate::state::StatusSurface::Review,
             )))

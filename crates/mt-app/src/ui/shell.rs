@@ -394,7 +394,9 @@ fn field_surface(
                     FieldSurface::Review | FieldSurface::Revision
                 )
             },
-            move || notices::status_line_at(notice.clone(), status, StatusSurface::Review),
+            move || {
+                notices::status_line_at(notice.clone(), language, status, StatusSurface::Review)
+            },
         ));
     for want in [
         FieldSurface::Revision,

@@ -2,6 +2,8 @@
 
 ## Deferred
 
+- [ ] **Escape with an editor selection during an in-flight Translation collapses the selection first**; revisit if
+  users expect one Escape to cancel.
 - [ ] **Keyboard press feedback on Win32**: nsh 0.7.1 dispatches only `Press`
   for keyboard activation, so pressables show no press-down visual for keyboard
   use. Revisit when nsh exposes keyboard press-down and release events.

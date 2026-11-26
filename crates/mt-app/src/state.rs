@@ -157,10 +157,7 @@ pub(crate) enum StatusKind {
 
 #[derive(Clone)]
 pub(crate) struct UndoNotice {
-    pub(crate) label: SharedString,
-    /// Rebuilds what the Undo undoes in `language`, so a live Undo survives a
-    /// language switch without keeping the old language's text.
-    pub(crate) retext: Rc<dyn Fn(Language) -> SharedString>,
+    pub(crate) label: fn(Language) -> &'static str,
     /// Returns a localized failure notice when the reversal could not happen,
     /// so the caller can keep the action live for a retry.
     pub(crate) reverse: Rc<dyn Fn() -> Result<(), SharedString>>,
@@ -290,10 +287,6 @@ pub struct AppState {
     // Whether the shown status line is the Review wait notice, so a freed
     // Review slot clears exactly that notice and no newer one.
     review_wait_notice: Rc<Cell<bool>>,
-    // The text a live Undo was published with: clearing a notice that
-    // overwrote it restores the text, so the Undo keeps a visible line until
-    // its deadline.
-    undo_text: Rc<RefCell<SharedString>>,
     /// The source column's camera ([`DocumentFocus`]): the line a docked
     /// surface wants levelled with it. Set it with
     /// [`AppState::focus_document_line`].
@@ -872,7 +865,6 @@ impl AppState {
             review_busy: signal(false),
             review_busy_elsewhere: signal(false),
             review_wait_notice: Rc::new(Cell::new(false)),
-            undo_text: Rc::new(RefCell::new(SharedString::default())),
             document_focus: signal(DocumentFocus::default()),
             review_unavailable: signal(None),
             translation_busy: signal(false),
@@ -1048,20 +1040,15 @@ impl AppState {
 
     fn publish(&self, mut surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
         self.review_wait_notice.set(false);
-        // A pending Undo stays on the line: a newer message carries it on
-        // until its deadline, when the slot is freed or taken. The line keeps
-        // the Undo's own text; a transient done message never replaces what
-        // the Undo describes. Its line is the surface the user sees, computed
+        // A pending Undo stays on the line until its deadline, when the slot
+        // is freed or taken: the newest message keeps its own text and carries
+        // the control with it. Its line is the surface the user sees, computed
         // from the UI state, never the surface the notice was first routed to
         // (contract amendment 18).
         if let Some(action) = self.pending_undo.borrow().as_ref() {
             surface = self.undo_surface();
             if message.action.is_none() {
                 message.action = Some(action.clone());
-                if kind == StatusKind::Success {
-                    message.text = self.undo_text.borrow().clone();
-                    message.count = None;
-                }
             }
         }
         self.status_surface.set(surface);
@@ -1116,7 +1103,6 @@ impl AppState {
         self.undo_generation.set(generation);
         self.pending_undo.borrow_mut().replace(action.clone());
         let text = text.into();
-        *self.undo_text.borrow_mut() = text.clone();
         self.publish(
             surface,
             StatusKind::Info,
@@ -1271,10 +1257,7 @@ impl AppState {
             StatusSurface::Settings,
             crate::i18n::t(language, crate::i18n::Key::UsageCleared),
             UndoNotice {
-                label: SharedString::from(crate::i18n::t(language, crate::i18n::Key::Undo)),
-                retext: Rc::new(|language| {
-                    SharedString::from(crate::i18n::t(language, crate::i18n::Key::UsageCleared))
-                }),
+                label: s::undo_clear_counts,
                 reverse: Rc::new(reverse),
                 commit: Rc::new(commit),
             },
@@ -1811,8 +1794,8 @@ impl AppState {
             return;
         }
         if self.pending_undo.borrow().is_some() {
-            let text = self.undo_text.borrow().clone();
-            self.status.update(|message| message.text = text);
+            self.status
+                .update(|message| message.text = SharedString::default());
             self.status_generation
                 .set(self.status_generation.get_untracked().wrapping_add(1));
         } else {
@@ -2241,7 +2224,7 @@ impl AppState {
     }
 
     pub fn discard_recovered(&self, record: &RecoveredRecord) {
-        self.begin_undo(vec![record.clone()]);
+        self.begin_undo(vec![record.clone()], s::undo_discard);
     }
 
     pub fn restore_all_recovered(&self) {
@@ -2251,12 +2234,12 @@ impl AppState {
     }
 
     pub fn discard_all_recovered(&self) {
-        self.begin_undo(self.recovery_records.get());
+        self.begin_undo(self.recovery_records.get(), s::undo_discard_all);
     }
 
     /// There is one pending slot: a second Tier-2 action commits the older
     /// hold at once, then starts its own.
-    fn begin_undo(&self, records: Vec<RecoveredRecord>) {
+    fn begin_undo(&self, records: Vec<RecoveredRecord>, label: fn(Language) -> &'static str) {
         if records.is_empty() {
             return;
         }
@@ -2288,8 +2271,7 @@ impl AppState {
             StatusSurface::Editor,
             s::discarded_draft(language),
             UndoNotice {
-                label: SharedString::from(s::undo(language)),
-                retext: Rc::new(|language| SharedString::from(s::discarded_draft(language))),
+                label,
                 reverse,
                 commit,
             },
@@ -5033,45 +5015,15 @@ impl AppState {
         self.settings
             .update(|settings| settings.language = language);
         // A switch is not a new outcome: the old notice would keep the old
-        // language. A live Undo re-renders in the new language and keeps
-        // its own text; the save stays silent rather than replacing it.
+        // language. A live Undo's control re-renders in the new language;
+        // the save stays silent rather than replacing the newest message.
         self.set_settings_notice("", false);
         if self.pending_undo.borrow().is_some() {
-            self.relocalize_pending_undo(language);
             self.save_settings_quietly();
         } else {
             self.clear_status();
             self.save_settings();
         }
-    }
-
-    fn relocalize_pending_undo(&self, language: Language) {
-        let label = SharedString::from(crate::i18n::t(language, crate::i18n::Key::Undo));
-        let retext = {
-            let pending = self.pending_undo.borrow();
-            let Some(action) = pending.as_ref() else {
-                return;
-            };
-            (action.retext)(language)
-        };
-        {
-            let mut pending = self.pending_undo.borrow_mut();
-            if let Some(action) = pending.as_mut() {
-                action.label = label.clone();
-            }
-        }
-        let own_text = self.status.get_untracked().text == *self.undo_text.borrow();
-        *self.undo_text.borrow_mut() = retext.clone();
-        self.status.update(|message| {
-            if own_text {
-                message.text = retext.clone();
-            }
-            if let Some(action) = message.action.as_mut() {
-                action.label = label.clone();
-            }
-        });
-        self.status_generation
-            .set(self.status_generation.get_untracked().wrapping_add(1));
     }
 
     pub fn set_theme(&self, theme: ThemePreference) {
@@ -5266,13 +5218,7 @@ impl AppState {
             StatusSurface::Settings,
             crate::i18n::t(language, crate::i18n::Key::CredentialDeleted),
             UndoNotice {
-                label: SharedString::from(crate::i18n::t(language, crate::i18n::Key::Undo)),
-                retext: Rc::new(|language| {
-                    SharedString::from(crate::i18n::t(
-                        language,
-                        crate::i18n::Key::CredentialDeleted,
-                    ))
-                }),
+                label: s::undo_remove_key,
                 reverse: Rc::new(reverse),
                 commit: Rc::new(commit),
             },
@@ -5597,10 +5543,31 @@ mod s {
         }
     }
 
-    pub(super) fn undo(language: Language) -> &'static str {
+    pub(super) fn undo_discard(language: Language) -> &'static str {
         match language {
-            Language::English => "Undo",
-            Language::Chinese => "撤销",
+            Language::English => "Undo discard",
+            Language::Chinese => "撤销丢弃",
+        }
+    }
+
+    pub(super) fn undo_discard_all(language: Language) -> &'static str {
+        match language {
+            Language::English => "Undo discard all",
+            Language::Chinese => "撤销全部丢弃",
+        }
+    }
+
+    pub(super) fn undo_clear_counts(language: Language) -> &'static str {
+        match language {
+            Language::English => "Undo clear counts",
+            Language::Chinese => "撤销清除计数",
+        }
+    }
+
+    pub(super) fn undo_remove_key(language: Language) -> &'static str {
+        match language {
+            Language::English => "Undo remove key",
+            Language::Chinese => "撤销移除密钥",
         }
     }
 
@@ -7036,8 +7003,7 @@ mod tests {
             StatusSurface::Editor,
             SharedString::from("Discarded recovered draft"),
             UndoNotice {
-                label: SharedString::from("Undo"),
-                retext: Rc::new(|_| SharedString::from("Discarded recovered draft")),
+                label: |_| "Undo discard",
                 reverse: Rc::new(move || {
                     reverse.set(true);
                     Ok(())
@@ -7090,8 +7056,7 @@ mod tests {
             StatusSurface::Editor,
             UNDO_TEXT,
             UndoNotice {
-                label: SharedString::from("Undo"),
-                retext: Rc::new(|_| SharedString::from(UNDO_TEXT)),
+                label: |_| "Undo discard",
                 reverse: Rc::new(|| Ok(())),
                 commit: Rc::new(|| {}),
             },
@@ -7141,8 +7106,8 @@ mod tests {
             .expect("the probe ran");
         assert!(waiting, "B never showed the wait notice");
         assert!(carried, "the wait notice dropped the live Undo's action");
-        assert_eq!(
-            text, UNDO_TEXT,
+        assert!(
+            text.is_empty(),
             "a freed Review slot left the wait text on the line"
         );
         assert!(kept, "clearing the wait text dropped the live Undo");

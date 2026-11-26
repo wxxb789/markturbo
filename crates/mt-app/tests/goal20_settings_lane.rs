@@ -785,7 +785,7 @@ fn a_language_switch_clears_the_english_settings_notice() {
 }
 
 #[test]
-fn a_language_switch_relocalizes_a_live_undo() {
+fn a_language_switch_renames_a_live_undo() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, _config, _codex_home) = start();
     app.set_viewport(Size::new(Points(1400.0), Points(900.0)))
@@ -805,13 +805,15 @@ fn a_language_switch_relocalizes_a_live_undo() {
     app.press("id:settings-language-chinese")
         .expect("switch the language");
     app.wait_for("text:界面语言").expect("the Chinese page");
-    app.wait_for("id:settings-page >> text:撤销")
-        .expect("the Undo label in the new language");
-    app.wait_for("text:已删除本地计数。记录偏好和已导出的副本不变。")
-        .expect("the Undo's own text in the new language");
+    app.wait_for("id:settings-page >> text:撤销清除计数")
+        .expect("the Undo names its action in the new language");
+    app.wait_for(
+        "text:Local counts deleted. Recording preference and exported copies are unchanged.",
+    )
+    .expect("the newest message keeps its own text");
     assert!(
-        !app.shows("设置已保存。"),
-        "the save notice replaced the live Undo's text: {:?}",
+        !app.shows("设置已保存。") && !app.shows("Settings saved."),
+        "the save notice replaced the live Undo's message: {:?}",
         app.screen().texts()
     );
     assert_eq!(
@@ -825,7 +827,7 @@ fn a_language_switch_relocalizes_a_live_undo() {
 }
 
 #[test]
-fn a_theme_switch_during_a_live_undo_keeps_the_undos_own_text() {
+fn a_theme_switch_during_a_live_undo_shows_the_saves_own_text() {
     let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let (mut app, _config, _codex_home) = start_with_manual_clock();
     app.set_viewport(Size::new(Points(1400.0), Points(900.0)))
@@ -844,28 +846,100 @@ fn a_theme_switch_during_a_live_undo_keeps_the_undos_own_text() {
 
     app.press("id:settings-theme-dark")
         .expect("switch the theme while the Undo is live");
-    app.wait_for(
-        "text:Local counts deleted. Recording preference and exported copies are unchanged.",
-    )
-    .expect("the Undo's own text survives the theme's save");
+    app.wait_for("text:Settings saved.")
+        .expect("the save shows its own text");
+    app.wait_for("id:settings-page >> text:Undo clear counts")
+        .expect("the Undo names its action");
 
     app.press("id:settings-language-chinese")
         .expect("switch the language");
     app.wait_for("text:界面语言").expect("the Chinese page");
-    app.wait_for("id:settings-page >> text:撤销")
+    app.wait_for("id:settings-page >> text:撤销清除计数")
         .expect("the Undo label in the new language");
-    app.wait_for("text:已删除本地计数。记录偏好和已导出的副本不变。")
-        .expect("the Undo's own text in the new language");
-    assert!(
-        !app.shows("Settings saved.") && !app.shows("设置已保存。"),
-        "the save notice replaced the live Undo's text: {:?}",
-        app.screen().texts()
-    );
+    app.wait_for("text:Settings saved.")
+        .expect("the newest message keeps its own text");
     assert_eq!(
         app.screen().count("id:status-action").expect("selector"),
         1,
         "the Undo stayed on exactly one status line"
     );
+}
+
+#[test]
+fn a_slow_folder_shows_beside_the_named_undo() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, config, _codex_home) = start_with_manual_clock();
+    let slow = tempfile::tempdir().expect("slow workspace");
+    let release = config.path().join("release-slow-scan");
+    std::fs::write(slow.path().join("slow.md"), "# Slow\n").expect("slow file");
+    let day = mt_core::usage::day_bucket(std::time::SystemTime::now());
+    let store = config.path().join("data").join("usage.json");
+    std::fs::create_dir_all(store.parent().expect("the data directory"))
+        .expect("the data directory");
+    std::fs::write(
+        &store,
+        format!(
+            r#"{{"schema_version":1,"days":{{"{day}":{{"events":{{"artifact_opened":1}},"review_started":{{}},"review_durations":{{}},"accepted_hunks":0,"rejected_hunks":0}}}}}}"#
+        ),
+    )
+    .expect("a seeded store");
+
+    app.set_viewport(Size::new(Points(1400.0), Points(900.0)))
+        .expect("the walk's viewport");
+    open_settings(&mut app);
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.wait_for(
+        "text:Last 180 days: 1 day active · 0 Reviews · 0 revision decisions · 1 total event",
+    )
+    .expect("the seeded counts");
+    app.press("id:usage-clear").expect("clear the counts");
+    app.wait_for("id:settings-page >> id:status-action")
+        .expect("the Undo");
+
+    // The scan parks until the test releases it, so the open's notice owns
+    // the line while the Undo is live.
+    mt_app::test_vault::gate_read(slow.path(), &release);
+    app.on_pick_paths(vec![slow.path().to_path_buf()])
+        .expect("answer the folder picker");
+    app.press("id:title-settings").expect("open the title menu");
+    app.press("id:title-menu-open-folder")
+        .expect("open the slow folder");
+    app.wait_for("text:Opening folder…")
+        .expect("the slow open announces itself");
+
+    app.scroll("id:settings-scroll", Points(-10_000.0))
+        .expect("back to the language row");
+    app.settle();
+    app.press("id:settings-language-chinese")
+        .expect("switch the language");
+    app.wait_for("text:界面语言").expect("the Chinese page");
+    app.wait_for("id:settings-page >> text:撤销清除计数")
+        .expect("the Undo names its action in the new language");
+    assert!(
+        app.screen()
+            .matches("role:button[撤销清除计数]")
+            .expect("the role selector"),
+        "the Undo's accessible label follows the language"
+    );
+    app.wait_for("text:Opening folder…")
+        .expect("the folder progress keeps its own text");
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo stayed on exactly one status line"
+    );
+
+    std::fs::write(&release, "go").expect("release the slow scan");
+    app.press("id:status-action").expect("undo the clear");
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("back to the usage counters");
+    app.settle();
+    app.wait_for(
+        "text:Last 180 days: 1 day active · 0 Reviews · 0 revision decisions · 1 total event",
+    )
+    .expect("the Undo restores the captured counts");
 }
 
 fn y_of(app: &Headless, id: &str) -> f32 {

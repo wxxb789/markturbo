@@ -853,6 +853,84 @@ fn copy_exports_only_the_approved_result_and_saves_nothing() {
     );
 }
 
+/// `Copy` in the Revision field while a Settings Undo is live: the
+/// confirmation is the status line's newest message and the control names
+/// what it would reverse.
+#[test]
+fn copy_beside_a_live_undo_keeps_its_own_confirmation() {
+    let _guard = TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let source = "Original\nUnchanged\n";
+    let (review, revision) = two_change_outputs(source);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let body = read_http_body(&mut stream);
+            let request: serde_json::Value =
+                serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+            if request["stream"].as_bool().unwrap_or(false) {
+                write_sse(&mut stream, &revision);
+            } else {
+                write_review_json(&mut stream, &review);
+            }
+        }
+    });
+    let (_document, _directory, _config) = revision_fixture(source, &base_url);
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(px(1440.0), px(900.0)))
+        .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+    app.press("id:title-review").expect("prepare Review");
+    app.wait_for("id:consent-card").expect("Review disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("Review ready");
+    app.press("label:Prepare revision")
+        .expect("prepare Revision");
+    app.wait_for("text:Ask for a revision?")
+        .expect("Revision disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:revision-accept", Duration::from_secs(20))
+        .expect("the hunks arrive");
+
+    app.press("id:title-settings").expect("open the title menu");
+    app.press("id:title-menu-settings").expect("open Settings");
+    app.wait_for("id:settings-page").expect("settings page");
+    app.scroll("id:settings-scroll", nsh_engine::Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.press("id:usage-clear").expect("clear the counts");
+    app.wait_for("id:settings-page >> id:status-action")
+        .expect("the Undo");
+    app.press("id:settings-close").expect("close Settings");
+    app.wait_for("id:revision-copy")
+        .expect("the Revision field is back");
+
+    app.press("id:revision-copy").expect("press Copy");
+    app.wait_for("text:Approved result copied to the clipboard.")
+        .expect("the confirmation keeps its own text");
+    app.wait_for("id:field >> text:Undo clear counts")
+        .expect("the Undo names the action it would reverse");
+    assert!(
+        app.screen()
+            .matches("role:button[Undo clear counts]")
+            .expect("the role selector"),
+        "the Undo keeps its named accessible label"
+    );
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo stayed on exactly one status line"
+    );
+}
+
 const REPLACEMENT: &str = "Typed over everything\n";
 
 #[test]

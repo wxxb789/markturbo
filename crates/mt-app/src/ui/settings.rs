@@ -119,6 +119,7 @@ pub(crate) fn page(
         .child(notice_line(state.clone()))
         .child(notices::status_line_at(
             state,
+            language,
             presence,
             crate::state::StatusSurface::Settings,
         ))
