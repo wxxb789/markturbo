@@ -1049,13 +1049,19 @@ impl AppState {
     fn publish(&self, mut surface: StatusSurface, kind: StatusKind, mut message: StatusMessage) {
         self.review_wait_notice.set(false);
         // A pending Undo stays on the line: a newer message carries it on
-        // until its deadline, when the slot is freed or taken. Its line is
-        // the surface the user sees, computed from the UI state, never the
-        // surface the notice was first routed to (contract amendment 18).
+        // until its deadline, when the slot is freed or taken. The line keeps
+        // the Undo's own text; a transient done message never replaces what
+        // the Undo describes. Its line is the surface the user sees, computed
+        // from the UI state, never the surface the notice was first routed to
+        // (contract amendment 18).
         if let Some(action) = self.pending_undo.borrow().as_ref() {
             surface = self.undo_surface();
             if message.action.is_none() {
                 message.action = Some(action.clone());
+                if kind == StatusKind::Success {
+                    message.text = self.undo_text.borrow().clone();
+                    message.count = None;
+                }
             }
         }
         self.status_surface.set(surface);

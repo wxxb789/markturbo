@@ -824,6 +824,50 @@ fn a_language_switch_relocalizes_a_live_undo() {
         .expect("the Undo is spent");
 }
 
+#[test]
+fn a_theme_switch_during_a_live_undo_keeps_the_undos_own_text() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start_with_manual_clock();
+    app.set_viewport(Size::new(Points(1400.0), Points(900.0)))
+        .expect("the walk's viewport");
+    open_settings(&mut app);
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.press("id:usage-on").expect("enable the counters");
+    app.press("id:usage-clear").expect("clear the counts");
+    app.wait_for("id:settings-page >> id:status-undo")
+        .expect("the Undo");
+    app.scroll("id:settings-scroll", Points(-10_000.0))
+        .expect("back to the theme and language rows");
+    app.settle();
+
+    app.press("id:settings-theme-dark")
+        .expect("switch the theme while the Undo is live");
+    app.wait_for(
+        "text:Local counts deleted. Recording preference and exported copies are unchanged.",
+    )
+    .expect("the Undo's own text survives the theme's save");
+
+    app.press("id:settings-language-chinese")
+        .expect("switch the language");
+    app.wait_for("text:界面语言").expect("the Chinese page");
+    app.wait_for("id:settings-page >> text:撤销")
+        .expect("the Undo label in the new language");
+    app.wait_for("text:已删除本地计数。记录偏好和已导出的副本不变。")
+        .expect("the Undo's own text in the new language");
+    assert!(
+        !app.shows("Settings saved.") && !app.shows("设置已保存。"),
+        "the save notice replaced the live Undo's text: {:?}",
+        app.screen().texts()
+    );
+    assert_eq!(
+        app.screen().count("id:status-action").expect("selector"),
+        1,
+        "the Undo stayed on exactly one status line"
+    );
+}
+
 fn y_of(app: &Headless, id: &str) -> f32 {
     app.screen()
         .layout_nodes()

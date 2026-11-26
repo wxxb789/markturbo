@@ -1976,7 +1976,7 @@ mod tests {
         state.toggle_context();
         let armed = state.clone();
         effect(move || {
-            if armed.context_resolved.get().is_none() {
+            if armed.context_resolved.get().is_none() || armed.active.get().is_none() {
                 return;
             }
             if armed.context_selected.get().is_empty() {
