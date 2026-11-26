@@ -160,8 +160,8 @@ fn bounds(app: &Headless, id: &str) -> nsh_core::geometry::Bounds<Points> {
 }
 
 /// The row text truncates before the actions; the hit test presses Restore
-/// and Discard at 1000 (Source and Split) and 1100 px, and the Restore
-/// opens the row's own draft.
+/// and Discard at 1000 (Source and Split) and 1100 px, and the Restore on
+/// the remaining row opens that row's own draft.
 #[test]
 fn recovery_actions_stay_pressable_at_narrow_widths() {
     if !cfg!(windows) {
@@ -207,14 +207,15 @@ fn recovery_actions_stay_pressable_at_narrow_widths() {
             );
         }
 
-        let names = ["first.md", "second.md"];
-        let first_row = app
-            .screen()
-            .texts()
+        let row0 = ["first.md", "second.md"]
             .into_iter()
-            .find_map(|text| names.iter().find(|name| text.contains(**name)).copied())
-            .expect("the first row names its file");
-        let (expected, other) = if first_row == "first.md" {
+            .find(|name| {
+                app.screen()
+                    .matches(&format!("id:recovery-row-0 >> text:/{name}/"))
+                    .expect("selector")
+            })
+            .expect("row 0 names its file");
+        let (discarded, expected) = if row0 == "first.md" {
             (FIRST_DRAFT, SECOND_DRAFT)
         } else {
             (SECOND_DRAFT, FIRST_DRAFT)
@@ -229,10 +230,10 @@ fn recovery_actions_stay_pressable_at_narrow_widths() {
         app.wait_for_gone("id:recovery-banner", Duration::from_secs(5))
             .expect("the restored row leaves the banner");
         app.wait_for(&format!("id:source-editor >> text:{expected}"))
-            .expect("the restored document shows its row's draft");
+            .expect("the restored document shows the remaining row's draft");
         assert!(
-            !app.shows(other),
-            "the other row's draft was restored: {:?}",
+            !app.shows(discarded),
+            "the discarded row's draft was restored: {:?}",
             app.screen().texts()
         );
     }
