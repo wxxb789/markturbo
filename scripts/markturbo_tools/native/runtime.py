@@ -74,8 +74,8 @@ INTEGRITY_NAMES = {
     "protected",
 }
 
-# How the nsh 0.6.1 UI appears in Windows UI Automation. Verified against the
-# nsh-platform-windows 0.6.1 crate source:
+# How the nsh 0.7.1 UI appears in Windows UI Automation. Verified against the
+# nsh-platform-windows 0.7.1 crate source:
 #
 # * AutomationId is the view's `.test_id(..)` (access/uia.rs), but only on a
 #   view that is itself a UIA element. Plain wrappers are looked through
@@ -2603,7 +2603,7 @@ class NativeHarness:
             return actual
         self.win32.send_key(app.hwnd, VK_BACK)
         # An empty document copies line-wise as its one empty line, "\n"
-        # (nsh-base 0.6.1 `editor/commands.rs` `copy`). Backspace over Select
+        # (nsh-base 0.7.1 `editor/commands.rs` `copy`). Backspace over Select
         # All leaves no line break behind, so here "\n" can only mean empty.
         self.wait_editor_fingerprint(app, fingerprint_text("\n"), self.ui_timeout)
         return fingerprint_text("")

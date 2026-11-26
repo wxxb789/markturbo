@@ -532,8 +532,10 @@ fn start_field_over_buffer(
         }
     });
     let (document, directory, config) = revision_fixture(source, &base_url);
-    let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionFieldOverBuffer>()))
-        .expect("start the field over the buffer");
+    let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+        RevisionFieldOverBuffer,
+    >()))
+    .expect("start the field over the buffer");
     app.wait_for(&format!("text:Buffer: {buffer}"))
         .expect("document loaded");
     app.press("text:Review").expect("prepare Review");
@@ -1034,8 +1036,10 @@ fn a_prepared_review_keeps_an_in_flight_revision_until_it_is_sent() {
         );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
-    let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionAcrossDocuments>()))
-        .expect("start the two-document controls");
+    let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+        RevisionAcrossDocuments,
+    >()))
+    .expect("start the two-document controls");
     app.wait_for("text:Tabs: 1").expect("document loaded");
     app.press("text:Review").expect("prepare Review");
     app.press("text:Send Review").expect("send Review");
@@ -1176,8 +1180,10 @@ fn a_prepared_revision_lands_on_the_tab_that_prepared_it() {
         );
         std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
     }
-    let mut app = Headless::start(EngineConfig::new(Root::of::<RevisionAcrossDocuments>()))
-        .expect("start the two-document controls");
+    let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+        RevisionAcrossDocuments,
+    >()))
+    .expect("start the two-document controls");
     app.wait_for("text:Tabs: 1").expect("document loaded");
 
     // A reviews; B reviews too, so B has a Revision context of its own.

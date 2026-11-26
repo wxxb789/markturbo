@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use nsh_testing::Headless;
+use nsh_testing::{DragOptions, Headless};
 
 /// How long one pumped frame waits for the app before the loop looks again.
 const STEP: Duration = Duration::from_millis(25);
@@ -74,8 +74,12 @@ pub fn wait_for_pending_dialog(app: &mut Headless, what: &str, timeout: Duration
 pub fn hold_send(app: &mut Headless) {
     use nsh_core::geometry::{point, px};
 
-    app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
-        .expect("hold the send control");
+    app.drag_and_hold(
+        "id:consent-send",
+        point(px(0.0), px(0.0)),
+        DragOptions::default(),
+    )
+    .expect("hold the send control");
     app.wait(Duration::from_millis(1_100))
         .expect("the full charge");
     app.drop_held().expect("release the send control");

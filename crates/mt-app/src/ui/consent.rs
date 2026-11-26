@@ -107,7 +107,7 @@ enum KeyRole {
 /// The watched key of a raw event's logical key. Windows reports Space as
 /// `" "` and the modifier as `Control`; other backends spell
 /// `"Space"`/`"ControlLeft"`. macOS reports Command's press and its release
-/// as `Meta`/`MetaLeft`/`MetaRight` (nsh-platform-macos-0.6.1
+/// as `Meta`/`MetaLeft`/`MetaRight` (nsh-platform-macos-0.7.1
 /// `src/keyboard.rs`), so releasing Command ends the hold as releasing
 /// Control does.
 fn role_of(key: &str) -> KeyRole {
@@ -1916,8 +1916,8 @@ mod tests {
     use super::*;
     use mt_core::model::{ModelOperation, ModelRequestDisclosure, OutboundScope, Provider};
     use nsh_core::keymap::Modifiers;
-    use nsh_engine::{EngineConfig, Root};
-    use nsh_testing::Headless;
+    use nsh_engine::EngineConfig;
+    use nsh_testing::{DragOptions, Headless};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -2296,15 +2296,16 @@ mod tests {
 
     pub(super) fn start_harness() -> Headless {
         // A late frame once ran hold completion before its timer; manual time orders them.
-        let mut config = EngineConfig::new(Root::of::<Harness>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<Harness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         // A platform that focuses ordinary views and delivers focused-view
         // keys, as the Windows host does: the card takes the focus and its
         // raw handlers hear the tests' key events.
         config.environment.os = nsh_core::element::Os::Linux;
+        // The viewport before the window opens: the declared window sizes
+        // itself from it, so the card lays out at this size.
+        config.viewport = nsh_core::Size::new(Points(1_200.0), Points(800.0));
         let mut app = Headless::start(config).expect("start the harness");
-        app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
-            .expect("viewport");
         app.wait_for("id:consent-card").expect("the card");
         app
     }
@@ -2333,8 +2334,12 @@ mod tests {
     fn hold_send(app: &mut Headless) {
         use nsh_core::geometry::point;
 
-        app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
-            .expect("hold the send control");
+        app.drag_and_hold(
+            "id:consent-send",
+            point(px(0.0), px(0.0)),
+            DragOptions::default(),
+        )
+        .expect("hold the send control");
         app.run_for(Duration::from_millis(1_100))
             .expect("the full charge");
         app.drop_held().expect("release the send control");
@@ -2342,7 +2347,7 @@ mod tests {
 
     #[test]
     fn reduced_motion_keeps_transforms_out_of_the_card_subtree() {
-        let mut config = EngineConfig::new(Root::of::<ReducedMotionHarness>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<ReducedMotionHarness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the harness");
         app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
@@ -2376,8 +2381,12 @@ mod tests {
             .expect("the consent motion card")
             .id;
         use nsh_core::geometry::point;
-        app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
-            .expect("start the hold");
+        app.drag_and_hold(
+            "id:consent-send",
+            point(px(0.0), px(0.0)),
+            DragOptions::default(),
+        )
+        .expect("start the hold");
         app.drop_held().expect("release the hold");
         app.settle();
 
@@ -2493,7 +2502,8 @@ mod tests {
 
     #[test]
     fn a_revision_of_a_selection_names_its_scope_and_offers_no_other() {
-        let mut config = EngineConfig::new(Root::of::<RevisionSelectionHarness>());
+        let mut config =
+            EngineConfig::new(nsh_testing::windowed_root::<RevisionSelectionHarness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the harness");
         app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
@@ -2541,7 +2551,7 @@ mod tests {
 
     #[test]
     fn translation_uses_the_hold_to_send_card() {
-        let mut config = EngineConfig::new(Root::of::<TranslationHarness>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<TranslationHarness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the harness");
         app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
@@ -2607,7 +2617,7 @@ mod tests {
             animation::{AnimationProp, Animator},
         };
 
-        let mut config = EngineConfig::new(Root::of::<SentFadeHarness>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<SentFadeHarness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = Headless::start(config).expect("start the harness");
         app.set_viewport(nsh_core::Size::new(Points(1_200.0), Points(800.0)))
@@ -2875,7 +2885,7 @@ mod tests {
     }
 
     fn shifted_key_keeps_consent_open_without_pressing_the_background(key: &str) {
-        let mut config = EngineConfig::new(Root::of::<BackgroundFocusHarness>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<BackgroundFocusHarness>());
         config.environment.os = nsh_core::platform::Os::Linux;
         config.environment.idiom = nsh_core::platform::Idiom::Desktop;
         let mut app = Headless::start(config).expect("start the harness");
@@ -3050,6 +3060,9 @@ mod tests {
         let sends_state = state.clone();
         let reopen_state = state.clone();
         let swap_state = state.clone();
+        let window = nsh_core::element::desktop::current_window();
+        let hide_window = window.clone();
+        let show_window = window;
         view()
             .w(px(1_200.0))
             .h(px(800.0))
@@ -3076,6 +3089,23 @@ mod tests {
                     })
                     .child(prims::rest("swap")),
             )
+            .child(
+                view()
+                    .test_id("hold-hide-window")
+                    .focusable(false)
+                    .on_press(move |_: &PressEvent| {
+                        // Hidden for half a second, then back as the system
+                        // would: the hidden window has no hit test, so the
+                        // harness restores it itself.
+                        hide_window.hide();
+                        let show = show_window.clone();
+                        set_timeout(Duration::from_millis(500), move || {
+                            show.show();
+                            show.focus();
+                        });
+                    })
+                    .child(prims::rest("hide window")),
+            )
             .child(when(
                 move || is_open(&state),
                 move || card(card_state.clone(), Language::English),
@@ -3091,7 +3121,7 @@ mod tests {
     }
 
     fn start_keyboard_harness() -> Headless {
-        let mut config = EngineConfig::new(Root::of::<KeyboardHarness>());
+        let mut config = EngineConfig::new(nsh_testing::windowed_root::<KeyboardHarness>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         // A platform that focuses ordinary views, as the Windows host does:
         // the card takes the focus and its controls are Tab stops.
@@ -3345,13 +3375,12 @@ mod tests {
         let mut app = start_keyboard_harness();
         key_down(&mut app, "Enter", ctrl_enter());
         app.run_for(Duration::from_millis(300)).expect("held");
-        app.set_environment("the window lost the keyboard focus", |env| {
-            let mut state = env.window_state.take().unwrap_or_default();
-            state.focused = false;
-            env.window_state = Some(state);
-        })
-        .expect("the key focus loss");
-        app.run_for(Duration::from_millis(700))
+        // The platform hides the main window (the user switched away): the
+        // window reports `focused: false`, as it does when a native sheet
+        // takes the keyboard focus. The harness shows it again after 500 ms,
+        // before the hold's deadline.
+        press_without_settling(&app, "id:hold-hide-window");
+        app.run_for(Duration::from_millis(1_000))
             .expect("past 900 ms");
         assert_eq!(
             send_count(&app),
@@ -3359,12 +3388,6 @@ mod tests {
             "a window without the key focus sends nothing"
         );
         // Back with the key focus, a fresh hold still works.
-        app.set_environment("the window has the keyboard focus again", |env| {
-            if let Some(state) = env.window_state.as_mut() {
-                state.focused = true;
-            }
-        })
-        .expect("the key focus back");
         key_up(&mut app, "Enter", ctrl_enter());
         key_down(&mut app, "Enter", ctrl_enter());
         app.run_for(Duration::from_millis(1_000))
@@ -3435,8 +3458,12 @@ mod tests {
         app.run_for(Duration::from_millis(600)).expect("to 600 ms");
         // The pointer takes over: the keyboard charge ends with its timer,
         // and the pointer's own charge starts from zero at 600 ms.
-        app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
-            .expect("pointer press at 600 ms");
+        app.drag_and_hold(
+            "id:consent-send",
+            point(px(0.0), px(0.0)),
+            DragOptions::default(),
+        )
+        .expect("pointer press at 600 ms");
         app.run_for(Duration::from_millis(300))
             .expect("past the keyboard hold's 900 ms");
         assert_eq!(
@@ -3497,13 +3524,21 @@ mod tests {
         let mut app = start_harness();
         app.set_environment("reduced motion", |env| env.reduce_motion = true)
             .expect("reduced motion");
-        app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
-            .expect("down for 500 ms");
+        app.drag_and_hold(
+            "id:consent-send",
+            point(px(0.0), px(0.0)),
+            DragOptions::default(),
+        )
+        .expect("down for 500 ms");
         app.run_for(Duration::from_millis(500)).expect("500 ms");
         app.drop_held().expect("up");
         app.run_for(Duration::from_millis(20)).expect("a beat");
-        app.drag_and_hold("id:consent-send", point(px(0.0), px(0.0)))
-            .expect("down again for 500 ms");
+        app.drag_and_hold(
+            "id:consent-send",
+            point(px(0.0), px(0.0)),
+            DragOptions::default(),
+        )
+        .expect("down again for 500 ms");
         app.run_for(Duration::from_millis(500)).expect("500 ms");
         app.drop_held().expect("up");
         app.run_for(Duration::from_millis(800))

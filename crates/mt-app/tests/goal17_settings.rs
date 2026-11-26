@@ -39,9 +39,23 @@ fn start_settings() -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     engine.environment.idiom = Idiom::Desktop;
     engine.environment.color_scheme = ColorScheme::Light;
     let mut app = Headless::start(engine).expect("start app");
-    app.set_viewport(Size::new(Points(1280.0), Points(900.0)))
-        .expect("900px viewport");
     app.wait_for("id:shell").expect("shell");
+    // The declared window opens at 1280x800; `setViewport` resizes the
+    // window the app shows, which is what runs these tests at Goal 17's
+    // 1280x900.
+    app.set_viewport(Size::new(Points(1280.0), Points(900.0)))
+        .expect("900px window");
+    assert_eq!(
+        app.window_state("main")
+            .expect("the desktop has the main window")
+            .expect("the main window is open")
+            .content_bounds
+            .size
+            .height
+            .0,
+        900.0,
+        "the settings tests run in Goal 17's 900pt window"
+    );
     app.press("id:title-settings").expect("open title menu");
     app.press("id:title-menu-settings").expect("open settings");
     app.wait_for("id:settings-page").expect("settings page");
@@ -100,6 +114,60 @@ fn settings_page_rows_land_on_the_four_point_grid() {
             "`{id}` starts on the 4px grid: y={y}"
         );
     }
+}
+
+#[test]
+fn the_usage_disclosure_wraps_to_its_full_text() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (app, _config, _codex_home) = start_settings();
+    let expected = mt_app::i18n::t(
+        mt_core::settings::Language::English,
+        mt_app::i18n::Key::UsageDisclosure,
+    );
+    let node = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == expected)
+        })
+        .expect("the usage disclosure's text");
+    assert!(
+        node.bounds.size.height.0 > mt_app::ui::tokens::TYPE_UI_LINE,
+        "the usage disclosure wraps instead of clipping to one line: {:?}",
+        node.bounds
+    );
+}
+
+#[test]
+fn the_unconfigured_credential_hint_wraps_at_a_640pt_window() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let (mut app, _config, _codex_home) = start_settings();
+    app.set_viewport(Size::new(Points(640.0), Points(900.0)))
+        .expect("640pt window");
+    app.settle();
+    let expected = mt_app::i18n::t(
+        mt_core::settings::Language::English,
+        mt_app::i18n::Key::ChooseProviderForCredential,
+    );
+    let node = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == expected)
+        })
+        .expect("the Unconfigured credential hint");
+    assert!(
+        node.bounds.size.height.0 >= 2.0 * mt_app::ui::tokens::TYPE_UI_LINE,
+        "the hint lays out at least two lines at 640pt: {:?}",
+        node.bounds
+    );
+    assert!(app.screen().shows(expected), "the full hint is present");
 }
 
 #[test]

@@ -239,6 +239,10 @@ pub struct AppState {
     pub search_truncated: Signal<bool>,
     pub search_busy: Signal<bool>,
     pub(crate) palette_open: Signal<bool>,
+    /// The window `App` declared as the app's main one, kept while its
+    /// content renders; the close paths use it so they close that window
+    /// instead of the hidden host.
+    pub(crate) main_window: Rc<RefCell<Option<nsh_core::element::desktop::WindowRef>>>,
     /// Whether the titlebar menu is open: the first layer of the fixed
     /// Escape order.
     pub title_menu_open: Signal<bool>,
@@ -832,6 +836,7 @@ impl AppState {
             search_truncated: signal(false),
             search_busy: signal(false),
             palette_open: signal(false),
+            main_window: Rc::new(RefCell::new(None)),
             title_menu_open: signal(false),
             settings: signal(settings),
             settings_open: signal(false),
@@ -2560,7 +2565,7 @@ impl AppState {
                             state.tabs.get().iter().find(|tab| tab.dirty.get()).cloned()
                         else {
                             state.guard.set(None);
-                            nsh_core::element::desktop::current_window().close();
+                            state.close_main_window();
                             return;
                         };
                         let outcome = if tab.untitled {
@@ -2624,7 +2629,7 @@ impl AppState {
                         self.retire_tab_recovery(tab);
                     }
                 }
-                nsh_core::element::desktop::current_window().close();
+                self.close_main_window();
             }
             GuardKind::ReloadFromDisk(_) | GuardKind::OverwriteDisk(_) => {}
         }
@@ -2975,12 +2980,24 @@ impl AppState {
             .map(|tab| tab.id)
             .collect();
         if dirty.is_empty() {
-            nsh_core::element::desktop::current_window().close();
+            self.close_main_window();
             return;
         }
         self.checkpoint_dirty_now();
         // The in-app guard takes the decision (`ui::notices`).
         self.open_guard(GuardKind::QuitApp);
+    }
+
+    /// Closes the app's declared main window; the app's quit mode
+    /// (`LastWindowClosed`, set in `app.rs`) ends the app when its last
+    /// window closes. Falls back to quitting when the window never rendered
+    /// (a headless close before the first frame).
+    fn close_main_window(&self) {
+        if let Some(window) = self.main_window.borrow().clone() {
+            window.close();
+        } else {
+            nsh_core::element::desktop::quit();
+        }
     }
 
     /// Translate the active document through the consent-bound provider path.
@@ -5746,11 +5763,10 @@ mod tests {
             let routed = editor == StatusSurface::Editor && settings == StatusSurface::Settings;
             view().child(text(if routed { "routed" } else { "wrong surface" }))
         }
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                ErrorRoutingProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<ErrorRoutingProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("text:routed")
             .expect("the settings surface receives the error");
     }
@@ -5782,11 +5798,10 @@ mod tests {
 
     #[test]
     fn opening_a_folder_says_so_at_once_and_lists_it_after() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                OpenFolderProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<OpenFolderProbe>(),
+        ))
+        .expect("start the probe");
         app.wait_for("text:folder open")
             .expect("the walk lands after the status");
         let (opening, opened) = OPENED_FOLDER
@@ -5800,11 +5815,10 @@ mod tests {
 
     #[test]
     fn revision_accept_and_undo_update_the_buffer() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                RevisionWriteProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<RevisionWriteProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (accepted, undone) = OUTCOME
             .lock()
@@ -5844,11 +5858,10 @@ mod tests {
 
     #[test]
     fn preparing_or_cancelling_a_review_keeps_the_shown_result() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                ReviewPreservationProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<ReviewPreservationProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (kept, closed) = REVIEW_PRESERVATION
             .lock()
@@ -5919,7 +5932,7 @@ mod tests {
     #[test]
     fn focus_round_trips_to_the_document_view_and_refuses_behind_a_card() {
         let mut config =
-            nsh_engine::EngineConfig::new(nsh_engine::Root::of::<DocumentViewFocusProbe>());
+            nsh_engine::EngineConfig::new(nsh_testing::windowed_root::<DocumentViewFocusProbe>());
         // A platform that gives ordinary views the keyboard focus, as the
         // Windows host does.
         config.environment.os = nsh_core::platform::Os::Linux;
@@ -6095,11 +6108,10 @@ mod tests {
 
     #[test]
     fn cancelling_a_new_review_keeps_the_revision_that_arrived() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                ReviewSessionProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<ReviewSessionProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (stale, binding, selection, answers, arrived, revision, shown, closed, tabs) =
             SESSION_PRESERVATION
@@ -6221,11 +6233,10 @@ mod tests {
 
     #[test]
     fn preparing_a_revision_discloses_the_tabs_own_review() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                RevisionPerTabProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<RevisionPerTabProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (shown_a, output_a, answer_a, b_kept) = REVISION_TABS
             .lock()
@@ -6263,11 +6274,10 @@ mod tests {
 
     #[test]
     fn a_review_unavailable_reason_stays_with_its_tab() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                ReviewUnavailablePerTabProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<ReviewUnavailablePerTabProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (other_clean, a_reason, b_reason) = REVIEW_UNAVAILABLE_TABS
             .lock()
@@ -6301,11 +6311,10 @@ mod tests {
 
     #[test]
     fn a_second_done_without_a_proposal_decides_nothing() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                DoneTwiceProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<DoneTwiceProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (first, second) = DONE_TWICE
             .lock()
@@ -6370,11 +6379,10 @@ mod tests {
 
     #[test]
     fn a_review_the_text_moved_past_prepares_no_revision() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                StaleRevisionProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<StaleRevisionProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (current, stale) = PREPARED
             .lock()
@@ -6438,15 +6446,14 @@ mod tests {
     where
         P::Props: Default,
     {
-        let mut engine = nsh_engine::EngineConfig::new(nsh_engine::Root::of::<P>());
+        let mut engine = nsh_engine::EngineConfig::new(nsh_testing::windowed_root::<P>());
         engine.environment.os = nsh_core::platform::Os::Windows;
         engine.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        // The viewport before the window opens: the declared window sizes
+        // itself from it, so the probe lays out at this size.
+        engine.viewport =
+            nsh_core::Size::new(nsh_engine::Points(1440.0), nsh_engine::Points(900.0));
         let mut app = nsh_testing::Headless::start(engine).expect("start the probe");
-        app.set_viewport(nsh_core::Size::new(
-            nsh_engine::Points(1440.0),
-            nsh_engine::Points(900.0),
-        ))
-        .expect("viewport");
         let probe = format!("Probe: {UNSET_SOURCE:?} dirty=false");
         app.wait_for(&format!("text:{probe}"))
             .expect("the clean document");
@@ -6548,11 +6555,10 @@ mod tests {
 
     #[test]
     fn a_translation_and_disk_reload_update_the_buffer() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                ReplaceProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<ReplaceProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (translated, reloaded) = REPLACED
             .lock()
@@ -6669,11 +6675,10 @@ mod tests {
 
     #[test]
     fn a_failing_credential_save_keeps_an_unrelated_pending_undo() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                FailedSaveKeepsUndoProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<FailedSaveKeepsUndoProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (before, failed, after) = FAILED_SAVE_UNDO
             .lock()
@@ -6705,11 +6710,10 @@ mod tests {
 
     #[test]
     fn a_capture_read_failure_reports_it_without_a_deletion_or_undo() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                CaptureFailureProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<CaptureFailureProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (error, undo, status_action, notice) = CAPTURE_FAILURE
             .lock()
@@ -6747,11 +6751,10 @@ mod tests {
 
     #[test]
     fn a_capture_read_failure_keeps_the_previous_undo_live() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                FailedCaptureKeepsUndoProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<FailedCaptureKeepsUndoProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (before, failed, after, status_action) = FAILED_CAPTURE_KEEPS_UNDO
             .lock()
@@ -6789,11 +6792,10 @@ mod tests {
 
     #[test]
     fn a_failed_usage_capture_reports_it_without_a_deletion_or_undo() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                UsageCaptureFailureProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<UsageCaptureFailureProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (undo, notice, store_untouched) = USAGE_CAPTURE_FAILURE
             .lock()
@@ -6847,7 +6849,8 @@ mod tests {
 
     #[test]
     fn a_failed_commit_delete_reaches_the_status_line_after_settings_closes() {
-        let mut config = nsh_engine::EngineConfig::new(nsh_engine::Root::of::<FailedDeleteProbe>());
+        let mut config =
+            nsh_engine::EngineConfig::new(nsh_testing::windowed_root::<FailedDeleteProbe>());
         config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::now());
         let mut app = nsh_testing::Headless::start(config).expect("start the probe");
         app.set_viewport(nsh_core::Size::new(
@@ -6959,11 +6962,10 @@ mod tests {
 
     #[test]
     fn cancelling_a_revision_keeps_a_live_undo_reachable() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                RevisionCancelKeepsUndoProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<RevisionCancelKeepsUndoProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (offered, restored) = REVISION_CANCEL_KEEPS_UNDO
             .lock()
@@ -7032,11 +7034,10 @@ mod tests {
 
     #[test]
     fn a_freed_review_slot_clears_the_wait_notice_before_the_undo_expires() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                WaitClearsBeforeUndoProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<WaitClearsBeforeUndoProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (waiting, carried, text, kept, spent) = WAIT_CLEAR_BEFORE_UNDO
             .lock()
@@ -7071,11 +7072,10 @@ mod tests {
 
     #[test]
     fn an_expired_undo_leaves_no_wait_notice_once_the_slot_frees() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                WaitOutlivesUndoProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<WaitOutlivesUndoProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (wait_kept, action_gone, text) = WAIT_OUTLIVES_UNDO
             .lock()
@@ -7132,11 +7132,10 @@ mod tests {
 
     #[test]
     fn a_failed_selection_prepare_does_not_park_another_tabs_session() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                PrepareSnapshotProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<PrepareSnapshotProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (disclosed, kept) = PREPARE_SNAPSHOT
             .lock()
@@ -7173,11 +7172,10 @@ mod tests {
 
     #[test]
     fn closing_a_tab_releases_its_revision_session() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                ClosedTabSessionProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<ClosedTabSessionProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (still_stored, active_b) = CLOSED_TAB_SESSION
             .lock()
@@ -7247,11 +7245,10 @@ mod tests {
 
     #[test]
     fn closing_the_last_tab_clears_the_shown_revision() {
-        let mut app =
-            nsh_testing::Headless::start(nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
-                LastTabRevisionProbe,
-            >()))
-            .expect("start the probe");
+        let mut app = nsh_testing::Headless::start(nsh_engine::EngineConfig::new(
+            nsh_testing::windowed_root::<LastTabRevisionProbe>(),
+        ))
+        .expect("start the probe");
         app.first_render().expect("render the probe");
         let (open_before, open_after, context_cleared, hunks_cleared, ledger_cleared) =
             LAST_TAB_REVISION

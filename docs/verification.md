@@ -153,7 +153,7 @@ and that absence stays pending, not a pass. Their unit tests run in
 `check native`, not the fast gate. Pass the release binary with
 `--exe target/release/markturbo.exe`.
 
-How nsh 0.6.1 exposes views to UIA, and so how the harnesses select them:
+How nsh 0.7.1 exposes views to UIA, and so how the harnesses select them:
 
 - A view's `test_id` is the UIA AutomationId, but only when the view is itself
   an element. An explicit role sets the control type; without one, text,
@@ -229,7 +229,7 @@ the app only where the behaviour itself needs a restart.
   the buffer survived. Launch failures carry `FIRST_LAUNCH_` or
   `RESTORE_LAUNCH_`. Headless: `tests/conflict.rs` (the refused save leaves
   the edit in the editor and nothing is written before Overwrite),
-  `tests/tab_close_guard.rs` (Cancel keeps the dirty mark, which nsh 0.6.1's
+  `tests/tab_close_guard.rs` (Cancel keeps the dirty mark, which nsh 0.7.1's
   UIA folds into the `title-file` Button), `tests/recovery_restore.rs` (a
   discarded record is not offered on the next launch),
   `tests/save_as_overwrite.rs` and `ui/revision.rs` `SaveConflictProbe`.
@@ -255,7 +255,7 @@ the app only where the behaviour itself needs a restart.
   and every hunk accepted (`tests/revision_flow.rs`); an edit over every hunk
   offering no Accept and Done writing nothing
   (`an_edit_over_every_hunk_offers_no_accept_and_done_writes_nothing`); the
-  dirty mark, folded away by nsh 0.6.1's UIA (`tests/revision_flow.rs`); the
+  dirty mark, folded away by nsh 0.7.1's UIA (`tests/revision_flow.rs`); the
   A, R and Ctrl+Z keys and A refused on a changed part (`ui/revision.rs`); a
   safe save over a file changed on disk (`ui/revision.rs`); frontmatter,
   fence and link anchoring (mt-core).
