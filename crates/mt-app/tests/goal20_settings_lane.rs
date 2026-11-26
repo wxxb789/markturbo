@@ -807,10 +807,13 @@ fn a_language_switch_renames_a_live_undo() {
     app.wait_for("text:界面语言").expect("the Chinese page");
     app.wait_for("id:settings-page >> text:撤销清除计数")
         .expect("the Undo names its action in the new language");
-    app.wait_for(
-        "text:Local counts deleted. Recording preference and exported copies are unchanged.",
-    )
-    .expect("the newest message keeps its own text");
+    app.wait_for("text:已删除本地计数。记录偏好和已导出的副本不变。")
+        .expect("the Undo's own result follows the language");
+    assert!(
+        !app.shows("Local counts deleted. Recording preference and exported copies are unchanged."),
+        "the English result survived the switch: {:?}",
+        app.screen().texts()
+    );
     assert!(
         !app.shows("设置已保存。") && !app.shows("Settings saved."),
         "the save notice replaced the live Undo's message: {:?}",
@@ -936,10 +939,8 @@ fn a_slow_folder_shows_beside_the_named_undo() {
     app.scroll("id:settings-scroll", Points(10_000.0))
         .expect("back to the usage counters");
     app.settle();
-    app.wait_for(
-        "text:Last 180 days: 1 day active · 0 Reviews · 0 revision decisions · 1 total event",
-    )
-    .expect("the Undo restores the captured counts");
+    app.wait_for("text:近 180 天：活跃 1 天 · 完成审查 0 次 · 修订决定 0 次 · 共 1 条记录")
+        .expect("the Undo restores the captured counts");
 }
 
 fn y_of(app: &Headless, id: &str) -> f32 {

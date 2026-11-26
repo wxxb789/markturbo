@@ -651,3 +651,47 @@ fn a_newer_notice_does_not_hide_the_pending_undo() {
         .expect("the rows come back");
     assert_eq!(checkpoint_files(&keys), 2, "nothing was deleted");
 }
+
+// A discarded draft's own result follows a language switch as its label
+// does, and the line empties when the hold spends it.
+#[test]
+fn a_discarded_drafts_result_follows_the_language_and_ends_with_the_hold() {
+    if !cfg!(windows) {
+        // DPAPI is the production protector; non-Windows builds intentionally
+        // have no plaintext recovery fallback.
+        return;
+    }
+    let mut seeded = two_recovered();
+    let app = &mut seeded.app;
+    app.press("id:recovery-discard-0")
+        .expect("discard the first draft");
+    app.wait_for("text:Discarded recovered draft")
+        .expect("the English result");
+    app.wait_for("id:status-action").expect("the Undo");
+
+    app.press("id:title-settings").expect("open the title menu");
+    app.press("id:title-menu-settings").expect("open Settings");
+    app.wait_for("id:settings-page").expect("the settings page");
+    app.press("id:settings-language-chinese")
+        .expect("switch the language");
+    app.wait_for("text:界面语言").expect("the Chinese page");
+    app.wait_for("id:settings-page >> text:已丢弃恢复的草稿")
+        .expect("the result follows the language");
+    app.wait_for("id:settings-page >> text:撤销丢弃")
+        .expect("the Undo label follows the language");
+    assert!(
+        !app.shows("Discarded recovered draft"),
+        "the English result survived the switch: {:?}",
+        app.screen().texts()
+    );
+
+    app.run_for(Duration::from_millis(HOLD_MS + 500))
+        .expect("the hold elapses");
+    app.wait_for_gone("id:status-action", Duration::from_secs(5))
+        .expect("the Undo is spent");
+    app.wait_for_gone(
+        "id:settings-page >> text:已丢弃恢复的草稿",
+        Duration::from_secs(5),
+    )
+    .expect("the spent result leaves the line");
+}

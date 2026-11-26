@@ -167,6 +167,10 @@ pub(crate) struct UndoNotice {
 #[derive(Clone, Default)]
 pub struct StatusMessage {
     pub(crate) text: SharedString,
+    // A live Undo's own result: the status line re-renders it after a
+    // language switch, and the hold's end clears it. A newer notice clears
+    // this with its own text.
+    pub(crate) text_fn: Option<fn(Language) -> &'static str>,
     pub(crate) count: Option<SharedString>,
     pub(crate) action: Option<UndoNotice>,
 }
@@ -183,8 +187,7 @@ impl StatusMessage {
     pub(crate) fn plain(text: impl Into<SharedString>) -> Self {
         Self {
             text: text.into(),
-            count: None,
-            action: None,
+            ..Self::default()
         }
     }
 
@@ -192,15 +195,27 @@ impl StatusMessage {
         Self {
             text: text.into(),
             count: Some(count.into()),
-            action: None,
+            ..Self::default()
         }
     }
 
-    pub(crate) fn undoable(text: impl Into<SharedString>, action: UndoNotice) -> Self {
+    pub(crate) fn undoable(
+        text: fn(Language) -> &'static str,
+        language: Language,
+        action: UndoNotice,
+    ) -> Self {
         Self {
-            text: text.into(),
+            text: SharedString::from(text(language)),
+            text_fn: Some(text),
             count: None,
             action: Some(action),
+        }
+    }
+
+    pub(crate) fn text_in(&self, language: Language) -> SharedString {
+        match self.text_fn {
+            Some(text) => SharedString::from(text(language)),
+            None => self.text.clone(),
         }
     }
 
@@ -1095,18 +1110,18 @@ impl AppState {
     pub(crate) fn notify_undo(
         &self,
         surface: StatusSurface,
-        text: impl Into<SharedString>,
+        text: fn(Language) -> &'static str,
         action: UndoNotice,
     ) {
         self.commit_pending_undo();
         let generation = self.undo_generation.get().wrapping_add(1);
         self.undo_generation.set(generation);
         self.pending_undo.borrow_mut().replace(action.clone());
-        let text = text.into();
+        let language = self.settings.get().language;
         self.publish(
             surface,
             StatusKind::Info,
-            StatusMessage::undoable(text, action),
+            StatusMessage::undoable(text, language, action),
         );
         let state = self.clone();
         self.spawn_task(async move {
@@ -1149,7 +1164,14 @@ impl AppState {
             return;
         };
         (action.commit)();
-        if self.status.get_untracked().action.is_some() {
+        // The commit may itself publish a failure notice: read the line after
+        // it ran, and only a still-shown Undo result ends with its hold.
+        let shown = self.status.get_untracked();
+        if shown.text_fn.is_some() {
+            self.status.set(StatusMessage::default());
+            self.status_generation
+                .set(self.status_generation.get_untracked().wrapping_add(1));
+        } else if shown.action.is_some() {
             self.status.update(|message| message.action = None);
             self.status_generation
                 .set(self.status_generation.get_untracked().wrapping_add(1));
@@ -1229,7 +1251,6 @@ impl AppState {
             }
         };
         self.refresh_usage_counts();
-        let language = self.settings.get().language;
         let state = self.clone();
         let reverse = {
             let usage = Rc::clone(&self.usage);
@@ -1255,7 +1276,7 @@ impl AppState {
         };
         self.notify_undo(
             StatusSurface::Settings,
-            crate::i18n::t(language, crate::i18n::Key::UsageCleared),
+            |language| crate::i18n::t(language, crate::i18n::Key::UsageCleared),
             UndoNotice {
                 label: s::undo_clear_counts,
                 reverse: Rc::new(reverse),
@@ -2249,7 +2270,6 @@ impl AppState {
             .collect();
         self.recovery_records
             .update(|current| current.retain(|record| !keys.contains(&record.record.key)));
-        let language = self.settings.get().language;
         let reverse: Rc<dyn Fn() -> Result<(), SharedString>> = {
             let state = self.clone();
             let keys = keys.clone();
@@ -2269,7 +2289,7 @@ impl AppState {
         };
         self.notify_undo(
             StatusSurface::Editor,
-            s::discarded_draft(language),
+            s::discarded_draft,
             UndoNotice {
                 label,
                 reverse,
@@ -5015,8 +5035,9 @@ impl AppState {
         self.settings
             .update(|settings| settings.language = language);
         // A switch is not a new outcome: the old notice would keep the old
-        // language. A live Undo's control re-renders in the new language;
-        // the save stays silent rather than replacing the newest message.
+        // language. A live Undo's text and control re-render in the new
+        // language; the save stays silent rather than replacing the newest
+        // message.
         self.set_settings_notice("", false);
         if self.pending_undo.borrow().is_some() {
             self.save_settings_quietly();
@@ -5216,7 +5237,7 @@ impl AppState {
         };
         self.notify_undo(
             StatusSurface::Settings,
-            crate::i18n::t(language, crate::i18n::Key::CredentialDeleted),
+            |language| crate::i18n::t(language, crate::i18n::Key::CredentialDeleted),
             UndoNotice {
                 label: s::undo_remove_key,
                 reverse: Rc::new(reverse),
@@ -7001,7 +7022,7 @@ mod tests {
         let reverse = Rc::clone(&reversed);
         state.notify_undo(
             StatusSurface::Editor,
-            SharedString::from("Discarded recovered draft"),
+            s::discarded_draft,
             UndoNotice {
                 label: |_| "Undo discard",
                 reverse: Rc::new(move || {
@@ -7036,8 +7057,6 @@ mod tests {
         assert!(restored, "the Undo did not restore its work");
     }
 
-    const UNDO_TEXT: &str = "Discarded recovered draft";
-
     fn review_wait_text() -> String {
         flow_copy::S::ReviewWaitingElsewhere
             .text(Language::English)
@@ -7054,7 +7073,7 @@ mod tests {
         state.new_document();
         state.notify_undo(
             StatusSurface::Editor,
-            UNDO_TEXT,
+            s::discarded_draft,
             UndoNotice {
                 label: |_| "Undo discard",
                 reverse: Rc::new(|| Ok(())),

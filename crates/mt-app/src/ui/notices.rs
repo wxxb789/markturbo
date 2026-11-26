@@ -1484,11 +1484,10 @@ pub(crate) fn status_line_at(
             .gap(px(SPACE_2))
             .child(
                 text(move || {
-                    if owner.get() == surface {
-                        message.get().text
-                    } else {
-                        SharedString::default()
+                    if owner.get() != surface {
+                        return SharedString::default();
                     }
+                    message.get().text_in(language)
                 })
                 .font_family(tokens::FONT_UI)
                 .text_size(px(tokens::TYPE_UI))
@@ -2440,7 +2439,7 @@ mod tests {
             .child(prims::primary_action("probe-notify", "Notify", move || {
                 notify_state.notify_undo(
                     crate::state::StatusSurface::Editor,
-                    "Cleared the counts",
+                    |_| "Cleared the counts",
                     crate::state::UndoNotice {
                         label: |_| "Undo clear counts",
                         reverse: std::rc::Rc::new(|| Ok(())),
