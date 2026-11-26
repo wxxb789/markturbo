@@ -24,8 +24,8 @@ use crate::{
         motion::{EASE_OUT, RAIL_WIDEN_MS, reduced_motion},
         prims, shell,
         tokens::{
-            self, COLUMN_GAP, FIELD_GAP, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT,
-            RAIL_HOVER_W, RAIL_W, SPACE_1, SPACE_2, SPACE_3, SPACE_5, TYPE_UI, TYPE_UI_LINE,
+            self, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT, RAIL_HOVER_W, RAIL_W, SPACE_1,
+            SPACE_2, SPACE_3, SPACE_5, TYPE_UI, TYPE_UI_LINE,
         },
     },
 };
@@ -555,13 +555,7 @@ fn palette_line(state: AppState, language: Language, palette: Palette) -> impl I
     // The line belongs to the field: its left edge follows the field's own
     // (the overlay's, below 1040), and it is no wider than the field's
     // reading measure.
-    let left = move || {
-        if Layout::of(shell::client_width_now()).field_overlays() {
-            shell::client_width_now() * (1.0 - Layout::OVERLAY_FRACTION)
-        } else {
-            RAIL_W + COLUMN_GAP + Layout::of(shell::client_width_now()).measure() + FIELD_GAP
-        }
-    };
+    let left = move || Layout::of(shell::client_width_now()).field_left(shell::client_width_now());
     view()
         .test_id("palette")
         .child(
