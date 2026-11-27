@@ -539,10 +539,13 @@ fn tree(
     let tabs = state.tabs;
     let open_files = computed(move || {
         tabs.with(|tabs| {
-            tabs.iter()
-                .filter(|tab| !tab.untitled)
-                .map(|tab| (tab.path.clone(), tab.id))
-                .collect::<HashMap<_, _>>()
+            let mut open = HashMap::new();
+            for tab in tabs.iter().filter(|tab| !tab.untitled) {
+                // The first tab of a path is the one activation targets, so
+                // the row's dot, selected state and close share its id.
+                open.entry(tab.path.clone()).or_insert(tab.id);
+            }
+            open
         })
     });
     view()
@@ -613,6 +616,7 @@ fn tree(
                     let path = entry.path.clone();
                     let tab = computed(move || open_files.with(|open| open.get(&path).copied()));
                     let press_state = state.clone();
+                    let press_tab = tab;
                     file_line(
                         "sidebar-file",
                         entry.depth,
@@ -624,6 +628,10 @@ fn tree(
                         language,
                         open,
                         move || {
+                            if let Some(id) = press_tab.get() {
+                                activate(&press_state, palette, id, narrow);
+                                return;
+                            }
                             if narrow {
                                 press_state.sidebar_overlay.set(false);
                             }

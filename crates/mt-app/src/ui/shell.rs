@@ -203,8 +203,15 @@ pub(super) fn field_overlays_source(state: &AppState) -> bool {
 fn source_width(state: &AppState, layout: Layout) -> f32 {
     if preview_track(state, layout) {
         stage_width() * state.view_track.get()
-    } else {
+    } else if layout.field_overlays() || surface(state) == FieldSurface::None {
         layout.measure() + 2.0 * tokens::COLUMN_GAP
+    } else {
+        // The dock's own budget: at 1068 client points with the rail folded
+        // it is FIELD_MIN_W wide past its right inset. A narrower stage
+        // gives the deficit to the source instead of clipping the field.
+        (stage_width() - tokens::FIELD_MIN_W - tokens::FIELD_RIGHT_INSET)
+            .min(layout.measure() + 2.0 * tokens::COLUMN_GAP)
+            .max(0.0)
     }
 }
 
@@ -317,12 +324,12 @@ fn stage(
 /// A pointer owns the free ratio only while the same tab and its track are
 /// available. The stage can disappear before that pointer reports its end.
 fn divider_touch(state: AppState, layout: Layout, dragging: Signal<bool>) -> impl Fn(&TouchEvent) {
-    let captured = Rc::new(Cell::new(None::<(u64, u32)>));
+    let captured = Rc::new(Cell::new(None::<(u64, u32, f32)>));
     let finish = {
         let captured = captured.clone();
         let state = state.clone();
         move || {
-            let Some((tab, _)) = captured.take() else {
+            let Some((tab, _, _)) = captured.take() else {
                 return;
             };
             if untracked(|| state.active.try_get()) == Some(Some(tab)) {
@@ -338,7 +345,7 @@ fn divider_touch(state: AppState, layout: Layout, dragging: Signal<bool>) -> imp
         move || {
             let eligible = preview_track(&state, layout);
             let active = state.active.get();
-            if let Some((tab, _)) = captured.get()
+            if let Some((tab, _, _)) = captured.get()
                 && (!eligible || active != Some(tab))
             {
                 finish();
@@ -349,13 +356,15 @@ fn divider_touch(state: AppState, layout: Layout, dragging: Signal<bool>) -> imp
     move |event| {
         let active = state.active.get_untracked();
         if !untracked(|| preview_track(&state, layout))
-            || captured.get().is_some_and(|(tab, _)| Some(tab) != active)
+            || captured
+                .get()
+                .is_some_and(|(tab, _, _)| Some(tab) != active)
         {
             finish();
             dragging.set(false);
             return;
         }
-        let Some((_, pointer)) = captured.get() else {
+        let Some((_, pointer, offset)) = captured.get() else {
             if event.phase == TouchPhase::Start
                 && let Some(tab) = active
             {
@@ -364,7 +373,7 @@ fn divider_touch(state: AppState, layout: Layout, dragging: Signal<bool>) -> imp
                 if let Some(point) = event.points.iter().find(|point| {
                     point.changed && (point.page.x.0 - x).abs() <= tokens::DIVIDER_HIT_W / 2.0
                 }) {
-                    captured.set(Some((tab, point.id)));
+                    captured.set(Some((tab, point.id, point.page.x.0 - x)));
                     dragging.set(true);
                     state.set_view_track_now(ratio);
                 }
@@ -382,7 +391,7 @@ fn divider_touch(state: AppState, layout: Layout, dragging: Signal<bool>) -> imp
             TouchPhase::Move => {
                 let width = untracked(stage_width);
                 let from = untracked(sidebar_width_now);
-                state.set_view_track_now((point.page.x.0 - from) / width.max(1.0));
+                state.set_view_track_now((point.page.x.0 - offset - from) / width.max(1.0));
             }
             TouchPhase::End | TouchPhase::Cancel => {
                 finish();
@@ -991,7 +1000,7 @@ mod tests {
     use nsh_testing::{Headless, LayoutNode};
 
     use super::*;
-    use crate::state::{GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, Pane};
+    use crate::state::{GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, Pane, ReviewUnavailable};
 
     /// The document the probes open: a heading on its first line, so the
     /// first glyph the column draws is known.
@@ -1204,6 +1213,129 @@ mod tests {
             }))
             .child(focus_trace_text(&state))
             .child(shell(state, Language::English, Layout::Wide))
+    }
+
+    #[component]
+    fn DockedFieldProbe() -> impl IntoElement {
+        let state = AppState::new();
+        if let Some(parent) = probe_path().parent() {
+            state.open_folder(parent.to_path_buf());
+        }
+        state.open_file(probe_path().to_path_buf());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(control("probe-review", &state, |state| {
+                state
+                    .review_unavailable
+                    .set(Some(ReviewUnavailable::NotSetUp));
+            }))
+            .child(control("probe-context", &state, |state| {
+                state.context_open.set(true);
+            }))
+            .child(control("probe-revision", &state, |state| {
+                present_revision_over_probe(state);
+            }))
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
+    fn present_revision_over_probe(state: &AppState) {
+        use mt_core::review::{
+            ByteRange, SourceSnapshot,
+            revision::{RevisionChange, RevisionEdit, RevisionLimits, RevisionProposal},
+        };
+        let text = state
+            .active_tab()
+            .expect("the probe document")
+            .text
+            .get()
+            .to_string();
+        let before = "Describe the next release.";
+        let start = text.find(before).expect("the probe's paragraph") as u64;
+        let range = ByteRange::new(start, start + before.len() as u64).expect("a range");
+        let proposal = RevisionProposal::validate(
+            &text,
+            SourceSnapshot::new(0, 0),
+            vec![RevisionChange::new(
+                "Name the first release.",
+                vec![RevisionEdit::new(
+                    range,
+                    before,
+                    "Describe the first release.",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision(proposal);
+    }
+
+    fn assert_action_whole(app: &Headless, action: &str) {
+        let field = node(app, "field").bounds;
+        let selector = format!("id:{action}");
+        let target = app
+            .screen()
+            .press_target(&selector)
+            .expect("a selector")
+            .unwrap_or_else(|| panic!("`{action}` is not pressable"));
+        let control = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.id == target)
+            .expect("the press target is laid out");
+        assert!(
+            control.bounds.origin.x.0 >= field.origin.x.0
+                && control.bounds.origin.x.0 + control.bounds.size.width.0
+                    <= field.origin.x.0 + field.size.width.0,
+            "`{action}` at {:?} is not whole inside the field {field:?}",
+            control.bounds
+        );
+    }
+
+    #[test]
+    fn the_medium_window_with_the_sidebar_open_keeps_field_actions_whole() {
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<DockedFieldProbe>().tokens(tokens::theme()),
+        );
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1040.0), Points(720.0)))
+            .expect("the 1040 point window");
+        app.wait_for("text:Describe the next release.")
+            .expect("the probe document");
+        assert_eq!(
+            node(&app, "sidebar").bounds.size.width.0,
+            tokens::SIDEBAR_W,
+            "the repro needs the sidebar expanded"
+        );
+
+        press(&mut app, "probe-review");
+        app.wait_for("id:review-unavailable")
+            .expect("the review field");
+        for action in ["review-open-settings", "review-again", "review-close"] {
+            assert_action_whole(&app, action);
+        }
+        press(&mut app, "review-close");
+        app.wait_for_gone("id:review-unavailable", std::time::Duration::from_secs(2))
+            .expect("the whole Close action closes the field");
+
+        press(&mut app, "probe-context");
+        app.wait_for("id:context-field").expect("the context field");
+        for action in ["context-review", "context-refresh", "context-close"] {
+            assert_action_whole(&app, action);
+        }
+        press(&mut app, "context-close");
+        app.wait_for_gone("id:context-field", std::time::Duration::from_secs(2))
+            .expect("the whole Close action closes the field");
+
+        press(&mut app, "probe-revision");
+        app.wait_for("id:revision-field")
+            .expect("the revision field");
+        for action in ["revision-accept", "revision-reject"] {
+            assert_action_whole(&app, action);
+        }
     }
 
     fn file_probe() -> Headless {

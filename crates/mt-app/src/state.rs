@@ -1619,7 +1619,16 @@ impl AppState {
 
         let state = self.clone();
         self.spawn_task(async move {
-            let loaded = match blocking(move || io::load(&path)).await {
+            let loaded = match blocking({
+                let path = path.clone();
+                move || {
+                    #[cfg(any(test, feature = "test-vault"))]
+                    crate::test_vault::wait_for_read(&path);
+                    io::load(&path)
+                }
+            })
+            .await
+            {
                 Ok(Ok(loaded)) => loaded,
                 Ok(Err(error)) => {
                     state.notify_failure(crate::i18n::Key::OpenFailed, &error);
@@ -1631,6 +1640,17 @@ impl AppState {
                 }
             };
             let opened = loaded.path.clone();
+            // Two quick opens of one path both pass the check above while
+            // their reads are in flight: the read that lands first owns the
+            // tab, and a later answer focuses it instead of inserting a
+            // duplicate no tree row could follow.
+            if let Some(tab) = state.tabs.get().iter().find(|tab| tab.path == opened) {
+                #[cfg(any(test, feature = "test-vault"))]
+                crate::test_vault::note_duplicate_open(&opened);
+                state.set_active(tab.id);
+                state.focus_editor();
+                return;
+            }
             state.add_tab(loaded);
             state.record_usage(UsageEvent::ArtifactOpened);
             state.notify_named(crate::i18n::Key::Opened, &opened);
@@ -3704,10 +3724,10 @@ impl AppState {
     }
 
     /// The non-empty primary selection the mounted source editor of `tab`
-    /// shows now, as byte offsets into `text`. Preview hides the selection
-    /// without destroying it, and an editor for other text selects nothing.
+    /// shows now, as byte offsets into `text`. A hidden editor's selection is
+    /// not reviewable, and an editor for other text selects nothing.
     fn selection_in(&self, tab: &Tab, text: &str) -> Option<(usize, usize)> {
-        if tab.pane.get_untracked().view() == View::Preview {
+        if crate::ui::shell::shows_full_preview(self) {
             return None;
         }
         let (owner, editor) = self.source_editor.get()?;
@@ -5160,7 +5180,11 @@ impl AppState {
     pub fn open_settings(&self) {
         self.settings_scroll_offset.set(0.0);
         self.refresh_usage_counts();
+        self.sidebar_overlay.set(false);
         self.settings_open.set(true);
+        // The rail unmounts with the workspace: its palette must not eat the
+        // first Escape from behind the page.
+        self.close_palette();
         self.sync_undo_surface();
     }
 

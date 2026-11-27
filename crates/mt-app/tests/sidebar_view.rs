@@ -10,7 +10,7 @@ use std::{
 use mt_app::ui::{motion, tokens};
 use nsh_core::{
     AccessibilityRole, Bounds, Command, EventKind, EventPayload, MountItem, NodeId, PayloadValue,
-    ROOT_ID, Size,
+    Point, PointerType, ROOT_ID, Size, TouchEvent, TouchPhase, TouchPoint,
     animation::{AnimationOp, AnimationProp, Animator, Driver},
     geometry::{point, px},
     keymap::{Keymap, Keystroke},
@@ -19,6 +19,8 @@ use nsh_core::{
 };
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::{DragOptions, Headless, LayoutNode, Screen};
+
+mod support;
 
 const WAIT: Duration = Duration::from_secs(5);
 const WIDE: Size<Points> = Size::new(Points(1440.0), Points(900.0));
@@ -176,6 +178,62 @@ fn finish_camera(app: &mut Headless) {
         .expect("finish the camera tween");
 }
 
+fn touch_path(app: &Headless, id: &str) -> Vec<NodeId> {
+    let nodes = app.screen().layout_nodes();
+    let node = nodes
+        .iter()
+        .find(|node| node.test_id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no `{id}` to touch"));
+    let mut path = vec![node.id];
+    let mut parent = node.parent;
+    while parent != ROOT_ID && !path.contains(&parent) {
+        path.push(parent);
+        let Some(node) = nodes.iter().find(|node| node.id == parent) else {
+            break;
+        };
+        parent = node.parent;
+    }
+    path
+}
+
+fn send_touch(app: &mut Headless, phase: TouchPhase, path: &[NodeId], page: Point<Points>) {
+    let point = TouchPoint {
+        id: 1,
+        target: path[0],
+        path: if phase == TouchPhase::Start {
+            path.to_vec()
+        } else {
+            Vec::new()
+        },
+        page,
+        location: point(px(0.0), px(0.0)),
+        changed: true,
+        pointer_type: PointerType::Mouse,
+        pressure: TouchPoint::default_pressure(phase, true),
+        tilt_x: 0.0,
+        tilt_y: 0.0,
+    };
+    let event = TouchEvent {
+        phase,
+        timestamp: 0.0,
+        points: vec![point],
+        activated: None,
+        modifiers: nsh_core::keymap::Modifiers::default(),
+    };
+    let engine = app.engine().control();
+    engine.dispatch_event(
+        ROOT_ID,
+        EventKind::Touch,
+        EventPayload::Touch(Box::new(event)),
+    );
+    let (sent, received) = mpsc::channel();
+    engine.flush(move |_| {
+        let _ = sent.send(());
+    });
+    received.recv_timeout(WAIT).expect("apply the touch event");
+    app.catch_up();
+}
+
 fn step_view(app: &mut Headless) {
     app.press("id:title-view").expect("press the view button");
     finish_camera(app);
@@ -289,6 +347,42 @@ fn cycling_moves_the_divider_to_the_matching_stop() {
         step_view(&mut app);
         assert_stop(&app, ratio);
     }
+}
+
+#[test]
+fn a_grab_at_the_divider_hit_edges_keeps_its_offset() {
+    let _fixture = Fixture::notes();
+    let mut app = start_in(WIDE);
+    step_view(&mut app);
+    assert_stop(&app, 0.5);
+
+    let path = touch_path(&app, "stage-divider");
+    let center = bounds(app.screen(), "stage-divider").center();
+    let edge = point(
+        px(center.x.0 - (tokens::DIVIDER_HIT_W / 2.0 - 1.0)),
+        center.y,
+    );
+    send_touch(&mut app, TouchPhase::Start, &path, edge);
+    send_touch(
+        &mut app,
+        TouchPhase::Move,
+        &path,
+        point(px(edge.x.0 + 1.0), edge.y),
+    );
+    let expected = stage_width(&app) * 0.5 + 1.0;
+    let actual = divider_x(&app);
+    assert!(
+        (actual - expected).abs() <= 1.5,
+        "the edge grab moved with the pointer: divider at {actual:.2}, expected {expected:.2}"
+    );
+    send_touch(
+        &mut app,
+        TouchPhase::End,
+        &path,
+        point(px(edge.x.0 + 1.0), edge.y),
+    );
+    finish_camera(&mut app);
+    assert_stop(&app, 0.5);
 }
 
 #[test]
@@ -601,6 +695,54 @@ fn save_as_keeps_the_tab_switchable_until_the_tree_is_refreshed() {
 }
 
 #[test]
+fn a_second_quick_open_of_one_file_reuses_its_tab() {
+    let fixture = Fixture::notes();
+    let root = fixture.dir.path().join("workspace");
+    let slow = fixture.write("workspace/slow.md", "# Slow\n");
+    let first_release = fixture.dir.path().join("release-first");
+    let second_release = fixture.dir.path().join("release-second");
+    let mut app = start_in(WIDE);
+    wait_for_sidebar_width(&mut app, tokens::SIDEBAR_W);
+    app.on_pick_paths(vec![root])
+        .expect("choose the workspace in the picker");
+    app.press("id:title-settings").expect("open the title menu");
+    app.press("id:title-menu-open-folder")
+        .expect("open the workspace");
+    let row = "id:sidebar-tree >> role:button[slow.md]";
+    app.wait_for(row).expect("the slow file in the tree");
+
+    mt_app::test_vault::gate_reads(&slow, [first_release.clone(), second_release.clone()]);
+    app.press(row).expect("the first open starts a read");
+    app.press(row)
+        .expect("the second open starts before the first lands");
+    support::wait_for_marker(
+        &mut app,
+        "both reads reach the gate",
+        Duration::from_secs(5),
+        |_| mt_app::test_vault::gate_reads_started(&slow) == 2,
+    );
+
+    std::fs::write(&first_release, "go").expect("release the first read");
+    wait_for_title(&mut app, "slow.md");
+    std::fs::write(&second_release, "go").expect("release the second read");
+    support::wait_for_marker(
+        &mut app,
+        "the late read focuses the existing tab",
+        Duration::from_secs(10),
+        |_| mt_app::test_vault::duplicate_open_focused(&slow),
+    );
+
+    app.press_key("mod+b").expect("collapse the sidebar");
+    wait_for_sidebar_width(&mut app, COLLAPSED);
+    // The strip gives every open tab one tick.
+    assert_eq!(
+        app.screen().count("id:sidebar-strip >> id:rail-file-row"),
+        Ok(2),
+        "notes.md and slow.md are the only tabs"
+    );
+}
+
+#[test]
 fn recovery_and_conflict_actions_remain_visible_in_full_preview() {
     use mt_core::{
         document::io,
@@ -763,6 +905,32 @@ fn leaving_narrow_through_settings_discards_the_invisible_sidebar_overlay() {
         node(app.screen(), "sidebar-panel").is_none(),
         "the old overlay must not reopen"
     );
+}
+
+#[test]
+fn one_escape_closes_settings_over_the_narrow_sidebar_overlay() {
+    let _fixture = Fixture::notes();
+    let mut app = start_in(NARROW);
+    app.press_key("mod+b").expect("open the narrow overlay");
+    app.wait_for("id:sidebar-panel").expect("the overlay opens");
+    app.press_key("mod+,").expect("open Settings over it");
+    app.wait_for("id:settings-page")
+        .expect("Settings replaces the workspace");
+    app.press_key("escape")
+        .expect("the first Escape closes the visible Settings");
+    app.wait_for_gone("id:settings-page", WAIT)
+        .expect("one Escape closes Settings, not the invisible overlay");
+
+    // The palette is the rail's other transient layer over the workspace.
+    app.press_key("mod+p").expect("open the palette");
+    app.wait_for("id:palette-input").expect("the palette");
+    app.press_key("mod+,").expect("open Settings over it");
+    app.wait_for("id:settings-page")
+        .expect("Settings replaces the workspace");
+    app.press_key("escape")
+        .expect("the first Escape closes the visible Settings");
+    app.wait_for_gone("id:settings-page", WAIT)
+        .expect("one Escape closes Settings, not the invisible palette");
 }
 
 #[test]

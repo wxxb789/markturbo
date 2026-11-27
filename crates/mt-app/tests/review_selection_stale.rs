@@ -111,6 +111,21 @@ fn a_selection_the_editor_no_longer_shows_is_not_reviewed() {
     app.wait_for("id:stage-dock >> id:preview-column")
         .expect("the preview took the stage");
     assert_no_selection_review(&mut app, "the Preview pane");
+    // Context over Preview shows the source screen again, so the selection
+    // the mounted editor still holds is on screen and is reviewable.
+    app.press("id:title-file")
+        .expect("open Context over Preview");
+    app.wait_for("id:context-field")
+        .expect("Context occupies the dock");
+    menu(&mut app, "title-menu-review-selection");
+    app.wait_for("id:consent-scope-selection")
+        .expect("the visible source selection is reviewable");
+    app.press("id:consent-cancel-button").expect("cancel");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the card closed");
+    app.press_key("escape").expect("close Context");
+    app.wait_for_gone("id:context-field", Duration::from_secs(2))
+        .expect("Context closed");
     app.press("id:title-view").expect("return to Edit");
     app.wait_for("label:Markdown source")
         .expect("the editor is visible again");
