@@ -188,6 +188,11 @@ There are no screenshots of the current UI in the repository.
 - Open a folder as a workspace, or start from **New file** or **Paste** without
   creating a file first. Open files appear as dots in the left rail; find files
   with `Ctrl+P` and search contents with `Ctrl+Shift+F`.
+- Drop supported documents on the window to open each in a normal tab (the
+  last one ends up active); dropping a folder opens it as the workspace, and a
+  drop of files the app cannot open reports how many were skipped, never their
+  paths. While a drag hovers, a quiet screen slides in from the right edge
+  saying what it will open.
 - Read and edit in **Edit**, **Preview**, or **Split** (the default for each
   tab), or render through the WebView with **Web preview** and **Split · Web**;
   the ⚙ menu switches between all five.
@@ -200,10 +205,15 @@ There are no screenshots of the current UI in the repository.
 - On Windows, recover unsaved changes after a crash: a banner offers
   **Restore** or **Discard** on the next start. Recovery checkpoints exist only
   on Windows.
-- Refuse to overwrite a file that changed on disk. Saving over it shows
-  **Changed on disk** with **Compare**, **Keep mine**, **Use disk version**, and
-  **Save As…**. There is no file watcher; the check happens on save and on
-  recovery.
+- Follow the disk while a document is open. A clean document that changes on
+  disk reloads itself with a quiet **Updated from disk** notice, keeping the
+  caret line and scroll as closely as the new text allows; a document with
+  unsaved edits shows **Changed on disk** at once, and a file that was moved or
+  deleted shows **Moved or deleted on disk** with **Save As…**. Saving over a
+  file that changed still shows **Compare**, **Keep mine**, **Use disk
+  version**, and **Save As…**, and the app's own save is never mistaken for an
+  external change. The app holds no file handle beyond a single read or write,
+  so another editor's save never waits on it.
 - **Save As…** replaces an existing file once the native save dialog has
   confirmed the overwrite, and refuses a destination that is open in another
   tab. Save writes back in the file's own encoding, byte-order mark, and line

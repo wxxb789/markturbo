@@ -170,3 +170,18 @@
     (`FOCUS_RETRY_FRAMES`), not that a key typed at the exact frame the editor appears lands.
   - `reload_edit_race`'s no-notice assertion can still read the screen before a post-marker notice batch.
   - Tighten both only if nsh-testing gains a frame-exact or task-completion hook.
+- [ ] **Drops while a card or Settings is open (Goal 22 lane 22-B).** The drop handlers live on the
+  shell root, so a file dragged over an open consent card, the close guard, or the Settings page still
+  shows the drop screen (the overlay layer draws it above the card) and a drop opens documents behind
+  the open surface; the card's decision keeps referring to the tab it was opened for, so nothing is
+  misattributed. Decide whether those surfaces should swallow drags instead.
+- [ ] **`palette_folder::choosing_a_palette_file_focuses_the_opened_editor` fails on this workstation,
+  at the base commit `c049c0ed` too (not a Goal 22 lane 22-B regression).** A palette-row click opens
+  the file, and the plain key after it lands nowhere: `AppState::retry_editor_focus` reaches the new
+  editor's `api()` one frame before the editor's own input has a node, nsh drops the deferred
+  `focus()` call then, and the retry treats that first `api()` match as success. The app-side trace
+  shows a `Focus` for the palette input and none for the editor; a frame of extra work anywhere in
+  that window (an added `set_interval`, or the disk drain) flips the outcome. Verifying the focus
+  against the editor box's `on_focus_in` signal instead of `api()` breaks `focus_after_close`'s
+  "first focus" assertion, so the repair is a design decision for a Goal 20 follow-up (nsh may also
+  fix the dropped call upstream).

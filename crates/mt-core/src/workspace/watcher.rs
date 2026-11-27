@@ -42,7 +42,7 @@ impl Change {
 pub struct Watcher {
     _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<Vec<DebouncedEvent>>,
-    root: PathBuf,
+    root: Option<PathBuf>,
     document_directories: HashSet<PathBuf>,
     context_paths: HashSet<PathBuf>,
 }
@@ -52,7 +52,14 @@ pub struct Watcher {
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 impl Watcher {
-    /// Start watching `root` recursively.
+    /// Start with nothing watched.
+    ///
+    /// A workspace root arrives with [`Self::set_root`], and a document opened
+    /// outside any workspace still needs its own directory watched, which is
+    /// what [`Self::sync_document_directories`] is for. A watcher that
+    /// insisted on a root would have to invent one — the user's home, the
+    /// current directory — and a recursive watch of an invented root is not a
+    /// bounded watch.
     ///
     /// Uses [`NoCache`] rather than the platform default. On Windows the
     /// default is `FileIdMap`, whose `add_path` walks the entire tree opening a
@@ -66,9 +73,9 @@ impl Watcher {
     /// supply one, and `classify` derives the same answer from whether the
     /// path still exists — so the walk paid for a fallback that is never
     /// reached.
-    pub fn new(root: &Path) -> anyhow::Result<Self> {
+    pub fn new() -> anyhow::Result<Self> {
         let (tx, rx) = channel();
-        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
             DEBOUNCE,
             None,
             move |result| {
@@ -81,14 +88,42 @@ impl Watcher {
             NoCache,
             notify::Config::default(),
         )?;
-        debouncer.watch(root, RecursiveMode::Recursive)?;
         Ok(Self {
             _debouncer: debouncer,
             rx,
-            root: root.to_path_buf(),
+            root: None,
             document_directories: HashSet::new(),
             context_paths: HashSet::new(),
         })
+    }
+
+    /// Watch `root` recursively, replacing the previous root's watch.
+    ///
+    /// The root's recursive watch is the only recursive one: a document
+    /// directory outside it is watched by
+    /// [`Self::sync_document_directories`] non-recursively, and a document
+    /// directory that the new root now covers has its separate watch removed.
+    pub fn set_root(&mut self, root: &Path) -> anyhow::Result<()> {
+        let root = root.to_path_buf();
+        if self.root.as_deref() == Some(root.as_path()) {
+            return Ok(());
+        }
+        if let Some(previous) = self.root.take() {
+            self._debouncer.unwatch(&previous)?;
+        }
+        let covered: Vec<PathBuf> = self
+            .document_directories
+            .iter()
+            .filter(|directory| directory.starts_with(&root))
+            .cloned()
+            .collect();
+        for directory in covered {
+            self._debouncer.unwatch(&directory)?;
+            self.document_directories.remove(&directory);
+        }
+        self._debouncer.watch(&root, RecursiveMode::Recursive)?;
+        self.root = Some(root);
+        Ok(())
     }
 
     /// Match the non-recursive watches to the parents of open documents.
@@ -100,9 +135,25 @@ impl Watcher {
         &mut self,
         directories: impl IntoIterator<Item = PathBuf>,
     ) -> anyhow::Result<()> {
+        // The caller may hold the canonical spelling (`\\?\C:\…` on Windows,
+        // from `canonicalize`) while `set_root` was handed the spelling the
+        // user's folder picker produced; a directory covered under either
+        // spelling is already watched recursively.
+        let canonical_root = self
+            .root
+            .as_deref()
+            .and_then(|root| std::fs::canonicalize(root).ok());
         let desired: HashSet<_> = directories
             .into_iter()
-            .filter(|directory| !directory.starts_with(&self.root))
+            .filter(|directory| {
+                !self
+                    .root
+                    .as_deref()
+                    .is_some_and(|root| directory.starts_with(root))
+                    && !canonical_root
+                        .as_deref()
+                        .is_some_and(|root| directory.starts_with(root))
+            })
             .collect();
 
         let removed: Vec<_> = self
@@ -148,7 +199,7 @@ impl Watcher {
             for event in events {
                 changes.extend(classify(
                     &event,
-                    &self.root,
+                    self.root.as_deref(),
                     &self.document_directories,
                     &self.context_paths,
                 ));
@@ -157,8 +208,15 @@ impl Watcher {
         dedup(changes)
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// The non-recursive document directories watched right now, for a probe
+    /// that pins a tab's watch being added and removed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn watched_document_directories(&self) -> Vec<PathBuf> {
+        self.document_directories.iter().cloned().collect()
     }
 }
 
@@ -175,7 +233,7 @@ use super::walk::is_noise_path as is_noise;
 
 fn classify(
     event: &DebouncedEvent,
-    root: &Path,
+    root: Option<&Path>,
     document_directories: &HashSet<PathBuf>,
     context_paths: &HashSet<PathBuf>,
 ) -> Vec<Change> {
@@ -188,12 +246,18 @@ fn classify(
             if context_paths.contains(path.as_path()) {
                 return true;
             }
-            let root = std::iter::once(root)
+            let covering = root
+                .into_iter()
                 .chain(document_directories.iter().map(PathBuf::as_path))
                 .filter(|root| path.starts_with(root))
-                .max_by_key(|root| root.components().count())
-                .unwrap_or(root);
-            !is_noise(path, root)
+                .max_by_key(|root| root.components().count());
+            match covering {
+                Some(root) => !is_noise(path, root),
+                // No watch of ours covers the path: it arrived from a watch
+                // the caller removed between the event and this poll, and
+                // there is no root to judge its components against.
+                None => true,
+            }
         })
         .filter_map(|path| {
             let path = path.clone();
@@ -243,6 +307,14 @@ mod tests {
         DebouncedEvent::new(event, std::time::Instant::now())
     }
 
+    /// The watcher shape every rooted test had before the root became
+    /// optional: no watches, then one recursive root watch.
+    fn rooted(root: &Path) -> Watcher {
+        let mut watcher = Watcher::new().unwrap();
+        watcher.set_root(root).unwrap();
+        watcher
+    }
+
     #[test]
     fn context_marker_creation_and_removal_bypass_noise_filtering() {
         use notify::EventKind;
@@ -250,7 +322,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join(".git");
-        let mut watcher = Watcher::new(dir.path()).unwrap();
+        let mut watcher = rooted(dir.path());
         watcher.sync_context_paths([marker.clone()]);
         let (tx, rx) = channel();
         watcher.rx = rx;
@@ -291,12 +363,12 @@ mod tests {
 
         std::fs::rename(&from, &to).unwrap();
         assert_eq!(
-            classify(&rename, dir.path(), &HashSet::new(), &context_paths),
+            classify(&rename, Some(dir.path()), &HashSet::new(), &context_paths),
             vec![Change::Removed(from.clone()), Change::Created(to.clone())]
         );
         std::fs::rename(&to, &from).unwrap();
         assert_eq!(
-            classify(&rename, dir.path(), &HashSet::new(), &context_paths),
+            classify(&rename, Some(dir.path()), &HashSet::new(), &context_paths),
             vec![Change::Created(from), Change::Removed(to)]
         );
     }
@@ -322,7 +394,7 @@ mod tests {
                 real.clone(),
             ],
         );
-        let mut watcher = Watcher::new(dir.path()).unwrap();
+        let mut watcher = rooted(dir.path());
         let (tx, rx) = channel();
         watcher.rx = rx;
         watcher.sync_context_paths([marker.clone(), candidate.clone()]);
@@ -377,7 +449,7 @@ mod tests {
                     .flat_map(|event| {
                         classify(
                             event,
-                            &watcher.root,
+                            watcher.root.as_deref(),
                             &watcher.document_directories,
                             &watcher.context_paths,
                         )
@@ -399,7 +471,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         let path = root.join("a.md");
 
-        let watcher = Watcher::new(&root).unwrap();
+        let watcher = rooted(&root);
         std::fs::write(&path, "one\n").unwrap();
         let created = Change::Created(path.clone());
         assert_eq!(
@@ -414,7 +486,7 @@ mod tests {
         // A fresh subscription excludes queued fixture notifications. Native
         // FSEvents kinds are hints: a content change can still include Created.
         drop(watcher);
-        let watcher = Watcher::new(&root).unwrap();
+        let watcher = rooted(&root);
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -437,7 +509,7 @@ mod tests {
         let external_root = external.path().canonicalize().unwrap();
         let path = external_root.join("saved-as.md");
 
-        let mut watcher = Watcher::new(&primary_root).unwrap();
+        let mut watcher = rooted(&primary_root);
         watcher
             .sync_document_directories([external_root.clone()])
             .unwrap();
@@ -453,7 +525,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"one\n");
 
         drop(watcher);
-        let mut watcher = Watcher::new(&primary_root).unwrap();
+        let mut watcher = rooted(&primary_root);
         watcher.sync_document_directories([external_root]).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
@@ -481,7 +553,7 @@ mod tests {
             std::slice::from_ref(&path),
         );
         assert_eq!(
-            classify(&changed, root, &HashSet::new(), &HashSet::new()),
+            classify(&changed, Some(root), &HashSet::new(), &HashSet::new()),
             vec![Change::Modified(path)]
         );
     }
@@ -491,7 +563,7 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let mut watcher = Watcher::new(primary.path()).unwrap();
+        let mut watcher = rooted(primary.path());
 
         watcher
             .sync_document_directories([first.path().to_path_buf(), second.path().to_path_buf()])
@@ -514,7 +586,7 @@ mod tests {
             &[root.join("node_modules/pkg.md"), real.clone()],
         );
         assert_eq!(
-            classify(&created, root, &HashSet::new(), &HashSet::new()),
+            classify(&created, Some(root), &HashSet::new(), &HashSet::new()),
             vec![Change::Created(real)]
         );
     }
@@ -522,10 +594,106 @@ mod tests {
     #[test]
     fn poll_is_non_blocking_when_idle() {
         let dir = tempfile::tempdir().unwrap();
-        let watcher = Watcher::new(dir.path()).unwrap();
+        let watcher = rooted(dir.path());
         let start = std::time::Instant::now();
         assert!(watcher.poll().is_empty());
         assert!(start.elapsed() < Duration::from_millis(100), "poll blocked");
+    }
+
+    #[test]
+    fn a_rootless_watcher_reports_a_document_directory_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("dropped.md");
+
+        let mut watcher = Watcher::new().unwrap();
+        assert_eq!(watcher.root(), None);
+        watcher.sync_document_directories([root.clone()]).unwrap();
+        std::fs::write(&path, "one\n").unwrap();
+        assert_eq!(
+            receive_change(&watcher, &path, |change| matches!(
+                change,
+                Change::Created(_)
+            )),
+            Change::Created(path.clone())
+        );
+    }
+
+    #[test]
+    fn setting_a_new_root_moves_the_recursive_watch_and_drops_covered_directories() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_root = first.path().canonicalize().unwrap();
+        let second_root = second.path().canonicalize().unwrap();
+        let inner = second_root.join("notes");
+        std::fs::create_dir(&inner).unwrap();
+
+        let mut watcher = rooted(&first_root);
+        watcher.sync_document_directories([inner.clone()]).unwrap();
+        assert!(watcher.document_directories.contains(&inner));
+
+        watcher.set_root(&second_root).unwrap();
+        assert_eq!(watcher.root(), Some(second_root.as_path()));
+        assert!(
+            !watcher.document_directories.contains(&inner),
+            "a directory the new root covers keeps no separate watch"
+        );
+
+        let path = inner.join("a.md");
+        std::fs::write(&path, "one\n").unwrap();
+        assert_eq!(
+            receive_change(&watcher, &path, |change| matches!(
+                change,
+                Change::Created(_)
+            )),
+            Change::Created(path.clone())
+        );
+    }
+
+    #[test]
+    fn a_canonical_spelling_of_a_rooted_directory_is_not_watched_twice() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let mut watcher = rooted(root.path());
+
+        // `canonicalize` on Windows yields the verbatim (`\\?\C:\…`) spelling;
+        // the root was set from the user's own spelling.
+        watcher
+            .sync_document_directories([canonical.clone()])
+            .unwrap();
+        assert!(
+            watcher.document_directories.is_empty(),
+            "one directory must not hold a recursive and a non-recursive watch"
+        );
+    }
+
+    #[test]
+    fn a_path_under_no_watch_is_kept() {
+        let mut watcher = Watcher::new().unwrap();
+        let (tx, rx) = channel();
+        watcher.rx = rx;
+        let path = PathBuf::from("/somewhere/else/a.md");
+        tx.send(vec![event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            std::slice::from_ref(&path),
+        )])
+        .unwrap();
+        assert_eq!(watcher.poll(), vec![Change::Modified(path)]);
+    }
+
+    #[test]
+    fn setting_a_root_that_cannot_be_watched_is_an_error_the_callers_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-folder");
+        let mut watcher = Watcher::new().unwrap();
+        assert!(watcher.set_root(&missing).is_err());
+        assert_eq!(
+            watcher.root(),
+            None,
+            "a root that could not be watched is never kept"
+        );
     }
 
     #[test]
@@ -545,7 +713,7 @@ mod tests {
         }
 
         let start = std::time::Instant::now();
-        let watcher = Watcher::new(dir.path()).unwrap();
+        let watcher = rooted(dir.path());
         let elapsed = start.elapsed();
         drop(watcher);
 

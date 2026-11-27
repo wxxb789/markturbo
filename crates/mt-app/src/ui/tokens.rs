@@ -225,6 +225,18 @@ impl Palette {
     pub fn ink_at(self, alpha: f32) -> Color {
         with_alpha(self.ink, alpha)
     }
+
+    /// The Shoji paper: the toned panel ground the sidebar and the drop
+    /// screen share, opaque so it covers what it slides over. It is the
+    /// prototype's `--shoji-paper-solid` — the dark room's card tone, and the
+    /// light room under one [`Palette::afterimage_plate`] layer.
+    pub fn shoji_paper(self) -> Color {
+        if self.is_dark {
+            hex(0x15161A)
+        } else {
+            hex(0xEAE8E3)
+        }
+    }
 }
 
 /// `color` at `alpha` (0..=1).

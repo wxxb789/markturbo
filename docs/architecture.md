@@ -12,9 +12,11 @@
 
 |Module|Responsibility|
 |---|---|
-|`app.rs`|Application root: startup, the checkpoint ticker, the main window's close request (routed to the unsaved-changes guard), and the shell, re-keyed on language or layout-breakpoint changes.|
-|`ui/`|The Afterglow UI: `shell` (title row, rail, text column, field, overlay layer), `titlebar` (file name, Review, settings menu), `rail`, `welcome`, `document`/`preview`, `context`, `review`/`glow`, `revision`, `consent`, `notices`, `settings`, and the `tokens`/`fonts`/`prims`/`motion` foundation.|
+|`app.rs`|Application root: startup, the checkpoint ticker and the disk-drain ticker, the main window's close request (routed to the unsaved-changes guard), and the shell, re-keyed on language or layout-breakpoint changes.|
+|`ui/`|The Afterglow UI: `shell` (title row, rail, text column, field, overlay layer), `titlebar` (file name, Review, settings menu), `rail`, `welcome`, `document`/`preview`, `context`, `review`/`glow`, `revision`, `consent`, `notices`, `drop_screen`, `settings`, and the `tokens`/`fonts`/`prims`/`motion` foundation.|
 |`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore.|
+|`state/disk.rs`|The `notify` watcher's lifecycle, the event drain, and what an external change does to a tab or the tree.|
+|`state/drop.rs`|What a hovered drag offers, what a drop opens, and what it counts as skipped.|
 |`state/revision_ledger.rs`|`RevisionLedger`: where each hunk of a live Approved Revision sits in its tab's text.|
 |`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
 |`web.rs`, `links.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, preview link openings, localized strings and disclosures, log setup.|
@@ -511,6 +513,39 @@ primary recursive watch, but Open File and Save As register an additional
 parent when a document lives outside that root. Explorer and Harness refreshes
 remain scoped to the primary root; document conflict detection receives events
 from every registered document parent.
+
+The watch is event-driven (`notify` plus a 300 ms debouncer), never a polling
+loop over the filesystem. The workspace root is watched recursively from the
+moment it opens, even with no tab; each open document outside the root has its
+parent directory watched non-recursively, and a symbolic link whose target
+lives outside the workspace has the target's parent watched too, in addition to
+the link's own location. The queued batches are drained on the app's 1 s
+ticker, beside the recovery checkpoints — the drain adds no timer of its own
+(a repeating timer of its own perturbs nsh's deferred editor focus), and
+nothing is stat'ed until an event names a path; with the debouncer's 300 ms a
+change reaches the app within about a second. A clean document is
+re-read and adopted with a quiet **Updated from disk** notice and a short slip
+of the text (about 6 px, `motion::ENTER_MS`; opacity only under reduced
+motion). The reload is dropped unless the tab's disk-event generation and edit
+revision are unchanged since the read began: an edit made during the read keeps
+the buffer and its recovery record and raises the conflict banner, and a delete
+or move noticed during the read is never cleared by the older answer. A dirty
+document raises the conflict banner immediately, not at save. A file that was
+moved or deleted shows **Moved or deleted on disk** with Save As. The app's own
+save is never an external change: the freshly read stamp is compared with the
+tab's last-write stamp and writes nothing when they match. If the watcher
+cannot start, the app records a diagnostic and never blocks; saves keep their
+own stamp check.
+
+Reading for an open or a reload does not hold a file against other writers.
+Windows opens the snapshot, and the `SKILL.md` entrypoint, sharing read, write
+and delete, so another editor's atomic save (write a temp file, rename it over
+the path) proceeds while the app reads. Consistency is proved after the read
+instead: the path is opened again and must name the same object with the same
+length and modification time, or the read is retried. The Agent Skill path
+keeps its own entrypoint identity and directory-entry re-checks and falls back
+to an unbound, still editable document when a replacement defeats them. No
+file handle outlives a single read or write call.
 
 Three properties of the bytes survive a round trip: **line endings**, **BOM**,
 and **encoding**. The third was the expensive one to get wrong. Reading every

@@ -101,10 +101,14 @@ struct FileSnapshot {
 
 /// Read one internally consistent view of a path.
 ///
-/// The bytes, metadata, digest, and Windows object identity all come from one
-/// open handle. On Windows the handle denies writes and deletes while the
-/// snapshot is read, then a second handle proves the path still resolves to the
-/// same object before the first one is released.
+/// The bytes, metadata, digest, and object identity all come from one open
+/// handle, and a second handle proves the path still resolves to the same
+/// object — with the same length and modification time — before the snapshot is
+/// accepted. The read handle shares writes and deletes (see
+/// [`open_snapshot_file`]), so that proof is what turns a concurrent external
+/// replace into a retry instead of a torn or stale snapshot; it also lets
+/// another editor's atomic save replace the path while this read is live
+/// instead of failing on a sharing violation.
 fn read_snapshot(path: &Path) -> std::io::Result<FileSnapshot> {
     const MAX_ATTEMPTS: usize = 3;
 
@@ -144,15 +148,21 @@ fn read_snapshot_once(path: &Path) -> std::io::Result<Option<FileSnapshot>> {
     let object_id = file_object_id(&file)?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.read_to_end(&mut bytes)?;
+    #[cfg(test)]
+    run_read_race_hook();
     let stamp = FileStamp::from_bytes(&metadata, &bytes, object_id);
 
-    #[cfg(windows)]
+    // The read handle is still open, which is exactly the state another
+    // editor's rename-over must survive.
+    let current = open_snapshot_file(path)?;
+    let current_metadata = current.metadata()?;
+    if file_object_id(&current)? != object_id
+        || current_metadata.len() != metadata.len()
+        || current_metadata.modified().ok() != metadata.modified().ok()
     {
-        let current = open_snapshot_file(path)?;
-        if file_object_id(&current)? != stamp.object_id {
-            return Ok(None);
-        }
+        return Ok(None);
     }
+    drop(file);
 
     Ok(Some(FileSnapshot { bytes, stamp }))
 }
@@ -160,13 +170,20 @@ fn read_snapshot_once(path: &Path) -> std::io::Result<Option<FileSnapshot>> {
 #[cfg(windows)]
 fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
-    // Permit concurrent readers only. A writer or deleter cannot replace the
-    // path while this snapshot and its object-identity verification are live.
+    // Share everything: another editor's atomic save (write a temp file, then
+    // rename it over this path) needs write and delete access to the path, and
+    // denying them made that save fail while this read held the handle.
+    // Consistency does not come from the sharing mode but from
+    // [`read_snapshot_once`] re-checking the object identity, length and
+    // modification time after the read, and from [`load`] re-checking the
+    // source identity around it.
     std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ.0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
         .open(path)
 }
 
@@ -594,6 +611,8 @@ fn try_load_skill_source(path: &Path) -> Option<(FileSnapshot, SourceIdentity, S
     let object_id = file_object_id(&entrypoint).ok()?;
     let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
     entrypoint.read_to_end(&mut bytes).ok()?;
+    #[cfg(test)]
+    run_read_race_hook();
     let after = entrypoint.metadata().ok()?;
     if !opened_skill_entrypoint_is_regular(&after)
         || before.len() != bytes.len() as u64
@@ -667,8 +686,12 @@ fn skill_source_changed_error() -> std::io::Error {
 
 #[cfg(windows)]
 fn open_skill_directory(path: &Path) -> std::io::Result<File> {
-    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
-    open_skill_directory_with_share(path, FILE_SHARE_READ.0)
+    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    // A read must not stop another editor from renaming an entry inside the
+    // directory (its atomic save), so entries may be mutated while the route
+    // is being read; the identity checks after every read are what keep the
+    // route honest. A save keeps using the `_for_save` variant.
+    open_skill_directory_with_share(path, (FILE_SHARE_READ | FILE_SHARE_WRITE).0)
 }
 
 #[cfg(windows)]
@@ -753,12 +776,18 @@ fn open_canonical_skill_directory_with(
 #[cfg(windows)]
 fn open_skill_entrypoint(root: &File, canonical_root: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt as _;
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     let _ = root;
+    // As [`open_snapshot_file`]: sharing read only made an external atomic
+    // save of `SKILL.md` fail while it was read; the entrypoint identity and
+    // the directory-entry re-check in `try_load_skill_source` still prove the
+    // bytes came from this package.
     std::fs::OpenOptions::new()
         .read(true)
-        .share_mode(FILE_SHARE_READ.0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(canonical_root.join("SKILL.md"))
 }
@@ -1647,10 +1676,35 @@ fn stage(path: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile, SaveError
 
 #[cfg(test)]
 thread_local! {
+    static READ_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
     #[cfg(windows)]
     static RECOVERY_SOURCE_MATCH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
         std::cell::RefCell::new(None)
     };
+}
+
+/// Run `hook` once, between a read and the verification that follows it, so a
+/// test can rename a file over the path while the snapshot is live.
+#[cfg(test)]
+fn install_read_race_hook(hook: impl FnOnce() + 'static) {
+    READ_RACE_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "a read race hook is already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_read_race_hook() {
+    READ_RACE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 #[cfg(all(test, windows))]
@@ -1681,6 +1735,94 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    /// Rename `replacement` over `target` while the read of `target` between
+    /// its bytes and its verification is live; return where the rename's
+    /// result was recorded.
+    fn rename_over_during_read(
+        target: &Path,
+        replacement: &Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<std::io::Result<()>>>> {
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorded = outcome.clone();
+        let target = target.to_path_buf();
+        let replacement = replacement.to_path_buf();
+        install_read_race_hook(move || {
+            *recorded.borrow_mut() = Some(std::fs::rename(&replacement, &target));
+        });
+        outcome
+    }
+
+    fn rename_outcome(
+        outcome: &std::rc::Rc<std::cell::RefCell<Option<std::io::Result<()>>>>,
+    ) -> std::io::Result<()> {
+        let run = outcome.borrow();
+        match run.as_ref() {
+            Some(result) => match result {
+                Ok(()) => Ok(()),
+                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+            },
+            None => panic!("the read race hook did not run"),
+        }
+    }
+
+    /// The defect: a read holding a handle that denies write and delete made
+    /// another editor's atomic save (write a temp file, rename it over the
+    /// path) fail while the read was live. The read must also never hand back
+    /// a snapshot stitched from the two files.
+    #[test]
+    fn an_external_rename_over_during_a_read_neither_fails_the_writer_nor_tears_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_file(directory.path(), "plan.md", b"aaaa aaaa\n");
+        let replacement = write_file(directory.path(), "replacement.md", b"bbbb bbbb\n");
+
+        let outcome = rename_over_during_read(&path, &replacement);
+        let loaded = load(&path).expect("the read completes with a consistent snapshot");
+        rename_outcome(&outcome).expect("the external writer's rename-over must not fail");
+
+        assert!(
+            !(loaded.text.contains('a') && loaded.text.contains('b')),
+            "a snapshot mixing the two versions is corrupt: {:?}",
+            loaded.text
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"bbbb bbbb\n");
+        // A later read never races and must see the writer's bytes.
+        assert_eq!(load(&path).unwrap().text, "bbbb bbbb\n");
+        // The Windows check is exact: the second handle named a different
+        // object, so the snapshot was retried. Unix compares length and
+        // modification time instead, which a fast rename can defeat.
+        #[cfg(windows)]
+        assert_eq!(loaded.text, "bbbb bbbb\n");
+    }
+
+    /// The same race through the Agent Skill entrypoint, which `SKILL.md`
+    /// loads through first; the origin is dropped (never bound to replaced
+    /// bytes) and the fallback editable read sees the replacement.
+    #[test]
+    fn an_external_rename_over_of_a_skill_entrypoint_read_keeps_both_sides_consistent() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill_root = directory.path().join("skill");
+        std::fs::create_dir(&skill_root).unwrap();
+        let path = write_file(&skill_root, "SKILL.md", b"aaaa aaaa\n");
+        let replacement = write_file(&skill_root, "staged.md", b"bbbb bbbb\n");
+
+        let outcome = rename_over_during_read(&path, &replacement);
+        let loaded = load(&path).expect("the read completes with a consistent snapshot");
+        rename_outcome(&outcome).expect("the external writer's rename-over must not fail");
+
+        assert!(
+            !(loaded.text.contains('a') && loaded.text.contains('b')),
+            "a snapshot mixing the two versions is corrupt: {:?}",
+            loaded.text
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"bbbb bbbb\n");
+        assert_eq!(load(&path).unwrap().text, "bbbb bbbb\n");
+        assert!(
+            loaded.skill_origin().is_none(),
+            "the entrypoint's bytes stopped matching the package, so the \
+             fallback must carry no provenance"
+        );
     }
 
     #[test]

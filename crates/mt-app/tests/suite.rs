@@ -46,6 +46,10 @@ mod folder_open_token;
 mod goal17_settings;
 #[path = "goal20_settings_lane.rs"]
 mod goal20_settings_lane;
+#[path = "goal22_drop.rs"]
+mod goal22_drop;
+#[path = "goal22_live_disk.rs"]
+mod goal22_live_disk;
 #[path = "guard_untitled_cancel.rs"]
 mod guard_untitled_cancel;
 #[path = "guard_untitled_save.rs"]

@@ -36,6 +36,12 @@ use crate::{
     ui::{glow, motion, notices, preview, review, revision, titlebar, tokens},
 };
 
+/// How far the new text arrives from on a clean reload ("about 6 px", Goal 22
+/// decision 6).
+const RELOAD_SLIP_PX: f32 = 6.0;
+/// The ink the slip starts at before it fades back to full.
+const RELOAD_SLIP_DIM: f32 = 0.35;
+
 /// The column's content for the active document, by pane. Empty while no
 /// document is open (the shell shows [`crate::ui::welcome::welcome`] then).
 pub fn column(state: AppState, language: Language) -> impl IntoElement {
@@ -237,6 +243,37 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
         titlebar::bind_mod_enter(&keys_state);
     });
 
+    // The clean-reload slip (Goal 22, decision 6, lane 22-B): the changed
+    // text arrives from a few points to the right with a short ink fade, over
+    // the motion tokens. Only a successful adoption sets the marker, so a
+    // conflict or a failed read never plays it, and a tab that mounts after
+    // an adoption never replays the last one.
+    let slip_offset = animated_value(RELOAD_SLIP_PX);
+    let slip_opacity = animated_value(1.0);
+    let slip_state = state.clone();
+    let slip_tab = tab.id;
+    let seen_slip = Cell::new(state.reload_slip.get_untracked());
+    effect(move || {
+        let marker = slip_state.reload_slip.get();
+        if seen_slip.replace(marker) == marker {
+            return;
+        }
+        if !matches!(marker, Some((id, _)) if id == slip_tab) {
+            return;
+        }
+        if motion::reduced_motion() {
+            // No movement under reduced motion: a crossfade alone.
+            slip_offset.set(0.0);
+            slip_opacity.set(RELOAD_SLIP_DIM);
+            slip_opacity.timing(1.0, motion::REDUCED_CROSSFADE_MS, motion::EASE_OUT);
+        } else {
+            slip_offset.set(RELOAD_SLIP_PX);
+            slip_offset.timing(0.0, motion::ENTER_MS, motion::EASE_OUT);
+            slip_opacity.set(RELOAD_SLIP_DIM);
+            slip_opacity.timing(1.0, motion::ENTER_MS, motion::EASE_OUT);
+        }
+    });
+
     view()
         .test_id("source")
         .flex_1()
@@ -249,6 +286,8 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
             view()
                 .test_id("source-editor")
                 .element_ref(&editor_box)
+                .bind_translate_x(&slip_offset)
+                .bind_opacity(&slip_opacity)
                 // The editor reaches back over the column's left gap: its
                 // gutter fills the gap and its text starts at the measure,
                 // where it would without a gutter.

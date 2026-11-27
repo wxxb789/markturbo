@@ -59,6 +59,8 @@ use mt_core::{
 use nsh_base::editor::{Editor, EditorApi};
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
 
+pub(crate) mod disk;
+pub(crate) mod drop;
 pub(crate) mod flow_copy;
 mod revision_ledger;
 
@@ -124,12 +126,19 @@ pub struct Tab {
     pub revision: Signal<u64>,
     pub pane: Signal<Pane>,
     pub conflict: Signal<bool>,
+    /// The file this tab reads is gone from disk (moved or deleted): the
+    /// banner offers Save As. Cleared when it appears again.
+    pub disk_missing: Signal<bool>,
     pub untitled: bool,
     pub recovery_key: RecoveryKey,
     pub loaded: Rc<RefCell<LoadedFile>>,
     /// The latest Reload this tab asked for: an older request's answer that
     /// comes back later writes nothing.
     reload: Rc<Cell<u64>>,
+    /// Advanced by every disk event for this tab. A reload whose read began
+    /// under an older generation never applies, so a newer delete or move
+    /// notice is never cleared by an older read.
+    disk_generation: Rc<Cell<u64>>,
 }
 
 impl PartialEq for Tab {
@@ -419,6 +428,23 @@ pub struct AppState {
     /// The latest folder open's request token: a slower earlier scan must
     /// not commit its root, files, context, recents or status.
     folder_request: Rc<Cell<u64>>,
+    /// The latest workspace-tree refresh's request token: a slower earlier
+    /// scan must not commit its entries over a newer one.
+    tree_refresh: Rc<Cell<u64>>,
+    /// The filesystem watcher, created when the first folder or document
+    /// needs one. `None` until then, and after a watcher that could not
+    /// start (saves keep their own check).
+    watcher: Rc<RefCell<Option<mt_core::workspace::Watcher>>>,
+    /// Why live watching is off, when it is: a diagnostic, never a blocking
+    /// error.
+    watcher_issue: Rc<RefCell<Option<String>>>,
+    /// What a file drag hovering over the window offers; `None` when none is.
+    /// The drop screen draws it.
+    pub drop_offer: Signal<Option<drop::DropOffer>>,
+    /// The document whose disk version was adopted last, with a generation:
+    /// the source editor plays its slip once per new marker.
+    pub reload_slip: Signal<Option<(u64, u64)>>,
+    slip_generation: Rc<Cell<u64>>,
     #[cfg(test)]
     pub(crate) focus_last: Signal<Option<FocusTarget>>,
     next_id: Rc<Cell<u64>>,
@@ -933,6 +959,12 @@ impl AppState {
             palette_view: Rc::new(Cell::new(None)),
             settings_scroll_offset: Rc::new(Cell::new(0.0)),
             folder_request: Rc::new(Cell::new(0)),
+            tree_refresh: Rc::new(Cell::new(0)),
+            watcher: Rc::new(RefCell::new(None)),
+            watcher_issue: Rc::new(RefCell::new(None)),
+            drop_offer: signal(None),
+            reload_slip: signal(None),
+            slip_generation: Rc::new(Cell::new(0)),
             #[cfg(test)]
             focus_last: signal(None),
             next_id: Rc::new(Cell::new(1)),
@@ -1360,46 +1392,68 @@ impl AppState {
     /// The walk runs off the UI thread; each open carries a request token,
     /// and only the latest may commit.
     pub fn open_folder(&self, path: PathBuf) {
+        let request = self.begin_folder_open();
+        let state = self.clone();
+        self.spawn_task(async move {
+            state.finish_folder_open(path, request).await;
+        });
+    }
+
+    /// The open's own work, awaitable so a caller that must say something
+    /// after the folder lands (a drop's skipped-files notice) can order it.
+    pub(crate) async fn open_folder_now(&self, path: PathBuf) {
+        let request = self.begin_folder_open();
+        self.finish_folder_open(path, request).await;
+    }
+
+    /// The request token and the held "Opening folder…" line, both in place
+    /// before the walk starts so the status is on screen at once.
+    fn begin_folder_open(&self) -> u64 {
         let request = self.folder_request.get().wrapping_add(1);
         self.folder_request.set(request);
         self.notify_held(SharedString::from(s::opening_folder(
             self.settings.get().language,
         )));
+        request
+    }
+
+    /// The scan and its commit, once the token and the status are in place. A
+    /// superseded open writes nothing.
+    async fn finish_folder_open(&self, path: PathBuf, request: u64) {
         let state = self.clone();
-        self.spawn_task(async move {
-            let scanned = blocking({
-                let path = path.clone();
-                move || {
-                    #[cfg(any(test, feature = "test-vault"))]
-                    crate::test_vault::wait_for_read(&path);
-                    tree::read_dir_deep(&path, 4)
-                }
-            })
-            .await;
-            if state.folder_request.get() != request {
-                // A superseded open writes nothing; the test harness learns
-                // the stale scan returned this way.
+        let scanned = blocking({
+            let path = path.clone();
+            move || {
                 #[cfg(any(test, feature = "test-vault"))]
-                crate::test_vault::note_superseded_open(&path);
-                return;
+                crate::test_vault::wait_for_read(&path);
+                tree::read_dir_deep(&path, 4)
             }
-            match scanned {
-                Ok(Ok(nodes)) => {
-                    let mut entries = Vec::new();
-                    flatten(&nodes, 0, &mut entries);
-                    state.root.set(Some(path.clone()));
-                    state.entries.set(entries);
-                    state.reset_context();
-                    if state.context_open.get() {
-                        state.refresh_context();
-                    }
-                    state.record_recent(&path, RecentTargetKind::Workspace);
-                    state.notify_named(crate::i18n::Key::Opened, &path);
+        })
+        .await;
+        if state.folder_request.get() != request {
+            // A superseded open writes nothing; the test harness learns
+            // the stale scan returned this way.
+            #[cfg(any(test, feature = "test-vault"))]
+            crate::test_vault::note_superseded_open(&path);
+            return;
+        }
+        match scanned {
+            Ok(Ok(nodes)) => {
+                let mut entries = Vec::new();
+                flatten(&nodes, 0, &mut entries);
+                state.root.set(Some(path.clone()));
+                state.entries.set(entries);
+                state.reset_context();
+                if state.context_open.get() {
+                    state.refresh_context();
                 }
-                Ok(Err(error)) => state.notify_failure(crate::i18n::Key::OpenFolderFailed, &error),
-                Err(error) => state.notify_failure(crate::i18n::Key::OpenFolderFailed, &error),
+                state.record_recent(&path, RecentTargetKind::Workspace);
+                state.watch_workspace_root(&path);
+                state.notify_named(crate::i18n::Key::Opened, &path);
             }
-        });
+            Ok(Err(error)) => state.notify_failure(crate::i18n::Key::OpenFolderFailed, &error),
+            Err(error) => state.notify_failure(crate::i18n::Key::OpenFolderFailed, &error),
+        }
     }
 
     /// Opens `path` in a tab, or activates the tab already showing it.
@@ -1546,10 +1600,12 @@ impl AppState {
                 revision: signal(0),
                 pane: signal(self.chosen_pane.get()),
                 conflict: signal(false),
+                disk_missing: signal(false),
                 untitled: true,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
                 reload: Rc::new(Cell::new(0)),
+                disk_generation: Rc::new(Cell::new(0)),
             });
         });
         if dirty {
@@ -1590,13 +1646,16 @@ impl AppState {
                 revision: signal(0),
                 pane: signal(self.chosen_pane.get()),
                 conflict: signal(false),
+                disk_missing: signal(false),
                 untitled: false,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
                 reload: Rc::new(Cell::new(0)),
+                disk_generation: Rc::new(Cell::new(0)),
             });
         });
         self.set_active(id);
+        self.sync_document_watches();
         id
     }
 
@@ -2455,7 +2514,15 @@ impl AppState {
     /// The text is read when the comparison is asked for
     /// ([`Self::refresh_conflict_disk`]).
     fn note_conflict(&self, tab: &Tab) {
+        let repeated = tab.conflict.get_untracked();
         tab.conflict.set(true);
+        if repeated && self.conflict_compare.get_untracked() == Some(tab.id) {
+            // The user is looking at this conflict's comparison. A repeated
+            // notice for the same conflict window — a disk event the refused
+            // save already reported — must not fold the read they asked for;
+            // a folded comparison still drops it.
+            return;
+        }
         let id = tab.id;
         self.conflict_disks
             .update(|disks| disks.retain(|(entry, _)| *entry != id));
@@ -2744,6 +2811,7 @@ impl AppState {
                     tab.loaded.borrow_mut().stamp = stamp;
                     tab.dirty.set(false);
                     tab.conflict.set(false);
+                    tab.disk_missing.set(false);
                     state.retire_tab_recovery(&tab);
                     state.recovery_tracks.borrow_mut().remove(&tab.id);
                     state.record_usage(UsageEvent::ArtifactSaved);
@@ -2769,6 +2837,9 @@ impl AppState {
         self.review_bindings.borrow_mut().remove(&id);
         self.review_open_tabs.borrow_mut().remove(&id);
         self.tabs.update(|tabs| tabs.retain(|tab| tab.id != id));
+        // The closed tab's directories lose their watches when no other tab
+        // reads them.
+        self.sync_document_watches();
         if self.active.get() == Some(id) {
             let next = self.tabs.get().last().map(|tab| tab.id);
             match next {
@@ -2797,6 +2868,15 @@ impl AppState {
     }
 
     fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
+        // Where the mounted editor was scrolled to, so the adopted text is met
+        // as closely as it allows (decision 4). The editor keeps its own caret
+        // and selection across the text change, mapped onto the text they were
+        // on, and nothing here overrides them: the old line is not the old
+        // words, and a live selection has to survive a reload (see
+        // `review_selection_stale`). A tab that is not mounted has nothing to
+        // return to.
+        let anchor = self.mounted_editor_scroll(tab);
+        let restored = loaded.text.clone();
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
         // The retiring comparison must not diff the reloaded buffer.
@@ -2804,10 +2884,30 @@ impl AppState {
             tab.text.set(SharedString::from(text));
             tab.dirty.set(false);
             tab.conflict.set(false);
+            tab.disk_missing.set(false);
         });
         tab.revision.update(|revision| *revision += 1);
+        // The slip plays for a successful adoption only: a conflict or a
+        // failed read never reaches this.
+        let generation = self.slip_generation.get().wrapping_add(1);
+        self.slip_generation.set(generation);
+        self.reload_slip.set(Some((tab.id, generation)));
         self.retire_tab_recovery(tab);
         self.recovery_tracks.borrow_mut().remove(&tab.id);
+        if let Some((editor, scroll)) = anchor {
+            restore_editor_scroll(editor, scroll, restored, 2);
+        }
+    }
+
+    /// The mounted source editor's scroll offset, when it edits `tab`.
+    fn mounted_editor_scroll(&self, tab: &Tab) -> Option<(ComponentRef<Editor>, Point<Points>)> {
+        let (id, editor) = self.source_editor.get()?;
+        if id != tab.id {
+            return None;
+        }
+        let api = editor.api::<EditorApi>()?;
+        let scroll = api.scroll_offset();
+        Some((editor, scroll))
     }
 
     fn write_model_text(&self, tab: &Tab, text: String) {
@@ -5496,6 +5596,30 @@ fn flatten(nodes: &[FileNode], depth: usize, out: &mut Vec<Entry>) {
     }
 }
 
+/// Puts the mounted editor's scroll offset back once the adopted text is in
+/// it. The caret and the selection are the editor's own: it maps them onto
+/// the text they were on, which the adopted text's line numbers are not. The
+/// new value commits on a later frame, so a few frames are spent waiting for
+/// it; the offset is restored unchanged, the text usually differing by a line
+/// or two, which is the closest honest answer.
+fn restore_editor_scroll(
+    editor: ComponentRef<Editor>,
+    scroll: Point<Points>,
+    text: String,
+    frames_left: u8,
+) {
+    request_animation_frame(move |_| {
+        let Some(api) = editor.api::<EditorApi>() else {
+            return;
+        };
+        if api.value() != text && frames_left > 0 {
+            restore_editor_scroll(editor, scroll, text, frames_left - 1);
+            return;
+        }
+        api.set_scroll_offset(scroll);
+    });
+}
+
 /// The editor language for a path, by extension.
 pub fn language_for_path(path: &Path) -> &'static str {
     match path
@@ -5540,6 +5664,24 @@ mod s {
         match language {
             Language::English => "Opening folder…",
             Language::Chinese => "正在打开文件夹…",
+        }
+    }
+
+    /// A clean document was replaced from disk (decision 4).
+    pub(super) fn updated_from_disk(language: Language) -> &'static str {
+        match language {
+            Language::English => "Updated from disk",
+            Language::Chinese => "已从磁盘更新",
+        }
+    }
+
+    /// The one notice a drop leaves for what it could not open: a count,
+    /// never a path.
+    pub(super) fn skipped_files(language: Language, count: usize) -> String {
+        match (language, count) {
+            (Language::English, 1) => "Skipped 1 file that can't be opened".to_owned(),
+            (Language::English, count) => format!("Skipped {count} files that can't be opened"),
+            (Language::Chinese, count) => format!("已跳过 {count} 个无法打开的文件"),
         }
     }
 

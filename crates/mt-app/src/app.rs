@@ -52,6 +52,11 @@ pub fn App() -> impl IntoElement {
     let _ticker = stored(set_interval(Duration::from_secs(1), move || {
         if ticker_flag.get() {
             tick_state.checkpoint_tick();
+            // The watcher's debounced batches are drained here too: the drain
+            // is not a filesystem poll (nothing is stat'ed until an event
+            // names a path), and it adds no timer of its own — a repeating
+            // timer of its own perturbs nsh's deferred editor focus.
+            tick_state.disk_tick();
         }
     }));
     let _ticker_guard = stored(TickerGuard(ticker_alive));

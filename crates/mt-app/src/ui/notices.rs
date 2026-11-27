@@ -311,7 +311,27 @@ fn local_offset_seconds() -> i64 {
 
 /// Whether the active document differs from what is on disk.
 pub fn has_conflict(state: &AppState) -> bool {
-    state.active_tab().is_some_and(|tab| tab.conflict.get())
+    state
+        .active_tab()
+        .is_some_and(|tab| tab.conflict.get() || tab.disk_missing.get())
+}
+
+/// The banner's leading line: a vanished file says so, and a file still there
+/// is simply a different version. Reactive, so it follows whichever state the
+/// active tab is in.
+fn line_for(state: &AppState, language: Language) -> impl Fn() -> SharedString + 'static {
+    let state = state.clone();
+    move || {
+        let missing = state.active_tab().is_some_and(|tab| tab.disk_missing.get());
+        SharedString::from(s(
+            if missing {
+                S::MovedOrDeleted
+            } else {
+                S::ChangedOnDisk
+            },
+            language,
+        ))
+    }
 }
 
 /// The external-change banner: your file is not what it was on disk. It offers
@@ -330,7 +350,10 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
         move || {
             let active = state.active.get();
             let changed_tab = previous.replace(active) != active;
-            if let Some(tab) = state.active_tab().filter(|tab| tab.conflict.get()) {
+            if let Some(tab) = state
+                .active_tab()
+                .filter(|tab| tab.conflict.get() || tab.disk_missing.get())
+            {
                 let content = (state.conflict_compare.get() == Some(tab.id))
                     .then(|| comparison_content(&state, &tab))
                     .flatten();
@@ -366,7 +389,7 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
                 .child(
                     view()
                         .flex_1()
-                        .child(prims::ink(s(S::ChangedOnDisk, language))),
+                        .child(prims::ink(line_for(&state, language))),
                 )
                 .child(compare_action(&state, language, disabled.clone()))
                 .child(
@@ -1747,6 +1770,7 @@ enum S {
     Discard,
     DiscardAll,
     ChangedOnDisk,
+    MovedOrDeleted,
     Compare,
     HideComparison,
     KeepMine,
@@ -1776,6 +1800,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::Discard => "Discard",
             S::DiscardAll => "Discard all",
             S::ChangedOnDisk => "Changed on disk",
+            S::MovedOrDeleted => "Moved or deleted on disk",
             S::Compare => "Compare",
             S::HideComparison => "Hide comparison",
             S::KeepMine => "Keep mine",
@@ -1806,6 +1831,7 @@ fn s(key: S, language: Language) -> &'static str {
             S::Discard => "丢弃",
             S::DiscardAll => "全部丢弃",
             S::ChangedOnDisk => "磁盘上的文件已更改",
+            S::MovedOrDeleted => "已在磁盘上移动或删除",
             S::Compare => "比较",
             S::HideComparison => "收起比较",
             S::KeepMine => "保留我的版本",
