@@ -994,25 +994,49 @@ fn the_settings_status_line_clears_the_usage_actions() {
         .expect("scroll the usage actions into view");
     app.settle();
 
-    let node = |id: &str| {
+    fn node(app: &Headless, id: &str) -> nsh_core::geometry::Bounds<Points> {
         app.screen()
             .layout_nodes()
             .into_iter()
             .find(|node| node.test_id.as_deref() == Some(id))
             .unwrap_or_else(|| panic!("`{id}` on screen"))
             .bounds
-    };
-    let actions_bottom = ["usage-inspect", "usage-export", "usage-clear"]
-        .iter()
-        .map(|id| {
-            let bounds = node(id);
-            bounds.origin.y.0 + bounds.size.height.0
-        })
-        .fold(0.0_f32, f32::max);
-    let status = node("status");
+    }
+    fn actions_bottom(app: &Headless) -> f32 {
+        ["usage-inspect", "usage-export", "usage-clear"]
+            .iter()
+            .map(|id| {
+                let bounds = node(app, id);
+                bounds.origin.y.0 + bounds.size.height.0
+            })
+            .fold(0.0_f32, f32::max)
+    }
+    let status = node(&app, "status");
     assert!(
-        actions_bottom <= status.origin.y.0 + 0.5,
-        "the status line overlaps the usage actions: actions end at {actions_bottom}, status starts at {}",
+        actions_bottom(&app) <= status.origin.y.0 + 0.5,
+        "the status line overlaps the usage actions: actions end at {}, status starts at {}",
+        actions_bottom(&app),
+        status.origin.y.0
+    );
+
+    // Toggling the counters from the walk's bottom scroll posts the notice
+    // without a scroll: the actions stay clear of it and of the status
+    // line, and the first press lands.
+    app.press("id:usage-on").expect("enable the counters");
+    app.wait_for("text:Usage-counter preference saved.")
+        .expect("the notice");
+    app.settle();
+    let bottom = actions_bottom(&app);
+    let notice = node(&app, "settings-notice");
+    assert!(
+        bottom <= notice.origin.y.0 + 0.5,
+        "the notice overlaps the usage actions: actions end at {bottom}, notice starts at {}",
+        notice.origin.y.0
+    );
+    let status = node(&app, "status");
+    assert!(
+        bottom <= status.origin.y.0 + 0.5,
+        "the status line overlaps the usage actions after the notice: actions end at {bottom}, status starts at {}",
         status.origin.y.0
     );
 

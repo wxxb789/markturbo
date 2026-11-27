@@ -132,3 +132,5 @@ mod welcome_leaves;
 mod welcome_recents;
 #[path = "window_close_guard.rs"]
 mod window_close_guard;
+#[path = "window_minimum.rs"]
+mod window_minimum;

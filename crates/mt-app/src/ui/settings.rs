@@ -137,32 +137,36 @@ fn heading(content: &'static str) -> impl IntoElement {
 
 /// The line above the status line: the last credential, usage or store outcome.
 /// It is absent until there is something to say, so an untouched page keeps its
-/// calm.
+/// calm — but its space is always reserved, so a notice appearing below the
+/// scroll cannot shrink the viewport under the content the user scrolled to.
 fn notice_line(state: AppState) -> impl IntoElement {
     let condition_state = state.clone();
     let text_state = state.clone();
     let color_state = state;
-    view().test_id("settings-notice").child(when(
-        move || !condition_state.settings_notice.get().is_empty(),
-        move || {
-            view()
-                .pt(px(SPACE_3))
-                .child(
-                    text(move || text_state.settings_notice.get())
-                        .font_family(FONT_UI)
-                        .text_size(px(TYPE_UI))
-                        .line_height(px(TYPE_UI_LINE))
-                        .text_color(move || {
-                            if color_state.settings_notice_error.get() {
-                                tokens::palette().danger
-                            } else {
-                                tokens::palette().ink_rest
-                            }
-                        }),
-                )
-                .into_element()
-        },
-    ))
+    view()
+        .test_id("settings-notice")
+        .h(px(SPACE_3 + TYPE_UI_LINE))
+        .child(when(
+            move || !condition_state.settings_notice.get().is_empty(),
+            move || {
+                view()
+                    .pt(px(SPACE_3))
+                    .child(
+                        text(move || text_state.settings_notice.get())
+                            .font_family(FONT_UI)
+                            .text_size(px(TYPE_UI))
+                            .line_height(px(TYPE_UI_LINE))
+                            .text_color(move || {
+                                if color_state.settings_notice_error.get() {
+                                    tokens::palette().danger
+                                } else {
+                                    tokens::palette().ink_rest
+                                }
+                            }),
+                    )
+                    .into_element()
+            },
+        ))
 }
 
 /// The form: one group per decision, in the order they matter.
