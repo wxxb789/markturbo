@@ -1578,7 +1578,11 @@ class OverwriteGuardTests(unittest.TestCase):
     """Keep mine's Overwrite guard card: only its Overwrite press writes."""
 
     def conflict_scenario(
-        self, *, overwrite_on_keep_mine: bool, overwrite_on_overwrite: bool
+        self,
+        *,
+        keep_mine_writes: bool = False,
+        overwrite_writes: bool = False,
+        overwrite_writes_cancelled: bool = False,
     ) -> tuple[object, object, Path]:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -1603,33 +1607,47 @@ class OverwriteGuardTests(unittest.TestCase):
         workspace.mkdir(parents=True)
         document = (workspace / "guarded.md").resolve()
         runtime.write_durable(document, HARNESS.ORIGINAL_BYTES)
-        mine = HARNESS.CONFLICT_EDIT.encode("utf-8")
-        dirty = runtime.fingerprint_bytes(mine)
-        harness.replace_editor = mock.Mock(return_value=dirty)
+        cancelled = HARNESS.CANCEL_EDIT.encode("utf-8")
+        confirmed = HARNESS.CONFIRM_EDIT.encode("utf-8")
+        # The scenarios edit distinct bytes; the confirmed overwrite must
+        # write only the second edit's, never the cancelled first edit's.
+        harness.replace_editor = mock.Mock(
+            side_effect=[
+                runtime.fingerprint_bytes(cancelled),
+                runtime.fingerprint_bytes(confirmed),
+            ]
+        )
         harness.save_via_menu = mock.Mock()
         harness.wait_name = mock.Mock()
-        harness.editor_fingerprint = mock.Mock(return_value=dirty)
         harness.find_control = mock.Mock(return_value=keep_mine)
         harness.name_present = mock.Mock(return_value=False)
 
         def pressed(control: object, _code: str) -> None:
             source = getattr(control, "control", control)
-            if source is keep_mine and overwrite_on_keep_mine:
-                runtime.write_durable(document, mine)
-            if source is overwrite and overwrite_on_overwrite:
-                runtime.write_durable(document, mine)
+            if source is keep_mine and keep_mine_writes:
+                runtime.write_durable(document, cancelled)
+            if source is overwrite and overwrite_writes:
+                runtime.write_durable(document, confirmed)
+            if source is overwrite and overwrite_writes_cancelled:
+                runtime.write_durable(document, cancelled)
 
         harness.click_control = mock.Mock(side_effect=pressed)
         return harness, app, document
 
     def test_external_conflict_overwrites_only_after_the_guard_confirms(self) -> None:
-        harness, app, document = self.conflict_scenario(
-            overwrite_on_keep_mine=False, overwrite_on_overwrite=True
-        )
+        harness, app, document = self.conflict_scenario(overwrite_writes=True)
         observations = harness.external_modification(app, document)
+        confirmed = runtime.fingerprint_bytes(HARNESS.CONFIRM_EDIT.encode("utf-8"))
         self.assertEqual(
             observations["external_modification_overwritten_source"],
-            observations["external_modification_dirty_editor"],
+            observations["external_modification_confirmed_editor"],
+        )
+        self.assertEqual(
+            observations["external_modification_confirmed_editor"], confirmed.evidence()
+        )
+        self.assertNotEqual(
+            observations["external_modification_cancel_editor"],
+            observations["external_modification_confirmed_editor"],
         )
         self.assertEqual(harness.find_control.call_count, 2)
         self.assertEqual(
@@ -1649,18 +1667,20 @@ class OverwriteGuardTests(unittest.TestCase):
         )
 
     def test_external_conflict_fails_when_keep_mine_writes_without_the_guard(self) -> None:
-        harness, app, document = self.conflict_scenario(
-            overwrite_on_keep_mine=True, overwrite_on_overwrite=False
-        )
+        harness, app, document = self.conflict_scenario(keep_mine_writes=True)
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.external_modification(app, document)
         self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
-        self.assertEqual(harness.click_control.call_count, 3)
+        self.assertEqual(harness.click_control.call_count, 2)
 
     def test_external_conflict_fails_when_the_guard_overwrite_never_writes(self) -> None:
-        harness, app, document = self.conflict_scenario(
-            overwrite_on_keep_mine=False, overwrite_on_overwrite=False
-        )
+        harness, app, document = self.conflict_scenario()
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.external_modification(app, document)
+        self.assertEqual(raised.exception.code, "OVERWRITE_SAVE_TIMEOUT")
+
+    def test_external_conflict_does_not_credit_the_cancelled_edits_bytes(self) -> None:
+        harness, app, document = self.conflict_scenario(overwrite_writes_cancelled=True)
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.external_modification(app, document)
         self.assertEqual(raised.exception.code, "OVERWRITE_SAVE_TIMEOUT")

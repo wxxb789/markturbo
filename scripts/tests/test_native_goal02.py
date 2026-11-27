@@ -42,7 +42,8 @@ def retired_scan() -> dict[str, int]:
 def observations(case_id: str = HARNESS.CASE_LIFECYCLE_SESSION) -> dict:
     original = fingerprint(HARNESS.ORIGINAL_BYTES)
     external = fingerprint(HARNESS.EXTERNAL_BYTES)
-    conflict = fingerprint(b"conflict")
+    cancelled = fingerprint(HARNESS.CANCEL_EDIT.encode("utf-8"))
+    confirmed = fingerprint(HARNESS.CONFIRM_EDIT.encode("utf-8"))
     pointer = fingerprint(b"pointer")
     window = fingerprint(b"window")
     edited = fingerprint(b"recovered")
@@ -50,12 +51,14 @@ def observations(case_id: str = HARNESS.CASE_LIFECYCLE_SESSION) -> dict:
         HARNESS.CASE_FLOWS[case_id],
         external_modification_loaded_source=original,
         external_modification_rewritten_source=external,
-        external_modification_dirty_editor=conflict,
+        external_modification_cancel_editor=cancelled,
+        external_modification_source_after_cancel=external,
+        external_modification_confirmed_editor=confirmed,
         external_modification_source_after_refused_save=external,
-        external_modification_overwritten_source=conflict,
+        external_modification_overwritten_source=confirmed,
         external_modification_conflict_ms=12.0,
         tab_close_editor=pointer,
-        tab_close_source_after_cancel=conflict,
+        tab_close_source_after_cancel=confirmed,
         tab_close_saved_source=pointer,
         checkpoint_editor=edited,
         checkpoint_ms=9999.0,
@@ -118,8 +121,17 @@ class EvidenceSchemaTests(unittest.TestCase):
             ("external_modification_rewritten_source", fingerprint(b"longer external"),
              "not same-length"),
             ("external_modification_conflict_ms", -1.0, "nonnegative timing"),
-            ("external_modification_source_after_refused_save", fingerprint(b"conflict"),
+            ("external_modification_source_after_refused_save", other,
              "refused Save changed"),
+            ("external_modification_source_after_cancel", other,
+             "Keep mine's Cancel changed"),
+            ("external_modification_cancel_editor", fingerprint(HARNESS.EXTERNAL_BYTES),
+             "disk bytes it must differ"),
+            ("external_modification_confirmed_editor", fingerprint(HARNESS.EXTERNAL_BYTES),
+             "disk bytes it must differ"),
+            ("external_modification_confirmed_editor",
+             fingerprint(HARNESS.CANCEL_EDIT.encode("utf-8")),
+             "same edit bytes"),
             ("external_modification_overwritten_source", other, "explicit overwrite"),
             ("tab_close_source_after_cancel", other, "tab close Cancel changed"),
             ("tab_close_saved_source", other, "Cancel did not preserve"),
@@ -211,7 +223,7 @@ class FakeDesk:
         root: Path,
         *,
         keep_mine_writes: bool = False,
-        keep_mine_delayed: bool = False,
+        keep_mine_delay: float | None = None,
         overwrite_writes: bool = True,
         overwrite_cancel_ignored: bool = False,
         home_opens: bool = True,
@@ -228,7 +240,7 @@ class FakeDesk:
     ) -> None:
         self.root = root
         self.keep_mine_writes = keep_mine_writes
-        self.keep_mine_delayed = keep_mine_delayed
+        self.keep_mine_delay = keep_mine_delay
         self.overwrite_writes = overwrite_writes
         self.overwrite_cancel_ignored = overwrite_cancel_ignored
         self.home_opens = home_opens
@@ -248,7 +260,7 @@ class FakeDesk:
         self.conflict = False
         self.guard: str | None = None
         self.overwrite_open = False
-        self.pending_write = False
+        self.pending_write: tuple[bytes, float] | None = None
         self.clock_now = 0.0
         self.sleeps: list[float] = []
         # Open tabs: an argv document opens one (a folder none), Restore and
@@ -338,8 +350,11 @@ class FakeDesk:
         return runtime.fingerprint_bytes(self.editor)
 
     def write_editor(self) -> None:
-        runtime.write_durable(self.document, self.editor)
-        self.known = self.editor
+        self.write_bytes(self.editor)
+
+    def write_bytes(self, value: bytes) -> None:
+        runtime.write_durable(self.document, value)
+        self.known = value
         self.conflict = self.conflict and self.conflict_sticks
 
     def clock(self) -> float:
@@ -348,9 +363,10 @@ class FakeDesk:
     def sleep(self, seconds: float) -> None:
         self.sleeps.append(seconds)
         self.clock_now += seconds
-        if self.pending_write:
-            self.pending_write = False
-            self.write_editor()
+        pending = self.pending_write
+        if pending is not None and self.clock_now >= pending[1]:
+            self.pending_write = None
+            self.write_bytes(pending[0])
 
     def name_present(self, _app: Any, name: str, _type: str) -> bool:
         if name == runtime.CONFLICT_HEADING:
@@ -382,8 +398,13 @@ class FakeDesk:
             self.overwrite_open = True
             if self.keep_mine_writes:
                 self.write_editor()
-            if self.keep_mine_delayed:
-                self.pending_write = True
+            if self.keep_mine_delay is not None and self.pending_write is None:
+                # The deferred write holds the bytes Keep mine acted on; a
+                # second click cannot schedule over the one already queued.
+                self.pending_write = (
+                    bytes(self.editor),
+                    self.clock_now + self.keep_mine_delay,
+                )
         elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]:
             if self.overwrite_writes:
                 self.write_editor()
@@ -507,6 +528,7 @@ class ScenarioTests(unittest.TestCase):
                 ("menu save",),
                 ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
                 ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"]),
+                ("edit",),
                 ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
                 ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]),
                 ("edit",),
@@ -535,12 +557,30 @@ class ScenarioTests(unittest.TestCase):
         for options, code in (
             (dict(keep_mine_writes=True, overwrite_writes=False),
              "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
-            (dict(keep_mine_delayed=True, overwrite_writes=False),
+            (dict(keep_mine_delay=0.6, overwrite_writes=False),
              "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
             (dict(overwrite_writes=False), "EXTERNAL_MODIFICATION_OVERWRITE_SAVE_TIMEOUT"),
         ):
             with self.subTest(code=code):
                 self.assert_fails(code, **options)
+
+    def test_a_deferred_keep_mine_write_is_caught_before_the_confirmation(self) -> None:
+        # The adversarial model: Keep mine's write lands 600 ms after its
+        # click and Overwrite writes nothing. The settle window must sample
+        # it, so wait_file cannot credit it as the confirmation.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        desk = FakeDesk(Path(directory.name), keep_mine_delay=0.6, overwrite_writes=False)
+        harness = desk.harness()
+        data, config, workspace, stderr = desk.case_roots(HARNESS.CASE_LIFECYCLE_SESSION)
+        document = (workspace / "guarded.md").resolve()
+        runtime.write_durable(document, HARNESS.ORIGINAL_BYTES)
+        app = desk.launch(document, data, config, workspace, stderr)
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.external_modification(app, document)
+
+        self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
 
     def test_guard_cancel_must_dismiss_the_card_before_the_next_step(self) -> None:
         for options, code in (
@@ -557,6 +597,9 @@ class ScenarioTests(unittest.TestCase):
     def test_the_no_write_window_samples_the_disk_repeatedly(self) -> None:
         _, desk = self.run_session()
 
+        # A deferred Keep mine write landed 600 ms after its click in the
+        # adversarial case; the window must be sampled beyond it.
+        self.assertGreaterEqual(HARNESS.OVERWRITE_SETTLE_SECONDS, 1.5)
         self.assertGreaterEqual(desk.clock_now, HARNESS.OVERWRITE_SETTLE_SECONDS)
         self.assertGreaterEqual(len(desk.sleeps), 2)
 

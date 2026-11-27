@@ -790,16 +790,25 @@ def validate_runtime_scan(value: Any) -> None:
     evidence.validate_runtime_scan(value, require_config=True)
 
 
-def validate_extra_window_count(observations: dict[str, Any]) -> None:
+def validate_extra_window_count(observations: dict[str, Any], reason: str | None) -> None:
     """A window count that disagrees with the extra-window list is invalid
     even when each part alone is well-formed; a FAIL record may omit the
-    count (the list itself fails the case), but never contradict it."""
+    count (the list itself fails the case), but never contradict it.
+
+    The main window can itself be missing from the visible list, so the
+    count is the extras plus zero or one main window. A record with only the
+    main window visible would have passed the collector's count check, so it
+    can never be the state a window-count failure records."""
     windows = observations.get(EXTRA_WINDOW_OBSERVATION_KEY)
     if not isinstance(windows, list):
         return
     count = observations.get("web_security_window_count")
-    if count is not None and count != len(windows) + 1:
+    if count is None:
+        return
+    if count not in (len(windows), len(windows) + 1):
         raise ValueError("extra-window count does not match the window count")
+    if reason == "APP_WINDOW_COUNT_UNEXPECTED" and count == 1 and not windows:
+        raise ValueError("a window-count failure cannot observe the main window alone")
 
 
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:

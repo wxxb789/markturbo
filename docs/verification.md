@@ -233,10 +233,11 @@ the app only where the behaviour itself needs a restart.
   questions and the keyless Review variants are headless mt-core/mt-app tests.
 - Goal 02, one case `lifecycle-session`, two launches (the interruption is
   the only restart). First launch: `EXTERNAL_MODIFICATION` (a same-length
-  rewrite with the loaded mtime is refused, then Keep mine and the guard
-  card's Overwrite write the exact bytes), `TAB_CLOSE` (with the sidebar panel open, the
-  open tab's row close raises the guard; Cancel keeps the file; the following
-  Save writes the exact edited bytes) and
+  rewrite with the loaded mtime is refused; Keep mine's Cancel leaves the
+  disk untouched over a sampled settle window, and a second, distinct edit's
+  guard card Overwrite writes that edit's exact bytes), `TAB_CLOSE` (with
+  the sidebar panel open, the open tab's row close raises the guard; Cancel
+  keeps the file; the following Save writes the exact edited bytes) and
   `CHECKPOINT` (an encrypted canonical record within 10 000 ms, no sentinel
   leak, then TerminateProcess). Relaunch on the workspace folder: `RESTORE`
   (Restore brings back the exact checkpointed bytes), `KEYBOARD_CLOSE`
@@ -260,9 +261,12 @@ the app only where the behaviour itself needs a restart.
   pre-navigation cell; the second detects no fixture cells, consistent with a
   browser block page. Exactly one app window remains, and the counted
   loopback listeners record no contacts, including on the final HTTPS port.
-  A second visible top-level window fails `APP_WINDOW_COUNT_UNEXPECTED` and
-  records each extra window's class, whether the main window owns it, and its
-  process image's file name (never a title).
+  A visible window set other than exactly the main window fails
+  `APP_WINDOW_COUNT_UNEXPECTED` and records each extra window's fixed
+  category (`app_window`, `dialog`, `webview2_popup` or `unknown`), whether
+  the main window owns it, and its process image's fixed family (`markturbo`,
+  `msedgewebview2` or `other`); a raw class name, executable path or title
+  never reaches evidence.
   Browser argument-string tests verify configuration only.
   Edit mode then hands the keyboard back. `DECISIONS`:
   Accept(h1), the executable script value after the CJK/emoji line, writes at

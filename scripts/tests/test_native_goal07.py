@@ -281,17 +281,23 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "extra windows"):
             HARNESS.validate_evidence(evidence)
 
-    def test_window_count_must_match_the_extra_window_list(self) -> None:
+    def test_window_count_is_consistent_with_the_extra_window_list(self) -> None:
         fact = {"category": "unknown", "owned_by_main": False, "process_image": "other"}
 
-        def failed(facts: list[dict], count: int | None) -> dict:
-            observations: dict[str, Any] = {HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: facts}
+        def failed(
+            facts: list[dict] | None,
+            count: int | None,
+            reason: str = "APP_WINDOW_COUNT_UNEXPECTED",
+        ) -> dict:
+            observations: dict[str, Any] = {}
+            if facts is not None:
+                observations[HARNESS.EXTRA_WINDOW_OBSERVATION_KEY] = facts
             if count is not None:
                 observations["web_security_window_count"] = count
             evidence = HARNESS.new_evidence(HASH)
             evidence["cases"][0].update(
                 status="FAIL",
-                reason_code="APP_WINDOW_COUNT_UNEXPECTED",
+                reason_code=reason,
                 failure_type="HarnessFailure",
                 duration_ms=1.0,
                 observations=observations,
@@ -299,11 +305,28 @@ class EvidenceTests(unittest.TestCase):
             HARNESS.complete_evidence(evidence, "FAIL")
             return evidence
 
-        HARNESS.validate_evidence(failed([fact], 2))
-        HARNESS.validate_evidence(failed([fact, fact], 3))
-        HARNESS.validate_evidence(failed([], 1))
-        for facts, count in (([fact], 1), ([fact, fact], 2)):
-            with self.subTest(count=count), self.assertRaisesRegex(
+        # The main window may itself be missing from the visible list, so the
+        # count is the extras plus zero or one main window; a record may also
+        # omit the count.
+        for facts, count in (
+            (None, None),
+            ([], 0),
+            ([fact], 1),
+            ([fact], 2),
+            ([fact, fact], 2),
+            ([fact, fact], 3),
+        ):
+            with self.subTest(facts=facts, count=count):
+                HARNESS.validate_evidence(failed(facts, count))
+        # Only the main window visible would have passed the collector's count
+        # check, so it cannot be the state a window-count failure records; a
+        # different failure reason may hold it.
+        with self.assertRaisesRegex(ValueError, "cannot observe the main window alone"):
+            HARNESS.validate_evidence(failed([], 1))
+        HARNESS.validate_evidence(failed([], 1, reason="APP_WINDOW_FOREGROUND_LOST"))
+        # Any count beside the list outside those states contradicts it.
+        for facts, count in (([], 2), ([fact], 3), ([fact, fact], 1)):
+            with self.subTest(facts=facts, count=count), self.assertRaisesRegex(
                 ValueError, "does not match the window count"
             ):
                 HARNESS.validate_evidence(failed(facts, count))

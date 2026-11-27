@@ -1368,12 +1368,18 @@ class Win32:
                 return True
             process = wt.DWORD()
             if not self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process)):
-                failure_code = "TASK_DIALOG_PROCESS_QUERY_FAILED"
-                return False
+                # A window destroyed during enumeration has no process: skip
+                # it, the caller's poll re-enumerates. PID 0 is the idle
+                # process; no real window has it.
+                return True
+            if process.value == 0:
+                return True
             if process.value != process_id or not self.user32.IsWindowVisible(hwnd):
                 return True
             class_name = ctypes.create_unicode_buffer(256)
             if not self.user32.GetClassNameW(hwnd, class_name, len(class_name)):
+                if not self.user32.IsWindow(hwnd):
+                    return True
                 failure_code = "TASK_DIALOG_CLASS_QUERY_FAILED"
                 return False
             if class_name.value == TASK_DIALOG_CLASS:
@@ -1391,25 +1397,24 @@ class Win32:
         if not owned_processes:
             raise HarnessFailure("PROCESS_JOB_EMPTY")
         handles: list[int] = []
-        failure_code: str | None = None
 
         @self._enum_windows_proc
         def collect(hwnd: int, _lparam: int) -> bool:
-            nonlocal failure_code
             if not self.user32.IsWindowVisible(hwnd):
                 return True
             process = wt.DWORD()
             if not self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process)):
-                failure_code = "APP_WINDOW_PROCESS_QUERY_FAILED"
-                return False
+                # A window destroyed during enumeration has no process; the
+                # caller's next poll sees the remaining windows.
+                return True
+            if process.value == 0:
+                return True
             if process.value in owned_processes:
                 handles.append(int(hwnd))
             return True
 
-        if not self.user32.EnumWindows(collect, 0) and failure_code is None:
+        if not self.user32.EnumWindows(collect, 0):
             raise HarnessFailure("APP_WINDOW_ENUM_FAILED")
-        if failure_code is not None:
-            raise HarnessFailure(failure_code)
         return tuple(handles)
 
     def window_facts(self, hwnd: int, main_hwnd: int) -> dict[str, Any]:

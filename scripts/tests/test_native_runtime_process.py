@@ -357,6 +357,118 @@ class OwnedProcessTests(unittest.TestCase):
         )
         self.assertEqual(win32.visible_top_level_windows((73, 89)), (101, 103))
 
+    def test_visible_top_level_windows_skip_a_window_that_disappears(self) -> None:
+        windows = {101: 73, 102: 0, 103: 89}
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = windows[hwnd]
+            return 1 if windows[hwnd] else 0
+
+        def enum_windows(callback, _lparam):
+            for hwnd in windows:
+                if not callback(hwnd, 0):
+                    return False
+            return True
+
+        win32.user32 = SimpleNamespace(
+            IsWindowVisible=lambda _hwnd: True,
+            GetWindowThreadProcessId=process_id,
+            EnumWindows=enum_windows,
+        )
+        self.assertEqual(win32.visible_top_level_windows((73, 89)), (101, 103))
+
+    def test_task_dialogs_skip_a_window_that_disappears_before_the_process_query(self) -> None:
+        process_ids = {101: 41, 102: 0, 103: 41}
+        class_names = {
+            101: runtime.TASK_DIALOG_CLASS,
+            102: runtime.TASK_DIALOG_CLASS,
+            103: "NshWindow",
+        }
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = process_ids[hwnd]
+            return 1 if process_ids[hwnd] else 0
+
+        def class_name(hwnd, buffer, _length):
+            buffer.value = class_names[hwnd]
+            return len(class_names[hwnd]) + 1
+
+        def enum_windows(callback, _lparam):
+            for hwnd in process_ids:
+                if not callback(hwnd, 0):
+                    return False
+            return True
+
+        win32.user32 = SimpleNamespace(
+            GetWindow=lambda _hwnd, _index: 0,
+            GetWindowThreadProcessId=process_id,
+            IsWindowVisible=lambda _hwnd: True,
+            GetClassNameW=class_name,
+            EnumWindows=enum_windows,
+        )
+        self.assertEqual(win32.task_dialogs(41), [101])
+
+    def test_task_dialogs_skip_a_window_that_disappears_before_the_class_query(self) -> None:
+        class_names = {101: runtime.TASK_DIALOG_CLASS, 102: None}
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(_hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 41
+            return 1
+
+        def class_name(hwnd, buffer, _length):
+            name = class_names[hwnd]
+            if name is None:
+                buffer.value = ""
+                return 0
+            buffer.value = name
+            return len(name) + 1
+
+        def enum_windows(callback, _lparam):
+            for hwnd in class_names:
+                if not callback(hwnd, 0):
+                    return False
+            return True
+
+        win32.user32 = SimpleNamespace(
+            GetWindow=lambda _hwnd, _index: 0,
+            GetWindowThreadProcessId=process_id,
+            IsWindowVisible=lambda _hwnd: True,
+            IsWindow=lambda hwnd: hwnd != 102,
+            GetClassNameW=class_name,
+            EnumWindows=enum_windows,
+        )
+        self.assertEqual(win32.task_dialogs(41), [101])
+
+    def test_task_dialogs_fail_closed_when_a_live_windows_class_is_unreadable(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(_hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 41
+            return 1
+
+        def enum_windows(callback, _lparam):
+            callback(101, 0)
+            return True
+
+        win32.user32 = SimpleNamespace(
+            GetWindow=lambda _hwnd, _index: 0,
+            GetWindowThreadProcessId=process_id,
+            IsWindowVisible=lambda _hwnd: True,
+            IsWindow=lambda _hwnd: True,
+            GetClassNameW=lambda _hwnd, _buffer, _length: 0,
+            EnumWindows=enum_windows,
+        )
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            win32.task_dialogs(41)
+        self.assertEqual(raised.exception.code, "TASK_DIALOG_CLASS_QUERY_FAILED")
+
     def test_window_facts_categorize_the_class_owner_and_process_image(self) -> None:
         win32 = object.__new__(runtime.Win32)
         calls: list[str] = []

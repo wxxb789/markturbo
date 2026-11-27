@@ -161,8 +161,9 @@ class EvidenceContract:
     extra_keys: frozenset[str] = frozenset()
     validate_extra: Callable[[dict[str, Any]], None] | None = None
     # A goal's cross-observation invariants, checked for PASS and non-PASS
-    # cases alike; PASS-only facts stay in `validate_passed_case`.
-    validate_case_observations: Callable[[dict[str, Any]], None] | None = None
+    # cases alike; PASS-only facts stay in `validate_passed_case`. The case's
+    # reason code is supplied so a check can scope itself to one failure.
+    validate_case_observations: Callable[[dict[str, Any], str | None], None] | None = None
 
     @property
     def case_ids(self) -> tuple[str, ...]:
@@ -314,10 +315,10 @@ def validate_observations(observations: Any, contract: EvidenceContract) -> None
 
 
 def _validate_case_observations(
-    contract: EvidenceContract, observations: dict[str, Any]
+    contract: EvidenceContract, observations: dict[str, Any], reason: str | None
 ) -> None:
     if contract.validate_case_observations is not None:
-        contract.validate_case_observations(observations)
+        contract.validate_case_observations(observations, reason)
 
 
 def validate_case(
@@ -344,7 +345,7 @@ def validate_case(
         if validate_context(context) != parent:
             raise ValueError("case process context differs from harness context")
     contract.validate_passed_case(case_id, observations)
-    _validate_case_observations(contract, observations)
+    _validate_case_observations(contract, observations, None)
 
 
 def _validate_executable(executable: Any, passed: bool) -> None:
@@ -457,7 +458,7 @@ def validate_evidence(evidence: Any, contract: EvidenceContract) -> None:
             validate_case(contract, case["id"], case["observations"], parent)
         else:
             validate_observations(case["observations"], contract)
-            _validate_case_observations(contract, case["observations"])
+            _validate_case_observations(contract, case["observations"], reason)
     if status == "PASS" and any(case["status"] != "PASS" for case in cases):
         raise ValueError("PASS requires every required case to pass")
     require_exact_keys(evidence["summary"], SUMMARY_KEYS, "case summary")

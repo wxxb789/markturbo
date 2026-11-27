@@ -7,7 +7,9 @@ observations contain only UTF-8 byte counts, SHA-256 digests, and timings.
 
 One case, two launches; only the interruption needs the restart. The first
 launch opens the document: a same-length external rewrite (mtime restored)
-must be refused by menu Save until Keep mine's Overwrite guard card confirms;
+must be refused by menu Save; Keep mine's Cancel must leave the disk
+untouched by the rewrite over a sampled settle window, and a second, distinct
+edit's Keep mine and Overwrite guard card must write that edit's bytes;
 the sidebar opens before a pointer hover reveals the tab's close, which must
 raise the guard card
 (Save / Don't save / Cancel), whose Cancel keeps the text, then menu Save
@@ -77,7 +79,7 @@ CASE_LIFECYCLE_SESSION = "lifecycle-session"
 CASE_FLOWS = {
     CASE_LIFECYCLE_SESSION: (
         "same-length rewrite -> menu Save refused with conflict -> Keep mine -> "
-        "Overwrite; pointer rail close -> guard Cancel -> menu Save; "
+        "Cancel -> Keep mine -> Overwrite; pointer rail close -> guard Cancel -> menu Save; "
         "edit -> recovery record -> TerminateProcess -> relaunch on the workspace -> "
         "Restore; SendInput Ctrl+W -> guard Don't save -> recovery record retired; "
         "workspace home file -> SendInput Alt+F4 -> quit guard Cancel -> WM_CLOSE -> "
@@ -103,7 +105,9 @@ FINGERPRINT_OBSERVATION_KEYS = frozenset(
     {
         "external_modification_loaded_source",
         "external_modification_rewritten_source",
-        "external_modification_dirty_editor",
+        "external_modification_cancel_editor",
+        "external_modification_source_after_cancel",
+        "external_modification_confirmed_editor",
         "external_modification_source_after_refused_save",
         "external_modification_overwritten_source",
         "tab_close_editor",
@@ -158,9 +162,11 @@ OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS = {
     "Cancel": "guard-cancel",
 }
 # Keep mine's Cancel must leave the disk untouched over this window; the disk
-# is sampled throughout it, not once, so a write queued behind the card is
-# caught before the confirmed Overwrite writes the target bytes.
-OVERWRITE_SETTLE_SECONDS = 0.5
+# is sampled throughout it, not once, so a deferred write behind the guard is
+# caught before the confirmed Overwrite writes a second edit's bytes. The
+# window stays above any plausible deferred write (the adversarial case
+# landed one after 600 ms).
+OVERWRITE_SETTLE_SECONDS = 1.5
 OVERWRITE_SETTLE_SAMPLE_INTERVAL_SECONDS = 0.05
 # The workspace home's file rows (`ui/welcome.rs` `workspace_home`), shown
 # while a workspace is open and no document is; the workspace holds one file.
@@ -172,7 +178,8 @@ RECOVERY_LOSS_WINDOW_MS = 10_000
 
 ORIGINAL_BYTES = b"native acceptance original"
 EXTERNAL_BYTES = b"native acceptance external"
-CONFLICT_EDIT = f"{DOCUMENT_SENTINEL}:conflict"
+CANCEL_EDIT = f"{DOCUMENT_SENTINEL}:cancel"
+CONFIRM_EDIT = f"{DOCUMENT_SENTINEL}:confirm"
 POINTER_EDIT = f"{DOCUMENT_SENTINEL}:pointer"
 WINDOW_EDIT = f"{DOCUMENT_SENTINEL}:window"
 RECOVERY_EDIT = f"{DOCUMENT_SENTINEL}:recovery"
@@ -221,12 +228,22 @@ def _require_timing(observations: dict[str, Any], key: str) -> float:
 
 
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
-    loaded, rewritten, dirty, refused, overwritten = _fingerprints(
+    (
+        loaded,
+        rewritten,
+        cancel_editor,
+        after_cancel,
+        confirmed_editor,
+        refused,
+        overwritten,
+    ) = _fingerprints(
         observations,
         "external_modification",
         "loaded_source",
         "rewritten_source",
-        "dirty_editor",
+        "cancel_editor",
+        "source_after_cancel",
+        "confirmed_editor",
         "source_after_refused_save",
         "overwritten_source",
     )
@@ -235,8 +252,14 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
     _require_timing(observations, "external_modification_conflict_ms")
     if refused != rewritten:
         raise ValueError("refused Save changed the externally rewritten source")
-    if dirty != overwritten or rewritten == overwritten:
-        raise ValueError("explicit overwrite did not preserve exact dirty editor bytes")
+    if after_cancel != rewritten:
+        raise ValueError("Keep mine's Cancel changed the externally rewritten source")
+    if cancel_editor == rewritten or confirmed_editor == rewritten:
+        raise ValueError("a conflict edit matched the disk bytes it must differ from")
+    if cancel_editor == confirmed_editor:
+        raise ValueError("cancel and confirm scenarios used the same edit bytes")
+    if overwritten != confirmed_editor:
+        raise ValueError("explicit overwrite did not preserve the second edit's bytes")
 
     editor, kept_source, saved = _fingerprints(
         observations, "tab_close", "editor", "source_after_cancel", "saved_source"
@@ -546,9 +569,15 @@ class Goal02Harness(BaseNativeHarness):
             self.sleep(min(OVERWRITE_SETTLE_SAMPLE_INTERVAL_SECONDS, deadline - self.clock()))
 
     def external_modification(self, app: RunningApp, document: Path) -> dict[str, Any]:
-        """A same-length rewrite with the loaded mtime is refused, then overwritten."""
+        """A same-length rewrite with the loaded mtime is refused, then overwritten.
+
+        Cancel and confirm are independent scenarios with distinct edit
+        bytes: the settle window's no-write proof covers the first edit's
+        Cancel, and only the confirmed Overwrite can write the second edit,
+        so a deferred write of the first can never answer for it.
+        """
         loaded = sha256_file(document)
-        dirty = self.replace_editor(app, CONFLICT_EDIT)
+        cancelled_edit = self.replace_editor(app, CANCEL_EDIT)
         before = document.stat()
         if len(ORIGINAL_BYTES) != len(EXTERNAL_BYTES):
             raise HarnessFailure("FIXTURE_LENGTH_MISMATCH")
@@ -569,8 +598,12 @@ class Goal02Harness(BaseNativeHarness):
         refused = sha256_file(document)
         if refused != rewritten:
             raise HarnessFailure("SAVE_OVERWROTE_EXTERNAL_REWRITE")
-        # The overwrite below writes the exact dirty bytes, which proves the
-        # conflict kept the buffer; no editor read is needed here.
+
+        # Scenario A: Keep mine opens the Overwrite guard card; its Cancel
+        # dismisses it without writing. The card must leave before the card
+        # the confirmed overwrite uses is raised, so a stale card cannot
+        # answer for it. The sampled settle window then proves the first
+        # edit's bytes never reached the disk after this Cancel.
         keep_mine = self.find_control(
             app,
             KEEP_MINE_AUTOMATION_ID,
@@ -579,9 +612,6 @@ class Goal02Harness(BaseNativeHarness):
             "KEEP_MINE_UIA_CONTRACT_MISMATCH",
         )
         self.click_control(keep_mine, "KEEP_MINE_CLICK_FAILED")
-        # Keep mine opens the Overwrite guard card; its Cancel dismisses it
-        # without writing. The card must leave before the card the confirmed
-        # overwrite uses is raised, so a stale card cannot answer for it.
         guard = self.guard_dialog(
             app,
             OVERWRITE_GUARD_HEADING,
@@ -592,8 +622,19 @@ class Goal02Harness(BaseNativeHarness):
         self.wait_guard_absent(
             app, OVERWRITE_GUARD_HEADING, "GUARD_NOT_DISMISSED_AFTER_CANCEL"
         )
-        # The no-write proof covers Keep mine's Cancel and the reopened card
-        # over the settle window; only then does Overwrite write the bytes.
+        self.require_unchanged_disk(
+            document,
+            rewritten,
+            OVERWRITE_SETTLE_SECONDS,
+            "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+        )
+        after_cancel = sha256_file(document)
+        if after_cancel != rewritten:
+            raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+
+        # Scenario B: a distinct edit's Keep mine and Overwrite write exactly
+        # its bytes; the cancelled edit can never stand in for them.
+        confirmed_edit = self.replace_editor(app, CONFIRM_EDIT)
         keep_mine = self.find_control(
             app,
             KEEP_MINE_AUTOMATION_ID,
@@ -608,14 +649,8 @@ class Goal02Harness(BaseNativeHarness):
             OVERWRITE_GUARD_BUTTON_NAMES,
             OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
         )
-        self.require_unchanged_disk(
-            document,
-            rewritten,
-            OVERWRITE_SETTLE_SECONDS,
-            "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
-        )
         self.click_control(guard["Overwrite"], "OVERWRITE_GUARD_OVERWRITE_CLICK_FAILED")
-        overwritten = self.wait_file(document, dirty, "OVERWRITE_SAVE_TIMEOUT")
+        overwritten = self.wait_file(document, confirmed_edit, "OVERWRITE_SAVE_TIMEOUT")
         # The next phases start from a clean, conflict-free document.
         wait_until(
             lambda: not self.name_present(app, CONFLICT_HEADING, "Text"),
@@ -625,7 +660,9 @@ class Goal02Harness(BaseNativeHarness):
         return {
             "external_modification_loaded_source": loaded.evidence(),
             "external_modification_rewritten_source": rewritten.evidence(),
-            "external_modification_dirty_editor": dirty.evidence(),
+            "external_modification_cancel_editor": cancelled_edit.evidence(),
+            "external_modification_source_after_cancel": after_cancel.evidence(),
+            "external_modification_confirmed_editor": confirmed_edit.evidence(),
             "external_modification_source_after_refused_save": refused.evidence(),
             "external_modification_overwritten_source": overwritten.evidence(),
             "external_modification_conflict_ms": conflict_ms,
