@@ -588,6 +588,7 @@ fn stale_banner(state: AppState, language: Language) -> impl IntoElement {
         .child(
             view()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .child(prims::ink(s(S::Stale, language)))
@@ -944,6 +945,7 @@ fn current_question_block(
             .child(
                 view()
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(SPACE_4))
                     .pt(px(SPACE_2))
@@ -1078,6 +1080,7 @@ fn findings_stepper(
     let mut row = view()
         .test_id("review-findings-stepper")
         .flex_row()
+        .flex_wrap()
         .items_center()
         .gap(px(SPACE_2))
         .child(
@@ -1218,6 +1221,7 @@ fn footer(
                 .test_id("review-actions")
                 .w_full()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap(px(SPACE_2))
                 .child(if stale {
@@ -1303,6 +1307,7 @@ fn loading_line(state: AppState, language: Language) -> impl IntoElement {
         .child(
             view()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .child(prims::rest(host))
@@ -1369,22 +1374,22 @@ fn unavailable(state: AppState, language: Language, reason: ReviewUnavailable) -
             false,
         ),
     };
-    let mut actions =
-        view()
-            .flex_row()
-            .items_center()
-            .gap(px(SPACE_4))
-            .child(prims::primary_action(
-                "review-open-settings",
-                label,
-                move || {
-                    if opens_settings {
-                        action_state.open_settings();
-                    } else {
-                        action_state.start_review();
-                    }
-                },
-            ));
+    let mut actions = view()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .gap(px(SPACE_4))
+        .child(prims::primary_action(
+            "review-open-settings",
+            label,
+            move || {
+                if opens_settings {
+                    action_state.open_settings();
+                } else {
+                    action_state.start_review();
+                }
+            },
+        ));
     if reason == ReviewUnavailable::NotSetUp {
         actions = actions.child(prims::quiet_action(
             "review-again",

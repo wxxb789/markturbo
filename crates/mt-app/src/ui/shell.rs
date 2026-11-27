@@ -1073,6 +1073,12 @@ mod tests {
         }
     }
 
+    fn second_recovered_record() -> mt_core::recovery::RecoveredRecord {
+        let mut record = recovered_record();
+        record.record.key = mt_core::recovery::RecoveryKey::for_document_id("shell-undo-probe-2");
+        record
+    }
+
     /// What the app's own last focus move handed the keyboard to, as text a
     /// test can read: one signal per app, so parallel lib tests never share
     /// a focus record.
@@ -1240,6 +1246,40 @@ mod tests {
             .child(shell(state, Language::English, Layout::Medium))
     }
 
+    // The controls sit on one row: a column of them costs the shell height
+    // the dock's footers need at 1040 points.
+    #[component]
+    fn DockAuditProbe() -> impl IntoElement {
+        let state = AppState::new();
+        if let Some(parent) = probe_path().parent() {
+            state.open_folder(parent.to_path_buf());
+        }
+        state.open_file(probe_path().to_path_buf());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(
+                view()
+                    .flex_row()
+                    .child(control("probe-revision", &state, |state| {
+                        present_revision_over_probe(state);
+                    }))
+                    .child(control("probe-recovery", &state, move |state| {
+                        state
+                            .recovery_records
+                            .set(vec![recovered_record(), second_recovered_record()]);
+                    }))
+                    .child(control("probe-close-dirty", &state, |state| {
+                        if let Some(tab) = state.active_tab() {
+                            tab.dirty.set(true);
+                            state.request_close_tab(tab.id);
+                        }
+                    })),
+            )
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
     fn present_revision_over_probe(state: &AppState) {
         use mt_core::review::{
             ByteRange, SourceSnapshot,
@@ -1272,13 +1312,17 @@ mod tests {
     }
 
     fn assert_action_whole(app: &Headless, action: &str) {
-        let field = node(app, "field").bounds;
+        assert_action_whole_in(app, "field", action);
+    }
+
+    fn assert_action_whole_in(app: &Headless, container: &str, action: &str) {
+        let field = node(app, container).bounds;
         let selector = format!("id:{action}");
         let target = app
             .screen()
             .press_target(&selector)
             .expect("a selector")
-            .unwrap_or_else(|| panic!("`{action}` is not pressable"));
+            .unwrap_or_else(|| panic!("`{action}` is not pressable in `{container}`"));
         let control = app
             .screen()
             .layout_nodes()
@@ -1289,9 +1333,32 @@ mod tests {
             control.bounds.origin.x.0 >= field.origin.x.0
                 && control.bounds.origin.x.0 + control.bounds.size.width.0
                     <= field.origin.x.0 + field.size.width.0,
-            "`{action}` at {:?} is not whole inside the field {field:?}",
+            "`{action}` at {:?} is not whole inside `{container}` {field:?}",
             control.bounds
         );
+    }
+
+    fn assert_text_whole_in(app: &Headless, container: &str, label: &str) {
+        let field = node(app, container).bounds;
+        let nodes = app.screen().layout_nodes();
+        let matching: Vec<_> = nodes
+            .iter()
+            .filter(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text.as_str() == label)
+            })
+            .collect();
+        assert!(!matching.is_empty(), "no `{label}` text on screen");
+        for control in matching {
+            assert!(
+                control.bounds.origin.x.0 >= field.origin.x.0
+                    && control.bounds.origin.x.0 + control.bounds.size.width.0
+                        <= field.origin.x.0 + field.size.width.0,
+                "`{label}` at {:?} is not whole inside `{container}` {field:?}",
+                control.bounds
+            );
+        }
     }
 
     #[test]
@@ -1335,6 +1402,163 @@ mod tests {
             .expect("the revision field");
         for action in ["revision-accept", "revision-reject"] {
             assert_action_whole(&app, action);
+        }
+    }
+
+    #[component]
+    fn ConflictContextProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().expect("conflict fixture directory"));
+        let path = directory.path().join("conflict.md");
+        std::fs::write(&path, "Original buffer").expect("write fixture");
+        state.open_file(path.clone());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(control("probe-conflict", &state, move |state| {
+                let _keep_directory = &directory;
+                std::fs::write(&path, "Updated disk contents").expect("external write");
+                if let Some(tab) = state.active_tab() {
+                    tab.conflict.set(true);
+                }
+            }))
+            .child(control("probe-context", &state, |state| {
+                state.context_open.set(true);
+            }))
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
+    #[test]
+    fn the_conflict_banner_with_context_open_keeps_every_action_whole() {
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<ConflictContextProbe>().tokens(tokens::theme()),
+        );
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1040.0), Points(720.0)))
+            .expect("the 1040 point window");
+        app.wait_for("text:Original buffer")
+            .expect("the conflict fixture loaded");
+        press_without_settling(&mut app, "probe-conflict");
+        app.wait_for("id:conflict-banner").expect("conflict banner");
+        app.settle();
+        assert_eq!(
+            node(&app, "sidebar").bounds.size.width.0,
+            tokens::SIDEBAR_W,
+            "the repro needs the sidebar expanded"
+        );
+
+        press(&mut app, "probe-context");
+        app.wait_for("id:context-field").expect("the context field");
+        for action in [
+            "conflict-compare",
+            "conflict-keep-mine",
+            "conflict-use-disk",
+            "conflict-save-as",
+        ] {
+            assert_action_whole_in(&app, "conflict-banner", action);
+        }
+        press(&mut app, "conflict-compare");
+        app.wait_for("id:conflict-previous")
+            .expect("the whole Compare action opened the comparison");
+    }
+
+    #[component]
+    fn ReviewWaitingFooterProbe() -> impl IntoElement {
+        use crate::state::{ReviewSection, ReviewView};
+
+        let state = AppState::new();
+        state.new_document();
+        let owner = state.active.get().expect("the revision's tab");
+        state.new_document();
+        let shown = state.active.get().expect("the result's tab");
+        state.arm_revision_in_flight(owner);
+        state.review_view.set(Some(ReviewView {
+            sections: vec![ReviewSection {
+                title: "Stated goal".to_owned(),
+                items: vec!["one".to_owned()],
+            }],
+            tab_id: Some(shown),
+            ..ReviewView::default()
+        }));
+        state.review_open.set(true);
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
+    #[test]
+    fn the_review_footer_keeps_close_whole_while_a_revision_runs_elsewhere() {
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<ReviewWaitingFooterProbe>().tokens(tokens::theme()),
+        );
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1260.0), Points(720.0)))
+            .expect("the 1260 point window");
+        app.wait_for("id:review-footer").expect("the review footer");
+        app.wait_for("text:Waiting for Revision on another document.")
+            .expect("the waiting line widens the footer");
+        assert_eq!(
+            node(&app, "sidebar").bounds.size.width.0,
+            tokens::SIDEBAR_W,
+            "the repro needs the sidebar expanded"
+        );
+
+        assert_action_whole(&app, "review-close");
+        press(&mut app, "review-close");
+        app.wait_for_gone("id:review-field", std::time::Duration::from_secs(2))
+            .expect("the whole Close action closes the review");
+    }
+
+    #[test]
+    fn the_dock_and_banners_keep_their_action_rows_whole_at_both_medium_widths() {
+        for width in [1040.0, 1260.0] {
+            let mut config = EngineConfig::new(
+                nsh_testing::windowed_root::<DockAuditProbe>().tokens(tokens::theme()),
+            );
+            config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+            let mut app = Headless::start(config).expect("start the probe");
+            app.set_viewport(nsh_core::Size::new(Points(width), Points(720.0)))
+                .expect("a medium window");
+            app.wait_for("text:Describe the next release.")
+                .expect("the probe document");
+            assert_eq!(
+                node(&app, "sidebar").bounds.size.width.0,
+                tokens::SIDEBAR_W,
+                "the repro needs the sidebar expanded at {width}"
+            );
+
+            press(&mut app, "probe-revision");
+            app.wait_for("id:revision-field")
+                .expect("the revision field");
+            for action in ["revision-done", "revision-copy", "revision-close"] {
+                assert_action_whole(&app, action);
+            }
+
+            press(&mut app, "probe-recovery");
+            app.wait_for("id:recovery-banner")
+                .expect("the recovery banner");
+            for action in [
+                "recovery-restore-all",
+                "recovery-discard-all",
+                "recovery-restore-0",
+                "recovery-discard-0",
+                "recovery-restore-1",
+                "recovery-discard-1",
+            ] {
+                assert_action_whole_in(&app, "recovery-banner", action);
+            }
+
+            press(&mut app, "probe-close-dirty");
+            app.wait_for("id:guard-card").expect("the guard card");
+            for action in ["guard-save", "guard-dont-save", "guard-cancel"] {
+                assert_action_whole_in(&app, "guard-card", action);
+            }
+
+            assert_text_whole_in(&app, "field", "Undo");
         }
     }
 

@@ -105,6 +105,7 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                     .test_id("recovery-actions")
                     .w_full()
                     .flex_row()
+                    .flex_wrap()
                     .gap(px(SPACE_3))
                     .pb(px(SPACE_3))
                     .child(prims::primary_action(
@@ -145,6 +146,7 @@ pub fn recovery_banner(state: AppState, language: Language) -> impl IntoElement 
                     .test_id(&format!("recovery-row-{index}"))
                     .w_full()
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(SPACE_3))
                     .pb(px(SPACE_3))
@@ -361,6 +363,7 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
             view()
                 .w_full()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap(px(SPACE_3))
                 .child(
@@ -554,6 +557,7 @@ fn compare_panel(
             view()
                 .w_full()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap(px(SPACE_2))
                 .child(
@@ -1227,6 +1231,7 @@ fn guard_card(
             view()
                 .w_full()
                 .flex_row()
+                .flex_wrap()
                 .gap(px(SPACE_2))
                 .children(controls),
         )
