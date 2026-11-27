@@ -1250,7 +1250,7 @@ mod tests {
 
     fn rail_name_color(app: &Headless) -> Color {
         app.screen()
-            .span_style("text:Inactive")
+            .span_style("id:sidebar-panel >> text:Inactive")
             .expect("the hovered inactive rail name style")
             .color
     }
@@ -1270,9 +1270,9 @@ mod tests {
             .expect("the collapsed sidebar");
         app.press_key("mod+b").expect("open the sidebar panel");
         app.settle();
-        app.wait_for("text:Inactive")
+        app.wait_for("id:sidebar-panel >> text:Inactive")
             .expect("the inactive rail name");
-        app.hover("text:Inactive")
+        app.hover("id:sidebar-panel >> text:Inactive")
             .expect("hover the inactive rail name");
         app.settle();
 
