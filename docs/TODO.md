@@ -239,3 +239,7 @@
 - [ ] **A failed recursive registration restores the old watch without a recheck** — if registering the new root fails, the
   rollback re-registers the old document-directory watch with an unchanged generation, so a write made in the gap is never
   read. Fix by advancing the generation on rollback so affected tabs re-check.
+- [ ] **A renamed symbolic link focuses its stale tab** — after `a.md`, a link to `real.md`, is renamed to `b.md`,
+  opening `b.md` focuses the old tab by its resolved target and discards the new read. No text is lost; Save on the
+  stale tab fails visibly. The fix needs a recovery key per tab instead of per path, so two tabs on one path cannot
+  share one record.

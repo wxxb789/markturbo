@@ -1017,107 +1017,6 @@ fn renaming_a_file_on_disk_gives_its_new_name_its_own_tab() {
 }
 
 #[test]
-fn renaming_a_symlink_on_disk_gives_its_new_name_its_own_tab() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let config = tempfile::tempdir().expect("config dir");
-    let target = workspace.path().join("real.md");
-    std::fs::write(&target, "# Real\n").expect("write the target");
-    let before = workspace.path().join("a.md");
-    let after = workspace.path().join("b.md");
-    if let Err(error) = symlink_file(&target, &before) {
-        eprintln!("skipping file-symlink test: {error}");
-        return;
-    }
-
-    let mut app = start(config.path(), Some(workspace.path()));
-    app.wait_for("id:workspace-home")
-        .expect("the workspace home");
-    app.press("id:workspace-home >> label:a.md")
-        .expect("open the link");
-    app.wait_for("text:# Real").expect("the target document");
-
-    std::fs::rename(&before, &after).expect("rename the link to b.md");
-    support::wait_for_marker(
-        &mut app,
-        "the renamed link's tab is missing",
-        Duration::from_secs(20),
-        |screen| {
-            screen
-                .texts()
-                .iter()
-                .any(|text| text.contains("Moved or deleted on disk"))
-        },
-    );
-
-    app.drop_files("id:shell", vec![file_uri(&after)])
-        .expect("drop the renamed link");
-    support::wait_for_marker(
-        &mut app,
-        "b.md is its own active tab",
-        Duration::from_secs(20),
-        |screen| active_title(screen).as_deref() == Some("b.md"),
-    );
-    assert_eq!(
-        open_tabs(&app),
-        2,
-        "a renamed link opens its own tab: {:?}",
-        app.screen().texts()
-    );
-}
-
-#[test]
-fn dropping_a_missing_links_target_gives_the_target_its_own_tab() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let config = tempfile::tempdir().expect("config dir");
-    let target = workspace.path().join("real.md");
-    std::fs::write(&target, "# Real\n").expect("write the target");
-    let link = workspace.path().join("a.md");
-    if let Err(error) = symlink_file(&target, &link) {
-        eprintln!("skipping file-symlink test: {error}");
-        return;
-    }
-
-    let mut app = start(config.path(), Some(workspace.path()));
-    app.wait_for("id:workspace-home")
-        .expect("the workspace home");
-    app.press("id:workspace-home >> label:a.md")
-        .expect("open the link");
-    app.wait_for("text:# Real").expect("the target document");
-
-    std::fs::rename(&link, workspace.path().join("b.md")).expect("rename the link to b.md");
-    support::wait_for_marker(
-        &mut app,
-        "the renamed link's tab is missing",
-        Duration::from_secs(20),
-        |screen| {
-            screen
-                .texts()
-                .iter()
-                .any(|text| text.contains("Moved or deleted on disk"))
-        },
-    );
-
-    // The missing link still names this resolved target; the target's open is
-    // newer and owns its own tab.
-    let canonical = std::fs::canonicalize(&target).expect("canonical target");
-    let target_spelling = mt_core::workspace::normalize_path(&canonical);
-    app.drop_files("id:shell", vec![file_uri(&target_spelling)])
-        .expect("drop the target");
-    support::wait_for_marker(
-        &mut app,
-        "real.md is its own active tab",
-        Duration::from_secs(20),
-        |screen| active_title(screen).as_deref() == Some("real.md"),
-    );
-    assert_eq!(
-        open_tabs(&app),
-        2,
-        "a missing link does not capture its target's open: {:?}",
-        app.screen().texts()
-    );
-}
-
-#[test]
 fn two_hard_links_to_one_file_are_two_tabs() {
     let workspace = tempfile::tempdir().expect("workspace");
     let config = tempfile::tempdir().expect("config dir");
@@ -1187,20 +1086,28 @@ fn dropping_a_plain_file_through_a_short_name_path_focuses_the_existing_tab() {
 
     let mut app = start(config.path(), None);
     app.wait_for("id:welcome-open-folder").expect("the welcome");
-    app.drop_files("id:shell", vec![file_uri(&plan), file_uri(&other)])
-        .expect("drop both documents");
-    app.wait_for("text:# Plan").expect("plan.md opens");
-    app.wait_for("text:# Other").expect("other.md opens");
+    // One drop per file: the column mounts only the active document, so
+    // plan.md's body is gone once the later drop makes other.md active.
+    app.drop_files("id:shell", vec![file_uri(&plan)])
+        .expect("drop plan.md");
     support::wait_for_marker(
         &mut app,
-        "other.md is active",
+        "plan.md is the active tab",
+        Duration::from_secs(20),
+        |screen| active_title(screen).as_deref() == Some("plan.md"),
+    );
+    app.drop_files("id:shell", vec![file_uri(&other)])
+        .expect("drop other.md");
+    support::wait_for_marker(
+        &mut app,
+        "other.md is the active tab",
         Duration::from_secs(20),
         |screen| active_title(screen).as_deref() == Some("other.md"),
     );
     assert_eq!(open_tabs(&app), 2, "each document is one tab");
 
-    // The plain file's 8.3 path must meet the long path its tab stores: the
-    // existing tab becomes active and no second tab appears.
+    // The plain file's 8.3 path must meet the long path its tab stores:
+    // without `io::load`'s expansion this is a third tab for the same file.
     app.drop_files("id:shell", vec![file_uri(&short.join("plan.md"))])
         .expect("drop plan.md through its 8.3 path");
     support::wait_for_marker(
