@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -57,7 +57,9 @@ use mt_core::{
     },
 };
 use nsh_base::editor::{Editor, EditorApi};
-use nsh_core::{file_dialog::SaveDialog, prelude::*};
+use nsh_core::{element::sample_easing, file_dialog::SaveDialog, prelude::*};
+
+use crate::ui::{motion, tokens::Layout};
 
 pub(crate) mod flow_copy;
 mod revision_ledger;
@@ -66,7 +68,33 @@ use revision_ledger::{LedgerRefusal, RevisionLedger};
 
 static FIRST_LAUNCH_CHECKED: AtomicBool = AtomicBool::new(false);
 
-/// Which panes a document shows.
+/// The three stops on the document's view track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Edit,
+    Split,
+    Preview,
+}
+
+impl View {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Edit => Self::Split,
+            Self::Split => Self::Preview,
+            Self::Preview => Self::Edit,
+        }
+    }
+
+    pub(crate) fn stop(self) -> f32 {
+        match self {
+            Self::Edit => 1.0,
+            Self::Split => 0.5,
+            Self::Preview => 0.0,
+        }
+    }
+}
+
+/// The stored pane, including the compatibility renderer where applicable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Pane {
     #[default]
@@ -78,8 +106,26 @@ pub enum Pane {
 }
 
 impl Pane {
-    fn mounts_source(self) -> bool {
-        matches!(self, Pane::Source | Pane::Split | Pane::SplitWeb)
+    pub fn view(self) -> View {
+        match self {
+            Self::Source => View::Edit,
+            Self::Split | Self::SplitWeb => View::Split,
+            Self::Preview | Self::Web => View::Preview,
+        }
+    }
+
+    pub fn web(self) -> bool {
+        matches!(self, Self::Web | Self::SplitWeb)
+    }
+
+    pub fn from_view(view: View, web: bool) -> Self {
+        match (view, web) {
+            (View::Edit, _) => Self::Source,
+            (View::Split, false) => Self::Split,
+            (View::Split, true) => Self::SplitWeb,
+            (View::Preview, false) => Self::Preview,
+            (View::Preview, true) => Self::Web,
+        }
     }
 
     pub(crate) fn of(stored: mt_core::settings::DocumentPane) -> Self {
@@ -123,6 +169,8 @@ pub struct Tab {
     pub dirty: Signal<bool>,
     pub revision: Signal<u64>,
     pub pane: Signal<Pane>,
+    // Edit has no compatibility variant in the stored pane enum.
+    web_preference: Signal<bool>,
     pub conflict: Signal<bool>,
     pub untitled: bool,
     pub recovery_key: RecoveryKey,
@@ -130,6 +178,17 @@ pub struct Tab {
     /// The latest Reload this tab asked for: an older request's answer that
     /// comes back later writes nothing.
     reload: Rc<Cell<u64>>,
+}
+
+impl Tab {
+    pub(crate) fn web_compat(&self) -> bool {
+        let pane = self.pane.get();
+        if pane.view() == View::Edit {
+            self.web_preference.get()
+        } else {
+            pane.web()
+        }
+    }
 }
 
 impl PartialEq for Tab {
@@ -238,6 +297,9 @@ pub struct AppState {
     pub entries: Signal<Vec<Entry>>,
     pub tabs: Signal<Vec<Tab>>,
     pub active: Signal<Option<u64>>,
+    pub sidebar_open: Signal<bool>,
+    pub sidebar_overlay: Signal<bool>,
+    pub view_track: Signal<f32>,
     pub status: Signal<StatusMessage>,
     pub(crate) status_surface: Signal<StatusSurface>,
     pub(crate) status_error: Signal<bool>,
@@ -361,9 +423,8 @@ pub struct AppState {
     /// `Selection` scope the card may switch to. `None` offers no selection.
     review_selection: Rc<Cell<Option<(usize, usize)>>>,
     /// The source editor `ui::document` mounted last, with the tab it edits.
-    /// Its selection is read live when a Review is prepared; once that
-    /// editor is unmounted (another pane or tab) its handle reaches nothing,
-    /// so a selection nobody sees is never reviewed.
+    /// Its selection is read live when a Review is prepared. A hidden
+    /// editor or one mounted for another tab supplies no selection.
     source_editor: Rc<Cell<Option<SourceEditor>>>,
     /// The tab a sent Review request belongs to, until its answer lands or
     /// the request stops mattering (replaced or withdrawn). It outlives the
@@ -410,18 +471,128 @@ pub struct AppState {
     recovery_tracks: Rc<RefCell<HashMap<u64, RecoveryTrack>>>,
     quit_discarded: Rc<Cell<bool>>,
     chosen_pane: Rc<Cell<Pane>>,
+    chosen_web: Rc<Cell<bool>>,
+    view_tween: TrackTween,
     /// The document view mounted last and the tab it belongs to: a retry
     /// waits for the tab it was asked to focus, never the ref it replaced.
     document_view: Rc<Cell<Option<(u64, ElementRef)>>>,
+    reading_view: Rc<Cell<Option<(u64, ElementRef)>>>,
+    /// The active tab awaiting keyboard focus, even if its view mounts
+    /// after the frame retries finish.
+    pending_editor_focus: Rc<Cell<Option<u64>>>,
     guard_view: Rc<Cell<Option<ElementRef>>>,
     compare_view: Rc<Cell<Option<ElementRef>>>,
     palette_view: Rc<Cell<Option<ElementRef>>>,
     /// The latest folder open's request token: a slower earlier scan must
     /// not commit its root, files, context, recents or status.
     folder_request: Rc<Cell<u64>>,
+    folder_refresh_request: Rc<Cell<u64>>,
     #[cfg(test)]
     pub(crate) focus_last: Signal<Option<FocusTarget>>,
     next_id: Rc<Cell<u64>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TrackCurve {
+    Camera,
+    Rail,
+    Fade,
+}
+
+impl TrackCurve {
+    fn duration(self) -> f32 {
+        match self {
+            Self::Camera => motion::CAMERA_MS,
+            Self::Rail => motion::RAIL_WIDEN_MS,
+            Self::Fade => motion::REDUCED_CROSSFADE_MS,
+        }
+    }
+
+    fn progress(self, elapsed_ms: f32) -> f32 {
+        match self {
+            Self::Camera => motion::camera_progress(elapsed_ms),
+            Self::Rail => {
+                static CURVE: LazyLock<Vec<f32>> = LazyLock::new(|| {
+                    sample_easing(motion::EASE_OUT, motion::RAIL_WIDEN_MS as usize + 1)
+                });
+                let index = elapsed_ms.floor() as usize;
+                let fraction = elapsed_ms - index as f32;
+                CURVE[index] + (CURVE[index + 1] - CURVE[index]) * fraction
+            }
+            Self::Fade => elapsed_ms / self.duration(),
+        }
+    }
+}
+
+/// A track's generation is owned by its surface; a retarget reads the last
+/// published ratio, and a pending frame from the old target cannot write it.
+#[derive(Clone, Default)]
+pub(crate) struct TrackTween(Rc<Cell<u64>>);
+
+impl TrackTween {
+    fn cancel(&self) -> u64 {
+        let next = self.0.get().wrapping_add(1);
+        self.0.set(next);
+        next
+    }
+
+    pub(crate) fn set_now(&self, value: Signal<f32>, target: f32) {
+        self.cancel();
+        value.set(target.clamp(0.0, 1.0));
+    }
+
+    pub(crate) fn to(&self, owner: Owner, value: Signal<f32>, target: f32, curve: TrackCurve) {
+        let generation = self.cancel();
+        let from = value.get_untracked();
+        if (!matches!(curve, TrackCurve::Fade) && motion::reduced_motion()) || from == target {
+            value.set(target);
+            return;
+        }
+        TrackFrames {
+            owner,
+            tween: self.clone(),
+            generation,
+            value,
+            from,
+            target,
+            curve,
+            start: nsh_core::time::now(),
+        }
+        .next();
+    }
+}
+
+struct TrackFrames {
+    owner: Owner,
+    tween: TrackTween,
+    generation: u64,
+    value: Signal<f32>,
+    from: f32,
+    target: f32,
+    curve: TrackCurve,
+    start: nsh_core::time::Instant,
+}
+
+impl TrackFrames {
+    fn next(self) {
+        let owner = self.owner;
+        owner.run(|| {
+            request_animation_frame(move |at| {
+                if self.tween.0.get() != self.generation {
+                    return;
+                }
+                let elapsed = at.saturating_duration_since(self.start).as_secs_f32() * 1000.0;
+                if elapsed >= self.curve.duration() {
+                    self.value.set(self.target);
+                } else {
+                    let progress = self.curve.progress(elapsed).clamp(0.0, 1.0);
+                    self.value
+                        .set(self.from + (self.target - self.from) * progress);
+                    self.next();
+                }
+            });
+        });
+    }
 }
 
 /// Checkpoint timing for one dirty tab.
@@ -839,6 +1010,9 @@ impl AppState {
             entries: signal(Vec::new()),
             tabs: signal(Vec::new()),
             active: signal(None),
+            sidebar_open: signal(settings.sidebar_expanded),
+            sidebar_overlay: signal(false),
+            view_track: signal(chosen_pane.view().stop()),
             status: signal(status),
             status_generation: signal(0_u64),
             status_held: signal(notice.is_some()),
@@ -909,6 +1083,8 @@ impl AppState {
             review_selection: Rc::new(Cell::new(None)),
             source_editor: Rc::new(Cell::new(None)),
             document_view: Rc::new(Cell::new(None)),
+            reading_view: Rc::new(Cell::new(None)),
+            pending_editor_focus: Rc::new(Cell::new(None)),
             review_in_flight: Rc::new(RefCell::new(None)),
             review_binding: Rc::new(RefCell::new(None)),
             review_views: Rc::new(RefCell::new(HashMap::new())),
@@ -928,15 +1104,19 @@ impl AppState {
             recovery_tracks: Rc::new(RefCell::new(HashMap::new())),
             quit_discarded: Rc::new(Cell::new(false)),
             chosen_pane: Rc::new(Cell::new(chosen_pane)),
+            chosen_web: Rc::new(Cell::new(chosen_pane.web())),
+            view_tween: TrackTween::default(),
             guard_view: Rc::new(Cell::new(None)),
             compare_view: Rc::new(Cell::new(None)),
             palette_view: Rc::new(Cell::new(None)),
             settings_scroll_offset: Rc::new(Cell::new(0.0)),
             folder_request: Rc::new(Cell::new(0)),
+            folder_refresh_request: Rc::new(Cell::new(0)),
             #[cfg(test)]
             focus_last: signal(None),
             next_id: Rc::new(Cell::new(1)),
         };
+        state.observe_view_stop();
         state.record_first_launch();
         state
     }
@@ -1369,11 +1549,7 @@ impl AppState {
         self.spawn_task(async move {
             let scanned = blocking({
                 let path = path.clone();
-                move || {
-                    #[cfg(any(test, feature = "test-vault"))]
-                    crate::test_vault::wait_for_read(&path);
-                    tree::read_dir_deep(&path, 4)
-                }
+                move || scan_workspace_entries(&path)
             })
             .await;
             if state.folder_request.get() != request {
@@ -1384,9 +1560,7 @@ impl AppState {
                 return;
             }
             match scanned {
-                Ok(Ok(nodes)) => {
-                    let mut entries = Vec::new();
-                    flatten(&nodes, 0, &mut entries);
+                Ok(Ok(entries)) => {
                     state.root.set(Some(path.clone()));
                     state.entries.set(entries);
                     state.reset_context();
@@ -1398,6 +1572,39 @@ impl AppState {
                 }
                 Ok(Err(error)) => state.notify_failure(crate::i18n::Key::OpenFolderFailed, &error),
                 Err(error) => state.notify_failure(crate::i18n::Key::OpenFolderFailed, &error),
+            }
+        });
+    }
+
+    /// Save As changes the inventory, not the workspace or its Context.
+    fn refresh_workspace_entries(&self, saved: &Path) {
+        let Some(root) = self
+            .root
+            .get_untracked()
+            .filter(|root| saved.starts_with(root))
+        else {
+            return;
+        };
+        let workspace_request = self.folder_request.get();
+        let refresh = self.folder_refresh_request.get().wrapping_add(1);
+        self.folder_refresh_request.set(refresh);
+        let state = self.clone();
+        self.spawn_task(async move {
+            let scanned = blocking({
+                let root = root.clone();
+                move || scan_workspace_entries(&root)
+            })
+            .await;
+            // A newer refresh wins, but a refresh never supersedes a folder
+            // open (including one already in flight when Save As finished).
+            if state.folder_request.get() == workspace_request
+                && state.folder_refresh_request.get() == refresh
+                && state
+                    .root
+                    .with_untracked(|current| current.as_ref() == Some(&root))
+                && let Ok(Ok(entries)) = scanned
+            {
+                state.entries.set(entries);
             }
         });
     }
@@ -1431,38 +1638,11 @@ impl AppState {
         });
     }
 
-    /// Whether this tab holds live Review or Revision work: a request out for
-    /// it, the answer bound to it, or the Revision a Review prepared. The
-    /// work travels with the tab, not with what is on screen — switching tabs
-    /// does not move it, and replacing the tab would drop it.
-    pub fn holds_live_model_output(&self, id: u64) -> bool {
-        let owns = |origin: &Option<ReviewOrigin>| origin.is_some_and(|origin| origin.tab_id == id);
-        let shown = self.review_views.borrow().contains_key(&id);
-        let binding = self.review_bindings.borrow().get(&id).copied();
-        let answer = shown
-            && binding.is_some_and(|binding| {
-                binding.tab_id == id
-                    // The same test `note_edit` uses to call a review stale:
-                    // the text has not moved on since the model read it.
-                    && self
-                        .tabs
-                        .get()
-                        .iter()
-                        .find(|tab| tab.id == id)
-                        .is_some_and(|tab| tab.revision.get() == binding.snapshot.revision)
-            });
-        let revision_work = self
-            .revision_sessions
-            .borrow()
-            .get(&id)
-            .is_some_and(|session| session.context.is_some())
-            || (self.active.get() == Some(id)
-                && (!self.revision_hunks.get().is_empty()
-                    || !self.revision_questions.get().is_empty()));
-        owns(&self.review_origin.borrow())
-            || owns(&self.review_in_flight.borrow())
-            || answer
-            || revision_work
+    pub(crate) fn outside_folder(&self, tab: &Tab) -> bool {
+        tab.untitled
+            || self
+                .root
+                .with(|root| root.as_ref().is_none_or(|root| !tab.path.starts_with(root)))
     }
 
     /// Start an empty document that does not have a source file yet.
@@ -1545,6 +1725,7 @@ impl AppState {
                 dirty: signal(dirty),
                 revision: signal(0),
                 pane: signal(self.chosen_pane.get()),
+                web_preference: signal(self.chosen_web.get()),
                 conflict: signal(false),
                 untitled: true,
                 recovery_key,
@@ -1589,6 +1770,7 @@ impl AppState {
                 dirty: signal(dirty),
                 revision: signal(0),
                 pane: signal(self.chosen_pane.get()),
+                web_preference: signal(self.chosen_web.get()),
                 conflict: signal(false),
                 untitled: false,
                 recovery_key,
@@ -1614,13 +1796,15 @@ impl AppState {
 
     pub fn active_tab(&self) -> Option<Tab> {
         let active = self.active.get()?;
-        self.tabs.get().iter().find(|tab| tab.id == active).cloned()
+        self.tabs
+            .with(|tabs| tabs.iter().find(|tab| tab.id == active).cloned())
     }
 
     pub fn set_active(&self, id: u64) {
         let previous = self.active.get();
         let changed = previous != Some(id);
         if changed {
+            self.pending_editor_focus.set(None);
             self.reset_context();
         }
         if changed && let Some(previous) = previous {
@@ -2756,6 +2940,9 @@ impl AppState {
     }
 
     fn close_tab_now(&self, id: u64) {
+        if self.pending_editor_focus.get() == Some(id) {
+            self.pending_editor_focus.set(None);
+        }
         // The tab's live model work goes with it: the cancel frees the
         // app-wide Review and Revision slots for the remaining tabs.
         self.cancel_review_owned_by(id);
@@ -2897,6 +3084,7 @@ impl AppState {
                     Ok(loaded) => {
                         self.close_tab_now(tab.id);
                         let new_id = self.add_tab(loaded);
+                        self.refresh_workspace_entries(&path);
                         self.record_usage(UsageEvent::ArtifactSaved);
                         SaveAsOutcome::Saved(new_id)
                     }
@@ -2919,9 +3107,27 @@ impl AppState {
     }
 
     pub fn set_pane(&self, id: u64, pane: Pane) {
-        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id) {
+        if let Some(tab) = self
+            .tabs
+            .with(|tabs| tabs.iter().find(|tab| tab.id == id).cloned())
+        {
+            if pane.view() == View::Preview
+                && pane.web() != tab.pane.get_untracked().web()
+                && self.active.get_untracked() == Some(id)
+            {
+                // This renderer is about to be replaced; don't send focus
+                // to its still-mounted outgoing node in this commit.
+                self.reading_view.set(None);
+            }
+            let web = if pane.view() == View::Edit {
+                tab.web_compat()
+            } else {
+                pane.web()
+            };
+            tab.web_preference.set(web);
             tab.pane.set(pane);
             self.chosen_pane.set(pane);
+            self.chosen_web.set(web);
             // The lib-test binary shares one settings dir; a pane choice must
             // not follow the next test's state into a different pane.
             #[cfg(not(test))]
@@ -2932,6 +3138,91 @@ impl AppState {
                     self.save_settings_with(&self.settings.get(), SettingsData::try_save_general);
             }
         }
+    }
+
+    pub fn set_sidebar_open(&self, open: bool) {
+        self.sidebar_open.set(open);
+        self.settings
+            .update(|settings| settings.sidebar_expanded = open);
+        // Tests observe the same setting without writing to the shared test directory.
+        #[cfg(not(test))]
+        let _ = self.save_settings_with(&self.settings.get(), SettingsData::try_save_general);
+    }
+
+    pub(crate) fn toggle_sidebar(&self, layout: Layout) {
+        if layout.field_overlays() {
+            self.sidebar_overlay.update(|open| *open = !*open);
+        } else {
+            self.sidebar_overlay.set(false);
+            self.set_sidebar_open(!self.sidebar_open.get());
+        }
+    }
+
+    pub(crate) fn active_view(&self) -> View {
+        self.active_tab()
+            .map_or(View::Edit, |tab| tab.pane.get().view())
+    }
+
+    pub fn cycle_view(&self) {
+        self.set_view(self.active_view().next());
+    }
+
+    pub fn set_web_compat(&self, web: bool) {
+        if let Some(tab) = self.active_tab() {
+            let view = tab.pane.get().view();
+            if view == View::Edit {
+                tab.web_preference.set(web);
+            }
+            self.set_pane(tab.id, Pane::from_view(view, web));
+        }
+    }
+
+    fn set_view(&self, view: View) {
+        if let Some(tab) = self.active_tab() {
+            self.set_pane(tab.id, Pane::from_view(view, tab.web_compat()));
+        }
+    }
+
+    pub fn set_view_track_now(&self, ratio: f32) {
+        self.view_tween.set_now(self.view_track, ratio);
+    }
+
+    pub(crate) fn snap_view_track(&self) {
+        let ratio = self.view_track.get_untracked();
+        let view = if ratio <= 0.25 {
+            View::Preview
+        } else if ratio <= 0.75 {
+            View::Split
+        } else {
+            View::Edit
+        };
+        if self.active_view() == view {
+            self.set_view_stop(view);
+        } else {
+            self.set_view(view);
+        }
+    }
+
+    fn set_view_stop(&self, view: View) {
+        self.view_tween
+            .to(self.owner, self.view_track, view.stop(), TrackCurve::Camera);
+    }
+
+    fn observe_view_stop(&self) {
+        let state = self.clone();
+        let previous = Cell::new(None);
+        effect(move || {
+            let tab = state.active_tab();
+            let id = tab.as_ref().map(|tab| tab.id);
+            let view = tab.map_or(View::Edit, |tab| tab.pane.get().view());
+            let reduced = motion::reduced_motion();
+            let before = previous.replace(Some((id, view, reduced)));
+            if before.is_none_or(|(old_id, _, _)| old_id != id) || reduced {
+                state.set_view_track_now(view.stop());
+            } else if before.is_some_and(|(_, old_view, _)| old_view != view) {
+                state.set_view_stop(view);
+            }
+        });
     }
 
     /// Saves the active document through the core's guarded commit. A conflict
@@ -3229,6 +3520,10 @@ impl AppState {
         self.document_view.set(Some((tab, view)));
     }
 
+    pub(crate) fn attach_reading_view(&self, tab: u64, view: ElementRef) {
+        self.reading_view.set(Some((tab, view)));
+    }
+
     pub fn attach_guard_view(&self, view: ElementRef) {
         self.guard_view.set(Some(view));
     }
@@ -3244,48 +3539,28 @@ impl AppState {
     /// The topmost open layer, else the active pane's editor or document
     /// view; the pane never switches. The caret never moves.
     pub fn focus_editor(&self) {
+        self.pending_editor_focus.set(None);
         let Some(active) = self.active.get() else {
             return;
         };
         if self.focus_open_layer() {
             return;
         }
-        if self
-            .active_tab()
-            .is_some_and(|tab| tab.pane.get().mounts_source())
-        {
-            // The new tab's editor mounts in a later commit: focus it when
-            // it is there, never the container it replaced.
-            self.retry_editor_focus(active, Self::FOCUS_RETRY_FRAMES);
-        } else {
-            // The Preview and Web panes mount their document the same way.
-            self.retry_document_focus(active, Self::FOCUS_RETRY_FRAMES);
-        }
+        // A mount can complete before the next retry or after the last one.
+        // Make it aware of the request as soon as the target is missing.
+        self.pending_editor_focus.set(Some(active));
+        self.retry_document_focus(active, Self::FOCUS_RETRY_FRAMES);
     }
 
-    /// Frames a pending editor focus waits for a tab switch to mount it.
+    /// Frames for the eager retry; a late mount can still take focus.
     pub const FOCUS_RETRY_FRAMES: u8 = 6;
 
-    fn retry_editor_focus(&self, active: u64, frames_left: u8) {
-        if self.focus_mounted_editor(active) {
-            return;
+    pub(crate) fn focus_on_document_mount(&self, tab: u64) {
+        if self.pending_editor_focus.get() == Some(tab) && self.active.get_untracked() == Some(tab)
+        {
+            self.pending_editor_focus.set(None);
+            self.focus_editor();
         }
-        if frames_left == 0 {
-            self.focus_document_view();
-            return;
-        }
-        let state = self.clone();
-        // The retry belongs to the app, not to the handler that asked for
-        // the focus: a key binding in a card that this action closes would
-        // take the pending frame down with it.
-        self.owned(|| {
-            request_animation_frame(move |_| {
-                if state.active.get() != Some(active) || state.focus_open_layer() {
-                    return;
-                }
-                state.retry_editor_focus(active, frames_left - 1);
-            });
-        });
     }
 
     fn focus_open_layer(&self) -> bool {
@@ -3341,16 +3616,34 @@ impl AppState {
     }
 
     fn retry_document_focus(&self, active: u64, frames_left: u8) {
-        if self.focus_mounted_document(active) {
+        let reading = crate::ui::shell::shows_full_preview(self);
+        let focused = if reading {
+            self.focus_mounted_document(active, &self.reading_view)
+        } else {
+            self.focus_mounted_editor(active)
+        };
+        if focused {
+            self.pending_editor_focus.set(None);
             return;
         }
         if frames_left == 0 {
+            if !reading {
+                self.focus_mounted_document(active, &self.document_view);
+            }
             return;
         }
+        // A tab or a dock change mounts its replacement in a later commit.
+        // Keep the retry under the app, not the closing layer's binding.
         let state = self.clone();
         self.owner.run(|| {
             request_animation_frame(move |_| {
-                if state.active.get() != Some(active) || state.focus_open_layer() {
+                if state.pending_editor_focus.get() != Some(active)
+                    || state.active.get() != Some(active)
+                {
+                    return;
+                }
+                if state.focus_open_layer() {
+                    state.pending_editor_focus.set(None);
                     return;
                 }
                 state.retry_document_focus(active, frames_left - 1);
@@ -3358,21 +3651,18 @@ impl AppState {
         });
     }
 
-    fn focus_document_view(&self) -> bool {
-        let Some(active) = self.active.get_untracked() else {
-            return false;
-        };
-        self.focus_mounted_document(active)
-    }
-
-    /// Focus the document view only when it belongs to `active`: the
-    /// subtree is keyed by tab, so the ref a switch replaces must not take
-    /// the keyboard.
-    fn focus_mounted_document(&self, active: u64) -> bool {
+    fn focus_mounted_document(
+        &self,
+        active: u64,
+        target: &Cell<Option<(u64, ElementRef)>>,
+    ) -> bool {
         if self.editor_focus_blocked() {
             return false;
         }
-        let Some((_, view)) = self.document_view.get().filter(|(tab, _)| *tab == active) else {
+        let Some((_, view)) = target
+            .get()
+            .filter(|(tab, view)| *tab == active && view.node().is_some())
+        else {
             return false;
         };
         view.focus();
@@ -3414,10 +3704,12 @@ impl AppState {
     }
 
     /// The non-empty primary selection the mounted source editor of `tab`
-    /// shows now, as byte offsets into `text`. No editor on screen for the
-    /// tab (another pane, another tab), or an editor that does not hold
-    /// `text`, selects nothing.
+    /// shows now, as byte offsets into `text`. Preview hides the selection
+    /// without destroying it, and an editor for other text selects nothing.
     fn selection_in(&self, tab: &Tab, text: &str) -> Option<(usize, usize)> {
+        if tab.pane.get_untracked().view() == View::Preview {
+            return None;
+        }
         let (owner, editor) = self.source_editor.get()?;
         let api = editor.api::<EditorApi>().filter(|_| owner == tab.id)?;
         // The editor holds the text with its line breaks as `\n`.
@@ -4894,7 +5186,7 @@ impl AppState {
     }
 
     /// Escape closes at most one layer, in the contract's fixed order — the
-    /// title menu, the guard or consent card, the palette, Settings, a
+    /// title menu, the guard or consent card, the palette, sidebar, Settings, a
     /// request in flight, the disk comparison. Every Escape binding runs
     /// this, so which layer closes never depends on which binding the
     /// keymap offered the key to. Returns whether one closed.
@@ -4924,6 +5216,11 @@ impl AppState {
         }
         if self.palette_open.get() {
             self.close_palette();
+            return true;
+        }
+        if self.sidebar_overlay.get() {
+            self.sidebar_overlay.set(false);
+            self.focus_editor();
             return true;
         }
         if self.settings_open.get() {
@@ -5482,6 +5779,15 @@ fn untitled_number(title: &str) -> Option<u64> {
     title.rsplit(' ').next()?.parse().ok()
 }
 
+fn scan_workspace_entries(path: &Path) -> std::io::Result<Vec<Entry>> {
+    #[cfg(any(test, feature = "test-vault"))]
+    crate::test_vault::wait_for_read(path);
+    let nodes = tree::read_dir_deep(path, 4)?;
+    let mut entries = Vec::new();
+    flatten(&nodes, 0, &mut entries);
+    Ok(entries)
+}
+
 fn flatten(nodes: &[FileNode], depth: usize, out: &mut Vec<Entry>) {
     for node in nodes {
         out.push(Entry {
@@ -6033,6 +6339,61 @@ mod tests {
             .expect("try to return the focus behind the card");
         app.wait_for("text:focused: false")
             .expect("the document view stayed out of the card's way");
+    }
+
+    #[component]
+    fn LateEditorFocusProbe() -> impl IntoElement {
+        let state = AppState::with_vault(CredentialVault::with_test_store(Arc::new(NoStore)));
+        // new_document requests focus before its source view can mount.
+        state.new_document();
+        let mounted = signal(false);
+        view()
+            .flex_col()
+            .w(px(500.0))
+            .h(px(400.0))
+            .child(
+                view()
+                    .test_id("mount-late-editor")
+                    .h(px(40.0))
+                    .w_full()
+                    .focusable(false)
+                    .on_press(move || mounted.set(true)),
+            )
+            .child(when(
+                move || mounted.get(),
+                move || crate::ui::document::column(state.clone()),
+            ))
+    }
+
+    #[test]
+    fn a_source_editor_that_mounts_after_the_retry_budget_takes_requested_focus() {
+        let mut config =
+            nsh_engine::EngineConfig::new(nsh_testing::windowed_root::<LateEditorFocusProbe>());
+        config.clock = nsh_core::time::Clock::manual(SystemTime::UNIX_EPOCH);
+        config.environment.os = nsh_core::platform::Os::Windows;
+        let mut app = nsh_testing::Headless::start(config).expect("start the late-mount probe");
+        app.wait_for("id:mount-late-editor")
+            .expect("the editor is still gated");
+        app.run_for(Duration::from_millis(
+            32 * (u64::from(AppState::FOCUS_RETRY_FRAMES) + 2),
+        ))
+        .expect("let the frame retries expire before the mount");
+        assert!(!app.screen().matches("id:source-editor").unwrap());
+
+        app.press("id:mount-late-editor")
+            .expect("release the mount, without focusing a control");
+        let editor = "label:Markdown source";
+        app.wait_for(editor).expect("the editor is mounted");
+        app.press_key("x")
+            .expect("type without clicking the editor");
+        assert_eq!(
+            app.screen()
+                .input_text(editor)
+                .expect("read the mounted editor")
+                .as_deref(),
+            Some("x"),
+            "the late mount must take the keyboard after frame retries expire"
+        );
     }
 
     /// The whole Review session a new preparation parks and a cancel puts

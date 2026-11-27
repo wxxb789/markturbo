@@ -4,8 +4,8 @@ The matrix is eleven product states at the configured minimum, default and wide
 DIP viewports in the two effective color modes and both interface languages.
 Each cell launches the packaged app on an isolated profile under the system
 temporary directory and drives the Afterglow UI with the native acceptance
-harness's own UIA steps (`runtime.NativeHarness`): the title menu's
-`title-menu-*` rows, controls found by AutomationId, typed input, and a real
+harness's own UIA steps (`runtime.NativeHarness`): the title view button, menu
+rows, controls found by AutomationId, typed input, and a real
 pointer hold on `consent-send`. Every cell proves it
 reached its named state by the state's own controls before it captures; a cell
 that cannot fails with a reason code prefixed by its state (for example
@@ -79,9 +79,9 @@ from .goal07 import (
     REVIEW_ANSWER_INPUT_AUTOMATION_ID,
 )
 from .runtime import (
-    MENU_EDIT_AUTOMATION_ID,
     MENU_SAVE_AUTOMATION_ID,
     MENU_WEB_AUTOMATION_ID,
+    VIEW_BUTTON_AUTOMATION_ID,
     HarnessBlocked,
     HarnessFailure,
     NativeHarness,
@@ -161,7 +161,6 @@ ACTIONABLE_ROLES = frozenset(
 WELCOME_NEW_FILE_AUTOMATION_ID = "welcome-new-file"
 TITLE_FILE_AUTOMATION_ID = "title-file"
 TITLE_REVIEW_AUTOMATION_ID = "title-review"
-MENU_SPLIT_AUTOMATION_ID = "title-menu-split"
 MENU_CONTEXT_AUTOMATION_ID = "title-menu-context"
 MENU_SETTINGS_AUTOMATION_ID = "title-menu-settings"
 WEB_VIEW_AUTOMATION_ID = "web-view"
@@ -982,9 +981,9 @@ class VisualHarness(NativeHarness):
         """Type `text` at the document's end, the way a user does, until the
         document shows it. The clipboard is never touched."""
         self.focus_editor(app)
-        # A layout switch just rebuilt the editor: its key bindings reach the
-        # window with a later frame, and Ctrl must be up before the text, or
-        # the caret stays put and the first character is lost.
+        # The editor's key bindings reach the window on a later frame after
+        # focus. Ctrl must also be up before typing, or the caret stays put
+        # and the first character is lost.
         self.win32.wait_frames()
         self.win32.send_shortcut(app.hwnd, VK_END)
         self.win32.wait_frames()
@@ -998,7 +997,7 @@ class VisualHarness(NativeHarness):
 
     def source_only(self, app: RunningApp) -> None:
         """The Edit layout: the editor, and no native preview beside it."""
-        self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
+        self.view_command(app, "Edit")
         self.editor_control(app)
         wait_until(
             lambda: not self.name_present(app, PLAN_HEADING, "Text"),
@@ -1042,23 +1041,27 @@ class VisualHarness(NativeHarness):
         return [TITLE_FILE_AUTOMATION_ID, "editor"]
 
     def ordinary_edit(self, app: RunningApp, *_: Any) -> list[str]:
-        self.open_document(app)
+        self.wait_title(app, PLAN_NAME, "DOCUMENT_NOT_OPEN")
         self.source_only(app)
         self.type_at_end(app, ORDINARY_EDIT_TEXT)
-        return [TITLE_FILE_AUTOMATION_ID, MENU_EDIT_AUTOMATION_ID, "editor"]
+        return [TITLE_FILE_AUTOMATION_ID, VIEW_BUTTON_AUTOMATION_ID, "editor"]
 
     def split(self, app: RunningApp, *_: Any) -> list[str]:
-        self.open_document(app)
-        self.menu_command(app, MENU_SPLIT_AUTOMATION_ID)
+        self.wait_title(app, PLAN_NAME, "DOCUMENT_NOT_OPEN")
+        self.view_command(app, "Split")
         self.editor_control(app)
         self.wait_text(app, PLAN_HEADING, "PREVIEW_MISSING")
-        return [TITLE_FILE_AUTOMATION_ID, MENU_SPLIT_AUTOMATION_ID, "editor", "preview"]
+        return [TITLE_FILE_AUTOMATION_ID, VIEW_BUTTON_AUTOMATION_ID, "editor", "preview"]
 
     def web_preview(self, app: RunningApp, *_: Any) -> list[str]:
-        self.open_document(app)
-        self.menu_command(app, MENU_WEB_AUTOMATION_ID)
-        self.require(app, WEB_VIEW_AUTOMATION_ID, "WEB_VIEW_MISSING")
-        return [TITLE_FILE_AUTOMATION_ID, MENU_WEB_AUTOMATION_ID, WEB_VIEW_AUTOMATION_ID]
+        self.wait_title(app, PLAN_NAME, "DOCUMENT_NOT_OPEN")
+        self.set_compatibility(app, True)
+        self.view_command(app, "Preview")
+        self.require(app, WEB_VIEW_AUTOMATION_ID, "WEB_VIEW_MISSING", "Group")
+        return [
+            TITLE_FILE_AUTOMATION_ID, MENU_WEB_AUTOMATION_ID, VIEW_BUTTON_AUTOMATION_ID,
+            WEB_VIEW_AUTOMATION_ID,
+        ]
 
     def context(self, app: RunningApp, cell: Cell, *_: Any) -> list[str]:
         self.open_document(app)

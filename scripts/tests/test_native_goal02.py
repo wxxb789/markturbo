@@ -358,8 +358,8 @@ class FakeDesk:
             self.known = self.editor = self.document.read_bytes()
             self.tabs += 1
 
-    def close_tab_by_pointer(self, _app: Any) -> None:
-        self.events.append(("rail close",))
+    def close_tab_by_pointer(self, _app: Any, title: str) -> None:
+        self.events.append(("sidebar close", title))
         self.guard = "tab"
 
     def click_lifecycle_decision(self, app: Any, name: str) -> None:
@@ -441,7 +441,7 @@ class ScenarioTests(unittest.TestCase):
                 ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
                 ("key", runtime.VK_RETURN),
                 ("edit",),
-                ("rail close",),
+                ("sidebar close", "guarded.md"),
                 ("guard", "Cancel"),
                 ("menu save",),
                 ("edit",),

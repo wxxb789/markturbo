@@ -164,8 +164,17 @@ How nsh 0.7.1 exposes views to UIA, and so how the harnesses select them:
   enumerated by it and told apart by their Name.
 - Title-menu rows (`title-menu-*`) are reached by invoking `title-settings`
   first, so a command can move between the title row and that menu without a
-  selector change. Save, Save As, Quit, Review selection and the Edit/Web
-  modes go through it.
+  selector change. Save, Save As, Quit, Review selection and the Web
+  compatibility switch (`title-menu-web`, a UIA Button with the Toggle
+  pattern) go through it; the switch changes the Preview renderer without
+  moving the view.
+- The three document views are one Button on the title row, `title-view`,
+  whose Name reads `View: {current} — switch to {next}`; each press advances
+  Edit → Split → Preview → Edit, so a command reads the Name and presses until
+  it reads the view it wants (at most three presses). The sidebar's panel is
+  opened with `Ctrl+B`; its rows carry the file names, each open tab's row
+  carries a `rail-close` Button named `Close {title}`, and the collapsed
+  strip's `rail-file-row` Buttons are named by tab title.
 - The editor's accessible element is the `Markdown source` IME input; its UIA
   Value is not the document. The harness reads the document with Ctrl+A, Ctrl+C
   sent as one input batch, waits for the clipboard sequence number to advance
@@ -191,8 +200,11 @@ How nsh 0.7.1 exposes views to UIA, and so how the harnesses select them:
   cancels fails the case. Test-id'd,
   in-window confirmation cards would let a harness select the button directly.
 
-The harnesses do not scan Rust source; a renamed selector fails the live run
-with that control's UIA timeout or contract-mismatch code.
+The harness unit tests hold one source-contract check that the canonical
+selectors (`rail-file-row`, `rail-close`, `sidebar-panel`, `sidebar-file`,
+`sidebar-outside-row`, `title-view`, `title-menu-web`) still appear under
+`crates/mt-app/src/ui/`. The live run itself scans no Rust source; a renamed
+selector fails there with that control's UIA timeout or contract-mismatch code.
 
 What each goal runs (`mt.py accept all` runs all four). Every phase of a
 merged session has its own observation-key prefix and failure-code prefix
@@ -214,8 +226,9 @@ the app only where the behaviour itself needs a restart.
 - Goal 02, one case `lifecycle-session`, two launches (the interruption is
   the only restart). First launch: `EXTERNAL_MODIFICATION` (a same-length
   rewrite with the loaded mtime is refused, then Keep mine and the Overwrite
-  alert write the exact bytes), `TAB_CLOSE` (the rail close raises the guard;
-  Cancel keeps the file; the following Save writes the exact edited bytes) and
+  alert write the exact bytes), `TAB_CLOSE` (with the sidebar panel open, the
+  open tab's row close raises the guard; Cancel keeps the file; the following
+  Save writes the exact edited bytes) and
   `CHECKPOINT` (an encrypted canonical record within 10 000 ms, no sentinel
   leak, then TerminateProcess). Relaunch on the workspace folder: `RESTORE`
   (Restore brings back the exact checkpointed bytes), `KEYBOARD_CLOSE`

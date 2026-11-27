@@ -1322,11 +1322,12 @@ fn listed_name(tab: &Tab, open: &[Tab]) -> String {
 fn field_overlay_inset(state: &AppState) -> f32 {
     let width = shell::client_width_now();
     let layout = tokens::Layout::of(width);
-    if !layout.field_overlays() || shell::surface(state) == shell::FieldSurface::None {
+    if !layout.field_overlays() || !shell::field_overlays_source(state) {
         return 0.0;
     }
-    let content_right = tokens::RAIL_W + tokens::COLUMN_GAP + layout.measure();
-    (content_right - layout.field_left(width)).max(0.0)
+    let sidebar = shell::sidebar_width_now();
+    let content_right = sidebar + tokens::COLUMN_GAP + layout.measure();
+    (content_right - layout.field_left_at(width, sidebar)).max(0.0)
 }
 
 /// [`documents_line`]'s shape for a list of names.
@@ -1472,13 +1473,17 @@ pub(crate) fn status_line_at(
     let owner = state.status_surface;
     let undo_state = state;
     let undo_message = message;
+    let line = view()
+        .w_full()
+        .h(px(tokens::TYPE_UI_LINE))
+        .bind_opacity(&presence.opacity);
+    let line = if reduced_motion() {
+        line
+    } else {
+        line.bind_translate_y(&presence.rise)
+    };
     view().test_id("status").w_full().pt(px(SPACE_3)).child(
-        view()
-            .w_full()
-            .h(px(tokens::TYPE_UI_LINE))
-            .bind_opacity(&presence.opacity)
-            .bind_translate_y(&presence.rise)
-            .flex_row()
+        line.flex_row()
             .justify_end()
             .items_center()
             .gap(px(SPACE_2))
@@ -1583,7 +1588,9 @@ fn status_undo(
 fn undo_max_width(surface: crate::state::StatusSurface) -> f32 {
     let width = shell::client_width_now();
     if surface == crate::state::StatusSurface::Editor {
-        tokens::Layout::of(width).column_width(width)
+        tokens::Layout::of(width)
+            .column_width(width)
+            .min(shell::stage_width())
     } else {
         width
     }

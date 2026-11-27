@@ -78,8 +78,10 @@ an upgrade path.
    sample is available: the embedded copy in release builds, or the
    repository's `sample/` folder in debug builds). Recent folders and files are
    listed below; one that no longer exists is marked **Missing**. Once a folder
-   is open, the welcome gives way to the workspace's home, which lists its
-   first files; press `Ctrl+P` to find any file. There is no file tree.
+   is open, click a file in the sidebar to open it. Press `Ctrl+B` to show or
+   hide the sidebar; MarkTurbo remembers the choice. Below 1040 px the
+   sidebar collapses to a strip, and `Ctrl+B` opens it over the editor without
+   moving the document. Press `Ctrl+P` to find any file.
 2. Open **⚙ → Settings**. Under **Endpoint**, choose a **Provider**, and
    optionally a **Base URL** and **Model**. Under **Credential**, enter the
    **API key** and choose **Store securely** or **Use for session**. Do not
@@ -186,11 +188,13 @@ There are no screenshots of the current UI in the repository.
 ## What it does
 
 - Open a folder as a workspace, or start from **New file** or **Paste** without
-  creating a file first. Open files appear as dots in the left rail; find files
-  with `Ctrl+P` and search contents with `Ctrl+Shift+F`.
-- Read and edit in **Edit**, **Preview**, or **Split** (the default for each
-  tab), or render through the WebView with **Web preview** and **Split · Web**;
-  the ⚙ menu switches between all five.
+  creating a file first. The sidebar lists the workspace tree and open files
+  outside it (plus any open file the tree does not list yet); open files appear
+  as ticks when the sidebar is collapsed. Find files with `Ctrl+P` and search
+  contents with `Ctrl+Shift+F`.
+- Click the titlebar's view button or press `Ctrl+E` to cycle **Edit → Split
+  → Preview**. The ⚙ menu's **Compatibility preview** toggle uses the WebView
+  for Preview and Split without adding another step to the cycle.
 - Render Mermaid, D2, PlantUML, and LaTeX math from document source.
 - Show the Effective Agent Context chain for the active file and the
   workspace's Skills, and include selected sources in Review.
@@ -406,7 +410,7 @@ Settings outranks its matching environment variable.
 
 ## Security
 
-The web layouts (**Web preview**, **Split · Web**) use one policy for Markdown,
+With **Compatibility preview** on, Preview and Split use one policy for Markdown,
 MDX and HTML. Script execution follows each source grammar for fidelity: Markdown
 runs only scripts CommonMark keeps as raw HTML (a type-1 HTML block, which may
 span blank lines, or an inline `<script>` in a paragraph without a blank line),
@@ -451,8 +455,10 @@ link-open check is
 | Anywhere | mod+`S` | Save |
 | Anywhere | mod+`Shift+S` | Save As |
 | Anywhere | mod+`P` / mod+`Shift+F` | Find a file / search files |
+| Anywhere | mod+`B` | Toggle the sidebar |
+| Document | mod+`E` | Cycle Edit → Split → Preview |
 | Anywhere | mod+`W` | Close the tab |
-| Anywhere | `Esc` | Close a menu or palette |
+| Anywhere | `Esc` | Close a menu, palette, or sidebar overlay |
 | Review result | `J` / `K` | Next / previous finding |
 | Review | `Esc` | Cancel a running review, or close |
 | Send card | hold `Ctrl+Enter` / `Esc` | Send / cancel |

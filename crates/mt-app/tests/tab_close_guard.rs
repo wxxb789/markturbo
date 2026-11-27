@@ -1,9 +1,8 @@
 //! A dirty tab's own close goes through the 'Close without saving?' guard,
 //! from the pointer and from the keyboard.
 //!
-//! The rail's close button lies outside the resting strip's clip: only the
-//! pointer over the strip widens it far enough to show (and reach) the
-//! button. Its guard's Cancel keeps the tab, the text and the dirty mark.
+//! The panel exposes the close button, while the collapsed strip only
+//! switches tabs. The guard's Cancel keeps the tab, text and dirty mark.
 //! `Ctrl+W` from the focused source editor raises the same guard, whose
 //! Don't save closes the tab and leaves the file as it was.
 
@@ -35,12 +34,11 @@ fn bounds(app: &Headless, id: &str) -> nsh_core::Bounds<Points> {
     node(app, id).bounds
 }
 
-/// Whether the close button lies inside the strip that clips it.
-fn close_is_inside_strip(app: &Headless) -> bool {
-    let strip = bounds(app, "rail-hover");
+/// Whether the close button lies inside the panel's clipping frame.
+fn close_is_inside_panel(app: &Headless) -> bool {
+    let panel = bounds(app, "sidebar-panel-clip");
     let close = bounds(app, "rail-close");
-    close.origin.x >= strip.origin.x
-        && close.origin.x + close.size.width <= strip.origin.x + strip.size.width
+    panel.contains(&close.center())
 }
 
 /// Whether the source editor draws the edited line (typed at the start of
@@ -80,24 +78,47 @@ fn a_dirty_tab_close_is_guarded_from_the_rail_and_from_ctrl_w() {
     app.wait_for("id:title-dirty").expect("dirty mark");
     assert!(editor_shows_edit(&app), "{:?}", app.screen().texts());
 
-    // At rest the strip clips the close button away; the pointer over the
-    // strip widens it over the button.
+    app.press_key("mod+b").expect("collapse the sidebar");
+    app.wait_for_gone("id:sidebar-panel", Duration::from_secs(5))
+        .expect("the panel closes");
     assert!(
-        node(&app, "rail-hover").clips,
-        "the strip clips what lies outside it"
+        !app.screen().matches("id:rail-close").unwrap(),
+        "the strip has no close button"
+    );
+    app.press_key("mod+b").expect("expand the sidebar");
+    app.wait_until("panel expanded", Duration::from_secs(5), |screen| {
+        screen.layout_nodes().iter().any(|node| {
+            node.test_id.as_deref() == Some("sidebar")
+                && node.bounds.size.width.0 == mt_app::ui::tokens::SIDEBAR_W
+        })
+    })
+    .expect("the panel opens");
+    assert!(
+        node(&app, "sidebar-panel-clip").clips,
+        "the panel is clipped to its track"
     );
     assert!(
-        !close_is_inside_strip(&app),
-        "the resting strip shows no close button"
+        close_is_inside_panel(&app),
+        "the tab's close button is in the panel"
     );
-    app.hover("id:rail-hover").expect("hover the rail");
-    app.settle();
-    assert!(
-        close_is_inside_strip(&app),
-        "the widened strip shows the close button"
+    let close_opacity = |app: &Headless| {
+        app.screen()
+            .view_style("id:rail-close")
+            .expect("select the close control's style")
+            .expect("the close control is mounted")
+            .effective_opacity
+    };
+    assert_eq!(
+        close_opacity(&app),
+        0.0,
+        "the close control is hidden at rest"
     );
 
-    // The rail's close raises the guard; Cancel keeps everything.
+    // The panel's close raises the guard; Cancel keeps everything.
+    app.hover("id:sidebar-panel >> role:button[notes.md]")
+        .expect("reveal the close control");
+    app.settle();
+    assert!(close_opacity(&app) > 0.0, "hover reveals the close control");
     app.press("id:rail-close").expect("close the tab");
     app.wait_for("id:guard-cancel")
         .expect("the close raises the guard");
@@ -109,7 +130,7 @@ fn a_dirty_tab_close_is_guarded_from_the_rail_and_from_ctrl_w() {
     app.wait_for("id:title-dirty")
         .expect("Cancel keeps the dirty mark");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         1,
         "Cancel keeps the tab"
     );
@@ -125,7 +146,7 @@ fn a_dirty_tab_close_is_guarded_from_the_rail_and_from_ctrl_w() {
     app.wait_for_gone(EDITOR, Duration::from_secs(5))
         .expect("Don't save closes the tab");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         0,
         "no tab is left"
     );

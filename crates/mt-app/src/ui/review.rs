@@ -2807,7 +2807,7 @@ mod tests {
                     .on_press(move |_: &PressEvent| blur_state.blur_source_editor())
                     .child(prims::rest("Blur the editor")),
             )
-            .child(crate::ui::document::column(state, Language::English))
+            .child(crate::ui::document::column(state))
     }
 
     /// A review that arrives through the field's own result watcher, so the

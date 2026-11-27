@@ -522,9 +522,8 @@ fn a_rejected_base_url_cannot_reach_disk_after_settings_closes() {
     app.wait_for_gone("id:settings-page", Duration::from_secs(5))
         .expect("settings closed");
 
-    app.press("id:title-settings").expect("open the title menu");
-    app.press("id:title-menu-preview")
-        .expect("switch the document view");
+    app.press("id:title-view").expect("choose Split");
+    app.press("id:title-view").expect("choose Preview");
     app.wait_for("id:preview-column")
         .expect("the preview pane is current");
 

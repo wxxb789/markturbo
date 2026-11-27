@@ -47,10 +47,11 @@ fn opening_a_workspace_replaces_the_welcome() {
         .expect("the picked folder replaces the welcome");
     app.wait_for("id:workspace-home")
         .expect("the workspace in the column");
-    app.wait_for("role:button[readme.md]")
-        .expect("the workspace's document, ready to open");
-    app.press("role:button[readme.md]")
-        .expect("open the document");
+    let home_file = "id:workspace-home >> role:button[readme.md]";
+    app.wait_for(home_file)
+        .expect("the workspace home's document, ready to open");
+    app.press(home_file)
+        .expect("open the document from the home");
     app.wait_for("label:Markdown source")
         .expect("the document's editor");
     drop(app);

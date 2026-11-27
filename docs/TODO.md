@@ -170,3 +170,22 @@
     (`FOCUS_RETRY_FRAMES`), not that a key typed at the exact frame the editor appears lands.
   - `reload_edit_race`'s no-notice assertion can still read the screen before a post-marker notice batch.
   - Tighten both only if nsh-testing gains a frame-exact or task-completion hook.
+- [ ] **Goal 22 lane 22-A residuals (implementation review, 2026-11-27).**
+  - Two guards implement one rule: `state.rs::observe_view_stop` snaps the track under reduced motion and
+    `TrackTween::to` does the same, so removing either alone is unobservable (the lane's mutation check had to
+    remove both to redden the reduced-motion acceptance test). Keep one guard when either is refactored.
+  - `scripts/tests/test_native_runtime_uia.py::test_sidebar_and_view_selectors_are_in_the_product_ui` cuts each
+    Rust file at `"\n#[cfg(test)]\nmod tests"` without asserting the marker was found, so a renamed test module
+    would let test-only literals satisfy it. Assert the split produced two parts.
+  - The stage's real width comes from flex layout while its children compute `client_width - sidebar_width`; the
+    two agree today but one source of truth would be better. `Pane::web()` also duplicates `Tab::web_preference`
+    outside Edit, and `chosen_pane`/`chosen_web` mirror each other.
+  - The renderer choice made in Edit is not persisted (`document_pane` stores `Source`), so it is lost across a
+    restart; before this lane a stored `Web`/`SplitWeb` survived only while the last view was not Edit.
+  - Crossing the 1280 px key mid-slide re-keys the shell, so the sidebar lands at its target instead of
+    continuing the slide; accepted (a re-key is not a movement), but noted.
+  - Two quick opens of one path before its read returns can still create two tabs, and the tree's path -> tab
+    map keeps one of them (pre-existing race in the open path).
+  - `document`'s new identity test mounts `document::column` directly, so it cannot catch a shell-level remount,
+    and the old "a remounted editor cuts to the held line" oracle is gone; `shell`'s field-gap test measures the
+    source screen rather than the Review column inside the dock.

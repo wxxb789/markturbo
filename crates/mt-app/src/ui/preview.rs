@@ -1,8 +1,7 @@
 //! Owner lane: document.
 //!
-//! The preview and the web compatibility pane, in the column (Preview / Web)
-//! and in the field (Split puts the preview in the field, SplitWeb the web
-//! pane).
+//! The reading side of the stage: full Preview, a labelled Split, or their
+//! Web compatibility renderer.
 //!
 //! Contract: [`column`] and [`field`] draw the rendered document — the shell
 //! places whichever the pane asks for; [`is_open`] tells the shell whether the
@@ -15,7 +14,7 @@
 //! 884 for both `FONT_UI` and the registered Regular face, 755 for a missing
 //! family, and 727 for DengXian.
 //!
-use std::{sync::LazyLock, time::Duration};
+use std::{cell::Cell, sync::LazyLock, time::Duration};
 
 use mt_core::{
     BlockKind, Document,
@@ -30,7 +29,7 @@ use nsh_core::{
 
 use crate::{
     i18n::{self, Key},
-    state::{AppState, Pane, Tab},
+    state::{AppState, Pane, Tab, View as DocumentView},
     ui::{
         motion, prims,
         tokens::{self, WEIGHT_MEDIUM},
@@ -38,75 +37,100 @@ use crate::{
     web,
 };
 
-/// Whether the field is showing the preview or the web pane (Split, SplitWeb).
+/// Whether the selected view has a reading pane.
 pub fn is_open(state: &AppState) -> bool {
     state
         .active_tab()
-        .is_some_and(|tab| matches!(tab.pane.get(), Pane::Split | Pane::SplitWeb))
+        .is_some_and(|tab| tab.pane.get().view() != DocumentView::Edit)
 }
 
 /// The rendered document, in the column.
 pub fn column(state: AppState, language: Language) -> impl IntoElement {
+    reading_frame(&state, state.active.get_untracked(), "preview-column")
+        .child(rendered(state, language))
+}
+
+fn reading_frame(state: &AppState, tab: Option<u64>, id: &str) -> View {
     let reference = element_ref();
-    if let Some(tab) = state.active_tab() {
-        state.attach_document_view(tab.id, reference);
+    if let Some(tab) = tab {
+        state.attach_reading_view(tab, reference);
     }
+    let state = state.clone();
+    let first_layout = Cell::new(true);
     view()
-        .test_id("preview-column")
+        .test_id(id)
         .element_ref(&reference)
         .focusable(true)
         .flex_1()
         .min_h(px(0.0))
         .h(relative(1.0))
-        .child(rendered(state, language))
+        .on_layout(move |_: &Bounds<Points>| {
+            if first_layout.replace(false)
+                && let Some(tab) = tab
+            {
+                state.focus_on_document_mount(tab);
+            }
+        })
 }
 
-/// The rendered document, in the field, under a quiet label naming the pane.
+/// The split caption moves independently of the reading body. A pane or
+/// layout change keeps the same scroll view or WebView until its renderer or
+/// the tab changes, or the dock stops showing the preview altogether.
 pub fn field(state: AppState, language: Language) -> AnyElement {
-    let pane_state = state.clone();
-    let web_state = state.clone();
-    let preview_state = state.clone();
+    let tabs = state.clone();
+    let last = Cell::new(None);
     view()
-        .test_id("preview-field")
         .flex_1()
         .min_h(px(0.0))
-        .h(relative(1.0))
         .flex_col()
-        .gap(px(tokens::SPACE_3))
-        .child(quiet_label(move || {
-            if pane_state
-                .active_tab()
-                .is_some_and(|tab| matches!(tab.pane.get(), Pane::SplitWeb))
-            {
-                SharedString::from(i18n::t(language, Key::ModeWeb))
-            } else {
-                SharedString::from(i18n::t(language, Key::ModeNative))
-            }
-        }))
-        .child(
-            when(
-                {
-                    let condition_state = web_state.clone();
-                    move || {
-                        condition_state
-                            .active_tab()
-                            .is_some_and(|tab| matches!(tab.pane.get(), Pane::SplitWeb))
-                    }
-                },
-                // Re-key on tab switch so the WebView binds to the new document.
-                move || {
-                    let tabs_state = web_state.clone();
-                    let pane_state = web_state.clone();
-                    each(
-                        move || tabs_state.active_tab().into_iter().collect::<Vec<_>>(),
-                        |tab: &Tab| tab.id,
-                        move |_, _| web(pane_state.clone(), language),
-                    )
-                    .into_element()
-                },
-            )
-            .otherwise(move || rendered(preview_state.clone(), language).into_element()),
-        )
+        .child(each(
+            move || {
+                tabs.active_tab()
+                    .map(|tab| {
+                        let pane = tab.pane.get();
+                        // During the run back to Edit, keep what was on screen.
+                        let pane = if pane.view() == DocumentView::Edit {
+                            last.get().filter(|(id, _)| *id == tab.id).map_or_else(
+                                || Pane::from_view(DocumentView::Split, tab.web_compat()),
+                                |(_, pane)| pane,
+                            )
+                        } else {
+                            pane
+                        };
+                        last.set(Some((tab.id, pane)));
+                        (tab.id, pane)
+                    })
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            },
+            |(id, pane)| (*id, pane.web()),
+            move |row: ReadSignal<(u64, Pane)>, _| {
+                let web = row.get_untracked().1.web();
+                view()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex_col()
+                    .child(when(
+                        move || row.get().1.view() == DocumentView::Split,
+                        move || {
+                            view()
+                                .test_id("preview-field")
+                                .pb(px(tokens::SPACE_3))
+                                .child(quiet_label(move || {
+                                    SharedString::from(i18n::t(
+                                        language,
+                                        if web { Key::ModeWeb } else { Key::ModeNative },
+                                    ))
+                                }))
+                        },
+                    ))
+                    .child(if web {
+                        self::web(state.clone(), language)
+                    } else {
+                        column(state.clone(), language).into_element()
+                    })
+            },
+        ))
         .into_element()
 }
 
@@ -116,15 +140,7 @@ pub fn web(state: AppState, language: Language) -> AnyElement {
             .into_element();
     };
     let text = tab.text;
-    let reference = element_ref();
-    state.attach_document_view(tab.id, reference);
-    view()
-        .test_id("web-pane")
-        .element_ref(&reference)
-        .focusable(true)
-        .flex_1()
-        .min_h(px(0.0))
-        .h(relative(1.0))
+    reading_frame(&state, Some(tab.id), "web-pane")
         .child(
             when(
                 move || text.get().trim().is_empty(),
@@ -1246,10 +1262,7 @@ mod tests {
         .expect("a narrow window");
         app.wait_for("label:Markdown source")
             .expect("the source editor");
-        // A document opens in Source; the user picks Split.
-        app.press("id:title-settings")
-            .expect("open the glyph's menu");
-        app.press("id:title-menu-split").expect("choose Split");
+        // The probe chooses Split directly, independently of the preference.
         app.wait_for("id:preview-field").expect("the field renders");
         app.wait_for("text:Release plan")
             .expect("the document renders");
@@ -1265,7 +1278,21 @@ mod tests {
             nsh_core::Points(900.0),
         ))
         .expect("a 1440x900 window");
-        app.settle();
+        app.wait_until(
+            "the wide dock reaches Split",
+            Duration::from_secs(5),
+            |screen| {
+                let nodes = screen.layout_nodes();
+                let width = |id| {
+                    nodes
+                        .iter()
+                        .find(|node| node.test_id.as_deref() == Some(id))
+                        .map_or(0.0, |node| node.bounds.size.width.0)
+                };
+                width("stage-dock") > 0.0 && width("stage-source") == width("stage-dock")
+            },
+        )
+        .expect("the divider reaches the middle");
         assert_preview_is_visible(&app);
     }
 

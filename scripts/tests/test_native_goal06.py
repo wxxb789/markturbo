@@ -6,6 +6,7 @@ import hashlib
 import tempfile
 import tomllib
 import unittest
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -449,6 +450,19 @@ class ConfiguredSessionTests(unittest.TestCase):
 
 class CleanCloseTests(unittest.TestCase):
     """The document's clean state, measured by how a close request ends."""
+
+    def setUp(self) -> None:
+        # Exit depends on how many polls the fake process sees, not on how
+        # much CPU time its shard gets between those polls.
+        now = 0.0
+
+        def sleep(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        self.enterContext(mock.patch.object(
+            HARNESS, "wait_until", partial(runtime.wait_until, clock=lambda: now, sleep=sleep)
+        ))
 
     @staticmethod
     def harness(

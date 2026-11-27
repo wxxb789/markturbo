@@ -105,7 +105,7 @@ fn the_slot_keeps_a_reviewed_tab_that_is_not_on_screen() {
     app.wait_for("text:# B")
         .expect("the startup document active again");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         2,
         "both files are open before another opens"
     );
@@ -115,7 +115,7 @@ fn the_slot_keeps_a_reviewed_tab_that_is_not_on_screen() {
     open_from_palette(&mut app, "c.md");
     app.wait_for("text:# C").expect("the new file opens");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         3,
         "the reviewed tab stays open: {:?}",
         app.screen().texts()

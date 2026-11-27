@@ -7,8 +7,8 @@ observations contain only UTF-8 byte counts, SHA-256 digests, and timings.
 
 One case, two launches; only the interruption needs the restart. The first
 launch opens the document: a same-length external rewrite (mtime restored)
-must be refused by menu Save until Keep mine is confirmed; the rail's close
-control, revealed by a real pointer hover, must raise the in-window guard card
+must be refused by menu Save until Keep mine is confirmed; the sidebar opens
+before a pointer hover reveals the tab's close, which must raise the guard card
 (Save / Don't save / Cancel), whose Cancel keeps the text, then menu Save
 writes it; an edited buffer (CJK + emoji) must then leave a canonical recovery
 record within 10 000 ms before TerminateProcess interrupts it. The relaunch is
@@ -41,6 +41,9 @@ from . import evidence
 from .evidence import leak_codes, validate_exact_fingerprint
 from .runtime import (
     INTEGRITY_NAMES,
+    SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID,
+    SIDEBAR_ROW_AUTOMATION_ID,
+    TAB_CLOSE_AUTOMATION_ID,
     VK_MENU,
     VK_W,
     CONFLICT_HEADING,
@@ -136,10 +139,6 @@ RECOVERY_LEASE_NAME = ".markturbo-recovery.lock"
 RECOVERY_ARTIFACT_PREFIX = ".markturbo-recovery-"
 PANIC_RE = re.compile(rb"\bpanic(?:ked)?\b")
 
-# The rail's per-tab close control (`ui/rail.rs`): a Button with its own test
-# id, clipped until the pointer widens the rail over a file row.
-RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
-TAB_CLOSE_AUTOMATION_ID = "rail-close"
 # The conflict and recovery actions (`ui/notices.rs`), each a Button with its
 # own id and its label as Name. The one recovered record is row 0. Keep mine's
 # confirmation is an nsh system alert outside the UIA tree, answered with
@@ -426,29 +425,48 @@ class Goal02Harness(BaseNativeHarness):
             raise HarnessFailure("RECOVERY_RECORD_EXCEEDED_10_SECONDS")
         return elapsed
 
-    def close_tab_by_pointer(self, app: RunningApp) -> None:
-        """Widen the rail under the pointer, then click the tab's close control."""
-        row = self.find_control(
-            app,
-            RAIL_FILE_ROW_AUTOMATION_ID,
-            "Button",
-            "RAIL_FILE_ROW_UIA_TIMEOUT",
-            "RAIL_FILE_ROW_UIA_CONTRACT_MISMATCH",
+    def close_tab_by_pointer(self, app: RunningApp, title: str) -> None:
+        """Open the sidebar, hover the named row, then click its close button."""
+        self.ensure_sidebar_open(app)
+
+        def named_button(name: str, ids: tuple[str, ...], code: str) -> Any:
+            def lookup() -> Any | None:
+                matches = [
+                    button
+                    for button in self.controls_by_name(app.hwnd, name, "Button", anonymous=False)
+                    if button.element_info.automation_id in ids
+                ]
+                if len(matches) > 1:
+                    raise HarnessFailure(f"{code}_UIA_CONTRACT_MISMATCH")
+                return matches[0] if matches else None
+
+            return self._wait_ready(lookup, f"{code}_UIA_TIMEOUT", None)
+
+        row = named_button(
+            title, (SIDEBAR_ROW_AUTOMATION_ID, SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID), "RAIL_FILE_ROW"
         )
-        try:
-            rectangle = row.rectangle()
-        except Exception as error:
-            raise HarnessFailure("RAIL_FILE_ROW_UIA_QUERY_FAILED", safe_exception_name(error)) from None
-        self.win32.move_cursor(
-            (rectangle.left + rectangle.right) // 2, (rectangle.top + rectangle.bottom) // 2
+        previous = None
+
+        def settled_centre() -> tuple[int, int] | None:
+            nonlocal previous
+            try:
+                rect = row.rectangle()
+            except Exception as error:
+                raise HarnessFailure(
+                    "RAIL_FILE_ROW_UIA_QUERY_FAILED", safe_exception_name(error)
+                ) from None
+            centre = ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+            settled = centre if centre == previous else None
+            previous = centre
+            return settled
+
+        # The panel acquires its UIA id before its translation has settled.
+        x, y = wait_until(
+            settled_centre, self.ui_timeout, "RAIL_FILE_ROW_UIA_TIMEOUT",
+            clock=self.clock, sleep=self.sleep,
         )
-        close = self.find_control(
-            app,
-            TAB_CLOSE_AUTOMATION_ID,
-            "Button",
-            "RAIL_CLOSE_UIA_TIMEOUT",
-            "RAIL_CLOSE_UIA_CONTRACT_MISMATCH",
-        )
+        self.win32.move_cursor(x, y)
+        close = named_button(f"Close {title}", (TAB_CLOSE_AUTOMATION_ID,), "RAIL_CLOSE")
         self.click_control(close, "RAIL_CLOSE_POINTER_CLICK_FAILED")
 
     def send_alt_f4(self, app: RunningApp) -> None:
@@ -526,10 +544,10 @@ class Goal02Harness(BaseNativeHarness):
         }
 
     def tab_close(self, app: RunningApp, document: Path) -> dict[str, Any]:
-        """The hover-revealed rail close raises the guard; Cancel keeps the text."""
+        """The sidebar row's close raises the guard; Cancel keeps the text."""
         editor = self.replace_editor(app, POINTER_EDIT)
         source = sha256_file(document)
-        self.close_tab_by_pointer(app)
+        self.close_tab_by_pointer(app, document.name)
         self.click_lifecycle_decision(app, "Cancel")
         self.require_running(app, "CANCEL_CLOSED_PROCESS")
         kept_source = sha256_file(document)

@@ -41,11 +41,13 @@ fn clean_launch_shows_welcome() {
         "a second status line under the welcome: {texts:?}"
     );
 
+    // On the welcome, Settings stays available and both document controls
+    // are present but disabled until a document opens.
     assert_eq!(
         app.screen()
             .count("id:title-row >> role:button")
             .expect("selector"),
-        2,
+        3,
         "the welcome's title row: {texts:?}"
     );
     assert_eq!(
@@ -55,15 +57,26 @@ fn clean_launch_shows_welcome() {
         1,
         "the Settings action"
     );
-    assert!(
-        app.screen()
-            .accessibility_state("id:title-review")
-            .expect("Review stays in the row")
-            .disabled
-    );
     assert_eq!(
-        app.screen().press_target("id:title-review").unwrap(),
-        None,
-        "Review cannot be pressed without a document"
+        app.screen()
+            .accessibility(Some("id:title-view"))
+            .expect("select the view control")
+            .expect("View stays in the row")
+            .name,
+        "View: Edit — switch to Split"
     );
+    for selector in ["id:title-view", "id:title-review"] {
+        assert!(
+            app.screen()
+                .accessibility_state(selector)
+                .expect("the control stays in the row")
+                .disabled,
+            "{selector} is disabled without a document"
+        );
+        assert_eq!(
+            app.screen().press_target(selector).unwrap(),
+            None,
+            "{selector} cannot be pressed without a document"
+        );
+    }
 }

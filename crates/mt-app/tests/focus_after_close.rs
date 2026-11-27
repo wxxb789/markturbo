@@ -126,7 +126,7 @@ fn focus_lands_on_the_editor_the_next_tab_mounts() {
         editor_text(&app)
     );
 
-    // The same path through a rail switch: first.md's dot rebuilds its
+    // The same path through the sidebar: switching to first.md mounts its
     // editor, and the next key must land there.
     open(&mut app, "third", "text:# Third heading");
     app.clear_commands();
@@ -173,7 +173,7 @@ fn ctrl_n_after_escape_focuses_the_new_editor() {
     app.press_key("escape").expect("escape");
     app.press_key("mod+n").expect("Ctrl+N");
     app.wait_until("a second tab", TIMEOUT, |screen| {
-        screen.count("id:rail-file-row").unwrap_or(0) == 2
+        screen.count("id:sidebar-outside-row").unwrap_or(0) == 2
     })
     .expect("Ctrl+N starts another document");
     app.press_key("q").expect("type into the new document");

@@ -675,10 +675,21 @@ class RecentControlBehaviorTests(unittest.TestCase):
             ("WELCOME_UIA_QUERY_FAILED", "RuntimeError"),
         )
 
-    def test_open_tabs_are_counted_by_their_rail_rows(self) -> None:
+    def test_open_tabs_are_counted_by_their_mounted_sidebar_close_buttons(self) -> None:
         app = type("App", (), {"hwnd": 42})()
-        rows = [self.element(HARNESS.RAIL_FILE_ROW_AUTOMATION_ID, 1)] * 2
-        self.assertEqual(self.harness(rows).open_tab_count(app), 2)
+        rows: list[object] = []
+        harness = self.harness(rows)
+
+        def open_sidebar(_app: object) -> None:
+            rows.extend(
+                self.element(runtime.TAB_CLOSE_AUTOMATION_ID, 1, visible=visible)
+                for visible in (False, True)
+            )
+
+        harness.ensure_sidebar_open = mock.Mock(side_effect=open_sidebar)
+
+        self.assertEqual(harness.open_tab_count(app), 2)
+        harness.ensure_sidebar_open.assert_called_once_with(app)
 
     def test_the_title_file_wait_ends_when_the_active_tab_is_named(self) -> None:
         app = type("App", (), {"hwnd": 42})()

@@ -9,7 +9,7 @@ use std::{cell::Cell, time::Duration};
 
 use mt_core::settings::Language;
 use nsh_core::{
-    AccessibilityCurrent, AccessibilityState, Color,
+    AccessibilityState, Checked, Color,
     element::{AnimatedValue, KeyOptions},
     keymap::When,
     prelude::*,
@@ -18,12 +18,12 @@ use nsh_core::{
 use crate::{
     app_paths,
     i18n::{self, Key},
-    state::{AppState, Pane, flow_copy},
+    state::{AppState, View as DocumentView, flow_copy},
     ui::{
         consent, motion, notices, prims, revision, shell,
         tokens::{
-            self, COLUMN_GAP, HAIRLINE, RAIL_DOT, RAIL_W, SPACE_1, SPACE_2, SPACE_3, TITLE_ROW_H,
-            TYPE_UI, TYPE_UI_LINE,
+            self, COLUMN_GAP, HAIRLINE, RAIL_W, SPACE_1, SPACE_2, SPACE_3, TITLE_ROW_H, TYPE_UI,
+            TYPE_UI_LINE,
         },
         welcome,
     },
@@ -150,6 +150,8 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
     // `Review` (and the rest of `Ctrl+Enter`) from wherever the focus is.
     let review_state = state.clone();
     effect(move || bind_mod_enter(&review_state));
+    let cycle_state = state.clone();
+    on_key("mod+e", move |_: &str| cycle_view(&cycle_state));
 
     let menu = MenuMotion::new(state.title_menu_open);
 
@@ -262,6 +264,7 @@ pub fn title_row(state: AppState, language: Language) -> impl IntoElement {
             },
         ))
         .child(view().flex_1())
+        .child(view_button(state.clone(), language))
         .child(review_action(state.clone(), language))
         .child(menu_anchor(state.clone(), language, menu))
 }
@@ -408,6 +411,113 @@ fn file_name(state: AppState, language: Language) -> impl IntoElement {
     ))
 }
 
+fn cycle_view(state: &AppState) {
+    if !consent::is_open(state) {
+        state.cycle_view();
+        state.focus_editor();
+    }
+}
+
+fn view_button(state: AppState, language: Language) -> View {
+    let mode = computed({
+        let state = state.clone();
+        move || state.active_view()
+    });
+    let track = state.view_track;
+    let active = state.active;
+    let duration = prims::press_color_duration();
+    prims::press_feedback_with_duration(
+        view()
+            .test_id("title-view")
+            .role(AccessibilityRole::Button)
+            .label(move || {
+                let current = view_name(mode.get(), language);
+                let next = view_name(mode.get().next(), language);
+                SharedString::from(match language {
+                    Language::English => format!("View: {current} — switch to {next}"),
+                    Language::Chinese => format!("视图：{current} — 切换到{next}"),
+                })
+            })
+            .window_drag(false)
+            .cursor_pointer()
+            .flex_row()
+            .items_center()
+            .gap(px(SPACE_2))
+            .px(px(SPACE_2))
+            .py(px(SPACE_1))
+            .group()
+            .border(px(HAIRLINE))
+            .border_color(Color::TRANSPARENT)
+            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
+            .disabled(move || active.get().is_none())
+            .disabled_style(|s| s.opacity(0.45))
+            .on_press(move || cycle_view(&state)),
+        duration,
+    )
+    .child(view_glyph(track))
+    .child(
+        prims::rest(move || view_name(mode.get(), language))
+            .transition_colors()
+            .duration(move || duration.get())
+            .group_hover(|s| s.text_color(|| tokens::palette().ink))
+            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink)),
+    )
+}
+
+fn view_glyph(track: Signal<f32>) -> View {
+    let bounds = tokens::VIEW_GLYPH_W - 2.0 * HAIRLINE;
+    view()
+        .test_id("title-view-glyph")
+        .relative()
+        .w(px(tokens::VIEW_GLYPH_W))
+        .h(px(tokens::VIEW_GLYPH_H))
+        .border(px(HAIRLINE))
+        .border_color(move || tokens::palette().ink_rest)
+        .group_hover(|s| s.border_color(|| tokens::palette().ink))
+        .overflow_hidden()
+        .children([1.0, 2.0].into_iter().map(|segment| {
+            view()
+                .absolute()
+                .left(px(bounds * segment / 3.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .w(px(HAIRLINE))
+                .bg(move || tokens::palette().hairline)
+                .into_element()
+        }))
+        .child(
+            view()
+                .test_id("title-view-fill")
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .w(move || px(bounds * track.get()))
+                .bg(move || tokens::palette().ink_at(0.24)),
+        )
+        .child(
+            view()
+                .test_id("title-view-needle")
+                .absolute()
+                .left(move || {
+                    px((bounds * track.get() - tokens::VIEW_NEEDLE_W / 2.0)
+                        .clamp(0.0, bounds - tokens::VIEW_NEEDLE_W))
+                })
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .w(px(tokens::VIEW_NEEDLE_W))
+                .bg(move || tokens::palette().ink),
+        )
+}
+
+fn view_name(view: DocumentView, language: Language) -> &'static str {
+    match view {
+        DocumentView::Edit => i18n::t(language, Key::ModeSource),
+        DocumentView::Split => s(S::Split, language),
+        DocumentView::Preview => i18n::t(language, Key::ModeNative),
+    }
+}
+
 fn review_action(state: AppState, language: Language) -> impl IntoElement {
     let enabled_state = state.clone();
     let blocked_state = state.clone();
@@ -498,13 +608,19 @@ fn menu_anchor(state: AppState, language: Language, menu: MenuMotion) -> impl In
 
 fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl IntoElement {
     let document_rows = signal(state.active.get_untracked().is_some());
-    let pane_selection = signal(untracked(|| state.active_tab().map(|tab| tab.pane.get())));
+    let web = signal(untracked(|| {
+        state.active_tab().is_some_and(|tab| tab.web_compat())
+    }));
     let document_state = state.clone();
     // Retain the menu's last snapshot while it fades out.
     effect(move || {
         if menu.is_open() {
             document_rows.set(document_state.active.get().is_some());
-            pane_selection.set(document_state.active_tab().map(|tab| tab.pane.get()));
+            web.set(
+                document_state
+                    .active_tab()
+                    .is_some_and(|tab| tab.web_compat()),
+            );
         }
     });
     let document = move || document_rows.get();
@@ -613,9 +729,6 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                     )
                     .into_element()
                 };
-                let pane = |test_id: &'static str, label: &'static str, pane: Pane| {
-                    pane_row(&state, menu, pane_selection, test_id, label, pane)
-                };
                 view()
                     .child(row(
                         "title-menu-save",
@@ -629,27 +742,7 @@ fn menu_panel(state: AppState, language: Language, menu: MenuMotion) -> impl Int
                         Some(shortcut(true, "S")),
                         |state| state.save_as_active(),
                     ))
-                    .child(pane(
-                        "title-menu-edit",
-                        i18n::t(language, Key::ModeSource),
-                        Pane::Source,
-                    ))
-                    .child(pane(
-                        "title-menu-preview",
-                        i18n::t(language, Key::ModeNative),
-                        Pane::Preview,
-                    ))
-                    .child(pane("title-menu-split", s(S::Split, language), Pane::Split))
-                    .child(pane(
-                        "title-menu-web",
-                        s(S::WebPreview, language),
-                        Pane::Web,
-                    ))
-                    .child(pane(
-                        "title-menu-split-web",
-                        s(S::SplitWeb, language),
-                        Pane::SplitWeb,
-                    ))
+                    .child(web_row(&state, language, menu, web))
                     .child(row(
                         "title-menu-translate",
                         i18n::t(language, Key::Translate),
@@ -790,45 +883,32 @@ fn menu_item(
     )
 }
 
-fn pane_row(
-    state: &AppState,
-    menu: MenuMotion,
-    pane_selection: Signal<Option<Pane>>,
-    test_id: &'static str,
-    label: &'static str,
-    pane: Pane,
-) -> AnyElement {
-    let on_screen = move || pane_selection.get() == Some(pane);
-    let current = on_screen;
+fn web_row(state: &AppState, language: Language, menu: MenuMotion, web: Signal<bool>) -> View {
     let state = state.clone();
     menu_row(
         menu,
-        test_id,
-        label,
+        "title-menu-web",
+        s(S::WebPreview, language),
         None,
         || true,
         move || {
             menu.close();
-            if let Some(tab) = state.active_tab() {
-                state.set_pane(tab.id, pane);
-            }
+            state.set_web_compat(!web.get_untracked());
+            state.focus_editor();
         },
     )
+    .role(AccessibilityRole::Switch)
     .accessibility_state(move || AccessibilityState {
-        current: current().then_some(AccessibilityCurrent::True),
+        checked: Some(if web.get() {
+            Checked::True
+        } else {
+            Checked::False
+        }),
         ..AccessibilityState::default()
     })
-    .child(when(on_screen, || {
-        view()
-            .test_id("title-menu-pane-dot")
-            .w(px(RAIL_DOT))
-            .h(px(RAIL_DOT))
-            .rounded(px(RAIL_DOT / 2.0))
-            .flex_shrink_0()
-            .bg(move || tokens::palette().ink)
-            .into_element()
-    }))
-    .into_element()
+    .child(
+        prims::faint(move || s(if web.get() { S::On } else { S::Off }, language)).flex_shrink_0(),
+    )
 }
 
 /// A shortcut as the menu names it: `Ctrl+S`, `Ctrl+Shift+S`; `⌘S`, `⇧⌘S`
@@ -1008,7 +1088,8 @@ enum S {
     SaveAs,
     Split,
     WebPreview,
-    SplitWeb,
+    On,
+    Off,
     Context,
     ReviewSelection,
 }
@@ -1023,7 +1104,8 @@ fn s(key: S, language: Language) -> &'static str {
             S::SaveAs => "Save As\u{2026}",
             S::Split => "Split",
             S::WebPreview => "Compatibility preview",
-            S::SplitWeb => "Split \u{00B7} Compatibility",
+            S::On => "On",
+            S::Off => "Off",
             S::Context => "Context",
             S::ReviewSelection => "Review selection",
         },
@@ -1035,7 +1117,8 @@ fn s(key: S, language: Language) -> &'static str {
             S::SaveAs => "另存为\u{2026}",
             S::Split => "分栏",
             S::WebPreview => "兼容预览",
-            S::SplitWeb => "分栏 \u{00B7} 兼容预览",
+            S::On => "开启",
+            S::Off => "关闭",
             S::Context => "上下文",
             S::ReviewSelection => "审查选区",
         },
@@ -1059,6 +1142,7 @@ fn review_blocked_label(language: Language) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Pane;
     use std::sync::mpsc::{self, Receiver, Sender};
 
     use nsh_engine::{EngineConfig, Points, Root};
@@ -1196,11 +1280,7 @@ mod tests {
             "title-menu-open-sample",
             "title-menu-save",
             "title-menu-save-as",
-            "title-menu-edit",
-            "title-menu-preview",
-            "title-menu-split",
             "title-menu-web",
-            "title-menu-split-web",
             "title-menu-translate",
             "title-menu-review-selection",
             "title-menu-context",
@@ -1210,19 +1290,6 @@ mod tests {
         .iter()
         .filter(|id| app.screen().matches(&format!("id:{id}")).unwrap())
         .count()
-    }
-
-    fn pane_dot_is_in_row(app: &Headless, row_id: &str) -> bool {
-        let nodes = app.screen().layout_nodes();
-        let dot = nodes
-            .iter()
-            .find(|node| node.test_id.as_deref() == Some("title-menu-pane-dot"))
-            .expect("the active pane's menu dot");
-        let row = nodes
-            .iter()
-            .find(|node| node.test_id.as_deref() == Some(row_id))
-            .expect("the pane's menu row");
-        row.bounds.contains(&dot.bounds.center())
     }
 
     #[test]
@@ -1344,16 +1411,16 @@ mod tests {
     }
 
     #[test]
-    fn pane_dot_stays_with_the_selection_when_the_menu_fades() {
+    fn compatibility_state_stays_with_the_snapshot_when_the_menu_fades() {
         let mut app = manual_app(nsh_testing::windowed_root::<PaneMenuProbe>());
         app.wait_for("id:title-settings")
             .expect("the title settings action");
         press_without_settling(&app, "id:title-settings");
-        app.wait_for("id:title-menu-preview")
-            .expect("the Preview pane row");
-        assert!(pane_dot_is_in_row(&app, "title-menu-edit"));
+        let compatibility = "id:title-menu-web";
+        app.wait_for("id:title-menu-web >> text:Off")
+            .expect("compatibility is off before the press");
 
-        press_without_settling(&app, "id:title-menu-preview");
+        press_without_settling(&app, compatibility);
         for _ in 0..2 {
             app.next_frame(Duration::from_millis(16))
                 .expect("advance during the menu exit");
@@ -1362,20 +1429,31 @@ mod tests {
         assert!(app.screen().matches("id:title-menu").unwrap());
         assert_eq!(
             app.screen()
-                .press_target("id:title-menu-edit")
-                .expect("the Source row selector"),
+                .press_target(compatibility)
+                .expect("the compatibility row selector"),
             None,
             "closed menu rows cannot receive presses during the exit"
         );
-        assert!(pane_dot_is_in_row(&app, "title-menu-edit"));
-        assert!(!pane_dot_is_in_row(&app, "title-menu-preview"));
+        assert!(
+            app.screen()
+                .matches("id:title-menu-web >> text:Off")
+                .unwrap()
+        );
+        assert!(
+            !app.screen()
+                .matches("id:title-menu-web >> text:On")
+                .unwrap()
+        );
+        press_without_settling(&app, "id:title-settings");
+        app.wait_for("id:title-menu-web >> text:On")
+            .expect("the reopened menu reflects the new preference");
     }
 
     #[test]
     fn a_fading_menu_leaves_the_underlay_pressable() {
         let mut app = manual_app(nsh_testing::windowed_root::<MenuUnderlayProbe>());
         let settings = "id:title-settings";
-        let row = "id:title-menu-split";
+        let row = "id:title-menu-web";
         app.wait_for(settings).expect("the settings action");
         app.press(settings).expect("open the menu");
         let row_id = app

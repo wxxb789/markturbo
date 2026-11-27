@@ -395,9 +395,24 @@ class FakeUi:
         self.names: dict[str, str] = {}
         self.texts: set[str] = set()
         self.pressed: list[str] = []
+        self.compatibility_on = False
 
     def on_press(self, automation_id: str) -> None:
         self.shown |= self.reveals.get(automation_id, set())
+        if automation_id == "title-view":
+            names = (
+                "View: Edit — switch to Split",
+                "View: Split — switch to Preview",
+                "View: Preview — switch to Edit",
+            )
+            reached = (names.index(self.names[automation_id]) + 1) % len(names)
+            self.names[automation_id] = names[reached]
+            if reached == 2 and self.compatibility_on:
+                self.shown.add("web-view")
+            if reached == 1:
+                self.texts.add(visual.PLAN_HEADING)
+            elif reached == 0:
+                self.texts.discard(visual.PLAN_HEADING)
 
 
 def fake_harness(ui: FakeUi) -> visual.VisualHarness:
@@ -405,14 +420,23 @@ def fake_harness(ui: FakeUi) -> visual.VisualHarness:
     harness.ui_timeout = 0.2
     harness._credential = None
 
-    def control_by_id(_hwnd: int, automation_id: str, _type: str, *_args: Any) -> Any:
-        return FakeControl(ui, automation_id) if automation_id in ui.shown else None
+    def control_by_id(_hwnd: int, automation_id: str, control_type: str, *_args: Any) -> Any:
+        if automation_id not in ui.shown:
+            return None
+        if automation_id == "web-view":
+            assert control_type == "Group"
+        return FakeControl(ui, automation_id)
 
     def menu_command(_app: Any, automation_id: str) -> None:
         FakeControl(ui, automation_id).invoke()
 
+    def set_compatibility(_app: Any, on: bool) -> None:
+        ui.pressed.append("title-menu-web")
+        ui.compatibility_on = on
+
     harness.control_by_id = control_by_id
     harness.menu_command = menu_command
+    harness.set_compatibility = set_compatibility
     harness.name_present = lambda _app, name, _type: name in ui.texts
     harness.editor_control = lambda *_args: object()
     return harness
@@ -448,15 +472,38 @@ class StatePlanTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "CLEAN_PROFILE_WELCOME_DOCUMENT_OPEN")
 
     def test_a_document_state_waits_for_the_fixture_tab(self) -> None:
-        ui = FakeUi({"title-file"}, {"title-menu-web": {"web-view"}})
+        ui = FakeUi({"title-file", "title-view"}, {})
+        ui.names["title-view"] = "View: Edit — switch to Split"
         ui.names["title-file"] = "other.md"
         with self.assertRaises(runtime.HarnessFailure) as raised:
             fake_harness(ui).prepare(APP, cell("web-compatibility-preview"), Path("p"), None)
         self.assertEqual(raised.exception.code, "WEB_COMPATIBILITY_PREVIEW_DOCUMENT_NOT_OPEN")
+        self.assertEqual(ui.pressed, [])
 
         ui.names["title-file"] = visual.PLAN_NAME
         markers = fake_harness(ui).prepare(APP, cell("web-compatibility-preview"), Path("p"), None)
-        self.assertEqual(markers[-1], "web-view")
+        self.assertEqual(ui.pressed, ["title-menu-web", "title-view", "title-view"])
+        self.assertEqual(markers, ["title-file", "title-menu-web", "title-view", "web-view"])
+
+    def test_edit_and_split_proofs_name_the_view_button(self) -> None:
+        ui = FakeUi({"title-file", "title-view"}, {})
+        ui.names["title-file"] = visual.PLAN_NAME
+        ui.names["title-view"] = "View: Preview — switch to Edit"
+        ui.texts.add(visual.PLAN_HEADING)
+        harness = fake_harness(ui)
+        harness.type_at_end = mock.Mock()
+        harness.wait_name = mock.Mock(side_effect=lambda _app, name, *_args: self.assertIn(name, ui.texts))
+
+        markers = harness.prepare(APP, cell("ordinary-edit"), Path("p"), None)
+        self.assertEqual(markers, ["title-file", "title-view", "editor"])
+        self.assertEqual(ui.pressed, ["title-view"])
+        self.assertNotIn(visual.PLAN_HEADING, ui.texts)
+        harness.type_at_end.assert_called_once_with(APP, visual.ORDINARY_EDIT_TEXT)
+
+        markers = harness.prepare(APP, cell("native-preview-or-split"), Path("p"), None)
+        self.assertEqual(markers, ["title-file", "title-view", "editor", "preview"])
+        self.assertEqual(ui.pressed, ["title-view", "title-view"])
+        harness.wait_name.assert_called_once_with(APP, visual.PLAN_HEADING, "Text", "PREVIEW_MISSING", None)
 
     def test_review_sends_only_through_the_consent_hold(self) -> None:
         ui = FakeUi(
