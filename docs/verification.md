@@ -233,9 +233,11 @@ the app only where the behaviour itself needs a restart.
   questions and the keyless Review variants are headless mt-core/mt-app tests.
 - Goal 02, one case `lifecycle-session`, two launches (the interruption is
   the only restart). First launch: `EXTERNAL_MODIFICATION` (a same-length
-  rewrite with the loaded mtime is refused; Keep mine's Cancel leaves the
-  disk untouched over a sampled settle window, and a second, distinct edit's
-  guard card Overwrite writes that edit's exact bytes), `TAB_CLOSE` (with
+  rewrite with the loaded mtime is refused; Keep mine's Cancel keeps the
+  first edit in the editor and the conflict notice, and its sampled settle
+  window leaves the disk untouched; a second, distinct edit's own settle
+  window then proves its Keep mine wrote nothing before the guard card's
+  Overwrite writes that edit's exact bytes), `TAB_CLOSE` (with
   the sidebar panel open, the open tab's row close raises the guard; Cancel
   keeps the file; the following Save writes the exact edited bytes) and
   `CHECKPOINT` (an encrypted canonical record within 10 000 ms, no sentinel
@@ -244,9 +246,11 @@ the app only where the behaviour itself needs a restart.
   (Ctrl+W, Don't save closes the tab without writing and retires the record)
   and `WINDOW_CLOSE` (the workspace home's row reopens the file; Alt+F4 and
   WM_CLOSE raise the quit guard; Cancel keeps the file; Save all writes the
-  exact bytes and the process exits 0; no recovery record survives). The editor is not
-  read after a refusal or a Cancel: the exact bytes of the next write prove
-  the buffer survived. Launch failures carry `FIRST_LAUNCH_` or
+  exact bytes and the process exits 0; no recovery record survives). Keep
+  mine's Cancel records one boolean from the editor readback (no text
+  reaches evidence); after the refused Save and the other Cancels the exact
+  bytes of the next write prove the buffer survived. Launch failures carry
+  `FIRST_LAUNCH_` or
   `RESTORE_LAUNCH_`. Headless: `tests/conflict.rs` (the refused save leaves
   the edit in the editor and nothing is written before Overwrite),
   `tests/tab_close_guard.rs` (Cancel keeps the dirty mark, which nsh 0.7.1's

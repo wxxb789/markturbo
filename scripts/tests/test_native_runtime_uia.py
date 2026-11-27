@@ -1617,19 +1617,34 @@ class OverwriteGuardTests(unittest.TestCase):
                 runtime.fingerprint_bytes(confirmed),
             ]
         )
+        # Cancel must read the first edit back; the readback helper itself is
+        # covered by SourceEditorTests and the goal-02 fakes.
+        harness.editor_fingerprint = mock.Mock(
+            return_value=runtime.fingerprint_bytes(cancelled)
+        )
         harness.save_via_menu = mock.Mock()
         harness.wait_name = mock.Mock()
         harness.find_control = mock.Mock(return_value=keep_mine)
-        harness.name_present = mock.Mock(return_value=False)
+        # The refused Save leaves the conflict notice up; a write resolves it.
+        conflict = {"open": True}
+
+        def name_present(_app: object, name: str, _type: str) -> bool:
+            return name == runtime.CONFLICT_HEADING and conflict["open"]
+
+        harness.name_present = name_present
+
+        def written(value: bytes) -> None:
+            runtime.write_durable(document, value)
+            conflict["open"] = False
 
         def pressed(control: object, _code: str) -> None:
             source = getattr(control, "control", control)
             if source is keep_mine and keep_mine_writes:
-                runtime.write_durable(document, cancelled)
+                written(cancelled)
             if source is overwrite and overwrite_writes:
-                runtime.write_durable(document, confirmed)
+                written(confirmed)
             if source is overwrite and overwrite_writes_cancelled:
-                runtime.write_durable(document, cancelled)
+                written(cancelled)
 
         harness.click_control = mock.Mock(side_effect=pressed)
         return harness, app, document
@@ -1650,6 +1665,7 @@ class OverwriteGuardTests(unittest.TestCase):
             observations["external_modification_confirmed_editor"],
         )
         self.assertEqual(harness.find_control.call_count, 2)
+        self.assertTrue(observations["external_modification_cancel_kept_editor"])
         self.assertEqual(
             [call.args[1:3] for call in harness.find_control.call_args_list],
             [(HARNESS.KEEP_MINE_AUTOMATION_ID, "Button")] * 2,
