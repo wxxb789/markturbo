@@ -13,11 +13,32 @@
 |Module|Responsibility|
 |---|---|
 |`app.rs`|Application root: startup, the checkpoint ticker, the main window's close request (routed to the unsaved-changes guard), and the shell, re-keyed on language or layout-breakpoint changes.|
-|`ui/`|The Afterglow UI: `shell` (title row, rail, text column, field, overlay layer), `titlebar` (file name, Review, settings menu), `rail`, `welcome`, `document`/`preview`, `context`, `review`/`glow`, `revision`, `consent`, `notices`, `settings`, and the `tokens`/`fonts`/`prims`/`motion` foundation.|
+|`ui/`|The Afterglow UI: `shell` (title row, sidebar, two-screen stage, overlay layer), `titlebar` (file name, view control, Review, settings menu), `rail` (sidebar and palette), `welcome`, `document`/`preview`, `context`, `review`/`glow`, `revision`, `consent`, `notices`, `settings`, and the `tokens`/`fonts`/`prims`/`motion` foundation.|
 |`state.rs`|`AppState` signals and actions: file open/save/save-as, search, context resolution, Review/Revision, recovery checkpoints/restore.|
 |`state/revision_ledger.rs`|`RevisionLedger`: where each hunk of a live Approved Revision sits in its tab's text.|
 |`app_paths.rs`, `assets.rs`|Bundled sample materialization and embedded licenses/sample assets.|
 |`web.rs`, `links.rs`, `i18n.rs`, `logging.rs`|HTML/CSP construction, preview link openings, localized strings and disclosures, log setup.|
+
+### Sidebar and document stage
+
+The sidebar lists the workspace tree and open tabs outside the folder, plus an
+"Open files not in the tree" group for any tab the tree does not represent yet
+(a Save As whose scan has not landed, a file beyond the scan's depth). It
+pushes the stage when expanded at 1040 px or more; below that it opens as an
+overlay and leaves the stage anchored to the 44 px strip, and the divider is
+not drawn (the dock keeps the legacy overlay geometry). `AppState` keeps the
+saved push preference and the transient overlay state separate.
+
+The source screen keeps its editor mounted by tab identity. The dock shows
+the preview or the active Review, Revision, or Context surface. In document
+views the shared ratio places the divider at Edit (1), Split (0.5), or
+Preview (0); the view button and drag snapping both target these stops. The
+track retargets from its drawn position, cuts when switching tabs, and uses
+an opacity fade instead of sliding under reduced motion. Web compatibility
+changes the preview renderer without adding a view stop, and the reading body
+is keyed by tab and renderer so Split to Preview keeps one subtree (a WebView
+does not reload). The recovery and conflict banners render on whichever screen
+is visible, so their actions stay reachable in full Preview.
 
 ### Optional local usage counters
 

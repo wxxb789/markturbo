@@ -57,7 +57,7 @@ fn the_menu_starts_a_new_file_and_a_pasted_document() {
     app.wait_for_gone("id:welcome", std::time::Duration::from_secs(5))
         .expect("the welcome leaves");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         1,
         "the new document is the one tab"
     );
@@ -77,7 +77,7 @@ fn the_menu_starts_a_new_file_and_a_pasted_document() {
     app.wait_until(
         "a second tab",
         std::time::Duration::from_secs(5),
-        |screen| screen.count("id:rail-file-row").unwrap_or(0) == 2,
+        |screen| screen.count("id:rail-close").unwrap_or(0) == 2,
     )
     .expect("Ctrl+N starts another document");
 
@@ -95,7 +95,7 @@ fn the_menu_starts_a_new_file_and_a_pasted_document() {
         app.screen().texts()
     );
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         3,
         "the pasted document is a third tab"
     );

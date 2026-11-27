@@ -43,7 +43,8 @@ native IFileSaveDialog, whose own overwrite confirmation is the only overwrite
 decision: Yes replaces the existing file. The app writes the file before it
 swaps the tab, so the harness waits for the title row's file name
 (`title-file`, a Button named after the active tab) before it edits the
-swapped tab. Each open tab has one rail row (`rail-file-row`).
+swapped tab. Each open tab has one mounted close control (`rail-close`) on its
+row in the expanded sidebar panel (`ensure_sidebar_open` before counting).
 Editor text is read with the editor's Select All + Copy (see
 `runtime.EDITOR_NAME`).
 """
@@ -62,8 +63,10 @@ from . import evidence
 from .evidence import leak_codes
 from .runtime import (
     INTEGRITY_NAMES,
+    TAB_CLOSE_AUTOMATION_ID,
     VK_A,
     VK_CONTROL,
+    VK_ESCAPE,
     VK_RETURN,
     VK_S,
     VK_W,
@@ -89,7 +92,6 @@ from .runtime import (
 
 SCHEMA = "markturbo.goal-03-native-acceptance"
 VK_SHIFT = 0x10
-VK_ESCAPE = 0x1B
 
 WELCOME_OPEN_FOLDER_AUTOMATION_ID = "welcome-open-folder"
 WELCOME_NEW_AUTOMATION_ID = "welcome-new-file"
@@ -103,7 +105,6 @@ WELCOME_ACTION_AUTOMATION_IDS = (
     WELCOME_SAMPLE_AUTOMATION_ID,
 )
 TITLE_FILE_AUTOMATION_ID = "title-file"
-RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
 # A file recent row is named `File <name>`; once its target is gone it is
 # disabled and named `File <name> — Missing` (`ui/welcome.rs` `recents`).
 RECENT_ROW_NAME = "File {name}"
@@ -176,8 +177,8 @@ STALE_RECENT_PRESS_SECONDS = 0.05
 # The stale-row fence. A press opens its file asynchronously, so no look right
 # after the stale press can prove it opened nothing. The saved row is clicked
 # after it; once that tab is shown the earlier press has been handled, and
-# this settle lets a late tab from either press reach the rail before the
-# harness counts the rows (the one fixed wait the phase keeps).
+# this settle lets a late tab from either press reach the sidebar before the
+# harness counts its close buttons (the one fixed wait the phase keeps).
 OPEN_TABS_SETTLE_SECONDS = 0.3
 
 
@@ -569,8 +570,12 @@ class Goal03Harness(BaseNativeHarness):
         wait_until(named, self.ui_timeout, "TITLE_FILE_TIMEOUT", interval=0.025)
 
     def open_tab_count(self, app: Any) -> int:
-        """How many tabs are open: one rail row each."""
-        return len(self.buttons_sharing_id(app, RAIL_FILE_ROW_AUTOMATION_ID, "RAIL_FILE_ROW"))
+        """How many tabs are open: one mounted close button each in the panel."""
+        self.ensure_sidebar_open(app)
+        closes = self.buttons_sharing_id(
+            app, TAB_CLOSE_AUTOMATION_ID, "RAIL_CLOSE", require_visible=False
+        )
+        return len(closes)
 
     def request_save_as_shortcut(self, app: Any) -> None:
         self.require_source_editor_focus(app, "SAVE_AS_SHORTCUT_EDITOR_NOT_FOCUSED")
@@ -606,8 +611,10 @@ class Goal03Harness(BaseNativeHarness):
             "WORKSPACE_HOME_UIA_TIMEOUT",
         )
 
-    def buttons_sharing_id(self, app: Any, automation_id: str, code: str) -> list[Any]:
-        """Every visible Button whose AutomationId is `automation_id`."""
+    def buttons_sharing_id(
+        self, app: Any, automation_id: str, code: str, *, require_visible: bool = True
+    ) -> list[Any]:
+        """The Buttons with this id; require visibility unless counting mounted controls."""
         try:
             uia = self.iuia_class()
             condition = uia.iuia.CreatePropertyCondition(
@@ -630,7 +637,7 @@ class Goal03Harness(BaseNativeHarness):
                 if (
                     info.automation_id != automation_id
                     or info.control_type != "Button"
-                    or not control.is_visible()
+                    or (require_visible and not control.is_visible())
                 ):
                     raise HarnessFailure(f"{code}_UIA_CONTRACT_MISMATCH")
                 controls.append(control)
@@ -770,7 +777,7 @@ class Goal03Harness(BaseNativeHarness):
                 raise HarnessFailure("SAVED_ROW_UIA_CONTRACT_MISMATCH")
             # A real pointer press on the disabled row, then a real click on
             # the saved row: the saved tab shown fences the stale press, and
-            # one rail row afterwards proves the stale press (or a mis-hit
+            # one sidebar close afterwards proves the stale press (or a mis-hit
             # neighbour) opened nothing.
             self.hold_control(app, stale_row, STALE_RECENT_PRESS_SECONDS, "STALE_PRESS_FAILED")
             self.click_control(saved_rows[0], "SAVED_ROW_CLICK_FAILED")

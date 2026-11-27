@@ -108,7 +108,7 @@ fn a_missing_recent_is_marked_disabled_and_opens_nothing() {
     app.idle(Duration::from_millis(200)).expect("settle");
     assert!(!missing.exists(), "no file was created for the missing row");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         0,
         "no document opened"
     );
@@ -184,7 +184,7 @@ fn a_recent_that_vanishes_after_render_flips_to_missing() {
         "the flipped row is no longer pressable"
     );
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         0,
         "the vanished target opened no document"
     );

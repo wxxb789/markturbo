@@ -106,9 +106,24 @@ EDITOR_NAME = "Markdown source"
 MENU_BUTTON_AUTOMATION_ID = "title-settings"
 MENU_SAVE_AUTOMATION_ID = "title-menu-save"
 MENU_SAVE_AS_AUTOMATION_ID = "title-menu-save-as"
-MENU_EDIT_AUTOMATION_ID = "title-menu-edit"
 MENU_WEB_AUTOMATION_ID = "title-menu-web"
 MENU_QUIT_AUTOMATION_ID = "title-menu-quit"
+VIEW_BUTTON_AUTOMATION_ID = "title-view"
+SIDEBAR_PANEL_AUTOMATION_ID = "sidebar-panel"
+SIDEBAR_ROW_AUTOMATION_ID = "sidebar-file"
+SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID = "sidebar-outside-row"
+RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
+TAB_CLOSE_AUTOMATION_ID = "rail-close"
+# The visual matrix drives both interface languages. Keep callers' view names
+# independent of the window's locale, but require the full accessible label.
+_VIEW_BUTTON_NAMES = {
+    "View: Edit — switch to Split": "Edit",
+    "View: Split — switch to Preview": "Split",
+    "View: Preview — switch to Edit": "Preview",
+    "视图：编辑 — 切换到分栏": "Edit",
+    "视图：分栏 — 切换到预览": "Split",
+    "视图：预览 — 切换到编辑": "Preview",
+}
 GUARD_HEADING = "Close without saving?"
 GUARD_BUTTON_NAMES = {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"}
 GUARD_BUTTON_AUTOMATION_IDS = {
@@ -133,8 +148,10 @@ SW_RESTORE = 9
 VK_CONTROL = 0x11
 VK_MENU = 0x12
 VK_A = 0x41
+VK_B = 0x42
 VK_BACK = 0x08
 VK_C = 0x43
+VK_ESCAPE = 0x1B
 VK_RETURN = 0x0D
 VK_Z = 0x5A
 VK_S = 0x53
@@ -2383,24 +2400,125 @@ class NativeHarness:
         )
         self.win32.press_and_hold(app.hwnd, x, y, seconds)
 
+    def _press_menu_anchor(self, app: RunningApp) -> None:
+        anchor = self.find_control(
+            app,
+            MENU_BUTTON_AUTOMATION_ID,
+            "Button",
+            "MENU_BUTTON_UIA_TIMEOUT",
+            "MENU_BUTTON_UIA_CONTRACT_MISMATCH",
+        )
+        self.invoke_control(anchor, "MENU_BUTTON_INVOKE_FAILED")
+
     def menu_command(self, app: RunningApp, automation_id: str) -> None:
-        """Run one title-menu row: open the settings glyph's menu, invoke the row."""
+        """Run one title-menu command: open Settings and invoke the row."""
         code = automation_id.upper().replace("-", "_")
         if self.control_by_id(
             app.hwnd, automation_id, "Button", f"{code}_UIA_CONTRACT_MISMATCH"
         ) is None:
-            anchor = self.find_control(
-                app,
-                MENU_BUTTON_AUTOMATION_ID,
-                "Button",
-                "MENU_BUTTON_UIA_TIMEOUT",
-                "MENU_BUTTON_UIA_CONTRACT_MISMATCH",
-            )
-            self.invoke_control(anchor, "MENU_BUTTON_INVOKE_FAILED")
+            self._press_menu_anchor(app)
         item = self.find_control(
             app, automation_id, "Button", f"{code}_UIA_TIMEOUT", f"{code}_UIA_CONTRACT_MISMATCH"
         )
         self.invoke_control(item, f"{code}_INVOKE_FAILED")
+
+    def _view_button(self, app: RunningApp, previous: str | None = None) -> tuple[Any, str]:
+        name = ""
+
+        def locate() -> Any | None:
+            nonlocal name
+            button = self.control_by_id(
+                app.hwnd, VIEW_BUTTON_AUTOMATION_ID, "Button", "TITLE_VIEW_UIA_CONTRACT_MISMATCH"
+            )
+            if button is None:
+                return None
+            name = button.element_info.name or ""
+            return button if name != previous else None
+
+        button = self._wait_ready(locate, "TITLE_VIEW_UIA_TIMEOUT", None)
+        return button, name
+
+    def view_button_name(self, app: RunningApp) -> str:
+        return self._view_button(app)[1]
+
+    def view_command(self, app: RunningApp, view: str) -> None:
+        """Reach the requested view in at most one full cycle of title-view."""
+        button, name = self._view_button(app)
+        for presses in range(4):
+            current = _VIEW_BUTTON_NAMES.get(name)
+            if current == view:
+                return
+            if current is None or presses == 3:
+                raise HarnessFailure("TITLE_VIEW_UIA_CONTRACT_MISMATCH")
+            self.invoke_control(button, "TITLE_VIEW_INVOKE_FAILED")
+            button, name = self._view_button(app, previous=name)
+
+    def _compatibility_button(self, app: RunningApp) -> Any | None:
+        return self.control_by_id(
+            app.hwnd, MENU_WEB_AUTOMATION_ID, "Button", "TITLE_MENU_WEB_UIA_CONTRACT_MISMATCH"
+        )
+
+    def _open_compatibility_switch(self, app: RunningApp) -> tuple[Any, bool]:
+        button = self._compatibility_button(app)
+        # A closing menu keeps its old, disabled rows until the fade ends.
+        if button is None or not button.is_enabled():
+            self._press_menu_anchor(app)
+        button = self._wait_ready(
+            lambda: self._compatibility_button(app), "TITLE_MENU_WEB_UIA_TIMEOUT", None
+        )
+        # nsh maps Switch to a UIA Button with Toggle, not Invoke. Its On/Off
+        # text is folded into the control rather than exposed on its own.
+        try:
+            toggle = button.iface_toggle
+            checked = toggle.CurrentToggleState
+        except self.no_pattern_error_class:
+            raise HarnessFailure("TITLE_MENU_WEB_UIA_CONTRACT_MISMATCH") from None
+        except Exception as error:
+            raise HarnessFailure("TITLE_MENU_WEB_UIA_QUERY_FAILED", safe_exception_name(error)) from None
+        if checked not in (0, 1):
+            raise HarnessFailure("TITLE_MENU_WEB_UIA_CONTRACT_MISMATCH")
+        return toggle, checked == 1
+
+    def compatibility_state(self, app: RunningApp) -> bool:
+        """Read the Web renderer's checked state and dismiss its menu."""
+        _toggle, checked = self._open_compatibility_switch(app)
+        self.win32.send_key(app.hwnd, VK_ESCAPE)
+        return checked
+
+    def set_compatibility(self, app: RunningApp, on: bool) -> None:
+        toggle, checked = self._open_compatibility_switch(app)
+        if checked == on:
+            self.win32.send_key(app.hwnd, VK_ESCAPE)
+            return
+        try:
+            toggle.Toggle()
+        except Exception as error:
+            raise HarnessFailure("TITLE_MENU_WEB_INVOKE_FAILED", safe_exception_name(error)) from None
+
+        def closed() -> bool:
+            button = self._compatibility_button(app)
+            return button is None or not button.is_enabled()
+
+        wait_until(
+            closed, self.ui_timeout, "TITLE_MENU_WEB_CLOSE_UIA_TIMEOUT",
+            interval=0.025, clock=self.clock, sleep=self.sleep,
+        )
+
+    def sidebar_collapsed(self, app: RunningApp) -> bool:
+        """Whether the expanded sidebar panel is absent from UIA."""
+        return self.control_absent(
+            app, SIDEBAR_PANEL_AUTOMATION_ID, "Group",
+            "SIDEBAR_PANEL_UIA_QUERY_FAILED", "SIDEBAR_PANEL_UIA_CONTRACT_MISMATCH",
+        )
+
+    def ensure_sidebar_open(self, app: RunningApp) -> None:
+        if not self.sidebar_collapsed(app):
+            return
+        self.win32.send_shortcuts(app.hwnd, (VK_B,))
+        self.find_control(
+            app, SIDEBAR_PANEL_AUTOMATION_ID, "Group",
+            "SIDEBAR_PANEL_UIA_TIMEOUT", "SIDEBAR_PANEL_UIA_CONTRACT_MISMATCH",
+        )
 
     def save_via_menu(self, app: RunningApp) -> None:
         self.menu_command(app, MENU_SAVE_AUTOMATION_ID)
@@ -2419,14 +2537,8 @@ class NativeHarness:
         )
 
     def activate_source_layout(self, app: RunningApp) -> None:
-        """Wait for the document's source editor; the Edit mode shows it."""
-        try:
-            self.editor_control(app, min(self.ui_timeout, 5.0))
-            return
-        except HarnessFailure as error:
-            if error.code != "SOURCE_EDITOR_UIA_TIMEOUT":
-                raise
-        self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
+        """Return to Edit and wait until the source editor is ready."""
+        self.view_command(app, "Edit")
         self.editor_control(app)
 
     def control_absent(

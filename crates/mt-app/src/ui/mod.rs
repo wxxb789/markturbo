@@ -4,13 +4,13 @@
 //! [`prims`] and [`motion`]. Every other file names its owner lane in its own
 //! header and only that lane edits it.
 //!
-//! One window, one room. The shell composes four regions — the 32px title row,
-//! the 44px rail, the text column and the field — plus the overlay layer the
-//! consent card and the notices use, and routes the field to exactly one
+//! One window, one room. The shell composes the title row, the Shoji sidebar,
+//! and the two-screen stage, plus the overlay layer for consent and notices.
+//! The source editor stays mounted on one screen; the other holds one docked
 //! surface at a time:
 //!
 //! ```text
-//! revision  >  review  >  context  >  preview (split)  >  nothing
+//! revision  >  review  >  context  >  preview  >  nothing
 //! ```
 //!
 //! A surface says whether it is on screen with its own `is_open(state)` and

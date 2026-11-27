@@ -51,9 +51,9 @@ fn switching_tabs_swaps_the_document_surface() {
     app.wait_for_gone("text:# First heading", Duration::from_secs(5))
         .expect("first document surface is gone");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         2,
-        "both open files hold a rail dot"
+        "both open files have a close action in the sidebar"
     );
 
     // Every open is a normal tab: a third file from the palette keeps all
@@ -66,22 +66,23 @@ fn switching_tabs_swaps_the_document_surface() {
     app.wait_for("text:# Third heading")
         .expect("third document");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         3,
         "the third file opens beside the others"
     );
 
-    // The title row is mounted once, so the pane commands in its menu must
-    // resolve the active tab when pressed rather than capture the startup
-    // `None`.
-    app.press("id:title-settings")
-        .expect("open the glyph's menu");
-    app.press("id:title-menu-preview")
-        .expect("switch to Preview");
-    app.wait_for("id:preview-column")
-        .expect("the preview takes the column");
-    app.wait_for_gone("label:Markdown source", Duration::from_secs(5))
-        .expect("source editor hidden by the active tab's pane change");
+    // The titlebar control resolves the active tab when pressed, not the
+    // tab (or welcome screen) available when the titlebar mounted.
+    app.press("id:title-view").expect("choose Split");
+    app.press("id:title-view").expect("choose Preview");
+    app.wait_for("id:stage-dock >> id:preview-column")
+        .expect("the preview takes the dock");
+    app.wait_until("source screen closes", Duration::from_secs(5), |screen| {
+        screen.layout_nodes().iter().any(|node| {
+            node.test_id.as_deref() == Some("stage-source") && node.bounds.size.width.0 == 0.0
+        })
+    })
+    .expect("the active tab's source screen is hidden");
     app.wait_for("text:Third heading")
         .expect("the active tab's preview");
 }

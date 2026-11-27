@@ -17,7 +17,6 @@ use std::{
     rc::Rc,
 };
 
-use mt_core::settings::Language;
 use nsh_base::{
     editor::{
         Editor, EditorApi, EditorDecoration, EditorPosition, EditorRange, EditorScrollBeyond,
@@ -32,86 +31,43 @@ use nsh_core::{
 };
 
 use crate::{
-    state::{AppState, Pane, Tab},
-    ui::{glow, motion, notices, preview, review, revision, titlebar, tokens},
+    state::{AppState, Tab},
+    ui::{glow, motion, notices, review, revision, shell, titlebar, tokens},
 };
 
-/// The column's content for the active document, by pane. Empty while no
-/// document is open (the shell shows [`crate::ui::welcome::welcome`] then).
-pub fn column(state: AppState, language: Language) -> impl IntoElement {
+/// The text stage's source view. The shell keys the slot by tab identity;
+/// changing the view track never replaces the mounted editor.
+pub fn column(state: AppState) -> impl IntoElement {
+    let active = state.clone();
+    each(
+        move || active.active_tab().into_iter().collect::<Vec<_>>(),
+        |tab| tab.id,
+        move |tab: ReadSignal<Tab>, _| source_document(state.clone(), tab.get_untracked()),
+    )
+}
+
+fn source_document(state: AppState, tab: Tab) -> impl IntoElement {
     let reference = element_ref();
-    // The ref is keyed by the tab it draws: a close or a tab switch mounts
-    // the next tab's document in a later commit, and focusing this ref must
-    // not hand the keyboard to the view it replaces.
-    let document_tab = state.active.get_untracked().unwrap_or_default();
+    let document_tab = tab.id;
     state.attach_document_view(document_tab, reference);
-    let state_for_tabs = state.clone();
-    #[cfg(test)]
     let focus_state = state.clone();
+    #[cfg(test)]
+    let reported_focus = state.clone();
     view()
         .test_id("document")
-        .focusable(true)
+        .focusable(move || !shell::shows_full_preview(&focus_state))
         .element_ref(&reference)
         .on_focus(move || {
             #[cfg(test)]
-            focus_state
+            reported_focus
                 .focus_last
                 .set(Some(crate::state::FocusTarget::Document(document_tab)));
         })
         .flex_1()
         .h(relative(1.0))
-        // The document starts 40px below the column's top edge, as the
-        // prototype's `.doc` does; the banners the shell puts above stay
-        // outside it.
+        // Banners belong above the document, outside this inset.
         .pt(px(tokens::SPACE_5))
-        // Keyed by tab AND by which column the pane draws: a retained row
-        // keeps its nodes, so a pane change that swaps the column (editor,
-        // preview, web) must be a new key, or the old column stays up.
-        .child(each(
-            move || {
-                state_for_tabs
-                    .active_tab()
-                    .into_iter()
-                    .map(|tab| {
-                        let kind = ColumnKind::of(tab.pane.get());
-                        (tab, kind)
-                    })
-                    .collect::<Vec<_>>()
-            },
-            |(tab, kind): &(Tab, ColumnKind)| (tab.id, *kind),
-            {
-                let state = state.clone();
-                move |row: ReadSignal<(Tab, ColumnKind)>, _| {
-                    let (tab, kind) = row.get();
-                    match kind {
-                        ColumnKind::Source => source(state.clone(), tab).into_element(),
-                        ColumnKind::Preview => {
-                            preview::column(state.clone(), language).into_element()
-                        }
-                        ColumnKind::Web => preview::web(state.clone(), language).into_element(),
-                    }
-                }
-            },
-        ))
-}
-
-/// Which surface the column draws for a pane: Split and Split · Web keep the
-/// editor in the column and put their preview in the field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ColumnKind {
-    Source,
-    Preview,
-    Web,
-}
-
-impl ColumnKind {
-    fn of(pane: Pane) -> Self {
-        match pane {
-            Pane::Source | Pane::Split | Pane::SplitWeb => Self::Source,
-            Pane::Preview => Self::Preview,
-            Pane::Web => Self::Web,
-        }
-    }
+        .child(source(state, tab))
 }
 
 /// The source editor: plain-file Markdown, bytes preserved, findings drawn as
@@ -145,10 +101,8 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
     // scroll into, and the editor computes its scroll target from the rows as
     // laid out, so the inset must be a frame old by then.
     //
-    // The effect's first run is this editor's mount (a tab switch or the mode
-    // toggle back to Source). A request it sees then is one the column already
-    // holds, not a new one, so the camera cuts: file switching and the mode
-    // toggle are instant.
+    // On mount (a new tab or a tab switch), a camera request the column
+    // already holds cuts to the line instead of replaying the glide.
     let glide = Glide::default();
     let camera_glide = glide.clone();
     let mounting = Cell::new(true);
@@ -237,12 +191,21 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
         titlebar::bind_mod_enter(&keys_state);
     });
 
+    let mount_focus = state.clone();
+    let tab_id = tab.id;
+    let first_layout = Cell::new(true);
     view()
         .test_id("source")
         .flex_1()
         .min_h(px(0.0))
         .h(relative(1.0))
-        .on_layout(move |frame: &Bounds<Points>| viewport.set(frame.size.height.0))
+        .on_layout(move |frame: &Bounds<Points>| {
+            viewport.set(frame.size.height.0);
+            if first_layout.replace(false) {
+                // Layout is delivered once the editor's native input exists.
+                mount_focus.focus_on_document_mount(tab_id);
+            }
+        })
         .child(
             // The editor's element carries no `test_id` of its own; the box
             // around it does, and it is the editor's own box.
@@ -565,6 +528,7 @@ mod tests {
 
     use super::*;
     use crate::state::AppState;
+    use crate::state::Pane;
 
     /// The fixture the probes open; the dir travels with it so it outlives the
     /// app. Sixty lines with a sentinel near the top, a heading and inline code
@@ -684,7 +648,7 @@ mod tests {
                     .h(px(8.0))
                     .on_press(move || open_review_state.review_open.set(true)),
             )
-            .child(column(state, Language::English))
+            .child(column(state))
     }
 
     /// The characters of a ruler line.
@@ -1412,23 +1376,27 @@ mod tests {
         );
     }
 
-    /// A camera request the column already holds is not a new one: when the
-    /// source editor is mounted again (the mode toggle back to Source, or a
-    /// tab switch and back) the line is level at once, because file switching
-    /// and the mode toggle are instant.
+    /// Cycling views retains the editor and its held camera position.
     #[test]
-    fn a_remounted_editor_cuts_to_the_held_line() {
+    fn a_view_cycle_keeps_the_editor_and_held_line() {
         let mut app = glide_probe(false);
         app.press("id:probe-focus-first").expect("focus line 3");
         app.run_for(Duration::from_millis(motion::CAMERA_MS as u64 + 60))
             .expect("the glide ends");
 
+        let editor_id = |app: &Headless| {
+            app.screen()
+                .layout_nodes()
+                .iter()
+                .find(|node| node.test_id.as_deref() == Some("source-editor"))
+                .expect("the source editor stays mounted")
+                .id
+        };
+        let editor = editor_id(&app);
         app.press("id:probe-pane-preview").expect("to Preview");
-        assert!(
-            app.screen().matches("label:Markdown source") == Ok(false),
-            "Preview takes the column"
-        );
+        assert_eq!(editor_id(&app), editor);
         app.press("id:probe-pane-source").expect("back to Source");
+        assert_eq!(editor_id(&app), editor);
         let offset = level_offset(&app, "PRIVATE-CAMERA-SENTINEL");
         assert!(
             offset.abs() <= tokens::TYPE_SOURCE_LINE,

@@ -44,9 +44,7 @@ fn opens_a_markdown_file() {
     // the document's own next action.
     app.wait_for("label:Markdown source")
         .expect("source editor");
-    app.press("id:title-settings")
-        .expect("open the glyph's menu");
-    app.press("id:title-menu-split").expect("choose Split");
+    app.press("id:title-view").expect("choose Split");
     app.wait_for("text:Release notes").expect("preview heading");
     app.wait_for("id:title-review")
         .expect("the document's Review action");

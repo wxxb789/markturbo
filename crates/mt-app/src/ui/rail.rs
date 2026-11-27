@@ -1,31 +1,31 @@
 //! Owner lane: chrome.
 //!
-//! The rail: a 44px strip at the far left with one 6px dot per open file
-//! (plain ink; the dot turns ember only while the file holds live model
-//! output), widening to 240px on hover to show names.
+//! The Shoji sidebar pushes the stage above the narrow breakpoint and
+//! overlays it below. Its folded edge strip gives every open tab one tick;
+//! its unfolded panel shows the workspace tree and tabs outside the folder.
 //!
-//! The shell gives `rail` no width; `rail` owns the strip's width.
-//!
-//! The rail also carries the app's file lists: `Ctrl+P` opens the workspace's
-//! files and `Ctrl+Shift+F` opens a content search as one input line at the
-//! top of the field. Every open creates or focuses a normal tab.
+//! Ctrl+P and Ctrl+Shift+F still open the file and content palettes.
 
-use std::path::PathBuf;
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use mt_core::settings::Language;
 use nsh_base::input;
-use nsh_core::{Color, element::KeyOptions, keymap::When, prelude::*};
+use nsh_core::{AccessibilityState, Color, element::KeyOptions, keymap::When, prelude::*};
 
 use crate::{
     i18n::{self, Key},
-    state::{AppState, Tab},
+    state::{AppState, Entry, Tab, TrackCurve, TrackTween},
     ui::{
-        consent,
-        motion::{EASE_OUT, RAIL_WIDEN_MS, reduced_motion},
-        prims, shell,
+        consent, motion, prims, shell,
         tokens::{
-            self, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT, RAIL_HOVER_W, RAIL_W, SPACE_1,
-            SPACE_2, SPACE_3, SPACE_5, TYPE_UI, TYPE_UI_LINE,
+            self, FONT_INPUT, FONT_UI, HAIRLINE, Layout, RAIL_DOT, RAIL_W, SIDEBAR_CAPTION,
+            SIDEBAR_MARK_W, SIDEBAR_ROW_H, SIDEBAR_TICK_H, SIDEBAR_TICK_INSET,
+            SIDEBAR_TICK_LABEL_SHIFT, SIDEBAR_TICK_LABEL_X, SIDEBAR_TICK_W, SIDEBAR_W, SPACE_1,
+            SPACE_2, SPACE_3, SPACE_4, TYPE_UI, TYPE_UI_LINE,
         },
     },
 };
@@ -33,10 +33,59 @@ use crate::{
 /// How many rows the palette lists at once.
 const MAX_ROWS: usize = 200;
 
-/// The rail: one dot per open file, the active file's at full ink.
-pub fn rail(state: AppState, language: Language) -> impl IntoElement {
-    let hovered = signal(false);
-    let names_opacity = animated_value(0.0);
+pub(super) fn rail(state: AppState, language: Language, layout: Layout) -> impl IntoElement {
+    let narrow = layout.field_overlays();
+    if !narrow {
+        state.sidebar_overlay.set(false);
+    }
+    let open = if narrow {
+        state.sidebar_overlay
+    } else {
+        state.sidebar_open
+    };
+    let initial = if open.get_untracked() { 1.0 } else { 0.0 };
+    let travel = signal(initial);
+    let fade = signal(initial);
+    let travel_tween = TrackTween::default();
+    let fade_tween = TrackTween::default();
+    let owner = Owner::current();
+    let before = Cell::new((open.get_untracked(), untracked(motion::reduced_motion)));
+    effect(move || {
+        let target = open.get();
+        let reduced = motion::reduced_motion();
+        let (was_open, was_reduced) = before.replace((target, reduced));
+        let to = if target { 1.0 } else { 0.0 };
+        if reduced {
+            if !was_reduced {
+                fade_tween.set_now(fade, travel.get_untracked());
+            }
+            travel_tween.set_now(travel, to);
+            if was_open != target || !was_reduced {
+                fade_tween.to(owner, fade, to, TrackCurve::Fade);
+            }
+        } else if was_reduced || was_open != target {
+            if was_reduced {
+                travel_tween.set_now(travel, fade.get_untracked());
+            }
+            travel_tween.to(owner, travel, to, TrackCurve::Rail);
+        }
+    });
+    let width = computed(move || {
+        if narrow {
+            RAIL_W
+        } else {
+            RAIL_W + (SIDEBAR_W - RAIL_W) * travel.get()
+        }
+    });
+    let drawn_width = shell::sidebar_width();
+    effect(move || drawn_width.set(shell::SidebarWidth(width.get())));
+    let visibility = computed(move || {
+        if motion::reduced_motion() {
+            fade.get()
+        } else {
+            travel.get()
+        }
+    });
     let palette = Palette {
         open: state.palette_open,
         mode: signal(PaletteMode::Files),
@@ -44,12 +93,67 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         highlighted: signal(None),
         submitted: signal(String::new()),
     };
+    bind_keys(&state, palette, open, narrow);
+    let strip_state = state.clone();
+    let panel_state = state.clone();
+    let collapsed = signal(HashSet::<PathBuf>::new());
+    let clip = view()
+        .absolute()
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .left(px(if narrow { RAIL_W } else { 0.0 }))
+        .w(move || {
+            px(if motion::reduced_motion() {
+                SIDEBAR_W
+            } else if narrow {
+                SIDEBAR_W * travel.get()
+            } else {
+                width.get()
+            })
+        })
+        .test_id("sidebar-panel-clip")
+        .overflow_hidden()
+        .pointer_events(PointerEvents::BoxNone)
+        .child(when(
+            move || open.get() || visibility.get() > 0.0,
+            move || {
+                panel(
+                    panel_state.clone(),
+                    language,
+                    palette,
+                    open,
+                    travel,
+                    fade,
+                    narrow,
+                    collapsed,
+                )
+            },
+        ));
+    view()
+        .test_id("sidebar")
+        .relative()
+        .z_index(4)
+        .flex_shrink_0()
+        .w(move || px(width.get()))
+        .h(relative(1.0))
+        .bg(move || tokens::palette().room)
+        .child(clip)
+        .child(when(
+            move || !open.get() || visibility.get() < 1.0,
+            move || strip(strip_state.clone(), palette, open, visibility),
+        ))
+        .child(when(move || palette.open.get(), {
+            move || palette_line(state.clone(), language, palette).into_element()
+        }))
+}
+
+fn bind_keys(state: &AppState, palette: Palette, open: Signal<bool>, narrow: bool) {
     // Every Escape binding runs the same fixed-order decision, so the
     // palette cannot be closed out of turn while a guard or menu is up.
     effect({
         let escape_state = state.clone();
         move || {
-            if palette.open.get() {
+            if palette.open.get() || (narrow && open.get()) {
                 let press_state = escape_state.clone();
                 on_key_with(
                     "escape",
@@ -124,273 +228,587 @@ pub fn rail(state: AppState, language: Language) -> impl IntoElement {
         },
     );
 
-    view()
-        .test_id("rail")
-        .relative()
-        // Above the text column and the field, so the widening and the
-        // palette line are not painted over. The shell's overlay layer stays
-        // above the whole room.
-        .z_index(4)
-        .w(px(RAIL_W))
-        .h(relative(1.0))
-        .bg(move || tokens::palette().room)
-        .child(strip(
-            state.clone(),
-            language,
-            hovered,
-            names_opacity,
-            palette,
-        ))
-        .child(when(move || palette.open.get(), {
-            let state = state.clone();
-            move || palette_line(state.clone(), language, palette).into_element()
-        }))
+    let toggle_state = state.clone();
+    on_key("mod+b", move |_: &str| {
+        if !consent::is_open(&toggle_state) {
+            toggle_state.toggle_sidebar(Layout::of(shell::client_width_now()));
+            if narrow && !open.get_untracked() {
+                toggle_state.focus_editor();
+            }
+        }
+    });
 }
 
 fn strip(
     state: AppState,
-    language: Language,
-    hovered: Signal<bool>,
-    names_opacity: AnimatedValue,
     palette: Palette,
+    open: Signal<bool>,
+    visibility: Memo<f32>,
 ) -> impl IntoElement {
+    let tabs = state.tabs;
+    let active = state.active;
     view()
-        .test_id("rail-hover")
-        .absolute()
-        .top(px(0.0))
-        .bottom(px(0.0))
-        .left(px(0.0))
-        // While the strip is open its whole 240px listens, so the pointer on
-        // a name keeps it open — as the widened strip would.
-        .w(move || px(if hovered.get() { RAIL_HOVER_W } else { RAIL_W }))
-        // What the strip does not show it does not take either: 44px wide
-        // when it rests, the width of the whole strip while it is open. With
-        // no clip the widened layers under it would keep taking the pointer
-        // over the text column.
-        .overflow_hidden()
-        .on_mouse_enter(move |_: &MouseEvent| {
-            hovered.set(true);
-            if reduced_motion() {
-                names_opacity.set(1.0);
-            } else {
-                names_opacity.timing(1.0, RAIL_WIDEN_MS, EASE_OUT);
-            }
-        })
-        .on_mouse_leave(move |_: &MouseEvent| {
-            hovered.set(false);
-            if reduced_motion() {
-                names_opacity.set(0.0);
-            } else {
-                names_opacity.timing(0.0, RAIL_WIDEN_MS, EASE_OUT);
-            }
-        })
-        .child(
-            view()
-                .test_id("rail-ground")
-                .absolute()
-                .top(px(0.0))
-                .bottom(px(0.0))
-                .left(px(0.0))
-                .w(px(RAIL_HOVER_W))
-                .bg(move || tokens::palette().room),
-        )
-        // Painted over the invisible names, so a press in the 44px strip is
-        // always a press on a dot.
-        .child(names(
-            state.clone(),
-            language,
-            hovered,
-            names_opacity,
-            palette,
-        ))
-        .child(dots(state, palette))
-}
-
-/// One 6px dot per open file, at the strip's left edge.
-fn dots(state: AppState, palette: Palette) -> impl IntoElement {
-    let list_state = state.clone();
-    view()
-        .test_id("rail-dots")
+        .test_id("sidebar-strip")
+        .role(AccessibilityRole::Group)
         .absolute()
         .top(px(0.0))
         .left(px(0.0))
         .w(px(RAIL_W))
-        .pt(px(SPACE_5))
+        .pt(px(SPACE_4))
         .flex_col()
+        .opacity(move || 1.0 - visibility.get())
+        .pointer_events(move || {
+            if open.get() {
+                PointerEvents::None
+            } else {
+                PointerEvents::BoxNone
+            }
+        })
         .child(each(
-            move || list_state.tabs.get(),
+            move || tabs.get(),
             |tab| tab.id,
-            move |tab: ReadSignal<Tab>, _| {
-                let tab = tab.get();
-                let id = tab.id;
-                let active_state = state.clone();
+            move |row: ReadSignal<Tab>, _| {
+                let id = row.get_untracked().id;
                 let press_state = state.clone();
-                let live_state = state.clone();
-                let live_dot_state = state.clone();
-                prims::press_feedback(view())
-                    .test_id("rail-file-row")
-                    .role(AccessibilityRole::Button)
-                    .optional_label(Some(tab.title.clone()))
-                    .h(px(24.0))
-                    .w(px(RAIL_W))
-                    .pl(px(15.0))
-                    .flex_row()
-                    .items_center()
-                    .cursor_pointer()
-                    .border(px(HAIRLINE))
-                    .border_color(Color::TRANSPARENT)
-                    .focus_visible(|s| s.border_color(|| tokens::palette().ink))
-                    .on_press(move |_event: &PressEvent| {
-                        press_state.set_active(id);
-                        palette.close(&press_state);
-                        press_state.focus_editor();
-                    })
-                    .child(
-                        view()
-                            .test_id("rail-dot")
-                            .w(px(14.0))
-                            .h(px(14.0))
-                            .rounded(px(7.0))
-                            .flex_row()
-                            .items_center()
-                            .justify_center()
-                            .bg(move || {
-                                if live_state.holds_live_model_output(id) {
-                                    tokens::palette().ember_bloom
-                                } else {
-                                    Color::TRANSPARENT
-                                }
+                let hover = signal(false);
+                let opacity = animated_value(0.0);
+                let shift = animated_value(-SIDEBAR_TICK_LABEL_SHIFT);
+                effect(move || {
+                    let hovered = hover.get();
+                    let reduced = motion::reduced_motion();
+                    opacity.timing(
+                        if hovered { 1.0 } else { 0.0 },
+                        if reduced {
+                            motion::REDUCED_CROSSFADE_MS
+                        } else {
+                            motion::HOVER_MS
+                        },
+                        motion::EASE_OUT,
+                    );
+                    if reduced {
+                        shift.set(0.0);
+                    } else {
+                        shift.timing(
+                            if hovered {
+                                0.0
+                            } else {
+                                -SIDEBAR_TICK_LABEL_SHIFT
+                            },
+                            motion::RAIL_WIDEN_MS,
+                            motion::EASE_OUT,
+                        );
+                    }
+                });
+                let strong = move || active.get() == Some(id) || hover.get();
+                press_row(
+                    "rail-file-row",
+                    move || row.get().title,
+                    move || !open.get(),
+                )
+                .w(px(RAIL_W))
+                .h(px(SPACE_4))
+                .pl(px(SIDEBAR_TICK_INSET))
+                .relative()
+                .on_mouse_enter(move |_: &MouseEvent| hover.set(true))
+                .on_mouse_leave(move |_: &MouseEvent| hover.set(false))
+                .on_press(move || activate(&press_state, palette, id, false))
+                .child(
+                    view()
+                        .w(px(SIDEBAR_TICK_W))
+                        .h(move || {
+                            px(if strong() {
+                                SIDEBAR_MARK_W
+                            } else {
+                                SIDEBAR_TICK_H
                             })
-                            .child(
-                                view()
-                                    .w(px(RAIL_DOT))
-                                    .h(px(RAIL_DOT))
-                                    .rounded(px(RAIL_DOT / 2.0))
-                                    .bg(move || {
-                                        if live_dot_state.holds_live_model_output(id) {
-                                            tokens::palette().ember
-                                        } else if active_state.active.get() == Some(id) {
-                                            tokens::palette().ink
-                                        } else {
-                                            // The prototype's `.dot`: the ink at
-                                            // 45%, between resting and faint.
-                                            tokens::palette().ink_at(0.45)
-                                        }
-                                    }),
-                            ),
-                    )
+                        })
+                        .bg(move || {
+                            if strong() {
+                                tokens::palette().ink
+                            } else {
+                                tokens::palette().ink_at(0.45)
+                            }
+                        }),
+                )
+                .child(
+                    view()
+                        .test_id("sidebar-tick-label")
+                        .absolute()
+                        .left(px(SIDEBAR_TICK_LABEL_X))
+                        .top(px(SPACE_1))
+                        .pointer_events(PointerEvents::None)
+                        .bg(move || tokens::palette().room)
+                        .bind_opacity(&opacity)
+                        .bind_translate_x(&shift)
+                        .child(
+                            view()
+                                .px(px(SPACE_2))
+                                .bg(move || tokens::palette().afterimage_plate)
+                                .child(prims::ink(move || row.get().title).number_of_lines(1)),
+                        ),
+                )
             },
         ))
 }
 
-/// The open files' names, at the widened strip's name column.
-fn names(
+fn panel(
     state: AppState,
     language: Language,
-    hovered: Signal<bool>,
-    names_opacity: AnimatedValue,
     palette: Palette,
+    open: Signal<bool>,
+    travel: Signal<f32>,
+    fade: Signal<f32>,
+    narrow: bool,
+    collapsed: Signal<HashSet<PathBuf>>,
 ) -> impl IntoElement {
-    let list_state = state.clone();
+    let groups = tab_groups(state.clone());
     view()
-        .test_id("rail-names")
+        .test_id("sidebar-panel")
+        .role(AccessibilityRole::Group)
+        .w(px(SIDEBAR_W))
         .absolute()
         .top(px(0.0))
         .bottom(px(0.0))
         .left(px(0.0))
-        .w(px(RAIL_HOVER_W))
-        .overflow_hidden()
-        .pt(px(SPACE_5))
+        .translate_x(move || {
+            px(if motion::reduced_motion() {
+                0.0
+            } else {
+                -(SIDEBAR_W - RAIL_W) * (1.0 - travel.get())
+            })
+        })
+        .opacity(move || {
+            if motion::reduced_motion() {
+                fade.get()
+            } else {
+                1.0
+            }
+        })
+        .pointer_events(move || {
+            if open.get() {
+                PointerEvents::Auto
+            } else {
+                PointerEvents::None
+            }
+        })
+        .bg(move || tokens::palette().room)
+        .child(
+            scroll()
+                .w_full()
+                .h(relative(1.0))
+                .flex_col()
+                .bg(move || tokens::palette().afterimage_plate)
+                .child(
+                    view()
+                        .w_full()
+                        .flex_col()
+                        .pt(px(SPACE_4))
+                        .px(px(SPACE_3))
+                        .pb(px(SPACE_3))
+                        .gap(px(SPACE_3))
+                        .child(tab_group(
+                            state.clone(),
+                            language,
+                            palette,
+                            open,
+                            narrow,
+                            groups,
+                            TabGroup::Outside,
+                        ))
+                        .child(tab_group(
+                            state.clone(),
+                            language,
+                            palette,
+                            open,
+                            narrow,
+                            groups,
+                            TabGroup::Unlisted,
+                        ))
+                        .child(tree(state, language, palette, open, narrow, collapsed)),
+                ),
+        )
+}
+
+#[derive(Clone, Copy)]
+enum TabGroup {
+    Outside,
+    Unlisted,
+}
+
+impl TabGroup {
+    fn rows(self, groups: &(Vec<Tab>, Vec<Tab>)) -> &Vec<Tab> {
+        match self {
+            Self::Outside => &groups.0,
+            Self::Unlisted => &groups.1,
+        }
+    }
+}
+
+fn tab_groups(state: AppState) -> Memo<(Vec<Tab>, Vec<Tab>)> {
+    computed(move || {
+        state.entries.with(|entries| {
+            let files: HashSet<_> = entries
+                .iter()
+                .filter(|entry| !entry.is_dir)
+                .map(|entry| &entry.path)
+                .collect();
+            state.tabs.with(|tabs| {
+                let mut outside = Vec::new();
+                let mut unlisted = Vec::new();
+                for tab in tabs {
+                    if state.outside_folder(tab) {
+                        outside.push(tab.clone());
+                    } else if !files.contains(&tab.path) {
+                        unlisted.push(tab.clone());
+                    }
+                }
+                (outside, unlisted)
+            })
+        })
+    })
+}
+
+fn tab_group(
+    state: AppState,
+    language: Language,
+    palette: Palette,
+    open: Signal<bool>,
+    narrow: bool,
+    groups: Memo<(Vec<Tab>, Vec<Tab>)>,
+    group: TabGroup,
+) -> impl IntoElement {
+    let active = state.active;
+    let (id, heading) = match group {
+        TabGroup::Outside => ("sidebar-outside", S::OutsideFolder),
+        TabGroup::Unlisted => ("sidebar-unlisted", S::UnlistedFiles),
+    };
+    when(
+        move || groups.with(|groups| !group.rows(groups).is_empty()),
+        move || {
+            let state = state.clone();
+            view()
+                .test_id(id)
+                .w_full()
+                .flex_col()
+                .child(
+                    prims::faint(s(heading, language))
+                        .px(px(SPACE_2))
+                        .pb(px(SPACE_1)),
+                )
+                .child(each(
+                    move || groups.with(|groups| group.rows(groups).clone()),
+                    |tab| tab.id,
+                    move |row: ReadSignal<Tab>, _| {
+                        let tab = row.get_untracked();
+                        let id = tab.id;
+                        let title = move || row.get().title;
+                        let folder = (!tab.untitled)
+                            .then(|| tab.path.parent())
+                            .flatten()
+                            .filter(|path| !path.as_os_str().is_empty())
+                            .map(|path| SharedString::from(path.to_string_lossy().into_owned()));
+                        let press_state = state.clone();
+                        file_line(
+                            "sidebar-outside-row",
+                            0,
+                            move || Some(id),
+                            active,
+                            title,
+                            folder,
+                            state.clone(),
+                            language,
+                            open,
+                            move || activate(&press_state, palette, id, narrow),
+                        )
+                    },
+                ))
+        },
+    )
+}
+
+fn tree(
+    state: AppState,
+    language: Language,
+    palette: Palette,
+    open: Signal<bool>,
+    narrow: bool,
+    collapsed: Signal<HashSet<PathBuf>>,
+) -> impl IntoElement {
+    let entries = state.entries;
+    let active = state.active;
+    let tabs = state.tabs;
+    let open_files = computed(move || {
+        tabs.with(|tabs| {
+            let mut open = HashMap::new();
+            for tab in tabs.iter().filter(|tab| !tab.untitled) {
+                // The first tab of a path is the one activation targets, so
+                // the row's dot, selected state and close share its id.
+                open.entry(tab.path.clone()).or_insert(tab.id);
+            }
+            open
+        })
+    });
+    view()
+        .test_id("sidebar-tree")
+        .w_full()
         .flex_col()
-        .bind_opacity(&names_opacity)
+        .gap(px(HAIRLINE))
         .child(each(
-            move || list_state.tabs.get(),
-            |tab| tab.id,
-            move |tab: ReadSignal<Tab>, _| {
-                let tab = tab.get();
-                let id = tab.id;
-                let title = tab.title.clone();
-                let active_state = state.clone();
-                let press_state = state.clone();
-                let close_state = state.clone();
-                view()
-                    .test_id("rail-name-row")
-                    .h(px(24.0))
-                    .w_full()
-                    .pl(px(44.0))
-                    .pr(px(SPACE_2))
-                    .flex_row()
-                    .items_center()
-                    .child(
-                        prims::press_feedback(view())
-                            .test_id("rail-name")
-                            // The dot row is this tab's keyboard stop: the
-                            // name is the pointer's way into the strip, and
-                            // a stop here would be clipped while it rests.
-                            .focusable(false)
-                            .role(AccessibilityRole::Button)
-                            .optional_label(Some(title.clone()))
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .py(px(SPACE_1))
-                            .flex_row()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_press(move |_event: &PressEvent| {
-                                press_state.set_active(id);
+            move || {
+                collapsed.with(|collapsed| {
+                    entries.with(|entries| {
+                        if collapsed.is_empty() {
+                            return entries.clone();
+                        }
+                        open_files.with(|open_files| {
+                            let mut hidden_below = None;
+                            entries
+                                .iter()
+                                .filter(|entry| {
+                                    if hidden_below.is_some_and(|depth| entry.depth > depth) {
+                                        // Even a folded folder keeps its open tabs one click away.
+                                        return !entry.is_dir
+                                            && open_files.contains_key(&entry.path);
+                                    }
+                                    hidden_below = (entry.is_dir
+                                        && collapsed.contains(&entry.path))
+                                    .then_some(entry.depth);
+                                    true
+                                })
+                                .cloned()
+                                .collect()
+                        })
+                    })
+                })
+            },
+            |entry| entry.path.clone(),
+            move |row: ReadSignal<Entry>, _| {
+                let entry = row.get_untracked();
+                let title = SharedString::from(entry.name);
+                if entry.is_dir {
+                    let path = entry.path.clone();
+                    let expanded =
+                        computed(move || collapsed.with(|folders| !folders.contains(&path)));
+                    press_row("sidebar-folder", title.clone(), move || open.get())
+                        .w_full()
+                        .h(px(SIDEBAR_ROW_H))
+                        .pl(px(indentation(entry.depth)))
+                        .gap(px(SPACE_2))
+                        .accessibility_state(move || AccessibilityState {
+                            expanded: Some(expanded.get()),
+                            ..Default::default()
+                        })
+                        .on_press(move || {
+                            collapsed.update(|folders| {
+                                if !folders.remove(&entry.path) {
+                                    folders.insert(entry.path.clone());
+                                }
+                            })
+                        })
+                        .child(
+                            mark_slot().child(prims::faint(move || {
+                                if expanded.get() { "▾" } else { "▸" }
+                            })),
+                        )
+                        .child(row_name(title, || false))
+                        .into_element()
+                } else {
+                    let path = entry.path.clone();
+                    let tab = computed(move || open_files.with(|open| open.get(&path).copied()));
+                    let press_state = state.clone();
+                    let press_tab = tab;
+                    file_line(
+                        "sidebar-file",
+                        entry.depth,
+                        move || tab.get(),
+                        active,
+                        move || title.clone(),
+                        None,
+                        state.clone(),
+                        language,
+                        open,
+                        move || {
+                            if let Some(id) = press_tab.get() {
+                                activate(&press_state, palette, id, narrow);
+                                return;
+                            }
+                            if narrow {
+                                press_state.sidebar_overlay.set(false);
+                            }
+                            if palette.open.get() {
                                 palette.close(&press_state);
-                                press_state.focus_editor();
-                            })
-                            .child(
-                                text(title.clone())
-                                    .font_family(FONT_UI)
-                                    .text_size(px(TYPE_UI))
-                                    .line_height(px(TYPE_UI_LINE))
-                                    .text_color(move || {
-                                        if active_state.active.get() == Some(id) {
-                                            tokens::palette().ink
-                                        } else {
-                                            tokens::palette().ink_rest
-                                        }
-                                    })
-                                    .hover(|s| s.text_color(|| tokens::palette().ink))
-                                    .truncate(),
-                            ),
+                            }
+                            press_state.open_file(entry.path.clone());
+                        },
                     )
-                    .child(
-                        prims::press_feedback(view())
-                            .test_id("rail-close")
-                            .w(px(16.0))
-                            .h(px(16.0))
-                            .flex_row()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .role(AccessibilityRole::Button)
-                            .optional_label(Some(SharedString::from(format!(
-                                "{} {}",
-                                s(S::Close, language),
-                                title
-                            ))))
-                            // A stop only while the strip is open: a clipped
-                            // button is no place for the focus to land.
-                            .focusable(move || hovered.get())
-                            .border(px(HAIRLINE))
-                            .border_color(Color::TRANSPARENT)
-                            .focus_visible(|s| s.border_color(|| tokens::palette().ink))
-                            .on_press(move || {
-                                close_state.request_close_tab(id);
-                                close_state.focus_editor();
+                    .into_element()
+                }
+            },
+        ))
+}
+
+fn indentation(depth: usize) -> f32 {
+    SPACE_2 + depth as f32 * SIDEBAR_MARK_W
+}
+
+fn activate(state: &AppState, palette: Palette, id: u64, narrow_panel: bool) {
+    state.set_active(id);
+    if narrow_panel {
+        state.sidebar_overlay.set(false);
+    }
+    if palette.open.get() {
+        palette.close(state);
+    } else {
+        state.focus_editor();
+    }
+}
+
+fn press_row(
+    id: &str,
+    label: impl IntoReactive<SharedString>,
+    enabled: impl Fn() -> bool + Clone + 'static,
+) -> View {
+    prims::press_feedback(view())
+        .test_id(id)
+        .role(AccessibilityRole::Button)
+        .label(label)
+        .flex_row()
+        .items_center()
+        .group()
+        .cursor_pointer()
+        .focusable(enabled.clone())
+        .disabled(move || !enabled())
+        .border(px(HAIRLINE))
+        .border_color(Color::TRANSPARENT)
+        .focus_visible(|s| s.border_color(|| tokens::palette().ink))
+}
+
+fn mark_slot() -> View {
+    view()
+        .w(px(SIDEBAR_MARK_W))
+        .h(px(SIDEBAR_MARK_W))
+        .flex_shrink_0()
+        .flex_row()
+        .items_center()
+        .justify_center()
+}
+
+fn row_name(
+    title: impl IntoReactive<SharedString>,
+    selected: impl Fn() -> bool + 'static,
+) -> impl IntoElement {
+    text(title)
+        .font_family(FONT_UI)
+        .text_size(px(TYPE_UI))
+        .line_height(px(TYPE_UI_LINE))
+        .text_color(move || {
+            if selected() {
+                tokens::palette().ink
+            } else {
+                tokens::palette().ink_rest
+            }
+        })
+        .group_hover(|s| s.text_color(|| tokens::palette().ink))
+        .truncate()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_line(
+    id: &str,
+    depth: usize,
+    tab: impl Fn() -> Option<u64> + Copy + 'static,
+    active: Signal<Option<u64>>,
+    title: impl Fn() -> SharedString + Clone + 'static,
+    folder: Option<SharedString>,
+    state: AppState,
+    language: Language,
+    open: Signal<bool>,
+    on_press: impl Fn() + 'static,
+) -> View {
+    let selected = move || tab().is_some_and(|id| active.get() == Some(id));
+    let min_height = if folder.is_some() {
+        SIDEBAR_ROW_H + TYPE_UI_LINE
+    } else {
+        SIDEBAR_ROW_H
+    };
+    let close_title = title.clone();
+    view()
+        .w_full()
+        .min_h(px(min_height))
+        .flex_row()
+        .items_center()
+        .pr(px(SPACE_2))
+        .group()
+        .child(
+            press_row(id, title.clone(), move || open.get())
+                .accessibility_state(move || AccessibilityState {
+                    selected: selected(),
+                    ..Default::default()
+                })
+                .min_h(px(min_height))
+                .flex_1()
+                .min_w(px(0.0))
+                .pl(px(indentation(depth)))
+                .gap(px(SPACE_2))
+                .on_press(on_press)
+                .child(mark_slot().child(when(
+                    move || tab().is_some(),
+                    move || {
+                        view()
+                            .w(px(RAIL_DOT))
+                            .h(px(RAIL_DOT))
+                            .rounded(px(RAIL_DOT / 2.0))
+                            .bg(move || {
+                                if selected() {
+                                    tokens::palette().ink
+                                } else {
+                                    tokens::palette().ink_at(0.45)
+                                }
                             })
-                            .child(
-                                text("\u{00D7}")
-                                    .font_family(FONT_UI)
-                                    .text_size(px(TYPE_UI))
-                                    .line_height(px(TYPE_UI_LINE))
-                                    .text_color(move || tokens::palette().ink_caption)
-                                    .hover(|s| s.text_color(|| tokens::palette().ink)),
-                            ),
-                    )
+                    },
+                )))
+                .child(
+                    view()
+                        .min_w(px(0.0))
+                        .flex_1()
+                        .flex_col()
+                        .child(row_name(title, selected))
+                        .children(folder.map(|folder| {
+                            text(folder)
+                                .font_family(FONT_UI)
+                                .text_size(px(SIDEBAR_CAPTION))
+                                .text_color(move || tokens::palette().ink_caption)
+                                .truncate()
+                                .into_element()
+                        })),
+                ),
+        )
+        .child(when(
+            move || tab().is_some(),
+            move || {
+                let state = state.clone();
+                let title = close_title.clone();
+                press_row(
+                    "rail-close",
+                    move || SharedString::from(format!("{} {}", s(S::Close, language), title())),
+                    move || open.get(),
+                )
+                .w(px(SPACE_3))
+                .h(px(SPACE_3))
+                .flex_shrink_0()
+                .justify_center()
+                .opacity(0.0)
+                .group_hover(|s| s.opacity(1.0))
+                .focus_visible(|s| s.opacity(1.0).border_color(|| tokens::palette().ink))
+                .transition_opacity()
+                .duration(motion::HOVER_MS)
+                .on_press(move || {
+                    if let Some(id) = tab() {
+                        state.request_close_tab(id);
+                        state.focus_editor();
+                    }
+                })
+                .child(prims::faint("×").group_hover(|s| s.text_color(|| tokens::palette().ink)))
             },
         ))
 }
@@ -553,7 +971,10 @@ fn palette_line(state: AppState, language: Language, palette: Palette) -> impl I
     // The line belongs to the field: its left edge follows the field's own
     // (the overlay's, below 1040), and it is no wider than the field's
     // reading measure.
-    let left = move || Layout::of(shell::client_width_now()).field_left(shell::client_width_now());
+    let left = move || {
+        let client = shell::client_width_now();
+        Layout::of(client).field_left_at(client, shell::sidebar_width_now())
+    };
     view()
         .test_id("palette")
         .child(
@@ -565,8 +986,8 @@ fn palette_line(state: AppState, language: Language, palette: Palette) -> impl I
                 .absolute()
                 .top(px(0.0))
                 .bottom(px(0.0))
-                .left(px(RAIL_W))
-                .w(move || px((shell::client_width_now() - RAIL_W).max(0.0)))
+                .left(move || px(shell::sidebar_width_now()))
+                .w(move || px(shell::stage_width()))
                 .on_press(move || palette.close(&scrim_state)),
         )
         .child(
@@ -766,6 +1187,8 @@ enum S {
     FindFile,
     Close,
     NoFolder,
+    OutsideFolder,
+    UnlistedFiles,
 }
 
 fn s(key: S, language: Language) -> &'static str {
@@ -774,11 +1197,15 @@ fn s(key: S, language: Language) -> &'static str {
             S::FindFile => "Find a file",
             S::Close => "Close",
             S::NoFolder => "Open a folder first to search its files.",
+            S::OutsideFolder => "Outside folder",
+            S::UnlistedFiles => "Open files not in the tree",
         },
         Language::Chinese => match key {
             S::FindFile => "查找文件",
             S::Close => "关闭",
             S::NoFolder => "请先打开文件夹以搜索其中的文件。",
+            S::OutsideFolder => "文件夹外",
+            S::UnlistedFiles => "未列在树中的打开文件",
         },
     }
 }
@@ -808,7 +1235,7 @@ mod tests {
             .w(px(640.0))
             .h(px(400.0))
             .flex_row()
-            .child(rail(state, Language::English))
+            .child(rail(state, Language::English, Layout::Narrow))
             .child(prims::primary_action("palette-primary", "Primary", || {}))
     }
 
@@ -823,13 +1250,13 @@ mod tests {
 
     fn rail_name_color(app: &Headless) -> Color {
         app.screen()
-            .span_style("text:Inactive")
+            .span_style("id:sidebar-panel >> text:Inactive")
             .expect("the hovered inactive rail name style")
             .color
     }
 
     #[test]
-    fn hovered_rail_and_focused_actions_track_the_current_theme() {
+    fn hovered_sidebar_and_focused_actions_track_the_current_theme() {
         let mut config =
             EngineConfig::new(nsh_testing::windowed_root::<PaletteProbe>().tokens(tokens::theme()));
         config.environment.color_scheme = ColorScheme::Light;
@@ -839,12 +1266,13 @@ mod tests {
         let mut app = Headless::start(config).expect("start the palette probe");
         app.set_viewport(nsh_core::Size::new(Points(640.0), Points(400.0)))
             .expect("set the viewport");
-        app.wait_for("id:rail-hover").expect("the collapsed rail");
-        app.hover("id:rail-hover").expect("open the rail names");
+        app.wait_for("id:sidebar-strip")
+            .expect("the collapsed sidebar");
+        app.press_key("mod+b").expect("open the sidebar panel");
         app.settle();
-        app.wait_for("text:Inactive")
+        app.wait_for("id:sidebar-panel >> text:Inactive")
             .expect("the inactive rail name");
-        app.hover("text:Inactive")
+        app.hover("id:sidebar-panel >> text:Inactive")
             .expect("hover the inactive rail name");
         app.settle();
 

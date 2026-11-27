@@ -42,9 +42,7 @@ fn documents_open_in_source_then_in_the_pane_last_chosen() {
     );
 
     // The user picks Split.
-    app.press("id:title-settings")
-        .expect("open the glyph's menu");
-    app.press("id:title-menu-split").expect("choose Split");
+    app.press("id:title-view").expect("choose Split");
     app.wait_for("id:preview-field")
         .expect("Split: the preview in the field");
 
@@ -55,11 +53,11 @@ fn documents_open_in_source_then_in_the_pane_last_chosen() {
         .expect("filter to second.md");
     app.submit("id:palette-input").expect("open second.md");
     app.wait_for_gone(
-        "id:preview-field >> text:First heading",
+        "id:stage-dock >> text:First heading",
         Duration::from_secs(5),
     )
     .expect("the first document left the field");
-    app.wait_for("id:preview-field >> text:Second heading")
+    app.wait_for("id:stage-dock >> text:Second heading")
         .expect("the second document opens in the pane last chosen");
     app.wait_for("label:Markdown source")
         .expect("Split keeps the editor");
@@ -70,7 +68,7 @@ fn documents_open_in_source_then_in_the_pane_last_chosen() {
         Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("restart the app");
     app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
         .expect("wide viewport");
-    app.wait_for("id:preview-field >> text:First heading")
+    app.wait_for("id:stage-dock >> text:First heading")
         .expect("the restarted app opens in the pane last chosen");
     app.wait_for("label:Markdown source")
         .expect("Split keeps the editor after a restart");

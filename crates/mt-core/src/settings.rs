@@ -291,6 +291,8 @@ pub struct SettingsData {
     /// Whether a no-argument launch begins in the welcome state.
     pub show_welcome_on_startup: bool,
     pub document_pane: DocumentPane,
+    /// The sidebar preference at widths that allow it to push the stage.
+    pub sidebar_expanded: bool,
     /// Explicit consent to local, content-free usage counters. Never enables
     /// an upload; export remains a separate deliberate user action.
     pub usage_metrics_enabled: bool,
@@ -323,6 +325,7 @@ impl Default for SettingsData {
             skills_group_by: GroupBy::default(),
             show_welcome_on_startup: true,
             document_pane: DocumentPane::default(),
+            sidebar_expanded: true,
             usage_metrics_enabled: false,
             recent_targets: Vec::new(),
         }
@@ -1184,6 +1187,7 @@ mod tests {
             translate_to: "de".into(),
             show_welcome_on_startup: false,
             document_pane: DocumentPane::Split,
+            sidebar_expanded: false,
             usage_metrics_enabled: true,
             recent_targets: vec![RecentTarget::new(
                 PathBuf::from("C:/work/notes.md"),

@@ -100,6 +100,8 @@ mod save_twice;
 mod settings_form_state;
 #[path = "shell.rs"]
 mod shell;
+#[path = "sidebar_view.rs"]
+mod sidebar_view;
 #[path = "tab_close_guard.rs"]
 mod tab_close_guard;
 #[path = "tab_switch.rs"]

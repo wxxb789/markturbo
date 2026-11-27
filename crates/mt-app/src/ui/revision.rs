@@ -433,6 +433,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                 view()
                     .test_id("revision-stale")
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(SPACE_3))
                     .child(prims::ink(S::OtherDocument.text(language)))
@@ -455,6 +456,7 @@ pub fn field(state: AppState, language: Language) -> impl IntoElement {
                 view()
                     .test_id("revision-busy")
                     .flex_row()
+                    .flex_wrap()
                     .items_center()
                     .gap(px(SPACE_3))
                     .child(prims::rest(i18n::t(language, Key::Revising)))
@@ -785,6 +787,7 @@ fn docked_proposal(
         .child(
             view()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .gap(px(SPACE_3))
                 .child(
@@ -952,6 +955,7 @@ fn decisions(
         .child(
             view()
                 .flex_row()
+                .flex_wrap()
                 .items_center()
                 .justify_start()
                 .w_full()
@@ -1060,6 +1064,7 @@ fn key_hints(language: Language) -> impl IntoElement {
     view()
         .test_id("revision-keys")
         .flex_row()
+        .flex_wrap()
         .items_center()
         .gap(px(SPACE_3))
         .child(pair("A", S::Accept))

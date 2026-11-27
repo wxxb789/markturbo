@@ -1,32 +1,23 @@
 //! Owner lane: foundation.
 //!
-//! The window shell: one room, four regions, one overlay layer.
-//!
-//! What the shell owns, and what nothing else may take over:
-//!
-//! * the opaque title row and the window's own chrome: the system title bar is
-//!   hidden and the caption controls' area is reserved (see
-//!   [`crate::ui::prims::caption_insets`]), so the room covers the whole
-//!   window;
-//! * the three layout breakpoints (client width ≥ 1280, 1040–1279, < 1040),
-//!   the rail's 44px, the text column's 40 + measure + 40 box and the field's
-//!   remaining width with its 40px left and 32px right insets;
-//! * below 1040 client width the field becomes an overlay over the right 46%
-//!   of the column, and the column dims to 40% beneath it;
-//! * the overlay layer the consent card and the notices guard live in;
-//! * what the field shows ([`FieldSurface`]) — exactly one surface at a time,
-//!   in a fixed order of precedence.
-//!
-//! Every surface is reached through its module's `is_open` / drawing function;
-//! the shell never draws a surface's insides.
+//! The window shell owns the opaque title row and native caption clearance,
+//! the sidebar and two-screen stage below it, and the window's overlay layer.
+//! Its client width sets the breakpoints (≥1280, 1040–1279, <1040). The stage
+//! width is the client width minus the sidebar's drawn width (44–240 points).
+//! The document track divides the stage between the mounted source and the
+//! preview; the 16-point divider snaps to Edit, Split, or Preview.
+//! Review, Revision and Context keep the measured column and the field's
+//! 40/32-point insets. Below 1040 the field covers the right 46% and dims the
+//! column beneath it. The shell routes these surfaces without drawing their
+//! contents.
 
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use mt_core::settings::Language;
-use nsh_core::{Points, prelude::*};
+use nsh_core::{Points, TouchEvent, TouchPhase, prelude::*};
 
 use crate::{
-    state::AppState,
+    state::{AppState, View as DocumentView},
     ui::{
         consent, context, document, motion, notices, preview, rail, review, revision, settings,
         titlebar,
@@ -48,7 +39,7 @@ pub enum FieldSurface {
     Review,
     /// The Effective Agent Context.
     Context,
-    /// The rendered document, in Split.
+    /// The rendered document, in Split or Preview.
     Preview,
 }
 
@@ -67,7 +58,7 @@ pub fn surface(state: &AppState) -> FieldSurface {
     }
 }
 
-/// The window: title row, rail, column, field and the overlay layer.
+/// The window: title row, sidebar, document stage and overlay layer.
 ///
 /// `layout` is the breakpoint `app.rs` re-keyed the shell with, so a shell that
 /// is rebuilt is a shell that crosses one.
@@ -82,6 +73,11 @@ pub(crate) fn shell_with_status(
     layout: Layout,
     status: notices::StatusPresence,
 ) -> impl IntoElement {
+    // Settings mounts in place of the rail, so the shell owns clearing the
+    // narrow overlay when a breakpoint changes with Settings still open.
+    if !layout.field_overlays() {
+        state.sidebar_overlay.set(false);
+    }
     let body_state = state.clone();
     let capture_state = state.clone();
     view()
@@ -150,40 +146,359 @@ pub fn client_width_now() -> f32 {
     }
 }
 
-/// The room under the title row: rail, column, field.
+/// The sidebar's drawn push width, measured in client points. Narrow always
+/// publishes the strip's width: its opened panel is an overlay, not a push.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct SidebarWidth(pub(super) f32);
+
+impl Default for SidebarWidth {
+    fn default() -> Self {
+        Self(tokens::RAIL_W)
+    }
+}
+
+pub(super) fn sidebar_width() -> Signal<SidebarWidth> {
+    global::<SidebarWidth>()
+}
+
+pub(super) fn sidebar_width_now() -> f32 {
+    sidebar_width().get().0
+}
+
+pub(super) fn stage_width() -> f32 {
+    (client_width_now() - sidebar_width_now()).max(0.0)
+}
+
+/// The room under the title row: the sidebar and the stage it pushes.
 fn workspace(
     state: AppState,
     language: Language,
     layout: Layout,
     status: notices::StatusPresence,
 ) -> impl IntoElement {
-    let field_open = state.clone();
-    let field_state = state.clone();
     view()
         .test_id("workspace")
         .flex_1()
         .w_full()
         .min_h(px(0.0))
         .flex_row()
-        .child(rail::rail(state.clone(), language))
-        .child(column(state.clone(), language, layout, status))
-        // No surface, no field: an empty field below 1040 would otherwise
-        // lay an opaque overlay over the column and dim it for nothing.
-        .child(when(
-            move || surface(&field_open) != FieldSurface::None,
-            move || field(field_state.clone(), language, layout, status),
+        .child(rail::rail(state.clone(), language, layout))
+        .child(stage(state, language, layout, status))
+}
+
+fn preview_track(state: &AppState, layout: Layout) -> bool {
+    !layout.field_overlays()
+        && state.active.get().is_some()
+        && matches!(surface(state), FieldSurface::None | FieldSurface::Preview)
+}
+
+pub(super) fn field_overlays_source(state: &AppState) -> bool {
+    match surface(state) {
+        FieldSurface::None => false,
+        FieldSurface::Preview => state.active_view() == DocumentView::Split,
+        _ => true,
+    }
+}
+
+fn source_width(state: &AppState, layout: Layout) -> f32 {
+    if preview_track(state, layout) {
+        stage_width() * state.view_track.get()
+    } else if layout.field_overlays() || surface(state) == FieldSurface::None {
+        layout.measure() + 2.0 * tokens::COLUMN_GAP
+    } else {
+        // The dock's own budget: at 1068 client points with the rail folded
+        // it is FIELD_MIN_W wide past its right inset. A narrower stage
+        // gives the deficit to the source instead of clipping the field.
+        (stage_width() - tokens::FIELD_MIN_W - tokens::FIELD_RIGHT_INSET)
+            .min(layout.measure() + 2.0 * tokens::COLUMN_GAP)
+            .max(0.0)
+    }
+}
+
+pub(crate) fn shows_full_preview(state: &AppState) -> bool {
+    surface(state) == FieldSurface::Preview && state.active_view() == DocumentView::Preview
+}
+
+// Move the banners and notice line to the reading screen only once it owns
+// the whole document area. The source and its editor stay mounted.
+fn preview_owns_chrome(state: &AppState, layout: Layout) -> bool {
+    shows_full_preview(state) && (layout.field_overlays() || state.view_track.get() == 0.0)
+}
+
+fn stage(
+    state: AppState,
+    language: Language,
+    layout: Layout,
+    status: notices::StatusPresence,
+) -> impl IntoElement {
+    let dragging = signal(false);
+    let layout_state = state.clone();
+    let source_width = computed(move || source_width(&layout_state, layout));
+    // Both screens use the same owner decision, including during the last
+    // frame of the slide. A clipped source must not retain banner controls.
+    let dock_chrome = computed({
+        let state = state.clone();
+        move || preview_owns_chrome(&state, layout)
+    });
+    let source_state = state.clone();
+    let source_visible = computed(move || {
+        if layout.field_overlays() {
+            !shows_full_preview(&source_state)
+        } else {
+            source_width.get() > 0.0
+        }
+    });
+    let overlay_open = state.sidebar_overlay;
+    let divider_state = state.clone();
+    let source_fade = screen_fade(&state, |state| (!shows_full_preview(state)).then_some(()));
+    let dock_fade = screen_fade(&state, |state| match surface(state) {
+        FieldSurface::None => None,
+        FieldSurface::Preview => state.active_tab().map(|tab| {
+            let pane = tab.pane.get();
+            (
+                FieldSurface::Preview,
+                pane.view() == DocumentView::Preview,
+                pane.web(),
+            )
+        }),
+        field => Some((field, false, false)),
+    });
+    let column_state = state.clone();
+    view()
+        .test_id("stage")
+        .relative()
+        .flex_1()
+        .min_w(px(0.0))
+        .h(relative(1.0))
+        .overflow_hidden()
+        .bg(move || tokens::palette().column_ground)
+        .opacity(move || {
+            if layout.field_overlays() && overlay_open.get() {
+                Layout::DIMMED
+            } else {
+                1.0
+            }
+        })
+        .on_touch(divider_touch(state.clone(), layout, dragging))
+        .child(
+            view()
+                .test_id("stage-source")
+                .w(move || px(source_width.get()))
+                .h(relative(1.0))
+                .overflow_hidden()
+                .pointer_events(move || surface_pointer(source_visible.get()))
+                .bind_opacity(&source_fade)
+                .child(
+                    view()
+                        .w_full()
+                        .h(relative(1.0))
+                        .opacity(move || {
+                            if !source_visible.get() {
+                                0.0
+                            } else if layout.field_overlays()
+                                && field_overlays_source(&column_state)
+                            {
+                                Layout::DIMMED
+                            } else {
+                                1.0
+                            }
+                        })
+                        .child(column(state.clone(), language, layout, status, dock_chrome)),
+                ),
+        )
+        .child(dock(
+            state.clone(),
+            language,
+            layout,
+            source_width,
+            dock_fade,
+            status,
+            dock_chrome,
         ))
+        .child(when(
+            move || preview_track(&divider_state, layout),
+            move || divider(source_width, dragging, language),
+        ))
+}
+
+/// A pointer owns the free ratio only while the same tab and its track are
+/// available. The stage can disappear before that pointer reports its end.
+fn divider_touch(state: AppState, layout: Layout, dragging: Signal<bool>) -> impl Fn(&TouchEvent) {
+    let captured = Rc::new(Cell::new(None::<(u64, u32, f32)>));
+    let finish = {
+        let captured = captured.clone();
+        let state = state.clone();
+        move || {
+            let Some((tab, _, _)) = captured.take() else {
+                return;
+            };
+            if untracked(|| state.active.try_get()) == Some(Some(tab)) {
+                untracked(|| state.snap_view_track());
+            }
+        }
+    };
+    cleanup(finish.clone());
+    effect({
+        let state = state.clone();
+        let captured = captured.clone();
+        let finish = finish.clone();
+        move || {
+            let eligible = preview_track(&state, layout);
+            let active = state.active.get();
+            if let Some((tab, _, _)) = captured.get()
+                && (!eligible || active != Some(tab))
+            {
+                finish();
+                dragging.set(false);
+            }
+        }
+    });
+    move |event| {
+        let active = state.active.get_untracked();
+        if !untracked(|| preview_track(&state, layout))
+            || captured
+                .get()
+                .is_some_and(|(tab, _, _)| Some(tab) != active)
+        {
+            finish();
+            dragging.set(false);
+            return;
+        }
+        let Some((_, pointer, offset)) = captured.get() else {
+            if event.phase == TouchPhase::Start
+                && let Some(tab) = active
+            {
+                let ratio = state.view_track.get_untracked();
+                let x = untracked(sidebar_width_now) + ratio * untracked(stage_width);
+                if let Some(point) = event.points.iter().find(|point| {
+                    point.changed && (point.page.x.0 - x).abs() <= tokens::DIVIDER_HIT_W / 2.0
+                }) {
+                    captured.set(Some((tab, point.id, point.page.x.0 - x)));
+                    dragging.set(true);
+                    state.set_view_track_now(ratio);
+                }
+            }
+            return;
+        };
+        let Some(point) = event
+            .points
+            .iter()
+            .find(|point| point.changed && point.id == pointer)
+        else {
+            return;
+        };
+        match event.phase {
+            TouchPhase::Move => {
+                let width = untracked(stage_width);
+                let from = untracked(sidebar_width_now);
+                state.set_view_track_now((point.page.x.0 - offset - from) / width.max(1.0));
+            }
+            TouchPhase::End | TouchPhase::Cancel => {
+                finish();
+                dragging.set(false);
+                state.focus_editor();
+            }
+            TouchPhase::Start => {}
+        }
+    }
+}
+
+/// Spatial motion reveals each pane. In reduced motion the track snaps and
+/// a change of the screen actually shown fades in at the destination.
+fn screen_fade<T: Copy + PartialEq + 'static>(
+    state: &AppState,
+    screen: impl Fn(&AppState) -> Option<T> + 'static,
+) -> AnimatedValue {
+    let opacity = animated_value(1.0);
+    let state = state.clone();
+    let before = Cell::new(None);
+    effect(move || {
+        let id = state.active.get();
+        let shown = screen(&state);
+        let reduced = motion::reduced_motion();
+        let previous = before.replace(Some((id, shown, reduced)));
+        if previous == Some((id, shown, reduced)) {
+            return;
+        }
+        opacity.set(1.0);
+        if shown.is_some()
+            && reduced
+            && previous.is_some_and(|(tab, screen, was_reduced)| {
+                tab == id && was_reduced && screen != shown
+            })
+        {
+            opacity.set(0.0);
+            opacity.timing(1.0, motion::REDUCED_CROSSFADE_MS, motion::EASE_OUT);
+        }
+    });
+    opacity
+}
+
+fn divider(
+    source_width: Memo<f32>,
+    dragging: Signal<bool>,
+    language: Language,
+) -> impl IntoElement {
+    let hover = signal(false);
+    let strong = move || dragging.get() || hover.get();
+    view()
+        .test_id("stage-divider")
+        .absolute()
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .left(move || px(source_width.get()))
+        .ml(px(-tokens::DIVIDER_HIT_W / 2.0))
+        .w(px(tokens::DIVIDER_HIT_W))
+        .z_index(2)
+        .role(AccessibilityRole::Button)
+        .label(match language {
+            Language::English => "Resize the panes",
+            Language::Chinese => "调整窗格大小",
+        })
+        .cursor(Cursor::ColResize)
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .on_mouse_enter(move |_: &MouseEvent| hover.set(true))
+        .on_mouse_leave(move |_: &MouseEvent| hover.set(false))
+        .child(view().w(px(tokens::HAIRLINE)).h_full().bg(move || {
+            if strong() {
+                tokens::palette().ink_faint
+            } else {
+                tokens::palette().hairline
+            }
+        }))
+        .child(
+            view()
+                .absolute()
+                .left(px((tokens::DIVIDER_HIT_W - tokens::DIVIDER_HANDLE_W) / 2.0))
+                .w(px(tokens::DIVIDER_HANDLE_W))
+                .h(move || {
+                    px(if strong() {
+                        tokens::SPACE_5
+                    } else {
+                        tokens::DIVIDER_HANDLE_H
+                    })
+                })
+                .bg(move || {
+                    if strong() {
+                        tokens::palette().ink
+                    } else {
+                        tokens::palette().ink_faint
+                    }
+                }),
+        )
 }
 
 /// The text column: the document's ground, its measure, its two 40px insets,
 /// the banners that belong above the text and the status line at its foot.
 ///
-/// Below 1040 client width it dims to 40% under the field.
 fn column(
     state: AppState,
     language: Language,
     layout: Layout,
     status: notices::StatusPresence,
+    dock_chrome: Memo<bool>,
 ) -> impl IntoElement {
     let active = state.active;
     let laid_out_tab = signal(active.get_untracked());
@@ -221,28 +536,26 @@ fn column(
             }
         }
     });
-    let dim_state = state.clone();
     view()
         .test_id("column")
-        .w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
+        .w_full()
+        .max_w(px(layout.measure() + 2.0 * tokens::COLUMN_GAP))
         .h(relative(1.0))
         .flex_col()
         .px(px(tokens::COLUMN_GAP))
         .pt(move || Length::from(px(snap_offset.get())))
         .bg(move || tokens::palette().column_ground)
-        // Only a field that is actually drawn dims the column under it.
-        .opacity(move || {
-            if layout.field_overlays() && surface(&dim_state) != FieldSurface::None {
-                Layout::DIMMED
-            } else {
-                1.0
-            }
-        })
-        .child(banner_slot(
-            "recovery-banner-slot",
-            move || recovery_open.get(),
-            move || notices::recovery_banner(recovery_banner_state.clone(), language),
-            track_reflow(recovery_deadline),
+        .child(when(
+            move || !dock_chrome.get(),
+            move || {
+                let state = recovery_banner_state.clone();
+                banner_slot(
+                    "recovery-banner-slot",
+                    move || recovery_open.get(),
+                    move || notices::recovery_banner(state.clone(), language),
+                    track_reflow(recovery_deadline.clone()),
+                )
+            },
         ))
         .child(
             view()
@@ -264,6 +577,7 @@ fn column(
                         column_content(
                             content_state.clone(),
                             language,
+                            dock_chrome,
                             move || {
                                 laid_out_tab.set(tab);
                                 if snap_offset.get_untracked() != 0.0 {
@@ -280,16 +594,21 @@ fn column(
                 .w_full()
                 .max_w(move || {
                     px(if layout.field_overlays() {
-                        (layout.column_width(client_width_now()) - tokens::COLUMN_GAP).max(0.0)
+                        (layout.column_width(client_width_now()).min(stage_width())
+                            - tokens::COLUMN_GAP)
+                            .max(0.0)
                     } else {
                         layout.measure()
                     })
                 })
-                .child(notices::status_line(state, language, status)),
+                .child(when(
+                    move || !dock_chrome.get(),
+                    move || notices::status_line(state.clone(), language, status),
+                )),
         )
 }
 
-fn track_reflow(deadline: Rc<Cell<Option<nsh_core::time::Instant>>>) -> impl Fn(f32) {
+fn track_reflow(deadline: Rc<Cell<Option<nsh_core::time::Instant>>>) -> impl Fn(f32) + Clone {
     move |ms| {
         let end = nsh_core::time::now() + Duration::from_secs_f32(ms / 1000.0);
         deadline.set(deadline.get().max(Some(end)));
@@ -299,18 +618,26 @@ fn track_reflow(deadline: Rc<Cell<Option<nsh_core::time::Instant>>>) -> impl Fn(
 fn column_content(
     state: AppState,
     language: Language,
+    dock_chrome: Memo<bool>,
     on_layout: impl Fn() + 'static,
-    on_reflow: impl Fn(f32) + 'static,
+    on_reflow: impl Fn(f32) + Clone + 'static,
 ) -> [AnyElement; 2] {
     let document_state = state.clone();
     let conflict_state = state.clone();
     let conflict_banner_state = state.clone();
     [
-        banner_slot(
-            "conflict-banner-slot",
-            move || notices::has_conflict(&conflict_state),
-            move || notices::conflict_banner(conflict_banner_state.clone(), language),
-            on_reflow,
+        when(
+            move || !dock_chrome.get(),
+            move || {
+                let test = conflict_state.clone();
+                let draw = conflict_banner_state.clone();
+                banner_slot(
+                    "conflict-banner-slot",
+                    move || notices::has_conflict(&test),
+                    move || notices::conflict_banner(draw.clone(), language),
+                    on_reflow.clone(),
+                )
+            },
         )
         .into_element(),
         view()
@@ -322,7 +649,7 @@ fn column_content(
             .child(
                 when(move || document::has_document(&document_state), {
                     let state = state.clone();
-                    move || document::column(state.clone(), language).into_element()
+                    move || document::column(state.clone()).into_element()
                 })
                 .otherwise(move || welcome::welcome(state.clone(), language).into_element()),
             )
@@ -330,55 +657,107 @@ fn column_content(
     ]
 }
 
-/// The field: all remaining width, unbordered, with the 40px field gap as its
-/// left inset, the app's 32px right inset and the docked reading position
-/// capped at 440px.
-///
-/// The left inset is the field's, once, for every surface and in both modes
-/// (the prototype's `.field > *`): a review's lens line and the preview's
-/// label start at the same x, and no surface adds an inset of its own.
-///
-/// Below 1040 client width it is an opaque overlay across the right 46% of the
-/// window, over the dimmed column.
-fn field(
+/// The narrow Preview stop uses the old full reading column; Split and the
+/// other docked surfaces keep the right-hand overlay. Above the breakpoint,
+/// the source's trailing edge is the dock's leading edge.
+fn dock(
     state: AppState,
     language: Language,
     layout: Layout,
+    source_width: Memo<f32>,
+    opacity: AnimatedValue,
     status: notices::StatusPresence,
+    dock_chrome: Memo<bool>,
 ) -> impl IntoElement {
-    let area = view()
-        .h(relative(1.0))
-        .pl(px(tokens::FIELD_GAP))
-        .pr(px(tokens::FIELD_RIGHT_INSET));
-    let area = if layout.field_overlays() {
-        area.absolute()
-            .top(px(0.0))
-            .bottom(px(0.0))
-            .left(move || px(layout.field_left(client_width_now())))
-            .right(px(0.0))
-            .bg(move || tokens::palette().room)
-    } else {
-        area.flex_1()
+    let full_preview = computed({
+        let state = state.clone();
+        move || shows_full_preview(&state)
+    });
+    let dock_state = state.clone();
+    let narrow = layout.field_overlays();
+    let left = move || {
+        if !narrow {
+            source_width.get()
+        } else if full_preview.get() {
+            0.0
+        } else {
+            (layout.field_left(client_width_now()) - tokens::RAIL_W).max(0.0)
+        }
     };
-    area.child(
-        view()
-            .w_full()
-            .max_w(px(tokens::FIELD_READING_MAX_W))
-            // The field's full height reaches its surface: a surface that
-            // scrolls (the preview) fills it rather than collapsing to 0.
-            .h(relative(1.0))
-            .child(field_surface(state, language, status)),
-    )
+    let visible = computed(move || {
+        if narrow {
+            surface(&dock_state) != FieldSurface::None
+        } else {
+            left() < stage_width()
+                && (surface(&dock_state) != FieldSurface::None
+                    || preview_track(&dock_state, layout))
+        }
+    });
+    let column_preview = move || narrow && full_preview.get();
+    view()
+        .test_id("stage-dock")
+        .absolute()
+        .top(px(0.0))
+        .bottom(px(0.0))
+        .left(move || px(left()))
+        .w(move || {
+            px(if column_preview() {
+                stage_width().min(layout.measure() + 2.0 * tokens::COLUMN_GAP)
+            } else {
+                (stage_width() - left()).max(0.0)
+            })
+        })
+        .pointer_events(move || surface_pointer(visible.get()))
+        .overflow_hidden()
+        .bind_opacity(&opacity)
+        .child(when(
+            move || visible.get(),
+            move || {
+                view()
+                    .w_full()
+                    .h(relative(1.0))
+                    .bg(move || tokens::palette().room)
+                    .pl(px(tokens::FIELD_GAP))
+                    .pr(move || {
+                        px(if column_preview() {
+                            tokens::COLUMN_GAP
+                        } else {
+                            tokens::FIELD_RIGHT_INSET
+                        })
+                    })
+                    .child(
+                        view()
+                            .w_full()
+                            .max_w(move || {
+                                px(if full_preview.get() {
+                                    layout.measure()
+                                } else {
+                                    tokens::FIELD_READING_MAX_W
+                                })
+                            })
+                            .h(relative(1.0))
+                            .child(field_surface(
+                                state.clone(),
+                                language,
+                                layout,
+                                status,
+                                dock_chrome,
+                            )),
+                    )
+            },
+        ))
 }
 
 fn field_surface(
     state: AppState,
     language: Language,
+    layout: Layout,
     status: notices::StatusPresence,
+    dock_chrome: Memo<bool>,
 ) -> impl IntoElement {
     use crate::state::StatusSurface;
-    let condition = state.clone();
     let notice = state.clone();
+    let condition = state.clone();
     let mut field = view()
         .test_id("field")
         .w_full()
@@ -399,7 +778,6 @@ fn field_surface(
         FieldSurface::Revision,
         FieldSurface::Review,
         FieldSurface::Context,
-        FieldSurface::Preview,
     ] {
         let condition_state = state.clone();
         let draw_state = state.clone();
@@ -408,17 +786,58 @@ fn field_surface(
             move || draw_field(draw_state.clone(), language, want),
         ));
     }
+    let preview_state = state.clone();
     field
+        .child(when(move || dock_chrome.get(), {
+            let state = state.clone();
+            move || preview_banners(state.clone(), language)
+        }))
+        .child(when(
+            move || {
+                surface(&preview_state) == FieldSurface::Preview
+                    || (preview_track(&preview_state, layout)
+                        && preview_state.view_track.get() < 1.0)
+            },
+            {
+                let state = state.clone();
+                move || preview::field(state.clone(), language)
+            },
+        ))
+        .child(when(
+            move || dock_chrome.get(),
+            move || notices::status_line(state.clone(), language, status),
+        ))
 }
 
-/// Draws the surface `[surface]` chose.
+fn preview_banners(state: AppState, language: Language) -> impl IntoElement {
+    let recovery_open = state.clone();
+    let recovery_draw = state.clone();
+    let conflict_open = state.clone();
+    view()
+        .w_full()
+        .flex_shrink_0()
+        .flex_col()
+        .child(banner_slot(
+            "recovery-banner-slot",
+            move || notices::has_recovery(&recovery_open),
+            move || notices::recovery_banner(recovery_draw.clone(), language),
+            |_| {},
+        ))
+        .child(banner_slot(
+            "conflict-banner-slot",
+            move || notices::has_conflict(&conflict_open),
+            move || notices::conflict_banner(state.clone(), language),
+            |_| {},
+        ))
+}
+
+/// Draws the non-preview surface [`surface`] chose.
 fn draw_field(state: AppState, language: Language, want: FieldSurface) -> AnyElement {
     match want {
         FieldSurface::Revision => revision::field(state, language).into_element(),
         FieldSurface::Review => review::field(state, language).into_element(),
         FieldSurface::Context => context::field(state, language).into_element(),
-        FieldSurface::Preview => preview::field(state, language).into_element(),
-        FieldSurface::None => view().into_element(),
+        FieldSurface::Preview | FieldSurface::None => unreachable!("not a docked field surface"),
     }
 }
 
@@ -581,7 +1000,7 @@ mod tests {
     use nsh_testing::{Headless, LayoutNode};
 
     use super::*;
-    use crate::state::{GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, Pane};
+    use crate::state::{GUARD_CANCEL_CHOICE, GUARD_DISCARD_CHOICE, Pane, ReviewUnavailable};
 
     /// The document the probes open: a heading on its first line, so the
     /// first glyph the column draws is known.
@@ -652,6 +1071,12 @@ mod tests {
             },
             source_conflicted: false,
         }
+    }
+
+    fn second_recovered_record() -> mt_core::recovery::RecoveredRecord {
+        let mut record = recovered_record();
+        record.record.key = mt_core::recovery::RecoveryKey::for_document_id("shell-undo-probe-2");
+        record
     }
 
     /// What the app's own last focus move handed the keyboard to, as text a
@@ -794,6 +1219,347 @@ mod tests {
             }))
             .child(focus_trace_text(&state))
             .child(shell(state, Language::English, Layout::Wide))
+    }
+
+    #[component]
+    fn DockedFieldProbe() -> impl IntoElement {
+        let state = AppState::new();
+        if let Some(parent) = probe_path().parent() {
+            state.open_folder(parent.to_path_buf());
+        }
+        state.open_file(probe_path().to_path_buf());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(control("probe-review", &state, |state| {
+                state
+                    .review_unavailable
+                    .set(Some(ReviewUnavailable::NotSetUp));
+            }))
+            .child(control("probe-context", &state, |state| {
+                state.context_open.set(true);
+            }))
+            .child(control("probe-revision", &state, |state| {
+                present_revision_over_probe(state);
+            }))
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
+    // The controls sit on one row: a column of them costs the shell height
+    // the dock's footers need at 1040 points.
+    #[component]
+    fn DockAuditProbe() -> impl IntoElement {
+        let state = AppState::new();
+        if let Some(parent) = probe_path().parent() {
+            state.open_folder(parent.to_path_buf());
+        }
+        state.open_file(probe_path().to_path_buf());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(
+                view()
+                    .flex_row()
+                    .child(control("probe-revision", &state, |state| {
+                        present_revision_over_probe(state);
+                    }))
+                    .child(control("probe-recovery", &state, move |state| {
+                        state
+                            .recovery_records
+                            .set(vec![recovered_record(), second_recovered_record()]);
+                    }))
+                    .child(control("probe-close-dirty", &state, |state| {
+                        if let Some(tab) = state.active_tab() {
+                            tab.dirty.set(true);
+                            state.request_close_tab(tab.id);
+                        }
+                    })),
+            )
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
+    fn present_revision_over_probe(state: &AppState) {
+        use mt_core::review::{
+            ByteRange, SourceSnapshot,
+            revision::{RevisionChange, RevisionEdit, RevisionLimits, RevisionProposal},
+        };
+        let text = state
+            .active_tab()
+            .expect("the probe document")
+            .text
+            .get()
+            .to_string();
+        let before = "Describe the next release.";
+        let start = text.find(before).expect("the probe's paragraph") as u64;
+        let range = ByteRange::new(start, start + before.len() as u64).expect("a range");
+        let proposal = RevisionProposal::validate(
+            &text,
+            SourceSnapshot::new(0, 0),
+            vec![RevisionChange::new(
+                "Name the first release.",
+                vec![RevisionEdit::new(
+                    range,
+                    before,
+                    "Describe the first release.",
+                )],
+            )],
+            RevisionLimits::default(),
+        )
+        .expect("a valid proposal");
+        state.present_revision(proposal);
+    }
+
+    fn assert_action_whole(app: &Headless, action: &str) {
+        assert_action_whole_in(app, "field", action);
+    }
+
+    fn assert_action_whole_in(app: &Headless, container: &str, action: &str) {
+        let field = node(app, container).bounds;
+        let selector = format!("id:{action}");
+        let target = app
+            .screen()
+            .press_target(&selector)
+            .expect("a selector")
+            .unwrap_or_else(|| panic!("`{action}` is not pressable in `{container}`"));
+        let control = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| node.id == target)
+            .expect("the press target is laid out");
+        assert!(
+            control.bounds.origin.x.0 >= field.origin.x.0
+                && control.bounds.origin.x.0 + control.bounds.size.width.0
+                    <= field.origin.x.0 + field.size.width.0,
+            "`{action}` at {:?} is not whole inside `{container}` {field:?}",
+            control.bounds
+        );
+    }
+
+    fn assert_text_whole_in(app: &Headless, container: &str, label: &str) {
+        let field = node(app, container).bounds;
+        let nodes = app.screen().layout_nodes();
+        let matching: Vec<_> = nodes
+            .iter()
+            .filter(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text.as_str() == label)
+            })
+            .collect();
+        assert!(!matching.is_empty(), "no `{label}` text on screen");
+        for control in matching {
+            assert!(
+                control.bounds.origin.x.0 >= field.origin.x.0
+                    && control.bounds.origin.x.0 + control.bounds.size.width.0
+                        <= field.origin.x.0 + field.size.width.0,
+                "`{label}` at {:?} is not whole inside `{container}` {field:?}",
+                control.bounds
+            );
+        }
+    }
+
+    #[test]
+    fn the_medium_window_with_the_sidebar_open_keeps_field_actions_whole() {
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<DockedFieldProbe>().tokens(tokens::theme()),
+        );
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1040.0), Points(720.0)))
+            .expect("the 1040 point window");
+        app.wait_for("text:Describe the next release.")
+            .expect("the probe document");
+        assert_eq!(
+            node(&app, "sidebar").bounds.size.width.0,
+            tokens::SIDEBAR_W,
+            "the repro needs the sidebar expanded"
+        );
+
+        press(&mut app, "probe-review");
+        app.wait_for("id:review-unavailable")
+            .expect("the review field");
+        for action in ["review-open-settings", "review-again", "review-close"] {
+            assert_action_whole(&app, action);
+        }
+        press(&mut app, "review-close");
+        app.wait_for_gone("id:review-unavailable", std::time::Duration::from_secs(2))
+            .expect("the whole Close action closes the field");
+
+        press(&mut app, "probe-context");
+        app.wait_for("id:context-field").expect("the context field");
+        for action in ["context-review", "context-refresh", "context-close"] {
+            assert_action_whole(&app, action);
+        }
+        press(&mut app, "context-close");
+        app.wait_for_gone("id:context-field", std::time::Duration::from_secs(2))
+            .expect("the whole Close action closes the field");
+
+        press(&mut app, "probe-revision");
+        app.wait_for("id:revision-field")
+            .expect("the revision field");
+        for action in ["revision-accept", "revision-reject"] {
+            assert_action_whole(&app, action);
+        }
+    }
+
+    #[component]
+    fn ConflictContextProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().expect("conflict fixture directory"));
+        let path = directory.path().join("conflict.md");
+        std::fs::write(&path, "Original buffer").expect("write fixture");
+        state.open_file(path.clone());
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .flex_col()
+            .child(control("probe-conflict", &state, move |state| {
+                let _keep_directory = &directory;
+                std::fs::write(&path, "Updated disk contents").expect("external write");
+                if let Some(tab) = state.active_tab() {
+                    tab.conflict.set(true);
+                }
+            }))
+            .child(control("probe-context", &state, |state| {
+                state.context_open.set(true);
+            }))
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
+    #[test]
+    fn the_conflict_banner_with_context_open_keeps_every_action_whole() {
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<ConflictContextProbe>().tokens(tokens::theme()),
+        );
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1040.0), Points(720.0)))
+            .expect("the 1040 point window");
+        app.wait_for("text:Original buffer")
+            .expect("the conflict fixture loaded");
+        press_without_settling(&mut app, "probe-conflict");
+        app.wait_for("id:conflict-banner").expect("conflict banner");
+        app.settle();
+        assert_eq!(
+            node(&app, "sidebar").bounds.size.width.0,
+            tokens::SIDEBAR_W,
+            "the repro needs the sidebar expanded"
+        );
+
+        press(&mut app, "probe-context");
+        app.wait_for("id:context-field").expect("the context field");
+        for action in [
+            "conflict-compare",
+            "conflict-keep-mine",
+            "conflict-use-disk",
+            "conflict-save-as",
+        ] {
+            assert_action_whole_in(&app, "conflict-banner", action);
+        }
+        press(&mut app, "conflict-compare");
+        app.wait_for("id:conflict-previous")
+            .expect("the whole Compare action opened the comparison");
+    }
+
+    #[component]
+    fn ReviewWaitingFooterProbe() -> impl IntoElement {
+        use crate::state::{ReviewSection, ReviewView};
+
+        let state = AppState::new();
+        state.new_document();
+        let owner = state.active.get().expect("the revision's tab");
+        state.new_document();
+        let shown = state.active.get().expect("the result's tab");
+        state.arm_revision_in_flight(owner);
+        state.review_view.set(Some(ReviewView {
+            sections: vec![ReviewSection {
+                title: "Stated goal".to_owned(),
+                items: vec!["one".to_owned()],
+            }],
+            tab_id: Some(shown),
+            ..ReviewView::default()
+        }));
+        state.review_open.set(true);
+        view()
+            .w_full()
+            .h(relative(1.0))
+            .child(shell(state, Language::English, Layout::Medium))
+    }
+
+    #[test]
+    fn the_review_footer_keeps_close_whole_while_a_revision_runs_elsewhere() {
+        let mut config = EngineConfig::new(
+            nsh_testing::windowed_root::<ReviewWaitingFooterProbe>().tokens(tokens::theme()),
+        );
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).expect("start the probe");
+        app.set_viewport(nsh_core::Size::new(Points(1260.0), Points(720.0)))
+            .expect("the 1260 point window");
+        app.wait_for("id:review-footer").expect("the review footer");
+        app.wait_for("text:Waiting for Revision on another document.")
+            .expect("the waiting line widens the footer");
+        assert_eq!(
+            node(&app, "sidebar").bounds.size.width.0,
+            tokens::SIDEBAR_W,
+            "the repro needs the sidebar expanded"
+        );
+
+        assert_action_whole(&app, "review-close");
+        press(&mut app, "review-close");
+        app.wait_for_gone("id:review-field", std::time::Duration::from_secs(2))
+            .expect("the whole Close action closes the review");
+    }
+
+    #[test]
+    fn the_dock_and_banners_keep_their_action_rows_whole_at_both_medium_widths() {
+        for width in [1040.0, 1260.0] {
+            let mut config = EngineConfig::new(
+                nsh_testing::windowed_root::<DockAuditProbe>().tokens(tokens::theme()),
+            );
+            config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+            let mut app = Headless::start(config).expect("start the probe");
+            app.set_viewport(nsh_core::Size::new(Points(width), Points(720.0)))
+                .expect("a medium window");
+            app.wait_for("text:Describe the next release.")
+                .expect("the probe document");
+            assert_eq!(
+                node(&app, "sidebar").bounds.size.width.0,
+                tokens::SIDEBAR_W,
+                "the repro needs the sidebar expanded at {width}"
+            );
+
+            press(&mut app, "probe-revision");
+            app.wait_for("id:revision-field")
+                .expect("the revision field");
+            for action in ["revision-done", "revision-copy", "revision-close"] {
+                assert_action_whole(&app, action);
+            }
+
+            press(&mut app, "probe-recovery");
+            app.wait_for("id:recovery-banner")
+                .expect("the recovery banner");
+            for action in [
+                "recovery-restore-all",
+                "recovery-discard-all",
+                "recovery-restore-0",
+                "recovery-discard-0",
+                "recovery-restore-1",
+                "recovery-discard-1",
+            ] {
+                assert_action_whole_in(&app, "recovery-banner", action);
+            }
+
+            press(&mut app, "probe-close-dirty");
+            app.wait_for("id:guard-card").expect("the guard card");
+            for action in ["guard-save", "guard-dont-save", "guard-cancel"] {
+                assert_action_whole_in(&app, "guard-card", action);
+            }
+
+            assert_text_whole_in(&app, "field", "Undo");
+        }
     }
 
     fn file_probe() -> Headless {
@@ -1005,7 +1771,7 @@ mod tests {
             app.screen()
                 .layout_nodes()
                 .iter()
-                .filter(|node| node.test_id.as_deref() == Some("rail-file-row"))
+                .filter(|node| node.test_id.as_deref() == Some("sidebar-outside-row"))
                 .count()
         };
         assert_eq!(tab_count(&app), 2);
@@ -1122,7 +1888,9 @@ mod tests {
             .layout_nodes()
             .into_iter()
             .filter_map(|node| match node.test_id.as_deref() {
-                Some("source-editor" | "rail-file-row") => Some((node.id, node.test_id.unwrap())),
+                Some("source-editor" | "sidebar-outside-row") => {
+                    Some((node.id, node.test_id.unwrap()))
+                }
                 _ => None,
             })
             .collect();
@@ -1145,7 +1913,7 @@ mod tests {
         });
         press(&mut app, "guard-dont-save");
         let removals: Vec<_> = receive.try_iter().collect();
-        for expected in ["source-editor", "rail-file-row"] {
+        for expected in ["source-editor", "sidebar-outside-row"] {
             let relevant: Vec<_> = removals
                 .iter()
                 .filter(|(name, _)| name.as_ref() == expected)
@@ -1307,6 +2075,8 @@ mod tests {
         config.environment.color_scheme = ColorScheme::Light;
         config.environment.reduce_motion = false;
         let mut app = Headless::start(config).expect("start");
+        app.set_viewport(nsh_core::Size::new(Points(1440.0), Points(900.0)))
+            .expect("the Wide probe's viewport");
         app.wait_for("text:Describe the next release.")
             .expect("document text");
         let shell = node(&app, "shell").id;
@@ -1856,20 +2626,44 @@ mod tests {
     #[test]
     fn every_field_surface_starts_one_field_gap_from_the_column() {
         let mut app = start(nsh_testing::windowed_root::<WideProbe>(), 1440.0);
-        let column = node(&app, "column").bounds;
-        let field_x = column.origin.x.0 + column.size.width.0 + tokens::FIELD_GAP;
-
         press(&mut app, "probe-review-open");
         app.wait_for("id:review-lens").expect("the review's lens");
+        let review_column = node(&app, "stage-source").bounds;
         let lens = node(&app, "review-lens").bounds.origin.x.0;
 
         press(&mut app, "probe-review-close");
         press(&mut app, "probe-split");
         app.wait_for("id:preview-field").expect("the preview field");
+        app.wait_until(
+            "the divider reaches Split",
+            Duration::from_secs(5),
+            |screen| {
+                let nodes = screen.layout_nodes();
+                let width = |id| {
+                    nodes
+                        .iter()
+                        .find(|node| node.test_id.as_deref() == Some(id))
+                        .map_or(0.0, |node| node.bounds.size.width.0)
+                };
+                width("stage-source") > 0.0 && width("stage-source") == width("stage-dock")
+            },
+        )
+        .expect("the divider reaches the middle");
+        let split_column = node(&app, "stage-source").bounds;
         let label = text_x(&app, "Preview");
 
-        assert_eq!(lens, field_x, "the review's lens starts at x{lens}");
-        assert_eq!(label, field_x, "the preview's label starts at x{label}");
+        let field_x =
+            |column: Bounds<Points>| column.origin.x.0 + column.size.width.0 + tokens::FIELD_GAP;
+        assert_eq!(
+            lens,
+            field_x(review_column),
+            "the review's lens starts at x{lens}"
+        );
+        assert_eq!(
+            label,
+            field_x(split_column),
+            "the preview's label starts at x{label}"
+        );
     }
 
     /// Below 1040 the field overlays the right 46% of the window, and its
