@@ -87,11 +87,14 @@ impl FileStamp {
 /// useful; fall back to canonical paths while both ends still exist so
 /// equivalent link spellings identify the same on-disk source.
 pub fn paths_match(left: &Path, right: &Path) -> bool {
-    crate::workspace::normalize_path(left) == crate::workspace::normalize_path(right)
-        || std::fs::canonicalize(left)
+    crate::workspace::normalize_path(left) == crate::workspace::normalize_path(right) || {
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_probe::note_path_resolution();
+        std::fs::canonicalize(left)
             .ok()
             .zip(std::fs::canonicalize(right).ok())
             .is_some_and(|(left, right)| left == right)
+    }
 }
 
 struct FileSnapshot {
@@ -532,6 +535,17 @@ impl LoadedFile {
     /// bound to a stable root and opened source identity.
     pub fn skill_origin(&self) -> Option<&SkillOrigin> {
         self.skill_origin.as_ref()
+    }
+
+    /// The resolved target path, when the document was opened through a
+    /// symbolic link.
+    pub fn resolved_target(&self) -> Option<&Path> {
+        match &self.source_identity {
+            SourceIdentity::SymbolicLink {
+                resolved_target, ..
+            } => Some(resolved_target),
+            SourceIdentity::Regular => None,
+        }
     }
 }
 

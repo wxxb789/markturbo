@@ -790,6 +790,11 @@ fn a_dirty_retargeted_symlink_keeps_watching_the_new_target() {
     std::fs::remove_file(&link).expect("unlink");
     symlink_file(&target_two, &link).expect("retarget the link");
     wait_for_text(&mut app, "Changed on disk", "the conflict banner");
+    // The unlink and the re-link can arrive as two debounced batches; let
+    // the second reload's answer land before the comparison opens, so the
+    // newer target's own watch is what closes it, not an answer already in
+    // flight.
+    pump_for(&mut app, Duration::from_millis(1_500));
 
     app.press("label:Compare").expect("compare");
     app.wait_for("id:conflict-previous")
@@ -963,5 +968,243 @@ fn under_reduced_motion_a_reload_does_not_slide_the_text() {
     assert!(
         marks.starts_to(ink, 1.0),
         "reduced motion fades the arriving text back up"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_differently_cased_workspace_still_sees_its_symlink_target_deleted() {
+    let parent = tempfile::tempdir().expect("workspace parent");
+    let config = tempfile::tempdir().expect("config dir");
+    let real = parent.path().join("Notes");
+    std::fs::create_dir(&real).expect("the real workspace name");
+    let flipped = parent.path().join("notes");
+    let target = real.join("real.md");
+    std::fs::write(&target, "# Real\n").expect("write the target");
+    let link = real.join("link.md");
+    if let Err(error) = symlink_file(&target, &link) {
+        eprintln!("skipping file-symlink test: {error}");
+        return;
+    }
+
+    let mut app = start(config.path(), Some(&flipped));
+    app.wait_for("id:workspace-home")
+        .expect("the differently cased workspace opens");
+    open_from_home(&mut app, "link.md");
+    app.wait_for("text:# Real")
+        .expect("the linked document is open");
+
+    std::fs::remove_file(&target).expect("delete the target");
+    wait_for_text(&mut app, "Moved or deleted on disk", "the missing banner");
+}
+
+#[test]
+fn a_deleted_file_tab_moves_to_outside_folder() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::write(workspace.path().join("plan.md"), "# Plan\n").expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.wait_for("text:# Plan").expect("the document");
+
+    std::fs::remove_file(workspace.path().join("plan.md")).expect("delete plan.md");
+    wait_for_text(&mut app, "Moved or deleted on disk", "the missing banner");
+
+    wait_for_marker(
+        &mut app,
+        "the deleted tab in Outside folder",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:sidebar-outside >> id:sidebar-outside-row")
+                .unwrap_or(false)
+        },
+    );
+    assert_eq!(
+        app.screen().count("id:sidebar-unlisted").expect("selector"),
+        0,
+        "a deleted tab is not in Unlisted: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_symlink_tab_whose_target_vanished_leaves_the_tree_marking() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let Some(target) = linked_document(workspace.path(), outside.path()) else {
+        return;
+    };
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "link.md");
+    app.wait_for("text:# Target one")
+        .expect("the linked document");
+
+    std::fs::remove_file(&target).expect("delete the target");
+    wait_for_text(&mut app, "Moved or deleted on disk", "the missing banner");
+
+    wait_for_marker(
+        &mut app,
+        "the vanished target's tab in Outside folder and not the tree",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:sidebar-outside >> id:sidebar-outside-row")
+                .unwrap_or(false)
+                && screen
+                    .count("id:sidebar-file >> id:sidebar-tree-open")
+                    .unwrap_or(1)
+                    == 0
+        },
+    );
+}
+
+#[test]
+fn a_file_created_between_the_workspace_scan_and_its_watch_still_reaches_the_tree() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::write(workspace.path().join("plan.md"), "# Plan\n").expect("write plan.md");
+    let scan_root = std::path::absolute(workspace.path()).expect("absolute root");
+    let release = config.path().join("release-first-scan");
+
+    // The first scan reads the folder and parks before committing.
+    mt_app::test_vault::gate_commit(&scan_root, &release);
+    let mut app = start(config.path(), Some(workspace.path()));
+    wait_for_marker(
+        &mut app,
+        "the first workspace scan to reach its commit",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::commit_gate_reached(&scan_root),
+    );
+
+    // The file lands after the scan read but before the root watch.
+    std::fs::write(workspace.path().join("appeared.md"), "# Appeared\n").expect("create a file");
+    std::fs::write(&release, b"").expect("let the first scan commit");
+
+    wait_for_marker(
+        &mut app,
+        "the re-scan lists the appeared file",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:workspace-home-file >> text:appeared.md")
+                .unwrap_or(false)
+        },
+    );
+}
+
+#[test]
+fn a_write_between_the_open_read_and_the_watch_still_reloads() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let other = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::write(workspace.path().join("plan.md"), "# Plan\n").expect("write plan.md");
+    // The window exists only outside the workspace: the root watch already
+    // covers a workspace file, but an outside document's own watch is
+    // installed after its first read.
+    let path = other.path().join("outside.md");
+    std::fs::write(&path, "# Original\n").expect("write outside.md");
+    let release = config.path().join("release-open-commit");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    mt_app::test_vault::gate_commit(&path, &release);
+    app.drop_files("id:shell", vec![file_uri(&path)])
+        .expect("drop the outside document");
+    wait_for_marker(
+        &mut app,
+        "the opening read to reach its commit",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::commit_gate_reached(&path),
+    );
+
+    std::fs::write(&path, "# External\n").expect("external write before the watch");
+    std::fs::write(&release, b"").expect("let the opening read finish");
+
+    wait_for_text(&mut app, "# External", "the re-checked text");
+}
+
+#[test]
+fn a_tree_row_that_becomes_a_directory_renders_the_folder_control() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = workspace.path().join("notes.md");
+    std::fs::write(&path, "# Notes\n").expect("write notes.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    wait_for_marker(
+        &mut app,
+        "the file row",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:sidebar-file >> text:notes.md")
+                .unwrap_or(false)
+        },
+    );
+
+    // Replace the file with a directory of the same name inside one debounce
+    // window: the entry flips kind without ever leaving the tree.
+    std::fs::remove_file(&path).expect("remove the file");
+    std::fs::create_dir(&path).expect("create the directory");
+    std::fs::write(path.join("inside.md"), "# Inside\n").expect("write inside.md");
+
+    wait_for_marker(
+        &mut app,
+        "the row becomes the folder control",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:sidebar-folder >> text:notes.md")
+                .unwrap_or(false)
+        },
+    );
+}
+
+#[test]
+fn a_drop_and_a_tree_event_resolve_no_paths_on_the_ui_thread() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let other = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::write(workspace.path().join("plan.md"), "# Plan\n").expect("write plan.md");
+    let dropped = other.path().join("dropped.md");
+    std::fs::write(&dropped, "# Dropped\n").expect("write dropped.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.wait_for("text:# Plan").expect("the document");
+    pump_for(&mut app, Duration::from_millis(600));
+
+    let before_drop = mt_core::test_probe::path_resolutions();
+    app.drop_files("id:shell", vec![file_uri(&dropped)])
+        .expect("drop the document");
+    app.wait_for("text:# Dropped")
+        .expect("the dropped document");
+    pump_for(&mut app, Duration::from_millis(600));
+    assert_eq!(
+        mt_core::test_probe::path_resolutions(),
+        before_drop,
+        "drop dispatch resolves no paths while the UI thread handles it"
+    );
+
+    let before_event = mt_core::test_probe::path_resolutions();
+    std::fs::write(workspace.path().join("appeared.md"), "# Appeared\n").expect("create a file");
+    wait_for_marker(
+        &mut app,
+        "the sidebar tree lists the created file",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:sidebar-file >> text:appeared.md")
+                .unwrap_or(false)
+        },
+    );
+    pump_for(&mut app, Duration::from_millis(600));
+    assert_eq!(
+        mt_core::test_probe::path_resolutions(),
+        before_event,
+        "watcher dispatch resolves no paths while the UI thread handles it"
     );
 }

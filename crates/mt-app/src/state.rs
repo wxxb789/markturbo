@@ -54,6 +54,7 @@ use mt_core::{
     },
     usage::{ReviewDurationBucket, UsageAggregate, UsageEvent, UsageEventKind, UsageStore},
     workspace::{
+        WatchIdentity,
         search::{self, Query},
         tree::{self, FileNode},
     },
@@ -182,6 +183,10 @@ pub struct Tab {
     pub untitled: bool,
     pub recovery_key: RecoveryKey,
     pub loaded: Rc<RefCell<LoadedFile>>,
+    /// The normalized key a watcher event and a drop de-duplication match
+    /// this tab by. Rebuilt when a disk snapshot is adopted, because a
+    /// symbolic link's resolved target can change then.
+    watch: Rc<RefCell<WatchIdentity>>,
     /// The latest Reload this tab asked for: an older request's answer that
     /// comes back later writes nothing.
     reload: Rc<Cell<u64>>,
@@ -190,8 +195,8 @@ pub struct Tab {
     /// or confirmation from an older baseline never commits.
     disk_generation: Rc<Cell<u64>>,
     /// The resolved target the latest disk read saw when it differed from the
-    /// adopted identity. A dirty tab's retargeted link keeps this target's
-    /// parent watched until the conflict resolves.
+    /// adopted identity, normalized. A dirty tab's retargeted link keeps this
+    /// target watched until the conflict resolves.
     detected_target: Rc<RefCell<Option<PathBuf>>>,
 }
 
@@ -203,6 +208,15 @@ impl Tab {
         } else {
             pane.web()
         }
+    }
+
+    /// Whether `key` (a normalized path) names this tab's document: its own
+    /// path, a symbolic link's resolved target, or a target a read detected
+    /// before the conflict resolved.
+    fn reads_key(&self, key: &Path) -> bool {
+        !self.untitled
+            && (self.watch.borrow().reads(key)
+                || self.detected_target.borrow().as_deref() == Some(key))
     }
 }
 
@@ -1668,6 +1682,10 @@ impl AppState {
                 }
                 state.record_recent(&path, RecentTargetKind::Workspace);
                 state.watch_workspace_root(&path);
+                // The root watch is live: re-scan so an entry created after
+                // the first scan read (and before the watch, which leaves no
+                // event behind) still reaches the tree.
+                state.refresh_tree_from_disk();
                 state.notify_named(crate::i18n::Key::Opened, &path);
                 true
             }
@@ -1733,7 +1751,10 @@ impl AppState {
                 move || {
                     #[cfg(any(test, feature = "test-vault"))]
                     crate::test_vault::wait_for_read(&path);
-                    io::load(&path)
+                    let loaded = io::load(&path);
+                    #[cfg(any(test, feature = "test-vault"))]
+                    crate::test_vault::wait_for_commit(&path);
+                    loaded
                 }
             })
             .await
@@ -1767,15 +1788,16 @@ impl AppState {
         });
     }
 
-    /// The open tab that reads `path`: the literal spelling first, then the
-    /// canonical one while both ends still exist, so a file reached through a
-    /// relative path, a different link spelling or an absolute one is one
-    /// tab.
+    /// The open tab that reads `path`: the normalized key names the literal
+    /// spelling, a symbolic link's resolved target, or a target a read
+    /// detected before the conflict resolved, so a file reached through a
+    /// relative path, a link or its target is one tab.
     fn tab_showing(&self, path: &Path) -> Option<Tab> {
+        let key = mt_core::workspace::normalize_path(path);
         self.tabs
             .get_untracked()
             .into_iter()
-            .find(|tab| !tab.untitled && (tab.path == path || io::paths_match(&tab.path, path)))
+            .find(|tab| tab.reads_key(&key))
     }
 
     pub(crate) fn outside_folder(&self, tab: &Tab) -> bool {
@@ -1856,6 +1878,7 @@ impl AppState {
         let (_, title) = self.next_untitled(self.settings.get().language, None);
         let recovery_key = RecoveryKey::new_memory();
         let text = signal(SharedString::from(text));
+        let watch = WatchIdentity::of(&path, None);
         self.tabs.update(|tabs| {
             tabs.push(Tab {
                 id,
@@ -1871,6 +1894,7 @@ impl AppState {
                 untitled: true,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
+                watch: Rc::new(RefCell::new(watch)),
                 reload: Rc::new(Cell::new(0)),
                 disk_generation: Rc::new(Cell::new(0)),
                 detected_target: Rc::new(RefCell::new(None)),
@@ -1884,7 +1908,20 @@ impl AppState {
     }
 
     fn add_tab(&self, loaded: LoadedFile) -> u64 {
-        self.add_tab_with(loaded, false)
+        let id = self.add_tab_with(loaded, false);
+        // The watch is live now: re-read the document so a write between its
+        // opening read and this subscription (which leaves no event behind)
+        // still reloads it or raises the conflict. A restored buffer was
+        // never read from disk, and gets no re-check.
+        if let Some(tab) = self
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == id)
+        {
+            self.reload_after_subscribe(&tab);
+        }
+        id
     }
 
     fn add_tab_with(&self, loaded: LoadedFile, dirty: bool) -> u64 {
@@ -1899,6 +1936,7 @@ impl AppState {
             .to_owned();
         let text = signal(SharedString::from(loaded.text.clone()));
         let path = loaded.path.clone();
+        let watch = WatchIdentity::of(&path, loaded.resolved_target());
         let recovery_key = RecoveryKey::for_path(&path);
         self.record_recent(&path, RecentTargetKind::File);
         if dirty {
@@ -1919,6 +1957,7 @@ impl AppState {
                 untitled: false,
                 recovery_key,
                 loaded: Rc::new(RefCell::new(loaded)),
+                watch: Rc::new(RefCell::new(watch)),
                 reload: Rc::new(Cell::new(0)),
                 disk_generation: Rc::new(Cell::new(0)),
                 detected_target: Rc::new(RefCell::new(None)),
@@ -3230,10 +3269,12 @@ impl AppState {
         // editor's own mapping. A tab that is not mounted has nothing to
         // return to.
         let anchor = self.mounted_editor_anchor(tab);
-        let identity_changed = tab.loaded.borrow().source_identity != loaded.source_identity;
+        let watch = WatchIdentity::of(&tab.path, loaded.resolved_target());
+        let identity_changed = *tab.watch.borrow() != watch;
         let restored = loaded.text.clone();
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
+        *tab.watch.borrow_mut() = watch;
         // The adopted identity is authoritative: a target an earlier read saw
         // while this tab was dirty is superseded by it.
         *tab.detected_target.borrow_mut() = None;
@@ -3275,10 +3316,16 @@ impl AppState {
             return None;
         }
         let api = editor.api::<EditorApi>()?;
+        let selections = api.selections();
+        let visible = api.visible_range();
+        let caret_visible = selections.last().is_none_or(|selection| {
+            visible.start.line <= selection.head.line && selection.head.line <= visible.end.line
+        });
         Some(EditorAnchor {
             editor,
-            selections: api.selections(),
+            selections,
             scroll: api.scroll_offset(),
+            caret_visible,
         })
     }
 
@@ -6095,6 +6142,8 @@ fn scan_workspace_entries(path: &Path) -> std::io::Result<Vec<Entry>> {
     #[cfg(any(test, feature = "test-vault"))]
     crate::test_vault::wait_for_read(path);
     let nodes = tree::read_dir_deep(path, 4)?;
+    #[cfg(any(test, feature = "test-vault"))]
+    crate::test_vault::wait_for_commit(path);
     let mut entries = Vec::new();
     flatten(&nodes, 0, &mut entries);
     Ok(entries)
@@ -6115,11 +6164,13 @@ fn flatten(nodes: &[FileNode], depth: usize, out: &mut Vec<Entry>) {
 }
 
 /// The mounted editor's place in `tab`: its caret and selection in
-/// line/column terms, and the scroll offset it was read at.
+/// line/column terms, the scroll offset it was read at, and whether the
+/// caret was visible then — a reader who scrolled away keeps the viewport.
 struct EditorAnchor {
     editor: ComponentRef<Editor>,
     selections: Vec<EditorSelection>,
     scroll: Point<Points>,
+    caret_visible: bool,
 }
 
 /// Puts the mounted editor's anchor back once the adopted text is in it, if
@@ -6146,8 +6197,13 @@ fn restore_editor_anchor(
         let Some(api) = anchor.editor.api::<EditorApi>() else {
             return;
         };
-        if api.value() != text && frames_left > 0 {
-            restore_editor_anchor(anchor, text, revision, version, frames_left - 1);
+        if api.value() != text {
+            // The shown text is not the reloaded version — the retries ran
+            // out, or something else replaced it. Its position is meaningless
+            // against other text, so it is never applied there.
+            if frames_left > 0 {
+                restore_editor_anchor(anchor, text, revision, version, frames_left - 1);
+            }
             return;
         }
         if revision.get_untracked() != version {
@@ -6162,7 +6218,9 @@ fn restore_editor_anchor(
             api.set_selections(anchor.selections.clone());
         }
         api.set_scroll_offset(anchor.scroll);
-        if let Some(head) = anchor.selections.last().map(|selection| selection.head) {
+        if anchor.caret_visible
+            && let Some(head) = anchor.selections.last().map(|selection| selection.head)
+        {
             api.reveal_position(head, false);
         }
     });

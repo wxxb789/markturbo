@@ -43,6 +43,10 @@ pub struct Watcher {
     _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<Vec<DebouncedEvent>>,
     root: Option<PathBuf>,
+    /// The root's canonical spelling, resolved once when the root is set: a
+    /// document directory covered under that spelling keeps no separate
+    /// watch, and no subscription re-resolves a path on the UI thread.
+    canonical_root: Option<PathBuf>,
     document_directories: HashSet<PathBuf>,
     context_paths: HashSet<PathBuf>,
 }
@@ -57,14 +61,21 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// `\\?\UNC\server\share`), while the workspace and the event paths usually
 /// use the plain form. A literal comparison of the two fails exactly where it
 /// matters most — a removed path has no canonical spelling left — so the
-/// verbatim prefix is stripped before anything is registered or matched.
+/// verbatim prefix is stripped before anything is registered or matched. The
+/// same Windows file systems are case-insensitive, so the plain spelling is
+/// case-folded too: `C:\Notes` and `C:\notes` are one path, and a delete
+/// event that spells the directory differently still matches the tab that
+/// opened through it. Unix keeps its case.
+///
+/// The result is a comparison key, never a path for I/O by itself: a caller
+/// registers or opens with the original spelling.
 pub fn normalize_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
 
-        if let Some(Component::Prefix(prefix)) = path.components().next() {
-            return match prefix.kind() {
+        let plain = if let Some(Component::Prefix(prefix)) = path.components().next() {
+            match prefix.kind() {
                 Prefix::VerbatimDisk(letter) => {
                     let mut plain = PathBuf::from(format!("{}:\\", letter as char));
                     for component in path.components().skip(2) {
@@ -84,10 +95,58 @@ pub fn normalize_path(path: &Path) -> PathBuf {
                     plain
                 }
                 _ => path.to_path_buf(),
-            };
+            }
+        } else {
+            path.to_path_buf()
+        };
+        PathBuf::from(plain.to_string_lossy().to_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// The one key a document is matched by: the normalized spelling of its
+/// path and, when it was opened through a symbolic link, the normalized
+/// spelling of the resolved target.
+///
+/// A key is a comparison value, never a path for I/O: on Windows it may name
+/// no file system entry under the key's casing. Watcher events, drop
+/// de-duplication and `open_file` compare these keys, so matching never
+/// resolves a path while the UI thread dispatches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchIdentity {
+    path: PathBuf,
+    target: Option<PathBuf>,
+}
+
+impl WatchIdentity {
+    /// The identity of the document at `path`, opened through
+    /// `resolved_target` when it is a symbolic link.
+    pub fn of(path: &Path, resolved_target: Option<&Path>) -> Self {
+        Self {
+            path: normalize_path(path),
+            target: resolved_target.map(normalize_path),
         }
     }
-    path.to_path_buf()
+
+    /// The normalized spelling of the document's own path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The normalized spelling of the resolved target, when the document was
+    /// opened through a symbolic link.
+    pub fn target(&self) -> Option<&Path> {
+        self.target.as_deref()
+    }
+
+    /// Whether `key` (already normalized) names the document's path or, for
+    /// a symbolic link, its resolved target.
+    pub fn reads(&self, key: &Path) -> bool {
+        self.path == key || self.target.as_deref() == Some(key)
+    }
 }
 
 impl Watcher {
@@ -131,6 +190,7 @@ impl Watcher {
             _debouncer: debouncer,
             rx,
             root: None,
+            canonical_root: None,
             document_directories: HashSet::new(),
             context_paths: HashSet::new(),
         })
@@ -161,6 +221,9 @@ impl Watcher {
             self.document_directories.remove(&directory);
         }
         self._debouncer.watch(&root, RecursiveMode::Recursive)?;
+        self.canonical_root = std::fs::canonicalize(&root)
+            .ok()
+            .map(|canonical| normalize_path(&canonical));
         self.root = Some(root);
         Ok(())
     }
@@ -177,23 +240,16 @@ impl Watcher {
         // The caller may hold the canonical spelling (`\\?\C:\…` on Windows,
         // from `canonicalize`) while `set_root` was handed the spelling the
         // user's folder picker produced; a directory covered under either
-        // spelling is already watched recursively.
-        let root = self.root.as_deref().map(normalize_path);
-        let canonical_root = self
-            .root
-            .as_deref()
-            .and_then(|root| std::fs::canonicalize(root).ok())
-            .map(|root| normalize_path(&root));
+        // spelling is already watched recursively. Both are stored keys: the
+        // comparison touches no file system.
+        let root = self.root.as_deref();
+        let canonical_root = self.canonical_root.as_deref();
         let desired: HashSet<_> = directories
             .into_iter()
             .map(|directory| normalize_path(&directory))
             .filter(|directory| {
-                !root
-                    .as_deref()
-                    .is_some_and(|root| directory.starts_with(root))
-                    && !canonical_root
-                        .as_deref()
-                        .is_some_and(|root| directory.starts_with(root))
+                !root.is_some_and(|root| directory.starts_with(root))
+                    && !canonical_root.is_some_and(|root| directory.starts_with(root))
             })
             .collect();
 
@@ -286,8 +342,9 @@ fn classify(
     event
         .paths
         .iter()
-        .map(|path| normalize_path(path))
-        .filter(|path| {
+        .enumerate()
+        .map(|(index, path)| (index, normalize_path(path)))
+        .filter(|(_, path)| {
             if context_paths.contains(path.as_path()) {
                 return true;
             }
@@ -304,17 +361,27 @@ fn classify(
                 None => true,
             }
         })
-        .filter_map(|path| {
+        .filter_map(|(index, path)| {
             Some(match event.kind {
                 EventKind::Create(_) => Change::Created(path),
                 EventKind::Remove(_) => Change::Removed(path),
-                EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-                    // A rename shows up as two paths; whichever still exists is
-                    // the new name, the other is gone.
-                    if path.exists() {
-                        Change::Created(path)
-                    } else {
-                        Change::Removed(path)
+                EventKind::Modify(notify::event::ModifyKind::Name(rename)) => {
+                    // A rename names its two halves; the platform says which
+                    // is which. `Both` carries the pair in `[from, to]`
+                    // order, so its per-path verdict is positional. Only a
+                    // platform that cannot say needs the path probed.
+                    match rename {
+                        notify::event::RenameMode::To => Change::Created(path),
+                        notify::event::RenameMode::From => Change::Removed(path),
+                        notify::event::RenameMode::Both if index == 0 => Change::Removed(path),
+                        notify::event::RenameMode::Both => Change::Created(path),
+                        notify::event::RenameMode::Any | notify::event::RenameMode::Other => {
+                            if path.exists() {
+                                Change::Created(path)
+                            } else {
+                                Change::Removed(path)
+                            }
+                        }
                     }
                 }
                 EventKind::Modify(_) => Change::Modified(path),
@@ -365,7 +432,7 @@ mod tests {
         use notify::event::{CreateKind, RemoveKind};
 
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(".git");
+        let marker = normalize_path(&dir.path().join(".git"));
         let mut watcher = rooted(dir.path());
         watcher.sync_context_paths([marker.clone()]);
         let (tx, rx) = channel();
@@ -395,8 +462,8 @@ mod tests {
         use notify::event::{ModifyKind, RenameMode};
 
         let dir = tempfile::tempdir().unwrap();
-        let from = dir.path().join(".git");
-        let to = dir.path().join("nested/.git");
+        let from = normalize_path(&dir.path().join(".git"));
+        let to = normalize_path(&dir.path().join("nested/.git"));
         std::fs::create_dir(dir.path().join("nested")).unwrap();
         std::fs::create_dir(&from).unwrap();
         let context_paths = HashSet::from([from.clone(), to.clone()]);
@@ -411,9 +478,13 @@ mod tests {
             vec![Change::Removed(from.clone()), Change::Created(to.clone())]
         );
         std::fs::rename(&to, &from).unwrap();
+        let reverse = event(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[to.clone(), from.clone()],
+        );
         assert_eq!(
-            classify(&rename, Some(dir.path()), &HashSet::new(), &context_paths),
-            vec![Change::Created(from), Change::Removed(to)]
+            classify(&reverse, Some(dir.path()), &HashSet::new(), &context_paths),
+            vec![Change::Removed(to), Change::Created(from)]
         );
     }
 
@@ -423,18 +494,18 @@ mod tests {
         use notify::event::ModifyKind;
 
         let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join(".git");
-        let candidate = dir.path().join("node_modules/AGENTS.md");
-        let real = dir.path().join("real.md");
+        let marker = normalize_path(&dir.path().join(".git"));
+        let candidate = normalize_path(&dir.path().join("node_modules/AGENTS.md"));
+        let real = normalize_path(&dir.path().join("real.md"));
         let changed = event(
             EventKind::Modify(ModifyKind::Any),
             &[
                 marker.clone(),
                 marker.join("HEAD"),
-                dir.path().join("nested/.git"),
+                normalize_path(&dir.path().join("nested/.git")),
                 candidate.clone(),
-                dir.path().join("node_modules/pkg.md"),
-                dir.path().join(".venv/AGENTS.md"),
+                normalize_path(&dir.path().join("node_modules/pkg.md")),
+                normalize_path(&dir.path().join(".venv/AGENTS.md")),
                 real.clone(),
             ],
         );
@@ -619,7 +690,11 @@ mod tests {
             .sync_document_directories([second.path().to_path_buf()])
             .unwrap();
         assert_eq!(watcher.document_directories.len(), 1);
-        assert!(watcher.document_directories.contains(second.path()));
+        assert!(
+            watcher
+                .document_directories
+                .contains(&normalize_path(second.path()))
+        );
     }
 
     #[test]
@@ -770,23 +845,35 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn verbatim_windows_paths_normalize_to_the_plain_spelling() {
+    fn verbatim_windows_paths_normalize_to_the_plain_folded_spelling() {
         assert_eq!(
             normalize_path(Path::new(r"\\?\C:\notes\plan.md")),
-            PathBuf::from(r"C:\notes\plan.md")
+            PathBuf::from(r"c:\notes\plan.md")
         );
         assert_eq!(
-            normalize_path(Path::new(r"\\?\UNC\server\share\plan.md")),
+            normalize_path(Path::new(r"\\?\UNC\server\share\Plan.MD")),
             PathBuf::from(r"\\server\share\plan.md")
         );
         assert_eq!(
-            normalize_path(Path::new(r"C:\notes\plan.md")),
-            PathBuf::from(r"C:\notes\plan.md")
+            normalize_path(Path::new(r"C:\Notes\Plan.MD")),
+            PathBuf::from(r"c:\notes\plan.md")
         );
         assert_eq!(
-            normalize_path(Path::new(r"\\?\Volume{8f2a}\plan.md")),
-            PathBuf::from(r"\\?\Volume{8f2a}\plan.md")
+            normalize_path(Path::new(r"\\?\Volume{8f2a}\Plan.MD")),
+            PathBuf::from(r"\\?\volume{8f2a}\plan.md")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_keys_fold_case_through_a_link_and_its_target() {
+        let identity = WatchIdentity::of(
+            Path::new(r"C:\Notes\Link.md"),
+            Some(Path::new(r"\\?\C:\NOTES\Real.md")),
+        );
+        assert!(identity.reads(&normalize_path(Path::new(r"c:\notes\link.MD"))));
+        assert!(identity.reads(&normalize_path(Path::new(r"C:\notes\REAL.md"))));
+        assert!(!identity.reads(&normalize_path(Path::new(r"c:\notes\other.md"))));
     }
 
     #[cfg(not(windows))]
@@ -794,6 +881,18 @@ mod tests {
     fn a_plain_path_normalizes_to_itself() {
         let path = Path::new("/notes/plan.md");
         assert_eq!(normalize_path(path), path);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_keys_keep_their_case_through_a_link_and_its_target() {
+        let identity = WatchIdentity::of(
+            Path::new("/notes/Link.md"),
+            Some(Path::new("/Notes/Real.md")),
+        );
+        assert!(identity.reads(Path::new("/notes/Link.md")));
+        assert!(identity.reads(Path::new("/Notes/Real.md")));
+        assert!(!identity.reads(Path::new("/notes/link.md")));
     }
 
     #[test]

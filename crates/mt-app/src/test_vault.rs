@@ -173,9 +173,10 @@ pub fn gate_reads_started(path: &Path) -> usize {
 
 static COMMIT_GATES: LazyLock<Mutex<Vec<PathGate>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-/// Hold the next reload of `path` after its snapshot was read and before the
-/// answer is committed, until the release path exists, so a test can let the
-/// disk change at the moment the answer is about to be applied.
+/// Hold the next blocking read of `path` — a reload or a workspace scan —
+/// after its content was read and before its answer is committed, until the
+/// release path exists, so a test can let the disk change at the moment the
+/// answer is about to be applied.
 pub fn gate_commit(path: impl Into<PathBuf>, release: impl Into<PathBuf>) {
     COMMIT_GATES
         .lock()

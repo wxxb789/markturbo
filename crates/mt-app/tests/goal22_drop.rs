@@ -197,7 +197,7 @@ fn an_unsupported_drop_shows_one_count_notice_and_names_no_path() {
 }
 
 #[test]
-fn the_drop_screen_follows_the_confirmed_unknown_and_unsupported_cases() {
+fn the_drop_screen_follows_the_confirmed_and_unknown_cases() {
     let directory = tempfile::tempdir().expect("document dir");
     let config = tempfile::tempdir().expect("config dir");
     let document = directory.path().join("plan.md");
@@ -255,8 +255,16 @@ fn the_drop_screen_follows_the_confirmed_unknown_and_unsupported_cases() {
     let picture = directory.path().join("photo.png");
     std::fs::write(&picture, b"\x89PNG\r\n\x1a\n").expect("write photo.png");
     drag_enter(&mut app, vec![file_uri(&picture)]);
-    app.wait_for("text:Can't open this file type")
-        .expect("every offered item is a confirmed unsupported file");
+    app.wait_for("text:Drop to open")
+        .expect("an inferred image type proves nothing about the item being a file");
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Can't open")),
+        "an inferred type never reads as unsupported: {:?}",
+        app.screen().texts()
+    );
 }
 
 /// The animation graph items of every view, recorded as the batches come: the
@@ -653,6 +661,17 @@ fn a_superseded_mixed_drop_publishes_no_skipped_notice() {
             .iter()
             .any(|text| text.contains("Skipped")),
         "a superseded drop publishes no skipped count: {:?}",
+        app.screen().texts()
+    );
+    // The slower document's own `Opened …` notice belongs to the dropped
+    // folder's request: opening B superseded it, so it must not overwrite
+    // B's success line either.
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Opened slow.md")),
+        "a superseded drop publishes no per-document notice: {:?}",
         app.screen().texts()
     );
 }

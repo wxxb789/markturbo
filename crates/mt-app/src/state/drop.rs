@@ -27,34 +27,29 @@ pub enum DropOffer {
 
 impl DropOffer {
     /// Classify the items a drag offers from its names and the event's types
-    /// only: a drag callback never touches the file system.
+    /// only: a drag callback never touches the file system. The event's MIME
+    /// types are inferred from the name's extension, so they never prove an
+    /// item is a file; only a document name or a folder the event marked
+    /// confirms anything.
     pub fn of(uris: &[String], mime_types: &[String]) -> Self {
         let mut confirmed = 0usize;
         let mut single: Option<SharedString> = None;
-        let mut unknown = false;
-        let mut unsupported = 0usize;
         for (index, uri) in uris.iter().enumerate() {
             let mime_type = mime_types
                 .get(index)
                 .map(String::as_str)
                 .unwrap_or_default();
-            match offered_kind(uri, mime_type) {
-                Offered::Openable(name) => {
-                    confirmed += 1;
-                    single = Some(name);
-                }
-                Offered::Unknown => unknown = true,
-                Offered::Unsupported => unsupported += 1,
+            if let Offered::Openable(name) = offered_kind(uri, mime_type) {
+                confirmed += 1;
+                single = Some(name);
             }
         }
-        match (confirmed, unknown, unsupported) {
-            (0, _, 0) => DropOffer::Unknown,
-            (0, false, _) => DropOffer::Unsupported,
-            (0, true, _) => DropOffer::Unknown,
-            (1, ..) => DropOffer::One {
+        match confirmed {
+            0 => DropOffer::Unknown,
+            1 => DropOffer::One {
                 name: single.expect("one confirmed item has a name"),
             },
-            (count, ..) => DropOffer::Many { count },
+            count => DropOffer::Many { count },
         }
     }
 
@@ -91,20 +86,19 @@ impl DropOffer {
 
 /// What one offered item's name and the event's type say about it.
 ///
-/// A document name and a trailing slash need no file system to confirm. A
-/// type the event carries marks a file the app cannot open; a name with
-/// neither may still be a folder, so it is never called unsupported.
+/// A document name and a trailing slash need no file system to confirm. An
+/// inferred type proves nothing — nsh reads it from the name's extension, so
+/// a folder named `archive.png` carries one — and an item that might be a
+/// folder is never called unsupported.
 enum Offered {
     /// A supported document, or a folder the event typed, with the name to
     /// show.
     Openable(SharedString),
     /// No reliable answer: it might be a folder, or nothing the app can read.
     Unknown,
-    /// A file whose event-carried type the app's document types reject.
-    Unsupported,
 }
 
-fn offered_kind(uri: &str, mime_type: &str) -> Offered {
+fn offered_kind(uri: &str, _mime_type: &str) -> Offered {
     if uri.ends_with('/') || uri.ends_with('\\') {
         return match uri_name(uri) {
             Some(name) => Offered::Openable(SharedString::from(name)),
@@ -116,9 +110,6 @@ fn offered_kind(uri: &str, mime_type: &str) -> Offered {
     };
     if DocType::of(Path::new(&name)).is_document() {
         return Offered::Openable(SharedString::from(name));
-    }
-    if !mime_type.is_empty() {
-        return Offered::Unsupported;
     }
     Offered::Unknown
 }
@@ -220,7 +211,9 @@ impl AppState {
                 Ok(plan) => plan,
                 Err(_) => return,
             };
-            let mut skipped = state.open_dropped_documents(plan.documents).await;
+            let mut skipped = state
+                .open_dropped_documents(plan.documents, folder_started_at)
+                .await;
             skipped += plan.skipped;
             // A folder drop's own notice belongs to the folder commit; a
             // superseded or blocked one publishes nothing, not even the
@@ -252,8 +245,11 @@ impl AppState {
     /// another's. Each path is confirmed a regular file at the load boundary,
     /// so a FIFO or a path that changed kind is skipped, never read; the
     /// tab lookup is repeated after the load, so two concurrent drops of one
-    /// file end in one tab.
-    async fn open_dropped_documents(&self, paths: Vec<PathBuf>) -> usize {
+    /// file end in one tab. Every `Opened …` notice is bound to
+    /// `workspace_request`, the folder request in force when the drop
+    /// happened: a drop the user superseded by opening another workspace
+    /// publishes nothing.
+    async fn open_dropped_documents(&self, paths: Vec<PathBuf>, workspace_request: u64) -> usize {
         let mut skipped = 0;
         for path in paths {
             if self.drop_blocked() {
@@ -271,7 +267,10 @@ impl AppState {
                     if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
                         return Ok(None);
                     }
-                    io::load(&path).map(Some)
+                    let loaded = io::load(&path).map(Some);
+                    #[cfg(any(test, feature = "test-vault"))]
+                    crate::test_vault::wait_for_commit(&path);
+                    loaded
                 })
                 .await
                 {
@@ -306,7 +305,9 @@ impl AppState {
             }
             self.add_tab(loaded);
             self.record_usage(UsageEvent::ArtifactOpened);
-            self.notify_named(crate::i18n::Key::Opened, &opened);
+            if self.folder_request.get() == workspace_request {
+                self.notify_named(crate::i18n::Key::Opened, &opened);
+            }
         }
         self.focus_editor();
         skipped
@@ -357,9 +358,11 @@ mod tests {
     }
 
     #[test]
-    fn only_an_event_typed_file_reads_as_unsupported() {
-        // The type the event carries decides; the file system is never asked.
-        assert_eq!(offer(&["file:///w/photo.png"]), DropOffer::Unsupported);
+    fn an_inferred_type_never_proves_an_item_is_a_file() {
+        // nsh infers the type from the name's extension, so a folder named
+        // `archive.png` carries one too. Nothing inferred may make the hover
+        // call an item unsupported; the drop's own metadata settles it.
+        assert_eq!(offer(&["file:///w/photo.png"]), DropOffer::Unknown);
         assert_eq!(
             offer(&["file:///w/photo.png", "file:///w/binary-blob"]),
             DropOffer::Unknown
@@ -370,12 +373,11 @@ mod tests {
                 name: SharedString::from("plan.md")
             }
         );
+        assert_eq!(offer(&["file:///w/archive.png"]), DropOffer::Unknown);
     }
 
     #[test]
     fn a_folder_name_with_neither_slash_nor_type_is_never_unsupported() {
-        // A folder named like a file: without a trailing slash or a type
-        // from the event, nothing may call it a file of the wrong kind.
         assert_eq!(offer(&["file:///w/archive.v1"]), DropOffer::Unknown);
         // The event can still mark it as a folder by its trailing slash.
         assert_eq!(
