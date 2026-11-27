@@ -4,7 +4,8 @@
 //! while a file drag hovers over the window (Goal 22, decision 6).
 //!
 //! It takes no pointer — the drag belongs to the window — and it says only
-//! what the drag's names confirm ([`crate::state::drop::DropOffer`]): the
+//! what the drag's names and the event's types confirm
+//! ([`crate::state::drop::DropOffer`]): the
 //! prototype's "side being dragged over" is not required, and skipped items
 //! are reported after the drop, by the drop's own notice.
 //!

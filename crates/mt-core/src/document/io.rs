@@ -83,11 +83,11 @@ impl FileStamp {
     }
 }
 
-/// Compare literal paths first so delete/rename notifications remain useful;
-/// fall back to canonical paths while both ends still exist so equivalent link
-/// spellings identify the same on-disk source.
+/// Compare the one spelling first so delete/rename notifications remain
+/// useful; fall back to canonical paths while both ends still exist so
+/// equivalent link spellings identify the same on-disk source.
 pub fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
+    crate::workspace::normalize_path(left) == crate::workspace::normalize_path(right)
         || std::fs::canonicalize(left)
             .ok()
             .zip(std::fs::canonicalize(right).ok())
@@ -153,16 +153,6 @@ fn read_snapshot_once(path: &Path) -> std::io::Result<Option<FileSnapshot>> {
     run_read_race_hook();
     let stamp = FileStamp::from_bytes(&metadata, &bytes, object_id);
 
-    // The read handle is still open, which is exactly the state another
-    // editor's rename-over must survive.
-    let current = open_snapshot_file(path)?;
-    let current_metadata = current.metadata()?;
-    if file_object_id(&current)? != object_id
-        || current_metadata.len() != metadata.len()
-        || current_metadata.modified().ok() != metadata.modified().ok()
-    {
-        return Ok(None);
-    }
     // An in-place overwrite keeps the object, the length and the modification
     // time, so the digest of a second read through the same handle is what
     // tells a torn snapshot from a whole one.
@@ -172,16 +162,39 @@ fn read_snapshot_once(path: &Path) -> std::io::Result<Option<FileSnapshot>> {
     if Sha256::digest(&again).as_slice() != stamp.digest.as_slice() {
         return Ok(None);
     }
+    #[cfg(test)]
+    run_read_reread_hook();
+
+    // The read handle is still open, which is exactly the state another
+    // editor's rename-over must survive. The path check comes after the last
+    // content read: a replacement during the second read would otherwise pass
+    // it because this handle kept returning the old bytes.
+    let current = open_snapshot_file(path)?;
+    let current_metadata = current.metadata()?;
+    if file_object_id(&current)? != object_id
+        || current_metadata.len() != metadata.len()
+        || current_metadata.modified().ok() != metadata.modified().ok()
+    {
+        return Ok(None);
+    }
     drop(file);
 
     Ok(Some(FileSnapshot { bytes, stamp }))
 }
 
+fn not_regular_file_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
+}
+
 #[cfg(windows)]
 fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
-    use windows::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, GetFileType,
+        },
     };
 
     // Share everything: another editor's atomic save (write a temp file, then
@@ -191,15 +204,86 @@ fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
     // [`read_snapshot_once`] re-checking the identity, length and modification
     // time and re-reading the bytes before accepting a snapshot, and from
     // [`load`] re-checking the source identity around it.
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .open(path)
+        .open(path)?;
+    // Bind the regular-file check to the opened handle: a path replaced by a
+    // pipe or device after an earlier check must never be read.
+    // SAFETY: `file` owns a valid handle.
+    if unsafe { GetFileType(HANDLE(file.as_raw_handle())) } != FILE_TYPE_DISK {
+        return Err(not_regular_file_error());
+    }
+    Ok(file)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
-    File::open(path)
+    use std::{
+        ffi::{CString, c_char, c_int},
+        os::fd::{AsRawFd as _, FromRawFd as _},
+        os::unix::ffi::OsStrExt as _,
+    };
+
+    unsafe extern "C" {
+        fn open(path: *const c_char, flags: c_int) -> c_int;
+        fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
+    }
+
+    const UNIX_O_RDONLY: c_int = 0;
+    const UNIX_F_GETFL: c_int = 3;
+    const UNIX_F_SETFL: c_int = 4;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in document path")
+    })?;
+    // `O_NONBLOCK` makes opening a FIFO substituted for the file return at
+    // once instead of waiting for a writer. Its handle's own metadata refuses
+    // anything that is not a regular file, and the flag is cleared before the
+    // read.
+    // SAFETY: `path` is a NUL-terminated path string.
+    let descriptor = unsafe {
+        open(
+            path.as_ptr(),
+            UNIX_O_RDONLY | UNIX_O_NONBLOCK | UNIX_O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `open` returned a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if !file.metadata()?.is_file() {
+        return Err(not_regular_file_error());
+    }
+    // SAFETY: `file` owns a live descriptor.
+    let flags = unsafe { fcntl(file.as_raw_fd(), UNIX_F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `file` owns a live descriptor and `flags` came from `F_GETFL`.
+    if unsafe { fcntl(file.as_raw_fd(), UNIX_F_SETFL, flags & !UNIX_O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular_file_error());
+    }
+    Ok(file)
+}
+
+#[cfg(not(any(windows, unix)))]
+fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular_file_error());
+    }
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -647,7 +731,21 @@ fn try_load_skill_source(path: &Path) -> Option<(FileSnapshot, SourceIdentity, S
     }
     let stamp = FileStamp::from_bytes(&after, &bytes, object_id);
 
-    // Prove the directory entry still names the file read through this root.
+    // An in-place overwrite keeps the object, the length and the modification
+    // time, so the digest of a second read through the same handle is what
+    // tells a torn snapshot from a whole one.
+    entrypoint.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let mut again = Vec::with_capacity(bytes.len());
+    entrypoint.read_to_end(&mut again).ok()?;
+    if Sha256::digest(&again).as_slice() != stamp.digest.as_slice() {
+        return None;
+    }
+    #[cfg(test)]
+    run_read_reread_hook();
+
+    // Prove the directory entry still names the file read through this root,
+    // after the last content read: a replacement during the second read would
+    // otherwise pass it because this handle kept returning the old bytes.
     let reopened = open_skill_entrypoint(&root.directory, &canonical_root).ok()?;
     let reopened_metadata = reopened.metadata().ok()?;
     if !opened_skill_entrypoint_is_regular(&reopened_metadata)
@@ -655,12 +753,6 @@ fn try_load_skill_source(path: &Path) -> Option<(FileSnapshot, SourceIdentity, S
         || reopened_metadata.len() != after.len()
         || reopened_metadata.modified().ok() != after.modified().ok()
     {
-        return None;
-    }
-    entrypoint.seek(std::io::SeekFrom::Start(0)).ok()?;
-    let mut again = Vec::with_capacity(bytes.len());
-    entrypoint.read_to_end(&mut again).ok()?;
-    if Sha256::digest(&again).as_slice() != stamp.digest.as_slice() {
         return None;
     }
 
@@ -1194,6 +1286,14 @@ impl SaveAuthorization {
         Ok(authorization)
     }
 
+    /// Record the exact disk version the user was shown when making the
+    /// destructive choice, so a later change stays outside that decision.
+    pub fn authorize_overwrite_of(&self, expected: FileStamp) -> Self {
+        let mut authorization = self.clone();
+        authorization.source = SourceSaveAuthorization::Overwrite { stamp: expected };
+        authorization
+    }
+
     /// Record that the user chose to recreate this currently missing regular
     /// source. A path that reappears before commit remains a conflict.
     pub fn authorize_missing_recreation(&self, file: &LoadedFile) -> Result<Self, SaveError> {
@@ -1708,6 +1808,9 @@ thread_local! {
     static READ_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
         std::cell::RefCell::new(None)
     };
+    static READ_REREAD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
+        std::cell::RefCell::new(None)
+    };
     #[cfg(windows)]
     static RECOVERY_SOURCE_MATCH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
         std::cell::RefCell::new(None)
@@ -1730,6 +1833,28 @@ fn install_read_race_hook(hook: impl FnOnce() + 'static) {
 #[cfg(test)]
 fn run_read_race_hook() {
     READ_RACE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+/// Run `hook` once, after the second content read and before the path check
+/// that follows it, so a test can replace the path inside that window.
+#[cfg(test)]
+fn install_read_reread_hook(hook: impl FnOnce() + 'static) {
+    READ_REREAD_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "a read reread hook is already installed"
+        );
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(test)]
+fn run_read_reread_hook() {
+    READ_REREAD_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
             hook();
         }
@@ -1824,6 +1949,91 @@ mod tests {
         // object id, Unix by its device and inode. The snapshot must be the
         // replacement, not the object the first handle kept open.
         assert_eq!(loaded.text, "bbbb bbbb\n");
+    }
+
+    /// Rename `replacement` over `target` after the second content read and
+    /// before the path check that follows it; return where the rename's
+    /// result was recorded.
+    fn rename_over_during_reread(
+        target: &Path,
+        replacement: &Path,
+    ) -> std::rc::Rc<std::cell::RefCell<Option<std::io::Result<()>>>> {
+        let outcome = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let recorded = outcome.clone();
+        let target = target.to_path_buf();
+        let replacement = replacement.to_path_buf();
+        install_read_reread_hook(move || {
+            *recorded.borrow_mut() = Some(std::fs::rename(&replacement, &target));
+        });
+        outcome
+    }
+
+    /// The defect: the path's identity was checked before the second content
+    /// read, so a replacement during that read passed because the first
+    /// handle kept returning the old bytes; the snapshot then named the old
+    /// object while the path pointed at the replacement.
+    #[test]
+    fn an_external_rename_over_during_the_final_reread_is_read_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_file(directory.path(), "plan.md", b"aaaa aaaa\n");
+        let replacement = write_file(directory.path(), "replacement.md", b"bbbb bbbb\n");
+
+        let outcome = rename_over_during_reread(&path, &replacement);
+        let loaded = load(&path).expect("the read retries and completes");
+        rename_outcome(&outcome).expect("the external writer's rename-over must not fail");
+
+        assert_eq!(
+            loaded.text, "bbbb bbbb\n",
+            "the snapshot must be the object the path names now"
+        );
+        assert_eq!(loaded.stamp, FileStamp::of(&path).unwrap());
+    }
+
+    /// The same final-reread race through the Agent Skill entrypoint: the
+    /// origin is dropped (never bound to bytes the path no longer names) and
+    /// the fallback editable read sees the replacement.
+    #[test]
+    fn an_external_rename_over_of_a_skill_entrypoint_during_the_final_reread_keeps_both_sides_consistent()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let skill_root = directory.path().join("skill");
+        std::fs::create_dir(&skill_root).unwrap();
+        let path = write_file(&skill_root, "SKILL.md", b"aaaa aaaa\n");
+        let replacement = write_file(&skill_root, "staged.md", b"bbbb bbbb\n");
+
+        let outcome = rename_over_during_reread(&path, &replacement);
+        let loaded = load(&path).expect("the read retries and completes");
+        rename_outcome(&outcome).expect("the external writer's rename-over must not fail");
+
+        assert_eq!(loaded.text, "bbbb bbbb\n");
+        assert!(
+            loaded.skill_origin().is_none(),
+            "the entrypoint's bytes stopped matching the package, so the \
+             fallback must carry no provenance"
+        );
+        assert_eq!(load(&path).unwrap().text, "bbbb bbbb\n");
+    }
+
+    /// A FIFO substituted for a document name must be refused by the opened
+    /// handle, without waiting for a writer the drop never has.
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn a_fifo_with_a_document_name_is_refused_without_waiting_for_a_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("notes.md");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            status.is_ok_and(|status| status.success()),
+            "mkfifo must create {fifo:?}"
+        );
+
+        let start = std::time::Instant::now();
+        let error = load(&fifo).expect_err("a FIFO is never read");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "the open must not wait for a writer"
+        );
     }
 
     /// Write `bytes` into `path` in place (the same object) and put its

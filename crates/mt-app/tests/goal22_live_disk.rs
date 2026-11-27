@@ -512,6 +512,31 @@ fn an_external_write_to_a_symlink_target_raises_the_banner_on_a_dirty_tab() {
     );
 }
 
+/// A link whose target lives inside the workspace: deleting the target must
+/// raise the missing banner. The target's resolved spelling is the canonical
+/// one (verbatim on Windows), the event's is the watch's, and only the one
+/// normalized spelling matches them after the target is gone.
+#[test]
+fn deleting_a_symlink_target_inside_the_workspace_raises_the_missing_banner() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let link = workspace.path().join("link.md");
+    let target = workspace.path().join("real.md");
+    std::fs::write(&target, "# Real\n").expect("write the target");
+    if let Err(error) = symlink_file(&target, &link) {
+        eprintln!("skipping file-symlink test: {error}");
+        return;
+    }
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "link.md");
+    app.wait_for("text:# Real")
+        .expect("the linked document is open");
+
+    std::fs::remove_file(&target).expect("delete the target");
+    wait_for_text(&mut app, "Moved or deleted on disk", "the missing banner");
+}
+
 #[test]
 fn a_retargeted_symlink_watch_follows_the_new_target() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -632,6 +657,153 @@ fn a_manual_reload_answer_after_a_delete_keeps_the_missing_banner() {
         "the buffer keeps the edit: {:?}",
         app.screen().texts()
     );
+}
+
+#[test]
+fn a_newer_disk_version_after_the_overwrite_card_is_not_clobbered() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = workspace.path().join("plan.md");
+    std::fs::write(&path, "# Original\n").expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.type_text(EDITOR, "\nLocal edit.")
+        .expect("edit the buffer");
+    std::fs::write(&path, "# Alpha disk\n").expect("external write");
+    wait_for_text(&mut app, "Changed on disk", "the conflict banner");
+
+    // The user compares Alpha and opens the overwrite confirmation bound to
+    // it.
+    app.press("label:Compare").expect("compare");
+    app.wait_for("id:conflict-previous")
+        .expect("the comparison panel");
+    app.press("label:Keep mine").expect("keep mine");
+    app.wait_for("id:guard-overwrite")
+        .expect("the overwrite guard");
+
+    // A newer version lands after the card was shown: the confirmation is
+    // bound to the version the user compared, so Beta must survive.
+    std::fs::write(&path, "# Beta disk\n").expect("a newer external write");
+    app.wait_for_gone("id:conflict-previous", Duration::from_secs(20))
+        .expect("the newer disk version closes the comparison");
+
+    app.press("id:guard-overwrite")
+        .expect("confirm the overwrite");
+    pump_for(&mut app, Duration::from_millis(800));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read the file"),
+        "# Beta disk\n",
+        "the newer disk version is not overwritten"
+    );
+    assert!(
+        shows(app.screen(), "Changed on disk"),
+        "the tab stays in a fresh conflict: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_pending_reload_never_overwrites_a_just_kept_version() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = workspace.path().join("plan.md");
+    let release = config.path().join("release-kept-read");
+    std::fs::write(&path, "# Original\n").expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.type_text(EDITOR, "\nLocal edit.")
+        .expect("edit the buffer");
+
+    // An external write starts a reload whose read of Alpha completes and
+    // parks before it commits. The save attempt raises the conflict while
+    // that answer waits.
+    mt_app::test_vault::gate_commit(&path, &release);
+    std::fs::write(&path, "# Alpha disk\n").expect("external write");
+    wait_for_marker(
+        &mut app,
+        "the reloaded answer reaches its commit",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::commit_gate_reached(&path),
+    );
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.press("id:title-menu-save").expect("attempt the save");
+    wait_for_text(&mut app, "Changed on disk", "the conflict banner");
+    app.press("label:Keep mine").expect("keep mine");
+    app.wait_for("id:guard-overwrite")
+        .expect("the overwrite guard");
+    app.press("id:guard-overwrite")
+        .expect("confirm the overwrite");
+    wait_for_text(&mut app, "Saved plan.md", "the kept save");
+
+    // Only now does the older, already-read answer commit: it read the
+    // version the kept decision replaced, so it must be dropped.
+    std::fs::write(&release, b"").expect("let the stale answer commit");
+    pump_for(&mut app, Duration::from_millis(800));
+    assert!(
+        shows(app.screen(), "Local edit."),
+        "the kept text stays in the editor: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        !shows(app.screen(), "Updated from disk"),
+        "the stale read never reloads: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .expect("read the file")
+            .contains("Local edit."),
+        "the kept text reached the disk"
+    );
+}
+
+#[test]
+fn a_dirty_retargeted_symlink_keeps_watching_the_new_target() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let first = tempfile::tempdir().expect("first target dir");
+    let second = tempfile::tempdir().expect("second target dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let target_one = first.path().join("target.md");
+    std::fs::write(&target_one, "# Target one\n").expect("write the first target");
+    let target_two = second.path().join("target.md");
+    std::fs::write(&target_two, "# Target two\n").expect("write the second target");
+    let link = workspace.path().join("link.md");
+    if let Err(error) = symlink_file(&target_one, &link) {
+        eprintln!("skipping file-symlink test: {error}");
+        return;
+    }
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "link.md");
+    app.wait_for("text:# Target one")
+        .expect("the linked document is open");
+    app.type_text(EDITOR, "\nLocal edit.")
+        .expect("edit the buffer");
+
+    // Retarget while dirty: the conflict goes up, and the new target's
+    // parent becomes watched at detection time, not at adoption.
+    std::fs::remove_file(&link).expect("unlink");
+    symlink_file(&target_two, &link).expect("retarget the link");
+    wait_for_text(&mut app, "Changed on disk", "the conflict banner");
+
+    app.press("label:Compare").expect("compare");
+    app.wait_for("id:conflict-previous")
+        .expect("the comparison panel");
+    assert!(
+        shows(app.screen(), "Target two"),
+        "the comparison reads the new target: {:?}",
+        app.screen().texts()
+    );
+
+    // A later write to the new target must reach the app: the comparison
+    // closes because its version is no longer the disk's, which only the
+    // watched new parent can say.
+    std::fs::write(&target_two, "# Target two changed\n").expect("write the new target");
+    app.wait_for_gone("id:conflict-previous", Duration::from_secs(20))
+        .expect("the newer target write closes the comparison");
 }
 
 #[test]

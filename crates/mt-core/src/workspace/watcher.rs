@@ -51,6 +51,45 @@ pub struct Watcher {
 /// enough that a human save feels immediate.
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// The one spelling watches are registered and events are matched by.
+///
+/// `canonicalize` on Windows yields the verbatim form (`\\?\C:\notes`,
+/// `\\?\UNC\server\share`), while the workspace and the event paths usually
+/// use the plain form. A literal comparison of the two fails exactly where it
+/// matters most — a removed path has no canonical spelling left — so the
+/// verbatim prefix is stripped before anything is registered or matched.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
+            return match prefix.kind() {
+                Prefix::VerbatimDisk(letter) => {
+                    let mut plain = PathBuf::from(format!("{}:\\", letter as char));
+                    for component in path.components().skip(2) {
+                        plain.push(component.as_os_str());
+                    }
+                    plain
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut plain = PathBuf::from(format!(
+                        r"\\{}\{}",
+                        server.to_string_lossy(),
+                        share.to_string_lossy()
+                    ));
+                    for component in path.components().skip(2) {
+                        plain.push(component.as_os_str());
+                    }
+                    plain
+                }
+                _ => path.to_path_buf(),
+            };
+        }
+    }
+    path.to_path_buf()
+}
+
 impl Watcher {
     /// Start with nothing watched.
     ///
@@ -104,7 +143,7 @@ impl Watcher {
     /// [`Self::sync_document_directories`] non-recursively, and a document
     /// directory that the new root now covers has its separate watch removed.
     pub fn set_root(&mut self, root: &Path) -> anyhow::Result<()> {
-        let root = root.to_path_buf();
+        let root = normalize_path(root);
         if self.root.as_deref() == Some(root.as_path()) {
             return Ok(());
         }
@@ -139,15 +178,17 @@ impl Watcher {
         // from `canonicalize`) while `set_root` was handed the spelling the
         // user's folder picker produced; a directory covered under either
         // spelling is already watched recursively.
+        let root = self.root.as_deref().map(normalize_path);
         let canonical_root = self
             .root
             .as_deref()
-            .and_then(|root| std::fs::canonicalize(root).ok());
+            .and_then(|root| std::fs::canonicalize(root).ok())
+            .map(|root| normalize_path(&root));
         let desired: HashSet<_> = directories
             .into_iter()
+            .map(|directory| normalize_path(&directory))
             .filter(|directory| {
-                !self
-                    .root
+                !root
                     .as_deref()
                     .is_some_and(|root| directory.starts_with(root))
                     && !canonical_root
@@ -186,7 +227,10 @@ impl Watcher {
     /// [`Self::sync_document_directories`]. Paths must use the same spelling as
     /// the watched paths so they match filesystem events.
     pub fn sync_context_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
-        self.context_paths = paths.into_iter().collect();
+        self.context_paths = paths
+            .into_iter()
+            .map(|path| normalize_path(&path))
+            .collect();
     }
 
     /// Drain pending changes without blocking.
@@ -242,6 +286,7 @@ fn classify(
     event
         .paths
         .iter()
+        .map(|path| normalize_path(path))
         .filter(|path| {
             if context_paths.contains(path.as_path()) {
                 return true;
@@ -260,7 +305,6 @@ fn classify(
             }
         })
         .filter_map(|path| {
-            let path = path.clone();
             Some(match event.kind {
                 EventKind::Create(_) => Change::Created(path),
                 EventKind::Remove(_) => Change::Removed(path),
@@ -425,6 +469,7 @@ mod tests {
         path: &Path,
         matches_change: impl Fn(&Change) -> bool,
     ) -> Change {
+        let path = normalize_path(path);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut observed = Vec::new();
         loop {
@@ -440,7 +485,7 @@ mod tests {
             observed.extend(events.iter().map(|event| {
                 (
                     event.kind,
-                    event.paths.iter().any(|event_path| event_path == path),
+                    event.paths.iter().any(|event_path| event_path == &path),
                 )
             }));
             let changes = dedup(
@@ -458,7 +503,7 @@ mod tests {
             );
             if let Some(found) = changes
                 .into_iter()
-                .find(|change| change.path() == path && matches_change(change))
+                .find(|change| change.path() == path.as_path() && matches_change(change))
             {
                 return found;
             }
@@ -469,7 +514,7 @@ mod tests {
     fn detects_an_external_modification() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let path = root.join("a.md");
+        let path = normalize_path(&root).join("a.md");
 
         let watcher = rooted(&root);
         std::fs::write(&path, "one\n").unwrap();
@@ -506,7 +551,7 @@ mod tests {
         let primary = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let primary_root = primary.path().canonicalize().unwrap();
-        let external_root = external.path().canonicalize().unwrap();
+        let external_root = normalize_path(&external.path().canonicalize().unwrap());
         let path = external_root.join("saved-as.md");
 
         let mut watcher = rooted(&primary_root);
@@ -603,7 +648,7 @@ mod tests {
     #[test]
     fn a_rootless_watcher_reports_a_document_directory_it_was_given() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = normalize_path(&dir.path().canonicalize().unwrap());
         let path = root.join("dropped.md");
 
         let mut watcher = Watcher::new().unwrap();
@@ -624,7 +669,7 @@ mod tests {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let first_root = first.path().canonicalize().unwrap();
-        let second_root = second.path().canonicalize().unwrap();
+        let second_root = normalize_path(&second.path().canonicalize().unwrap());
         let inner = second_root.join("notes");
         std::fs::create_dir(&inner).unwrap();
 
@@ -721,6 +766,34 @@ mod tests {
             elapsed < Duration::from_millis(500),
             "registering the watch took {elapsed:?}; it must not scan the tree"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_windows_paths_normalize_to_the_plain_spelling() {
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\C:\notes\plan.md")),
+            PathBuf::from(r"C:\notes\plan.md")
+        );
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\UNC\server\share\plan.md")),
+            PathBuf::from(r"\\server\share\plan.md")
+        );
+        assert_eq!(
+            normalize_path(Path::new(r"C:\notes\plan.md")),
+            PathBuf::from(r"C:\notes\plan.md")
+        );
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\Volume{8f2a}\plan.md")),
+            PathBuf::from(r"\\?\Volume{8f2a}\plan.md")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_plain_path_normalizes_to_itself() {
+        let path = Path::new("/notes/plan.md");
+        assert_eq!(normalize_path(path), path);
     }
 
     #[test]

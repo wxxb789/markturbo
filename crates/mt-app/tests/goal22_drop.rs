@@ -226,14 +226,24 @@ fn the_drop_screen_follows_the_confirmed_unknown_and_unsupported_cases() {
     app.wait_for_gone("id:drop-screen", Duration::from_secs(5))
         .expect("a leave clears the screen");
 
-    // A folder whose name says a type is still a folder: only the file
-    // system answers for the item's kind.
+    // The hover reads names and types only: a folder named like a file,
+    // without a trailing slash and without a type, is not confirmed here
+    // (the drop's own metadata settles it), and is never called
+    // unsupported.
     let folder = directory.path().join("archive.v1");
     std::fs::create_dir(&folder).expect("create archive.v1");
     let folder_uri = folder_uri(&folder);
     drag_enter(&mut app, vec![folder_uri.trim_end_matches('/').to_owned()]);
+    app.wait_for("text:Drop to open")
+        .expect("a folder named like a file stays unconfirmed while it hovers");
+    drag_leave(&mut app);
+    app.wait_for_gone("id:drop-screen", Duration::from_secs(5))
+        .expect("a leave clears the screen");
+
+    // The event's trailing slash is what marks the item as a folder.
+    drag_enter(&mut app, vec![folder_uri]);
     app.wait_for("text:Open archive.v1")
-        .expect("a folder named like a file is still openable");
+        .expect("a folder the event marked is openable");
     drag_leave(&mut app);
     app.wait_for_gone("id:drop-screen", Duration::from_secs(5))
         .expect("a leave clears the screen");
@@ -539,6 +549,106 @@ fn a_folder_scan_that_lands_behind_settings_does_not_open() {
             .expect("selector"),
         0,
         "the dismissed scan never becomes the workspace: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_folder_drop_blocked_by_a_card_clears_its_opening_notice() {
+    let work = tempfile::tempdir().expect("workspace");
+    let dropped = tempfile::tempdir().expect("dropped folder");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = work.path().join("plan.md");
+    std::fs::write(&path, "# Original\n").expect("write plan.md");
+    std::fs::write(dropped.path().join("inside.md"), "# Inside\n").expect("write inside.md");
+    let release = config.path().join("release-folder-scan");
+    let scan_path = std::path::absolute(dropped.path()).expect("absolute scan path");
+
+    let mut app = start(config.path(), Some(&path));
+    app.wait_for("text:# Original").expect("the document");
+    app.type_text("label:Markdown source", "\nLocal edit.")
+        .expect("edit the buffer");
+    std::fs::write(&path, "# External\n").expect("external write");
+    app.wait_for("text:Changed on disk")
+        .expect("the conflict banner");
+
+    // The drop is accepted while nothing blocks it; its folder scan parks.
+    mt_app::test_vault::gate_read(&scan_path, &release);
+    app.drop_files("id:shell", vec![folder_uri(dropped.path())])
+        .expect("drop the folder");
+    support::wait_for_marker(
+        &mut app,
+        "the folder scan to reach its gate",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::gate_reads_started(&scan_path) >= 1,
+    );
+    app.wait_for("text:Opening folder…")
+        .expect("the drop announces the folder open");
+
+    // A card opens while the scan is in flight: the scan commits nothing,
+    // and the held line belongs to the cancelled open, not to the card.
+    app.press("id:conflict-use-disk")
+        .expect("ask for the disk version");
+    app.wait_for("id:guard-reload").expect("the reload guard");
+    std::fs::write(&release, b"").expect("let the scan finish");
+    app.wait(Duration::from_millis(800))
+        .expect("let the drop land");
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Opening folder")),
+        "a blocked folder drop clears its held notice: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_superseded_mixed_drop_publishes_no_skipped_notice() {
+    let first = tempfile::tempdir().expect("dropped folder");
+    let other = tempfile::tempdir().expect("picked folder");
+    let config = tempfile::tempdir().expect("config dir");
+    let doc = first.path().join("slow.md");
+    let picture = first.path().join("photo.png");
+    let release = config.path().join("release-slow-drop-read");
+    std::fs::write(&doc, "# Slow\n").expect("write slow.md");
+    std::fs::write(&picture, b"\x89PNG").expect("write photo.png");
+    std::fs::write(other.path().join("other.md"), "# Other\n").expect("write other.md");
+
+    let mut app = start(config.path(), None);
+    app.wait_for("id:welcome-open-folder").expect("the welcome");
+
+    // The drop names the slow document, a skipped picture and folder A; its
+    // document read parks.
+    mt_app::test_vault::gate_read(&doc, &release);
+    app.drop_files(
+        "id:shell",
+        vec![file_uri(&doc), file_uri(&picture), folder_uri(first.path())],
+    )
+    .expect("drop the mixed set");
+    support::wait_for_marker(
+        &mut app,
+        "the dropped read to reach its gate",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::gate_reads_started(&doc) >= 1,
+    );
+
+    // While the document loads the user opens folder B.
+    app.on_pick_paths(vec![other.path().to_path_buf()])
+        .expect("answer the picker");
+    app.press("id:welcome-open-folder").expect("open folder B");
+    app.wait_for("id:workspace-home-file >> text:other.md")
+        .expect("B is the workspace");
+
+    std::fs::write(&release, b"").expect("let the slow read finish");
+    app.wait(Duration::from_millis(1_500))
+        .expect("let the drop land");
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Skipped")),
+        "a superseded drop publishes no skipped count: {:?}",
         app.screen().texts()
     );
 }

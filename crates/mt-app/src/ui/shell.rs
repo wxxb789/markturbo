@@ -114,7 +114,7 @@ pub(crate) fn shell_with_status(
         // screen leaves on leave or drop. A platform that sends no enter
         // position still gets the screen, which always comes from the right.
         .on_file_drag_enter(move |event: &FileDragEvent| {
-            drag_state.drop_hover(&event.uris);
+            drag_state.drop_hover(&event.uris, &event.mime_types);
         })
         .on_file_drag_leave(move |_: &()| leave_state.drop_leave())
         .on_file_drop(move |event: &FileDropEvent| {

@@ -26,15 +26,19 @@ pub enum DropOffer {
 }
 
 impl DropOffer {
-    /// Classify the items a drag offers: by the file system for local paths,
-    /// by the name otherwise.
-    pub fn of(uris: &[String]) -> Self {
+    /// Classify the items a drag offers from its names and the event's types
+    /// only: a drag callback never touches the file system.
+    pub fn of(uris: &[String], mime_types: &[String]) -> Self {
         let mut confirmed = 0usize;
         let mut single: Option<SharedString> = None;
         let mut unknown = false;
         let mut unsupported = 0usize;
-        for uri in uris {
-            match offered_kind(uri) {
+        for (index, uri) in uris.iter().enumerate() {
+            let mime_type = mime_types
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or_default();
+            match offered_kind(uri, mime_type) {
                 Offered::Openable(name) => {
                     confirmed += 1;
                     single = Some(name);
@@ -85,41 +89,22 @@ impl DropOffer {
     }
 }
 
-/// What one offered item's name and, when it names a local path, the file
-/// system confirm.
+/// What one offered item's name and the event's type say about it.
 ///
-/// A name alone never confirms a file: on a file drag the event carries names
-/// and inferred MIME types only, and a folder named `archive.v1` gets a MIME
-/// type from that name. A path the file system answers for does confirm its
-/// kind; without that answer nothing is called unsupported.
+/// A document name and a trailing slash need no file system to confirm. A
+/// type the event carries marks a file the app cannot open; a name with
+/// neither may still be a folder, so it is never called unsupported.
 enum Offered {
-    /// A supported document, or a folder, with the name to show.
+    /// A supported document, or a folder the event typed, with the name to
+    /// show.
     Openable(SharedString),
     /// No reliable answer: it might be a folder, or nothing the app can read.
     Unknown,
-    /// A regular file whose type the app's document types reject.
+    /// A file whose event-carried type the app's document types reject.
     Unsupported,
 }
 
-fn offered_kind(uri: &str) -> Offered {
-    if let Some(path) = file_path_of_uri(uri)
-        && let Ok(metadata) = std::fs::metadata(&path)
-    {
-        let Some(name) = path_name(&path) else {
-            return Offered::Unknown;
-        };
-        if metadata.is_dir() {
-            return Offered::Openable(SharedString::from(name));
-        }
-        if metadata.is_file() {
-            return if DocType::of(&path).is_document() {
-                Offered::Openable(SharedString::from(name))
-            } else {
-                Offered::Unsupported
-            };
-        }
-        return Offered::Unknown;
-    }
+fn offered_kind(uri: &str, mime_type: &str) -> Offered {
     if uri.ends_with('/') || uri.ends_with('\\') {
         return match uri_name(uri) {
             Some(name) => Offered::Openable(SharedString::from(name)),
@@ -131,6 +116,9 @@ fn offered_kind(uri: &str) -> Offered {
     };
     if DocType::of(Path::new(&name)).is_document() {
         return Offered::Openable(SharedString::from(name));
+    }
+    if !mime_type.is_empty() {
+        return Offered::Unsupported;
     }
     Offered::Unknown
 }
@@ -194,14 +182,14 @@ pub(crate) fn plan_drop(uris: &[String]) -> DropPlan {
 }
 
 impl AppState {
-    /// A drag entered: offer what its names confirm. A card, Settings or
-    /// another surface that replaces the workspace owns the interaction, so a
-    /// drag behind it offers nothing.
-    pub fn drop_hover(&self, uris: &[String]) {
+    /// A drag entered: offer what its names and types confirm. A card,
+    /// Settings or another surface that replaces the workspace owns the
+    /// interaction, so a drag behind it offers nothing.
+    pub fn drop_hover(&self, uris: &[String], mime_types: &[String]) {
         if self.drop_blocked() {
             return;
         }
-        self.drop_offer.set(Some(DropOffer::of(uris)));
+        self.drop_offer.set(Some(DropOffer::of(uris, mime_types)));
     }
 
     /// The drag left without dropping: the affordance clears.
@@ -209,31 +197,43 @@ impl AppState {
         self.drop_offer.set(None);
     }
 
-    /// A drop: open its documents in order in one task, make the last folder
-    /// the workspace, and report the skipped count once, last, naming no
-    /// paths. The folder's request token is claimed here, before the task's
-    /// first await, so a workspace the user opens while the documents load is
-    /// never overwritten by the older drop; the same check closes the task if
-    /// a card or Settings is up by the time it commits.
+    /// A drop: plan it off the UI thread, open its documents in order, make
+    /// the last folder the workspace, and report the skipped count once,
+    /// last, naming no paths. The folder intent in force when the drop
+    /// happened is what the commit compares against, so a workspace the user
+    /// opens while the plan or the documents are in flight is never
+    /// overwritten by the older drop; a card or Settings that goes up
+    /// meanwhile closes the task the same way. A superseded drop is quiet:
+    /// neither its folder nor its skipped count may replace the newer
+    /// workspace's notice.
     pub fn drop_files(&self, uris: &[String]) {
         self.drop_offer.set(None);
         if self.drop_blocked() {
             return;
         }
         let language = self.settings.get().language;
-        let plan = plan_drop(uris);
-        let folder = plan.folder.map(|folder| (folder, self.begin_folder_open()));
+        let folder_started_at = self.folder_request.get();
+        let uris = uris.to_vec();
         let state = self.clone();
         self.spawn_task(async move {
+            let plan = match blocking(move || plan_drop(&uris)).await {
+                Ok(plan) => plan,
+                Err(_) => return,
+            };
             let mut skipped = state.open_dropped_documents(plan.documents).await;
             skipped += plan.skipped;
-            if let Some((folder, request)) = folder {
-                if state.drop_blocked() {
-                    return;
-                }
-                state.finish_folder_open(folder, request, true).await;
+            // A folder drop's own notice belongs to the folder commit; a
+            // superseded or blocked one publishes nothing, not even the
+            // skipped count.
+            let mut may_publish_skipped = plan.folder.is_none();
+            if let Some(folder) = plan.folder
+                && !state.drop_blocked()
+                && state.folder_request.get() == folder_started_at
+            {
+                let request = state.begin_folder_open();
+                may_publish_skipped = state.finish_folder_open(folder, request, true).await;
             }
-            if skipped > 0 {
+            if skipped > 0 && may_publish_skipped {
                 state.notify_held(SharedString::from(s::skipped_files(language, skipped)));
             }
         });
@@ -281,7 +281,13 @@ impl AppState {
                         continue;
                     }
                     Ok(Err(error)) => {
-                        self.notify_failure(crate::i18n::Key::OpenFailed, &error);
+                        if error.kind() == std::io::ErrorKind::InvalidInput {
+                            // The opened handle refused a non-regular file: a
+                            // FIFO or device counts as skipped, never read.
+                            skipped += 1;
+                        } else {
+                            self.notify_failure(crate::i18n::Key::OpenFailed, &error);
+                        }
                         continue;
                     }
                     Err(error) => {
@@ -311,16 +317,27 @@ impl AppState {
 mod tests {
     use super::*;
 
+    /// The offer the app computes for these URIs, with the same types the
+    /// drag event carries for their names.
+    fn offer(uris: &[&str]) -> DropOffer {
+        let uris: Vec<String> = uris.iter().map(|uri| (*uri).to_owned()).collect();
+        let mime_types: Vec<String> = uris
+            .iter()
+            .map(|uri| nsh_core::platform::file_mime_type(uri).to_owned())
+            .collect();
+        DropOffer::of(&uris, &mime_types)
+    }
+
     #[test]
     fn a_supported_document_name_is_confirmed() {
         assert_eq!(
-            DropOffer::of(&["file:///w/plan.md".to_owned()]),
+            offer(&["file:///w/plan.md"]),
             DropOffer::One {
                 name: SharedString::from("plan.md")
             }
         );
         assert_eq!(
-            DropOffer::of(&["file:///w/a.md".to_owned(), "file:///w/b.txt".to_owned()]),
+            offer(&["file:///w/a.md", "file:///w/b.txt"]),
             DropOffer::Many { count: 2 }
         );
     }
@@ -328,41 +345,27 @@ mod tests {
     #[test]
     fn a_folder_marked_by_a_trailing_slash_is_confirmed_and_an_untyped_name_is_not() {
         assert_eq!(
-            DropOffer::of(&["file:///w/notes/".to_owned()]),
+            offer(&["file:///w/notes/"]),
             DropOffer::One {
                 name: SharedString::from("notes")
             }
         );
-        // No extension and no document name: it may be a folder the event did
-        // not type, so it is neither offered as openable nor called
-        // unsupported. (`README` would be a document name, not this case.)
-        assert_eq!(
-            DropOffer::of(&["file:///w/binary-blob".to_owned()]),
-            DropOffer::Unknown
-        );
-        assert_eq!(DropOffer::of(&[]), DropOffer::Unknown);
+        // No extension and no type: it may be a folder the event did not
+        // type, so it is neither offered as openable nor called unsupported.
+        assert_eq!(offer(&["file:///w/binary-blob"]), DropOffer::Unknown);
+        assert_eq!(DropOffer::of(&[], &[]), DropOffer::Unknown);
     }
 
     #[test]
-    fn only_a_confirmed_file_reads_as_unsupported() {
-        let directory = tempfile::tempdir().unwrap();
-        let picture = directory.path().join("photo.png");
-        std::fs::write(&picture, b"\x89PNG").unwrap();
-        let document = directory.path().join("plan.md");
-        std::fs::write(&document, "# plan\n").unwrap();
-        let picture_uri = url::Url::from_file_path(&picture).unwrap().to_string();
-        let document_uri = url::Url::from_file_path(&document).unwrap().to_string();
-
+    fn only_an_event_typed_file_reads_as_unsupported() {
+        // The type the event carries decides; the file system is never asked.
+        assert_eq!(offer(&["file:///w/photo.png"]), DropOffer::Unsupported);
         assert_eq!(
-            DropOffer::of(std::slice::from_ref(&picture_uri)),
-            DropOffer::Unsupported
-        );
-        assert_eq!(
-            DropOffer::of(&[picture_uri.clone(), "file:///w/binary-blob".to_owned()]),
+            offer(&["file:///w/photo.png", "file:///w/binary-blob"]),
             DropOffer::Unknown
         );
         assert_eq!(
-            DropOffer::of(&[picture_uri, document_uri]),
+            offer(&["file:///w/photo.png", "file:///w/plan.md"]),
             DropOffer::One {
                 name: SharedString::from("plan.md")
             }
@@ -370,15 +373,13 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_named_like_a_file_is_confirmed_openable() {
-        let directory = tempfile::tempdir().unwrap();
-        let folder = directory.path().join("archive.v1");
-        std::fs::create_dir(&folder).unwrap();
-        let uri = url::Url::from_directory_path(&folder).unwrap().to_string();
-        // A Windows folder URI does not have to end in a slash: the kind has
-        // to come from the file system, not the name.
+    fn a_folder_name_with_neither_slash_nor_type_is_never_unsupported() {
+        // A folder named like a file: without a trailing slash or a type
+        // from the event, nothing may call it a file of the wrong kind.
+        assert_eq!(offer(&["file:///w/archive.v1"]), DropOffer::Unknown);
+        // The event can still mark it as a folder by its trailing slash.
         assert_eq!(
-            DropOffer::of(&[uri.trim_end_matches('/').to_owned()]),
+            offer(&["file:///w/archive.v1/"]),
             DropOffer::One {
                 name: SharedString::from("archive.v1")
             }
@@ -392,7 +393,7 @@ mod tests {
         let uri = url::Url::from_file_path(&path).unwrap().to_string();
 
         assert_eq!(
-            DropOffer::of(&[uri]),
+            offer(&[uri.as_str()]),
             DropOffer::One {
                 name: SharedString::from("My Plan.md")
             }
@@ -472,6 +473,13 @@ mod tests {
         let plan = plan_drop(&[uri.clone()]);
         assert!(plan.documents.is_empty(), "a FIFO is never opened");
         assert_eq!(plan.skipped, 1);
-        assert_eq!(DropOffer::of(&[uri]), DropOffer::Unknown);
+        // The hover path knows only the name: it offers the document, and
+        // the drop's own handle check skips the FIFO.
+        assert_eq!(
+            offer(&[uri.as_str()]),
+            DropOffer::One {
+                name: SharedString::from("notes.md")
+            }
+        );
     }
 }

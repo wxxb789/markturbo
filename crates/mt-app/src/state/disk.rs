@@ -10,7 +10,7 @@
 //! poll: no stat happens until an event says a path changed.
 
 use super::*;
-use mt_core::workspace::{Change, Watcher};
+use mt_core::workspace::{Change, Watcher, normalize_path};
 
 impl AppState {
     /// Why live watching is off, when it could not start. `None` once the
@@ -95,6 +95,17 @@ impl AppState {
             {
                 directories.insert(parent.to_path_buf());
             }
+            // A read that saw a retargeted link before the conflict resolved
+            // names a directory the adopted identity does not: it stays
+            // watched until the adoption replaces it.
+            if let Some(parent) = tab
+                .detected_target
+                .borrow()
+                .as_deref()
+                .and_then(Path::parent)
+            {
+                directories.insert(parent.to_path_buf());
+            }
         }
         let result = self
             .watcher
@@ -119,13 +130,14 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// Whether `tab` reads `path`, directly or through a symbolic link whose
-    /// recorded target resolves there.
+    /// Whether `tab` reads `path`, directly, through a symbolic link whose
+    /// recorded target resolves there, or at a target a read detected before
+    /// the conflict resolved.
     fn tab_reads_path(tab: &Tab, path: &Path) -> bool {
         if tab.untitled {
             return false;
         }
-        if tab.path == path || io::paths_match(&tab.path, path) {
+        if io::paths_match(&tab.path, path) {
             return true;
         }
         let resolved = {
@@ -133,11 +145,20 @@ impl AppState {
             match &loaded.source_identity {
                 SourceIdentity::SymbolicLink {
                     resolved_target, ..
-                } => resolved_target.clone(),
-                SourceIdentity::Regular => return false,
+                } => Some(resolved_target.clone()),
+                SourceIdentity::Regular => None,
             }
         };
-        resolved == path || io::paths_match(&resolved, path)
+        if resolved
+            .as_deref()
+            .is_some_and(|resolved| io::paths_match(resolved, path))
+        {
+            return true;
+        }
+        tab.detected_target
+            .borrow()
+            .as_deref()
+            .is_some_and(|detected| io::paths_match(detected, path))
     }
 
     /// Drain the watcher's debounced batches. Called from the app's disk
@@ -164,18 +185,40 @@ impl AppState {
 
     /// Apply one change; true when the workspace tree's shape changed.
     fn apply_disk_change(&self, change: &Change) -> bool {
-        let path = change.path();
-        let in_root = self
-            .root
-            .get_untracked()
-            .is_some_and(|root| path.starts_with(&root));
+        let path = normalize_path(change.path());
+        let root = self.root.get_untracked().map(|root| normalize_path(&root));
+        let in_root = root.as_deref().is_some_and(|root| path.starts_with(root));
         let affects_tree = in_root && change.affects_tree();
         for tab in self.tabs.get_untracked() {
-            if Self::tab_reads_path(&tab, path) {
+            if Self::tab_reads_path(&tab, &path) {
                 self.handle_document_change(&tab);
             }
         }
         affects_tree
+    }
+
+    /// Record the identity a completed disk read resolved to when it differs
+    /// from the adopted one, and re-derive the watches at once: a dirty tab's
+    /// retargeted link keeps its new target's parent watched before the
+    /// conflict is resolved, not only when the snapshot is adopted.
+    pub(super) fn note_detected_target(&self, tab: &Tab, loaded: &LoadedFile) {
+        let changed = tab.loaded.borrow().source_identity != loaded.source_identity;
+        let target = if changed {
+            match &loaded.source_identity {
+                SourceIdentity::SymbolicLink {
+                    resolved_target, ..
+                } => resolved_target.parent().map(Path::to_path_buf),
+                SourceIdentity::Regular => None,
+            }
+        } else {
+            None
+        };
+        let previous = tab.detected_target.borrow().clone();
+        if previous == target {
+            return;
+        }
+        *tab.detected_target.borrow_mut() = target;
+        self.sync_document_watches();
     }
 
     fn handle_document_change(&self, tab: &Tab) {
@@ -210,7 +253,10 @@ impl AppState {
                 move || {
                     #[cfg(any(test, feature = "test-vault"))]
                     crate::test_vault::wait_for_read(&path);
-                    io::load(&path)
+                    let loaded = io::load(&path);
+                    #[cfg(any(test, feature = "test-vault"))]
+                    crate::test_vault::wait_for_commit(&path);
+                    loaded
                 }
             })
             .await;
@@ -230,7 +276,10 @@ impl AppState {
                 return;
             };
             let loaded = match answer {
-                Ok(Ok(loaded)) => loaded,
+                Ok(Ok(loaded)) => {
+                    state.note_detected_target(&current, &loaded);
+                    loaded
+                }
                 Ok(Err(error)) => {
                     if error.kind() == std::io::ErrorKind::NotFound {
                         current.disk_missing.set(true);
@@ -383,9 +432,10 @@ mod tests {
     const ANCHOR_OLD: &str = "line zero\nline one\nline two\nline three\nline four\ntail\n";
 
     /// Line 4 stays, but the four lines above it grow far past the caret's
-    /// old byte offset: offset mapping would leave the caret on line 0.
+    /// old byte offset and far past the viewport: offset mapping would leave
+    /// the caret on line 0, and the old scroll offset cannot show line 4.
     fn anchor_new() -> String {
-        let long = "A".repeat(120);
+        let long = "A".repeat(2_000);
         format!("{long}\n{long}\n{long}\n{long}\nline four\ntail\n")
     }
 
@@ -423,6 +473,7 @@ mod tests {
                     .font_family(tokens::FONT_SOURCE)
                     .font_size(px(tokens::TYPE_SOURCE))
                     .line_height(px(tokens::TYPE_SOURCE_LINE))
+                    .soft_wrap(true)
                     .w(px(600.0))
                     .h(px(400.0)),
             )
@@ -446,14 +497,22 @@ mod tests {
                             }
                             let shown = editor_ref
                                 .api::<EditorApi>()
-                                .and_then(|api| api.selections().pop())
-                                .map(|selection| {
-                                    format!(
-                                        "caret:{}:{}",
-                                        selection.head.line, selection.head.column
-                                    )
+                                .map(|api| {
+                                    let caret = api
+                                        .selections()
+                                        .pop()
+                                        .map(|selection| {
+                                            format!(
+                                                "caret:{}:{}",
+                                                selection.head.line, selection.head.column
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "caret:none".to_owned());
+                                    let visible = api.visible_range();
+                                    let in_view = visible.start.line <= 4 && 4 <= visible.end.line;
+                                    format!("{caret} in-view:{in_view}")
                                 })
-                                .unwrap_or_else(|| "caret:none".to_owned());
+                                .unwrap_or_else(|| "caret:none in-view:false".to_owned());
                             readback.set(SharedString::from(shown));
                         });
                     })
@@ -468,7 +527,109 @@ mod tests {
             .expect("start the probe");
         app.wait_for("id:anchor-reload").expect("the probe");
         app.press("id:anchor-reload").expect("reload");
-        app.wait_for("text:caret:4:1")
-            .expect("the caret stays on its line after the reload");
+        app.wait_for("text:caret:4:1 in-view:true")
+            .expect("the caret stays on its line and inside the viewport after the reload");
+    }
+
+    /// Two versions of one document, so the editor's text can tell which
+    /// adoption a pending caret restore belongs to.
+    fn superseded_version(marker: &str) -> String {
+        (0..40)
+            .map(|line| format!("{marker} line {line}\n"))
+            .collect()
+    }
+
+    /// Adopts one version with the caret on line 30, then adopts another with
+    /// the caret on line 0 before the first restore ran, and reads the caret
+    /// back after the restore frames. The first restore's version is gone by
+    /// then, so it must not move the caret back to line 30.
+    #[component]
+    fn SupersededRestoreProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().unwrap());
+        let path = directory.path().join("superseded.md");
+        std::fs::write(&path, superseded_version("old")).unwrap();
+        let id = state.add_tab(io::load(&path).unwrap());
+        let editor_ref = component_ref::<Editor>();
+        state.attach_source_editor(id, editor_ref);
+        let tab = state
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .expect("the tab");
+        let readback = signal(SharedString::from("caret:?"));
+        let press_state = state.clone();
+        let press_readback = readback;
+        let press_tab = tab.clone();
+        let keep = directory.clone();
+        view()
+            .test_id("superseded-probe")
+            .child(
+                editor()
+                    .component_ref(&editor_ref)
+                    .value({
+                        let tab = tab.clone();
+                        move || Some(tab.text.get())
+                    })
+                    .font_family(tokens::FONT_SOURCE)
+                    .font_size(px(tokens::TYPE_SOURCE))
+                    .line_height(px(tokens::TYPE_SOURCE_LINE))
+                    .soft_wrap(true)
+                    .w(px(600.0))
+                    .h(px(400.0)),
+            )
+            .child(
+                view()
+                    .test_id("superseded-reload")
+                    .on_press(move |_: &PressEvent| {
+                        let _ = &keep;
+                        if let Some(api) = editor_ref.api::<EditorApi>() {
+                            api.set_selections(vec![EditorSelection::caret(EditorPosition::new(
+                                30, 1,
+                            ))]);
+                        }
+                        std::fs::write(&path, superseded_version("first")).unwrap();
+                        let first = io::load(&path).unwrap();
+                        press_state.adopt_disk_version(&press_tab, first);
+                        if let Some(api) = editor_ref.api::<EditorApi>() {
+                            api.set_selections(vec![EditorSelection::caret(EditorPosition::new(
+                                0, 0,
+                            ))]);
+                        }
+                        std::fs::write(&path, superseded_version("second")).unwrap();
+                        let second = io::load(&path).unwrap();
+                        press_state.adopt_disk_version(&press_tab, second);
+                        let readback = press_readback;
+                        press_state.spawn_task(async move {
+                            for _ in 0..8 {
+                                request_animation_frame(|_| {}).await;
+                            }
+                            let shown = editor_ref
+                                .api::<EditorApi>()
+                                .and_then(|api| api.selections().pop())
+                                .map(|selection| {
+                                    format!(
+                                        "caret:{}:{}",
+                                        selection.head.line, selection.head.column
+                                    )
+                                })
+                                .unwrap_or_else(|| "caret:none".to_owned());
+                            readback.set(SharedString::from(shown));
+                        });
+                    })
+                    .child(text(|| "Reload twice")),
+            )
+            .child(text(move || readback.get()))
+    }
+
+    #[test]
+    fn a_superseded_reloads_caret_restore_is_skipped() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<SupersededRestoreProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:superseded-reload").expect("the probe");
+        app.press("id:superseded-reload").expect("reload twice");
+        app.wait_for("text:caret:0:0")
+            .expect("the superseded restore does not move the newer caret");
     }
 }
