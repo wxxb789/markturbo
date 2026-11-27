@@ -10,6 +10,7 @@ import ctypes
 import ctypes.wintypes as wt
 import datetime as dt
 import hashlib
+import itertools
 import json
 import math
 import ntpath
@@ -1627,6 +1628,19 @@ def clipboard_sequence_number() -> int:
     return int(_ClipboardApi.get().user32.GetClipboardSequenceNumber())
 
 
+_CLIPBOARD_SENTINEL_COUNTER = itertools.count(1)
+
+
+def clipboard_sentinel() -> str:
+    """A unique value an editor read puts on the clipboard before copying.
+
+    The read accepts only text that differs from this sentinel, so a copy
+    that never landed leaves a value it rejects; the Remote Desktop
+    clipboard relay can move the sequence number without the app copying.
+    """
+    return f"markturbo-harness-clipboard-{os.getpid()}-{next(_CLIPBOARD_SENTINEL_COUNTER)}"
+
+
 def read_clipboard_text() -> str | None:
     """The clipboard's Unicode text, None when it holds none.
 
@@ -2425,13 +2439,11 @@ class NativeHarness:
         except Exception as error:
             raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
-    def hold_control(
-        self, app: RunningApp, control: Any, seconds: float, failure_code: str
-    ) -> None:
-        """Press and hold the pointer at the control's centre, then release.
+    def settled_control_centre(self, control: Any, failure_code: str) -> tuple[int, int]:
+        """The control's centre, taken once two reads 50 ms apart agree.
 
-        A card glides in, so the centre is taken only once two reads 50 ms
-        apart agree: a hold aimed mid-glide can land beside the control.
+        A card glides in, so a centre taken mid-glide can leave a pointer
+        press beside the control.
         """
 
         def centre() -> tuple[int, int]:
@@ -2455,7 +2467,7 @@ class NativeHarness:
             previous = current
             return None
 
-        x, y = wait_until(
+        return wait_until(
             settled,
             self.ui_timeout,
             f"{failure_code}_TARGET_UNSETTLED",
@@ -2463,7 +2475,33 @@ class NativeHarness:
             clock=self.clock,
             sleep=self.sleep,
         )
+
+    def hold_control(
+        self, app: RunningApp, control: Any, seconds: float, failure_code: str
+    ) -> None:
+        """Press and hold the pointer at the control's centre, then release."""
+        x, y = self.settled_control_centre(control, failure_code)
         self.win32.press_and_hold(app.hwnd, x, y, seconds)
+
+    def aim_control(self, app: RunningApp, control: Any, failure_code: str) -> None:
+        """Move the pointer to the control's centre without pressing.
+
+        The move is separate from the press so the caller can sample state
+        after the move instead of during it.
+        """
+        x, y = self.settled_control_centre(control, failure_code)
+        self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
+        self.win32.move_cursor(x, y)
+
+    def click_aimed_control(self, app: RunningApp, failure_code: str) -> None:
+        """Press at the aimed point, without moving the pointer."""
+        self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
+        try:
+            self.win32.send_inputs(
+                [mouse_input(MOUSEEVENTF_LEFTDOWN), mouse_input(MOUSEEVENTF_LEFTUP)]
+            )
+        except Exception as error:
+            raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
     def _press_menu_anchor(self, app: RunningApp) -> None:
         anchor = self.find_control(
@@ -2687,27 +2725,28 @@ class NativeHarness:
     def forget_clipboard_text(self, expected: Fingerprint) -> None:
         """Empties the clipboard when it already holds `expected`.
 
-        An editor read takes any sequence move as its copy landing, and
-        another writer (the Remote Desktop clipboard relay) can move it too.
-        A dropped copy would then read the text left from an earlier read,
-        which passes only when that text is the one awaited. Emptying the
-        clipboard then leaves a dropped copy nothing to pass on; any other
-        text only fails the comparison and is read again.
+        A dropped copy must not read back the awaited text an earlier read
+        left on the clipboard; emptied, it has nothing to pass on. Any
+        other text is left alone: its own comparison fails and retries.
         """
         current = self.read_text_clipboard()
         if current is not None and fingerprint_text(current) == expected:
             self.write_text_clipboard(None)
 
-    def wait_clipboard_text(self, timeout_code: str) -> str:
+    def wait_clipboard_text(self, timeout_code: str, reject: str | None = None) -> str:
         """The clipboard's text once something (even an empty text) arrives.
 
+        A `reject` value (an editor read's sentinel) never counts: while the
+        clipboard still holds it, the copy it preceded has not landed.
         Inside an outer wait (`bounded_by`) this is a nested step and waits at
         most `inner_timeout()`; on its own it waits `ui_timeout`.
         """
 
         def copied() -> tuple[str] | None:
             value = self.read_text_clipboard()
-            return None if value is None else (value,)
+            if value is None or value == reject:
+                return None
+            return (value,)
 
         timeout = self.inner_timeout()
         (value,) = wait_until(
@@ -2723,19 +2762,15 @@ class NativeHarness:
     def read_editor_text(self, app: RunningApp, editor: Any | None = None) -> str:
         """The editor's exact document through its own Select All + Copy.
 
-        Only copies and reads, never writes the clipboard: the session saved
-        the user's clipboard once and restores it when the run ends. The copy
-        is known to have landed when the clipboard's sequence number moves
-        past the one sampled before Ctrl+A Ctrl+C (one input batch); the text
-        is then read once. A copy that has not landed after
-        `COPY_RESEND_SECONDS` is resent once (`copy_resends`). Another
-        clipboard writer (the Remote Desktop clipboard relay) can move the
-        sequence too, so callers compare the fingerprint and retry, first
-        emptying a clipboard that already holds the text they await
-        (`forget_clipboard_text`). Nothing
-        read here is written to evidence except its fingerprint. `editor` is
-        the editor control a caller already found; without one it is looked
-        up here.
+        A unique sentinel replaces the clipboard before every copy, and the
+        read accepts only text that differs from it: a sequence-number move
+        alone is not a landed copy (the Remote Desktop clipboard relay moves
+        it too), and a dropped copy cannot return the text the sentinel
+        replaced. The session saved the user's clipboard once and restores
+        it when the run ends. A copy not seen after `COPY_RESEND_SECONDS` is
+        asked for once more (`copy_resends`). Nothing read here is written
+        to evidence except its fingerprint. `editor` is the editor control a
+        caller already found; without one it is looked up here.
         """
         count("editor_reads")
         if editor is None:
@@ -2744,6 +2779,8 @@ class NativeHarness:
         timeout = self.inner_timeout()
         timeout = self.ui_timeout if timeout is None else timeout
         deadline = self.clock() + timeout
+        sentinel = clipboard_sentinel()
+        self.write_text_clipboard(sentinel)
         sequence = self.clipboard_sequence()
         self.win32.send_shortcuts(app.hwnd, (VK_A, VK_C))
         self.last_editor_sample_at = self.clock()
@@ -2753,7 +2790,7 @@ class NativeHarness:
             self.last_editor_sample_at = self.clock()
             if not self._clipboard_changed_since(sequence, max(0.0, deadline - self.clock())):
                 raise HarnessFailure("EDITOR_COPY_TIMEOUT")
-        return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
+        return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT", sentinel)
 
     def read_editor_fingerprint(self, app: RunningApp) -> Fingerprint | None:
         """One editor read on one UIA query: the editor found here is the one
@@ -3464,6 +3501,7 @@ __all__ = [
     "Win32",
     "artifact_contains",
     "build_launch_spec",
+    "clipboard_sentinel",
     "clipboard_sequence_number",
     "complete_evidence",
     "count",

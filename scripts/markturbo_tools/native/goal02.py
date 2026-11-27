@@ -664,15 +664,25 @@ class Goal02Harness(BaseNativeHarness):
             OVERWRITE_GUARD_BUTTON_NAMES,
             OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
         )
+        overwrite = guard["Overwrite"]
+        # Aim before the samples: the pointer move is the longest step left
+        # before the confirmation, so a deferred write landing on the way is
+        # seen by the samples instead of hiding under a moving click.
+        self.aim_control(app, overwrite, "OVERWRITE_GUARD_AIM_FAILED")
         # The second edit's Keep mine must write nothing before its card's
-        # Overwrite is pressed; scenario A's window ended before this click.
+        # Overwrite is pressed; scenario A's window ended before this click,
+        # and this window now also covers the pointer move.
         self.require_unchanged_disk(
             document,
             rewritten,
             OVERWRITE_SETTLE_SECONDS,
             "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
         )
-        self.click_control(guard["Overwrite"], "OVERWRITE_GUARD_OVERWRITE_CLICK_FAILED")
+        # One more sample immediately before the press; the press itself does
+        # not move the pointer.
+        if sha256_file(document) != rewritten:
+            raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+        self.click_aimed_control(app, "OVERWRITE_GUARD_OVERWRITE_CLICK_FAILED")
         overwritten = self.wait_file(document, confirmed_edit, "OVERWRITE_SAVE_TIMEOUT")
         # The next phases start from a clean, conflict-free document.
         wait_until(

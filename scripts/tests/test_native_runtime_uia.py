@@ -854,6 +854,39 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         harness.win32.press_and_hold.assert_called_once_with(73, 182, 58, 1.8)
         self.assertEqual((control.click_count, control.invoke_count), (0, 0))
 
+    def test_aim_control_moves_the_pointer_without_pressing(self) -> None:
+        control = FakeControl("guard-overwrite", "Button", bounds=(100, 40, 264, 76))
+        harness = native_harness(FreshRootFactory([FakeRoot([control])]))
+        harness.win32 = mock.Mock()
+
+        harness.aim_control(
+            running_app(), FakeUIAWrapper(FakeElementInfo(control)), "AIM_FAILED"
+        )
+
+        harness.win32.move_cursor.assert_called_once_with(182, 58)
+        harness.win32.require_foreground.assert_called_once_with(
+            73, runtime.FOREGROUND_TIMEOUT_SECONDS
+        )
+        harness.win32.press_and_hold.assert_not_called()
+        harness.win32.send_inputs.assert_not_called()
+        self.assertEqual((control.click_count, control.invoke_count), (0, 0))
+
+    def test_click_aimed_control_presses_without_moving_the_pointer(self) -> None:
+        harness = native_harness(FreshRootFactory([FakeRoot()]))
+        harness.win32 = mock.Mock()
+
+        harness.click_aimed_control(running_app(), "AIM_CLICK_FAILED")
+
+        harness.win32.require_foreground.assert_called_once_with(
+            73, runtime.FOREGROUND_TIMEOUT_SECONDS
+        )
+        harness.win32.move_cursor.assert_not_called()
+        (inputs,) = harness.win32.send_inputs.call_args.args
+        self.assertEqual(
+            [item.mi.dwFlags for item in inputs],
+            [runtime.MOUSEEVENTF_LEFTDOWN, runtime.MOUSEEVENTF_LEFTUP],
+        )
+
     def test_wait_name_retries_a_query_that_fails_while_the_ui_rebuilds(self) -> None:
         harness = native_harness(FreshRootFactory([FakeRoot()]), timeout=1.0)
         harness.controls_by_name = mock.Mock(
@@ -1207,12 +1240,31 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
                     harness.read_editor_fingerprint(running_app()), runtime.fingerprint_text(copied)
                 )
                 self.assertEqual(win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_C)])
-                # One read only copies and reads, never writes the clipboard;
-                # the session restores the user's clipboard once, at the end.
-                self.assertEqual(writes, [])
+                # One read replaces the clipboard with its own sentinel before
+                # copying, so a copy that does not land leaves a rejected
+                # value; the session restores the user's clipboard once, at
+                # the end.
+                self.assertEqual(len(writes), 1)
+                self.assertIsNotNone(writes[0])
+                self.assertNotEqual(writes[0], copied)
                 self.assertEqual(win32.clipboard, copied)
                 self.assertEqual(editor.focus_count, 1)
                 self.assertEqual(editor.value_pattern_count, 0)
+
+    def test_every_editor_read_writes_a_new_clipboard_sentinel(self) -> None:
+        win32 = FakeEditorWin32("text")
+        harness, _editor = editor_harness(win32)
+        writes: list[str | None] = []
+        harness.write_text_clipboard = writes.append
+
+        for _ in range(2):
+            self.assertEqual(
+                harness.read_editor_fingerprint(running_app()), runtime.fingerprint_text("text")
+            )
+
+        self.assertEqual(len(writes), 2)
+        self.assertIsNotNone(writes[0])
+        self.assertNotEqual(writes[0], writes[1])
 
     def test_a_focus_change_waits_for_the_keymap_frames_before_a_key(self) -> None:
         # The editor binds its keys and the app rebinds Ctrl+Enter as the
@@ -1291,7 +1343,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             )
         self.assertEqual(unreadable.exception.code, "EDITOR_TEXT_TIMEOUT")
         self.assertEqual(unreadable.exception.detail, "HarnessFailure")
-        self.assertEqual(silent.clipboard, "user clipboard")
+        self.assertNotEqual(silent.clipboard, "UNIQUE-DOCUMENT-CONTENT")
 
     def test_a_dropped_copy_never_passes_the_awaited_text_left_on_the_clipboard(self) -> None:
         class RelayedWin32(FakeEditorWin32):
@@ -1305,6 +1357,14 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         win32 = RelayedWin32("other")
         win32.clipboard = "awaited"
         harness, _editor = editor_harness(win32, timeout=0.001)
+        writes: list[str | None] = []
+        write_clipboard = harness.write_text_clipboard
+
+        def record(value: str | None) -> None:
+            writes.append(value)
+            write_clipboard(value)
+
+        harness.write_text_clipboard = record
 
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.wait_editor_fingerprint(
@@ -1312,9 +1372,36 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.code, "EDITOR_TEXT_TIMEOUT")
-        self.assertIsNone(win32.clipboard)
+        # The awaited text was forgotten first, then replaced by the read's
+        # sentinel; neither the stale text nor a copy result passed.
+        self.assertIsNotNone(writes[-1])
+        self.assertEqual(writes[-1], win32.clipboard)
+        self.assertNotEqual(win32.clipboard, "awaited")
 
-    def test_a_clipboard_holding_other_text_is_left_alone(self) -> None:
+    def test_a_stale_cancelled_edit_never_passes_a_copy_that_did_not_land(self) -> None:
+        # The review probe for goal-02's Cancel read-back: the clipboard still
+        # holds the cancelled edit, Cancel restored the disk version, the
+        # app's copy never lands, and another writer moves the sequence. The
+        # read must time out, never return the stale text.
+        class RelayedWin32(FakeEditorWin32):
+            """Every copy is dropped, yet another writer moves the sequence."""
+
+            def send_shortcut(self, hwnd: int, key: int) -> None:
+                self.shortcuts.append((hwnd, key))
+                if key == runtime.VK_C:
+                    self.sequence += 1
+
+        win32 = RelayedWin32("restored disk version")
+        win32.clipboard = "cancelled-edit"
+        harness, _editor = editor_harness(win32, timeout=0.001)
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.editor_fingerprint(running_app())
+
+        self.assertEqual(raised.exception.code, "EDITOR_TEXT_TIMEOUT")
+        self.assertNotEqual(win32.clipboard, "cancelled-edit")
+
+    def test_forgetting_leaves_a_foreign_clipboard_text_alone(self) -> None:
         win32 = FakeEditorWin32("after")
         harness, _editor = editor_harness(win32, timeout=1.0)
         writes: list[str | None] = []
@@ -1325,7 +1412,10 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         )
 
         self.assertEqual(actual, runtime.fingerprint_text("after"))
-        self.assertEqual(writes, [])
+        # The awaited text was not on the clipboard, so forgetting wrote
+        # nothing: the only write is the read's own sentinel.
+        self.assertEqual(len(writes), 1)
+        self.assertIsNotNone(writes[0])
 
     def stalled_copy_harness(self, copies: list[str | None]) -> tuple[object, FakeEditorWin32, list[float]]:
         win32 = FakeEditorWin32("text", copies=copies)
@@ -1647,6 +1737,13 @@ class OverwriteGuardTests(unittest.TestCase):
                 written(cancelled)
 
         harness.click_control = mock.Mock(side_effect=pressed)
+        aimed: list[object] = []
+        harness.aim_control = mock.Mock(
+            side_effect=lambda _app, control, _code: aimed.append(control)
+        )
+        harness.click_aimed_control = mock.Mock(
+            side_effect=lambda _app, code: pressed(aimed[-1], code)
+        )
         return harness, app, document
 
     def test_external_conflict_overwrites_only_after_the_guard_confirms(self) -> None:
@@ -1671,15 +1768,18 @@ class OverwriteGuardTests(unittest.TestCase):
             [(HARNESS.KEEP_MINE_AUTOMATION_ID, "Button")] * 2,
         )
         pressed = [call.args[0] for call in harness.click_control.call_args_list]
-        self.assertEqual(len(pressed), 4)
+        self.assertEqual(len(pressed), 3)
         self.assertIs(pressed[0], harness.find_control.return_value)
         self.assertIs(pressed[2], harness.find_control.return_value)
         self.assertEqual(
-            [pressed[1].element_info.automation_id, pressed[3].element_info.automation_id],
-            [
-                HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"],
-                HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"],
-            ],
+            pressed[1].element_info.automation_id,
+            HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"],
+        )
+        harness.click_aimed_control.assert_called_once()
+        aimed = harness.aim_control.call_args_list[0].args[1]
+        self.assertEqual(
+            aimed.element_info.automation_id,
+            HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"],
         )
 
     def test_external_conflict_fails_when_keep_mine_writes_without_the_guard(self) -> None:

@@ -228,6 +228,8 @@ class FakeDesk:
         keep_mine_writes: bool = False,
         keep_mine_delay: float | None = None,
         second_keep_mine_writes: bool = False,
+        second_keep_mine_delay: float | None = None,
+        release_write_on_pointer_move: bool = False,
         overwrite_writes: bool = True,
         overwrite_cancel_ignored: bool = False,
         overwrite_cancel_restores_editor: bool = False,
@@ -248,6 +250,8 @@ class FakeDesk:
         self.keep_mine_writes = keep_mine_writes
         self.keep_mine_delay = keep_mine_delay
         self.second_keep_mine_writes = second_keep_mine_writes
+        self.second_keep_mine_delay = second_keep_mine_delay
+        self.release_write_on_pointer_move = release_write_on_pointer_move
         self.overwrite_writes = overwrite_writes
         self.overwrite_cancel_ignored = overwrite_cancel_ignored
         self.overwrite_cancel_restores_editor = overwrite_cancel_restores_editor
@@ -270,6 +274,7 @@ class FakeDesk:
         self.conflict = False
         self.guard: str | None = None
         self.overwrite_open = False
+        self.aimed_control: str | None = None
         self.pending_write: tuple[bytes, float] | None = None
         self.clock_now = 0.0
         self.sleeps: list[float] = []
@@ -296,7 +301,9 @@ class FakeDesk:
         harness.wait_name = self.wait_name
         harness.save_via_menu = self.save_via_menu
         harness.find_control = lambda _app, automation_id, *_args: automation_id
+        harness.aim_control = self.aim_control
         harness.click_control = self.click_control
+        harness.click_aimed_control = self.click_aimed_control
         harness.invoke_control = self.invoke_control
         harness.guard_dialog = self.guard_dialog
         harness.close_tab_by_pointer = self.close_tab_by_pointer
@@ -402,7 +409,34 @@ class FakeDesk:
         else:
             self.write_editor()
 
-    def click_control(self, control: str, _code: str) -> None:
+    def click_control(self, control: str, code: str) -> None:
+        if (
+            control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]
+            and self.release_write_on_pointer_move
+        ):
+            # click_input moves the pointer before it presses, as it did
+            # when the review probe passed an unconfirmed write.
+            self.release_pending_write()
+        self.press_control(control, code)
+
+    def click_aimed_control(self, _app: Any, code: str) -> None:
+        """The press after `aim_control`: no pointer move, no released write."""
+        self.press_control(self.aimed_control, code)
+
+    def aim_control(self, _app: Any, control: str, _code: str) -> None:
+        self.aimed_control = control
+        self.events.append(("aim", control))
+        if self.release_write_on_pointer_move:
+            self.release_pending_write()
+
+    def release_pending_write(self) -> None:
+        """The app's queued write lands while the pointer travels."""
+        pending = self.pending_write
+        if pending is not None:
+            self.pending_write = None
+            self.write_bytes(pending[0])
+
+    def press_control(self, control: str, _code: str) -> None:
         self.events.append(("click", control))
         if control == HARNESS.KEEP_MINE_AUTOMATION_ID:
             self.keep_mine_clicks += 1
@@ -417,6 +451,15 @@ class FakeDesk:
                 self.pending_write = (
                     bytes(self.editor),
                     self.clock_now + self.keep_mine_delay,
+                )
+            if (
+                self.second_keep_mine_delay is not None
+                and self.keep_mine_clicks >= 2
+                and self.pending_write is None
+            ):
+                self.pending_write = (
+                    bytes(self.editor),
+                    self.clock_now + self.second_keep_mine_delay,
                 )
         elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]:
             if self.overwrite_writes:
@@ -547,6 +590,7 @@ class ScenarioTests(unittest.TestCase):
                 ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"]),
                 ("edit",),
                 ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
+                ("aim", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]),
                 ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]),
                 ("edit",),
                 ("sidebar close", "guarded.md"),
@@ -600,6 +644,18 @@ class ScenarioTests(unittest.TestCase):
         self.assert_fails(
             "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
             second_keep_mine_writes=True,
+            overwrite_writes=False,
+        )
+
+    def test_a_write_landing_during_the_pointer_move_fails_before_the_press(self) -> None:
+        # The review probe: the second Keep mine's write outlasts both settle
+        # windows and lands during the pointer move to Overwrite, which
+        # itself writes nothing. The samples after the move must catch it;
+        # wait_file must never credit it as the confirmation.
+        self.assert_fails(
+            "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+            second_keep_mine_delay=30.0,
+            release_write_on_pointer_move=True,
             overwrite_writes=False,
         )
 
