@@ -13,4 +13,6 @@ pub mod watcher;
 pub use history::{History, Visit};
 pub use tabs::{Tab, TabIdentity, Tabs};
 pub use tree::{FileNode, display_relative, is_openable, read_dir, read_dir_deep};
-pub use watcher::{Change, WatchIdentity, Watcher, normalize_path, path_is_covered, paths_match};
+pub use watcher::{
+    Change, WatchIdentity, Watcher, long_path, normalize_path, path_is_covered, paths_match,
+};

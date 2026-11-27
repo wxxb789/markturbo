@@ -15,7 +15,7 @@ use nsh_core::{
     element::{Idiom, Os},
 };
 use nsh_engine::{EngineConfig, Points, Root};
-use nsh_testing::Headless;
+use nsh_testing::{Headless, Screen};
 
 mod support;
 
@@ -72,6 +72,16 @@ fn node_id(app: &Headless, id: &str) -> NodeId {
 /// row; the collapsed strip's ticks are not part of the count.
 fn open_tabs(app: &Headless) -> usize {
     app.screen().count("id:rail-close").expect("selector")
+}
+
+/// The name the title row shows for the active tab.
+fn active_title(screen: &Screen) -> Option<String> {
+    screen
+        .layout_nodes()
+        .into_iter()
+        .find(|node| node.test_id.as_deref() == Some("title-file-name"))
+        .and_then(|node| node.text)
+        .map(|text| text.text.text.clone())
 }
 
 /// One raw event on the shell, as a platform would deliver it.
@@ -890,6 +900,8 @@ fn a_link_to_an_open_target_focuses_its_tab(workspace: &Path) {
     let config = tempfile::tempdir().expect("config dir");
     let target = workspace.join("real.md");
     std::fs::write(&target, "# Real\n").expect("write the target");
+    let other = workspace.join("other.md");
+    std::fs::write(&other, "# Other\n").expect("write other.md");
     let link = workspace.join("link.md");
     if let Err(error) = symlink_file(&target, &link) {
         eprintln!("skipping file-symlink test: {error}");
@@ -904,24 +916,52 @@ fn a_link_to_an_open_target_focuses_its_tab(workspace: &Path) {
     app.wait_for("text:# Real").expect("the target document");
     assert_eq!(open_tabs(&app), 1, "the target is one tab");
 
+    // A second, unrelated document is active, so the link's open must move
+    // focus back to the target to pass.
+    app.press("id:sidebar-tree >> role:button[other.md]")
+        .expect("open the other document");
+    support::wait_for_marker(
+        &mut app,
+        "the other document is active",
+        Duration::from_secs(20),
+        |screen| active_title(screen).as_deref() == Some("other.md"),
+    );
+    assert_eq!(open_tabs(&app), 2, "the other document is its own tab");
+
     app.drop_files("id:shell", vec![file_uri(&link)])
         .expect("drop the link");
-    app.wait(Duration::from_millis(800))
-        .expect("let the drop commit");
+    support::wait_for_marker(
+        &mut app,
+        "the drop focuses the target's tab",
+        Duration::from_secs(20),
+        |screen| active_title(screen).as_deref() == Some("real.md"),
+    );
     assert_eq!(
         open_tabs(&app),
-        1,
+        2,
         "a link to an open target focuses its tab: {:?}",
         app.screen().texts()
     );
 
+    app.press("id:sidebar-tree >> role:button[other.md]")
+        .expect("activate the other document");
+    support::wait_for_marker(
+        &mut app,
+        "the other document is active again",
+        Duration::from_secs(20),
+        |screen| active_title(screen).as_deref() == Some("other.md"),
+    );
     app.press("id:sidebar-tree >> role:button[link.md]")
         .expect("open the link from the sidebar");
-    app.wait(Duration::from_millis(800))
-        .expect("let the open land");
+    support::wait_for_marker(
+        &mut app,
+        "the tree press focuses the target's tab",
+        Duration::from_secs(20),
+        |screen| active_title(screen).as_deref() == Some("real.md"),
+    );
     assert_eq!(
         open_tabs(&app),
-        1,
+        2,
         "opening the link's own row keeps its tab: {:?}",
         app.screen().texts()
     );
@@ -931,6 +971,85 @@ fn a_link_to_an_open_target_focuses_its_tab(workspace: &Path) {
 fn dropping_a_symlink_to_an_open_target_focuses_the_existing_tab() {
     let workspace = tempfile::tempdir().expect("workspace");
     a_link_to_an_open_target_focuses_its_tab(workspace.path());
+}
+
+#[test]
+fn renaming_a_file_on_disk_gives_its_new_name_its_own_tab() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let before = workspace.path().join("a.md");
+    let after = workspace.path().join("b.md");
+    std::fs::write(&before, "# Renamed\n").expect("write a.md");
+
+    let mut app = start(config.path(), Some(workspace.path()));
+    app.wait_for("id:workspace-home")
+        .expect("the workspace home");
+    app.press("id:workspace-home >> label:a.md")
+        .expect("open a.md");
+    app.wait_for("text:# Renamed").expect("the document");
+
+    std::fs::rename(&before, &after).expect("rename to b.md");
+    support::wait_for_marker(
+        &mut app,
+        "the tree lists b.md",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:sidebar-file >> text:b.md")
+                .unwrap_or(false)
+        },
+    );
+
+    app.press("id:sidebar-tree >> role:button[b.md]")
+        .expect("open b.md");
+    support::wait_for_marker(
+        &mut app,
+        "b.md is its own active tab",
+        Duration::from_secs(20),
+        |screen| active_title(screen).as_deref() == Some("b.md"),
+    );
+    assert_eq!(
+        open_tabs(&app),
+        2,
+        "a renamed file opens its own tab: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn two_hard_links_to_one_file_are_two_tabs() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let first = workspace.path().join("first.md");
+    let second = workspace.path().join("second.md");
+    std::fs::write(&first, "# Linked\n").expect("write first.md");
+    if let Err(error) = std::fs::hard_link(&first, &second) {
+        eprintln!("skipping hard-link test: {error}");
+        return;
+    }
+
+    let mut app = start(config.path(), Some(workspace.path()));
+    app.wait_for("id:workspace-home")
+        .expect("the workspace home");
+    app.press("id:workspace-home >> label:first.md")
+        .expect("open the first link");
+    app.wait_for("text:# Linked").expect("the document");
+    assert_eq!(open_tabs(&app), 1, "the first link is one tab");
+
+    app.press("id:sidebar-tree >> role:button[second.md]")
+        .expect("open the second link");
+    support::wait_for_marker(
+        &mut app,
+        "the second link is its own active tab",
+        Duration::from_secs(20),
+        |screen| active_title(screen).as_deref() == Some("second.md"),
+    );
+    assert_eq!(
+        open_tabs(&app),
+        2,
+        "two hard links give two tabs: {:?}",
+        app.screen().texts()
+    );
 }
 
 /// GitHub's Windows runners place their temp directory under a short name, and

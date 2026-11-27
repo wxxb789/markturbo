@@ -45,6 +45,13 @@ pub fn gate_watch_registration(path: impl Into<PathBuf>, release: impl Into<Path
         });
 }
 
+/// Whether two paths name the one entry: the same spelling, or the file
+/// system's long spelling of both. A test names the path it asked the app to
+/// watch; the app registers the long spelling, so the two still meet.
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right || crate::workspace::long_path(left) == crate::workspace::long_path(right)
+}
+
 /// Whether the gated watch operation for `path` has been reached.
 pub fn watch_registration_reached(path: &Path) -> bool {
     let path = crate::workspace::normalize_path(path);
@@ -52,7 +59,7 @@ pub fn watch_registration_reached(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .any(|gate| crate::workspace::paths_match(&gate.path, &path) && gate.reached)
+        .any(|gate| same_path(&gate.path, &path) && gate.reached)
 }
 
 // Runs on the watcher's worker thread; the UI thread never waits.
@@ -64,7 +71,7 @@ pub(crate) fn wait_for_watch_registration(path: &Path) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(gate) = gates
             .iter_mut()
-            .find(|gate| !gate.reached && crate::workspace::paths_match(&gate.path, &path))
+            .find(|gate| !gate.reached && same_path(&gate.path, &path))
         else {
             return;
         };

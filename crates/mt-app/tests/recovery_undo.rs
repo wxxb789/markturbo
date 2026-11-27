@@ -65,8 +65,8 @@ fn two_recovered() -> Recovered {
 
     let mut keys = Vec::new();
     for path in [&first, &second] {
-        let key = RecoveryKey::for_path(path);
         let loaded = io::load(path).expect("load the file");
+        let key = RecoveryKey::for_path(&loaded.path);
         let checkpoint = RecoveryCheckpoint {
             key: key.clone(),
             text: loaded.text.clone(),

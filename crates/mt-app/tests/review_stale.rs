@@ -229,7 +229,7 @@ fn an_external_reload_marks_the_result_stale_without_dirtying_the_tab() {
             .expect("the recovery directory")
             .join(format!(
                 "{}.mtrecovery",
-                RecoveryKey::for_path(&document).as_str()
+                RecoveryKey::for_path(&mt_core::workspace::long_path(&document)).as_str()
             ));
         assert!(
             !record.exists(),

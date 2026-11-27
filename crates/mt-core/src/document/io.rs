@@ -615,8 +615,12 @@ fn sniff_encoding(bytes: &[u8]) -> (&'static Encoding, &[u8], bool) {
 ///
 /// Line endings are normalized to `\n` in memory — the editor and every parser
 /// want one convention — and restored on save. Undecodable bytes are replaced
-/// rather than rejected so a file with one bad byte still opens.
+/// rather than rejected so a file with one bad byte still opens. The path is
+/// expanded to its Windows long spelling first, so an opened 8.3 path meets
+/// the long form `canonicalize` gives its resolved targets.
 pub fn load(path: &Path) -> std::io::Result<LoadedFile> {
+    let path = crate::workspace::long_path(path);
+    let path = path.as_path();
     if is_skill_entrypoint(path)
         && let Some((snapshot, source_identity, skill_origin)) = try_load_skill_source(path)
     {

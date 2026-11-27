@@ -758,7 +758,7 @@ fn recovery_and_conflict_actions_remain_visible_in_full_preview() {
         store
             .checkpoint(
                 &RecoveryCheckpoint {
-                    key: RecoveryKey::for_path(&draft),
+                    key: RecoveryKey::for_path(&loaded.path),
                     text: "# From recovery\n".to_owned(),
                     metadata: RecoveryMetadata::from_loaded_file(&loaded),
                     revision: None,

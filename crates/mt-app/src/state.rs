@@ -1673,20 +1673,20 @@ impl AppState {
             return false;
         }
         match scanned {
-            Ok(Ok(entries)) => {
-                state.root.set(Some(path.clone()));
+            Ok(Ok((root, entries))) => {
+                state.root.set(Some(root.clone()));
                 state.entries.set(entries);
                 state.reset_context();
                 if state.context_open.get() {
                     state.refresh_context();
                 }
-                state.record_recent(&path, RecentTargetKind::Workspace);
-                state.watch_workspace_root(&path);
+                state.record_recent(&root, RecentTargetKind::Workspace);
+                state.watch_workspace_root(&root);
                 // The root watch is live: re-scan so an entry created after
                 // the first scan read (and before the watch, which leaves no
                 // event behind) still reaches the tree.
                 state.refresh_tree_from_disk();
-                state.notify_named(crate::i18n::Key::Opened, &path);
+                state.notify_named(crate::i18n::Key::Opened, &root);
                 true
             }
             Ok(Err(error)) => {
@@ -1727,7 +1727,7 @@ impl AppState {
                 && state
                     .root
                     .with_untracked(|current| current.as_ref() == Some(&root))
-                && let Ok(Ok(entries)) = scanned
+                && let Ok(Ok((_, entries))) = scanned
             {
                 state.entries.set(entries);
             }
@@ -1804,25 +1804,16 @@ impl AppState {
             .cloned()
     }
 
-    /// The tab already showing `loaded`: by the exact spelling of its path or
-    /// resolved target, or by the file object its opened handle read. The
-    /// object identity is what meets a Windows 8.3 short-name spelling with
-    /// the long form `canonicalize` returns for a symbolic link's target.
+    /// The tab already showing `loaded`: by the exact spelling of its path
+    /// or resolved target. A load expands its path to the file system's long
+    /// spelling, so an 8.3 short name meets the long form `canonicalize`
+    /// returns for a symbolic link's target.
     fn tab_showing_loaded(&self, loaded: &LoadedFile) -> Option<Tab> {
-        self.tab_showing(&loaded.path)
-            .or_else(|| {
-                loaded
-                    .resolved_target()
-                    .and_then(|target| self.tab_showing(target))
-            })
-            .or_else(|| {
-                let object_id = loaded.stamp.object_id?;
-                self.tabs
-                    .get_untracked()
-                    .iter()
-                    .find(|tab| tab.loaded.borrow().stamp.object_id == Some(object_id))
-                    .cloned()
-            })
+        self.tab_showing(&loaded.path).or_else(|| {
+            loaded
+                .resolved_target()
+                .and_then(|target| self.tab_showing(target))
+        })
     }
 
     pub(crate) fn outside_folder(&self, tab: &Tab) -> bool {
@@ -3439,6 +3430,7 @@ impl AppState {
         let _ = blocking(crate::test_vault::wait_for_save_gate).await;
         match picked.await {
             Ok(Some(path)) => {
+                let path = mt_core::workspace::long_path(&path);
                 if !tab.untitled && path == tab.path {
                     // Its own file: a plain Save, with its conflict check.
                     return if self.save_tab(tab.id) {
@@ -6177,15 +6169,16 @@ fn untitled_number(title: &str) -> Option<u64> {
     title.rsplit(' ').next()?.parse().ok()
 }
 
-fn scan_workspace_entries(path: &Path) -> std::io::Result<Vec<Entry>> {
+fn scan_workspace_entries(path: &Path) -> std::io::Result<(PathBuf, Vec<Entry>)> {
     #[cfg(any(test, feature = "test-vault"))]
     crate::test_vault::wait_for_read(path);
-    let nodes = tree::read_dir_deep(path, 4)?;
+    let root = mt_core::workspace::long_path(path);
+    let nodes = tree::read_dir_deep(&root, 4)?;
     #[cfg(any(test, feature = "test-vault"))]
     crate::test_vault::wait_for_commit(path);
     let mut entries = Vec::new();
     flatten(&nodes, 0, &mut entries);
-    Ok(entries)
+    Ok((root, entries))
 }
 
 fn flatten(nodes: &[FileNode], depth: usize, out: &mut Vec<Entry>) {

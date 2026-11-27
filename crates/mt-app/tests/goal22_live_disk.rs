@@ -1155,7 +1155,7 @@ fn under_reduced_motion_a_reload_does_not_slide_the_text() {
 
 #[cfg(windows)]
 #[test]
-fn a_differently_cased_workspace_misses_a_delete_by_event_spelling() {
+fn a_differently_cased_workspace_raises_the_missing_banner() {
     let parent = tempfile::tempdir().expect("workspace parent");
     let config = tempfile::tempdir().expect("config dir");
     let real = parent.path().join("Notes");
@@ -1176,18 +1176,10 @@ fn a_differently_cased_workspace_misses_a_delete_by_event_spelling() {
     app.wait_for("text:# Real")
         .expect("the linked document is open");
 
-    // The accepted residual in docs/TODO.md: the root watch is registered in
-    // the workspace's spelling (`notes`), the tab's resolved target keeps the
-    // file system's (`Notes`), and exact matching does not fold the two, so
-    // the delete is missed. The same-case delete is covered by
-    // `deleting_a_symlink_target_inside_the_workspace_raises_the_missing_banner`.
+    // The open expands the root to the file system's case, so the watch's
+    // event spelling meets the tab's resolved target.
     std::fs::remove_file(&target).expect("delete the target");
-    pump_for(&mut app, Duration::from_millis(2_500));
-    assert!(
-        !shows(app.screen(), "Moved or deleted on disk"),
-        "exact matching does not fold the event spelling into the tab's: {:?}",
-        app.screen().texts()
-    );
+    wait_for_text(&mut app, "Moved or deleted on disk", "the missing banner");
 }
 
 #[test]

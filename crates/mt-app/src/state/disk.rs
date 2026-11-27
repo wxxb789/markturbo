@@ -588,7 +588,9 @@ mod tests {
     fn RemovedDirectoryProbe() -> impl IntoElement {
         let state = AppState::new();
         let directory = std::rc::Rc::new(tempfile::tempdir().unwrap());
-        let drafts = directory.path().join("drafts");
+        // The app stores the long spelling; the injected event names the
+        // directory the same way its own watch would.
+        let drafts = mt_core::workspace::long_path(&directory.path().join("drafts"));
         std::fs::create_dir(&drafts).unwrap();
         let path = drafts.join("plan.md");
         std::fs::write(&path, "# Plan\n").unwrap();

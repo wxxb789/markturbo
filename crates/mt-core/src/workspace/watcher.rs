@@ -303,6 +303,43 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Windows: `path` in the file system's long spelling, every component in
+/// the case the volume stores it in, so a path held in its 8.3 short form or
+/// a case-only variant names the same file the way `canonicalize` names a
+/// symbolic link's target. The input path elsewhere and when no component
+/// exists; a path whose tail is missing keeps the spelled tail under its
+/// long, existing parent.
+pub fn long_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use windows::{Win32::Storage::FileSystem::GetLongPathNameW, core::PCWSTR};
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buffer = vec![0u16; wide.len()];
+        loop {
+            // SAFETY: `wide` is NUL-terminated and `buffer` is a live buffer
+            // whose length is passed in.
+            let written = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buffer)) };
+            if written == 0 {
+                return match path.parent() {
+                    Some(parent) => long_path(parent).join(path.file_name().unwrap_or_default()),
+                    None => path.to_path_buf(),
+                };
+            }
+            if (written as usize) < buffer.len() {
+                buffer.truncate(written as usize);
+                return std::ffi::OsString::from_wide(&buffer).into();
+            }
+            buffer.resize(written as usize + 1, 0);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// Whether two paths name the same entry: the same spelling after the
 /// Windows verbatim prefix is stripped. `Plan.md` and `plan.md` stay two
 /// paths even in a directory whose case-sensitivity attribute is on.

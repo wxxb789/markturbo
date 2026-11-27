@@ -225,13 +225,12 @@
   UI ticker still calls `Watcher::poll`. notify 8.2.2's FSEvents backend reports renames as `RenameMode::Any`, whose
   classification calls `path.exists()` synchronously; a queued event on a dropped network volume can still freeze the
   window. Fix by moving the existence probe off the UI thread.
-- [ ] **Windows case-only path spellings miss deletes and miss symlink-target writes** — with
-  exact path identity, any spelling-only difference breaks the event match: a delete event whose case differs from the
-  tab's path leaves the tab never marked missing; and with a workspace root cased differently from the real directory,
-  the root's event spelling misses a symlink tab's resolved target, so a target write reloads no clean tab and raises no
-  conflict on a dirty one. Opening one case-insensitive file through two spellings (`Plan.md`, then `plan.md`) no longer
-  yields two tabs: an open now also matches the tab by the file object its handle read. The event match still needs that
-  identity. Fix by identifying a file by its file ID (volume serial number plus file index) instead of its path spelling.
+- [ ] **Windows reparse aliases still split one file's event spellings** — an open expands an 8.3 short or case-only
+  spelling to the file system's long one, but `GetLongPathNameW` resolves no junction or directory symbolic link. A
+  path reached through an alias and the same file reached through its real directory therefore keep two spellings:
+  the alias-spelled event never marks the tab missing, and a symlink tab's `canonicalize`d target under the real
+  path reloads no clean tab and raises no conflict on a dirty one. Fix by identifying a file by its file ID (volume
+  serial number plus file index) instead of its path spelling.
 - [ ] **A directory alias shares an inotify descriptor with the real path** — on Linux, a tab opened through `alias/plan.md`
   where `alias` (outside the workspace) points at `A/notes`, then `A` opened as the workspace: both registrations share one
   inotify descriptor, and closing the last `alias` tab unwatches it, so `A/notes` loses live updates. Fix by keying watch

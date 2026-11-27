@@ -1044,6 +1044,9 @@ fn RevisionAcrossDocuments() -> impl IntoElement {
         .child(text(move || format!("Busy: {}", busy.get())))
         .child(text(move || format!("Tabs: {}", tabs.get().len())))
         .child(text(move || {
+            format!("Active: {}", state.active.get().unwrap_or_default())
+        }))
+        .child(text(move || {
             tabs.get()
                 .iter()
                 .map(|tab| format!("[{}]", tab.text.get()))
@@ -1280,10 +1283,12 @@ fn a_prepared_revision_lands_on_the_tab_that_prepared_it() {
     // and send it from there: B has a Revision context, A's is the one that
     // must receive the answer.
     app.press("text:Open first").expect("back to A");
+    app.wait_for("text:Active: 1").expect("A is active");
     app.press("text:Prepare Revision")
         .expect("prepare A's Revision");
     app.press("text:Open other").expect("switch to B");
     app.wait_for("text:Tabs: 2").expect("B shown");
+    app.wait_for("text:Active: 2").expect("B is active");
     app.press("text:Send Revision")
         .expect("send the prepared Revision");
     assert!(
@@ -1304,6 +1309,7 @@ fn a_prepared_revision_lands_on_the_tab_that_prepared_it() {
 
     // B, the other tab, has nothing of the answer.
     app.press("text:Open other").expect("back to B");
+    app.wait_for("text:Active: 2").expect("B is active");
     assert!(
         app.shows("Hunks: 0"),
         "B took A's answer: {:?}",

@@ -89,6 +89,13 @@ impl SecureCredentialStore for MemoryStore {
 
 static STORE: LazyLock<Arc<MemoryStore>> = LazyLock::new(Arc::default);
 
+/// Whether two paths name the one entry: the same spelling, or the file
+/// system's long spelling of both. A test names the path it asked the app to
+/// open; the app stores the long spelling, so the two still meet.
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right || mt_core::workspace::long_path(left) == mt_core::workspace::long_path(right)
+}
+
 type ReviewGenerationHook = Box<dyn Fn() + Send + 'static>;
 
 // One hook, run when a sent Review's task reaches its generation check. A
@@ -167,7 +174,7 @@ pub fn gate_reads_started(path: &Path) -> usize {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .find(|gate| gate.path == path)
+        .find(|gate| same_path(&gate.path, path))
         .map_or(0, |gate| gate.next)
 }
 
@@ -194,7 +201,7 @@ pub fn commit_gate_reached(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .find(|gate| gate.path == path)
+        .find(|gate| same_path(&gate.path, path))
         .is_some_and(|gate| gate.next > 0)
 }
 
@@ -203,7 +210,7 @@ pub(crate) fn wait_for_commit(path: &Path) {
         let mut gates = COMMIT_GATES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(gate) = gates.iter_mut().find(|gate| gate.path == path) else {
+        let Some(gate) = gates.iter_mut().find(|gate| same_path(&gate.path, path)) else {
             return;
         };
         let release = gate
@@ -253,7 +260,7 @@ pub fn open_superseded(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .any(|seen| seen == path)
+        .any(|seen| same_path(seen, path))
 }
 
 pub(crate) fn note_superseded_open(path: &Path) {
@@ -272,7 +279,7 @@ pub fn duplicate_open_focused(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .any(|seen| seen == path)
+        .any(|seen| same_path(seen, path))
 }
 
 pub(crate) fn note_duplicate_open(path: &Path) {
@@ -292,7 +299,7 @@ pub fn reload_superseded(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .any(|seen| seen == path)
+        .any(|seen| same_path(seen, path))
 }
 
 pub(crate) fn note_superseded_reload(path: &Path) {
@@ -309,7 +316,7 @@ pub(crate) fn wait_for_read(path: &Path) {
         let mut gates = PATH_GATES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(gate) = gates.iter_mut().find(|gate| gate.path == path) else {
+        let Some(gate) = gates.iter_mut().find(|gate| same_path(&gate.path, path)) else {
             return;
         };
         let release = gate

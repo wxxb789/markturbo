@@ -97,7 +97,7 @@ fn edits_during_the_reload_read_stay_in_the_buffer() {
             .expect("the recovery directory")
             .join(format!(
                 "{}.mtrecovery",
-                RecoveryKey::for_path(&path).as_str()
+                RecoveryKey::for_path(&mt_core::workspace::long_path(&path)).as_str()
             ));
         assert!(
             record.exists(),
