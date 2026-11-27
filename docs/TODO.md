@@ -225,12 +225,13 @@
   UI ticker still calls `Watcher::poll`. notify 8.2.2's FSEvents backend reports renames as `RenameMode::Any`, whose
   classification calls `path.exists()` synchronously; a queued event on a dropped network volume can still freeze the
   window. Fix by moving the existence probe off the UI thread.
-- [ ] **Windows reparse aliases still split one file's event spellings** — an open expands an 8.3 short or case-only
-  spelling to the file system's long one, but `GetLongPathNameW` resolves no junction or directory symbolic link. A
-  path reached through an alias and the same file reached through its real directory therefore keep two spellings:
-  the alias-spelled event never marks the tab missing, and a symlink tab's `canonicalize`d target under the real
-  path reloads no clean tab and raises no conflict on a dirty one. Fix by identifying a file by its file ID (volume
-  serial number plus file index) instead of its path spelling.
+- [ ] **Windows case-only directory spellings and reparse aliases still split one file's event spellings** — 8.3
+  short names are closed: an open expands a short spelling to the file system's long one. `GetLongPathNameW` keeps
+  the caller's case for a directory component, so a case-only spelling of a directory still names the same file with
+  a different spelling, and it resolves no junction or directory symbolic link, so an open through an alias keeps
+  the alias's spelling too. The mismatched event never marks the tab missing, and a symlink tab's `canonicalize`d
+  target under the real path reloads no clean tab and raises no conflict on a dirty one. Fix by identifying a file by
+  its file ID (volume serial number plus file index) at event and open matching instead of its path spelling.
 - [ ] **A directory alias shares an inotify descriptor with the real path** — on Linux, a tab opened through `alias/plan.md`
   where `alias` (outside the workspace) points at `A/notes`, then `A` opened as the workspace: both registrations share one
   inotify descriptor, and closing the last `alias` tab unwatches it, so `A/notes` loses live updates. Fix by keying watch

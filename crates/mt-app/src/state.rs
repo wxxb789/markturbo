@@ -1794,20 +1794,24 @@ impl AppState {
     // and a target a read detected before the conflict resolved, so a file
     // reached through a relative path, a link or its target is one tab. The
     // match is by the exact spelling, so two files that differ only in case
-    // stay two tabs.
+    // stay two tabs. A tab whose file is missing is never a match: its path
+    // or resolved target can name a different entry now (a renamed link),
+    // and the fresh open owns its own tab instead of being discarded into the
+    // stale one.
     fn tab_showing(&self, path: &Path) -> Option<Tab> {
         let key = mt_core::workspace::normalize_path(path);
         self.tabs
             .get_untracked()
             .iter()
-            .find(|tab| tab.reads_key_exactly(&key))
+            .find(|tab| !tab.disk_missing.get_untracked() && tab.reads_key_exactly(&key))
             .cloned()
     }
 
     /// The tab already showing `loaded`: by the exact spelling of its path
-    /// or resolved target. A load expands its path to the file system's long
-    /// spelling, so an 8.3 short name meets the long form `canonicalize`
-    /// returns for a symbolic link's target.
+    /// or resolved target, and only while that file is present
+    /// (`tab_showing`). A load expands its path to the file system's
+    /// long spelling, so an 8.3 short name meets the long form
+    /// `canonicalize` returns for a symbolic link's target.
     fn tab_showing_loaded(&self, loaded: &LoadedFile) -> Option<Tab> {
         self.tab_showing(&loaded.path).or_else(|| {
             loaded

@@ -303,12 +303,14 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Windows: `path` in the file system's long spelling, every component in
-/// the case the volume stores it in, so a path held in its 8.3 short form or
-/// a case-only variant names the same file the way `canonicalize` names a
-/// symbolic link's target. The input path elsewhere and when no component
-/// exists; a path whose tail is missing keeps the spelled tail under its
-/// long, existing parent.
+/// Windows: `path` in the file system's long spelling, so a path held in its
+/// 8.3 short form names the same file the way `canonicalize` names a symbolic
+/// link's target. The final component takes the case on disk; a directory
+/// component keeps the caller's case, so a case-only directory spelling stays
+/// a different spelling, and no junction or directory symbolic link is
+/// resolved. The input path elsewhere and when no component exists; a path
+/// whose tail is missing keeps the spelled tail under its long, existing
+/// parent.
 pub fn long_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
