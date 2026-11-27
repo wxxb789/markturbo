@@ -183,19 +183,11 @@ impl AppState {
             .is_some_and(|root| mt_core::workspace::path_is_covered(&path, root));
         let affects_tree = in_root && change.affects_tree();
         let tabs = self.tabs.get_untracked();
-        let exact: Vec<Tab> = tabs
+        let matched: Vec<Tab> = tabs
             .iter()
             .filter(|tab| tab.reads_key_exactly(&path))
             .cloned()
             .collect();
-        let matched: Vec<Tab> = if exact.is_empty() {
-            tabs.iter()
-                .filter(|tab| tab.reads_key_ignoring_case(&path))
-                .cloned()
-                .collect()
-        } else {
-            exact
-        };
         for tab in &matched {
             self.handle_document_change(tab);
         }
@@ -892,6 +884,100 @@ mod tests {
             app.wait(std::time::Duration::from_millis(25))
                 .expect("the probe keeps running");
         }
+    }
+
+    // A caret at `visible_range().end`: the exclusive end of the last
+    // visible row, which is the first position of the next wrapped row when
+    // that row is a continuation. A reload must treat it as off screen and
+    // not scroll the viewport to it.
+    #[component]
+    fn CaretAtVisibleEndProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().unwrap());
+        let path = directory.path().join("boundary.md");
+        std::fs::write(&path, wrapped_line('A')).unwrap();
+        let id = state.add_tab(io::load(&path).unwrap());
+        let editor_ref = component_ref::<Editor>();
+        state.attach_source_editor(id, editor_ref);
+        let tab = state
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .expect("the tab");
+        let readback = signal(SharedString::from("view:?"));
+        let press_state = state.clone();
+        let press_readback = readback;
+        let press_tab = tab.clone();
+        let keep = directory.clone();
+        view()
+            .test_id("boundary-probe")
+            .child(
+                editor()
+                    .component_ref(&editor_ref)
+                    .value({
+                        let tab = tab.clone();
+                        move || Some(tab.text.get())
+                    })
+                    .font_family(tokens::FONT_SOURCE)
+                    .font_size(px(tokens::TYPE_SOURCE))
+                    .line_height(px(tokens::TYPE_SOURCE_LINE))
+                    .soft_wrap(true)
+                    .w(px(600.0))
+                    .h(px(400.0)),
+            )
+            .child(
+                view()
+                    .test_id("boundary-reload")
+                    .on_press(move |_: &PressEvent| {
+                        let _ = &keep;
+                        let caret_visible = editor_ref
+                            .api::<EditorApi>()
+                            .map(|api| {
+                                let visible = api.visible_range();
+                                api.set_selections(vec![EditorSelection::caret(visible.end)]);
+                                let mut offset = api.scroll_offset();
+                                offset.y = px(0.0);
+                                api.set_scroll_offset(offset);
+                                press_state
+                                    .mounted_editor_anchor(&press_tab)
+                                    .is_none_or(|anchor| anchor.caret_visible)
+                            })
+                            .unwrap_or(true);
+                        std::fs::write(&path, wrapped_line('B')).unwrap();
+                        let loaded = io::load(&path).unwrap();
+                        press_state.adopt_disk_version(&press_tab, loaded);
+                        let readback = press_readback;
+                        press_state.spawn_task(async move {
+                            for _ in 0..6 {
+                                request_animation_frame(|_| {}).await;
+                            }
+                            let shown = editor_ref
+                                .api::<EditorApi>()
+                                .map(|api| {
+                                    format!(
+                                        "caret-visible:{} view:{}",
+                                        caret_visible,
+                                        api.visible_range().start.column
+                                    )
+                                })
+                                .unwrap_or_else(|| "caret-visible:? view:?".to_owned());
+                            readback.set(SharedString::from(shown));
+                        });
+                    })
+                    .child(text(|| "Reload")),
+            )
+            .child(text(move || readback.get()))
+    }
+
+    #[test]
+    fn a_reload_with_the_caret_at_the_exclusive_visible_end_keeps_the_viewport() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<CaretAtVisibleEndProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:boundary-reload").expect("the probe");
+        app.press("id:boundary-reload").expect("reload");
+        app.wait_for("text:caret-visible:false view:0")
+            .expect("the exclusive visible end is off screen and the viewport stays");
     }
 
     /// Two versions of one document, so the editor's text can tell which

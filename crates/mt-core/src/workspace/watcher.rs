@@ -61,6 +61,11 @@ pub struct Watcher {
     /// What the worker applied: `poll` classifies events by this, never by a
     /// watch that is not live yet.
     applied: Arc<Mutex<AppliedWatches>>,
+    /// The newest root the caller asked for, queued or live. A second
+    /// `set_root` compares against this rather than the applied root, so a
+    /// fast A -> B -> A keeps A queued behind B instead of being dropped
+    /// while B is still only requested.
+    requested_root: Option<PathBuf>,
     context_paths: HashSet<PathBuf>,
 }
 
@@ -119,6 +124,19 @@ impl WatchWorker {
         {
             self.problem(format!(
                 "File watcher could not stop watching the workspace: {error}"
+            ));
+        }
+        // A document directory about to become the root holds a
+        // non-recursive watch on the same path. `notify` keeps one
+        // registration per path, so registering the recursive watch first
+        // and then removing the covered document directory would remove the
+        // recursive watch itself. Remove the old watch before the
+        // registration.
+        if self.document_directories.remove(&root)
+            && let Err(error) = self.unwatch(&root)
+        {
+            self.problem(format!(
+                "File watcher could not stop watching a document directory: {error}"
             ));
         }
         if let Err(error) = self.watch(&root, RecursiveMode::Recursive) {
@@ -229,10 +247,8 @@ impl WatchWorker {
 /// matters most — a removed path has no canonical spelling left — so the
 /// verbatim prefix is stripped before anything is registered or matched. The
 /// spelling's case is kept: a directory with the case-sensitivity attribute
-/// turned on spells `Plan.md` and `plan.md` as two different files, and
-/// folding them would let a watch register — or a tab open — the wrong one.
-/// The case-insensitive comparison on Windows is a fallback, used only when
-/// no exact spelling matches ([`paths_match`], [`path_is_covered`]).
+/// turned on spells `Plan.md` and `plan.md` as two different files, and the
+/// two must stay two watches, two tabs and two paths.
 ///
 /// The result is a path: a caller registers or opens with it as it was given,
 /// minus a Windows verbatim prefix.
@@ -273,61 +289,30 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
-#[cfg(windows)]
-fn fold_case(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().to_lowercase())
-}
-
-/// Whether two paths name the same entry: the exact spelling first and, on
-/// Windows only when the exact spelling does not match, the case-insensitive
-/// one. `Plan.md` and `plan.md` in a case-sensitive directory stay two
-/// paths.
+/// Whether two paths name the same entry: the same spelling after the
+/// Windows verbatim prefix is stripped. `Plan.md` and `plan.md` stay two
+/// paths even in a directory whose case-sensitivity attribute is on.
 pub fn paths_match(left: &Path, right: &Path) -> bool {
-    same_path(&normalize_path(left), &normalize_path(right))
+    normalize_path(left) == normalize_path(right)
 }
 
-/// Whether `path` is `root` or below it, with the same exact-first,
-/// Windows-only case-insensitive fallback as [`paths_match`].
+/// Whether `path` is `root` or below it, by the exact spelling after the
+/// Windows verbatim prefix is stripped.
 pub fn path_is_covered(path: &Path, root: &Path) -> bool {
     covered_by(&normalize_path(path), &normalize_path(root))
 }
 
 fn covered_by(path: &Path, root: &Path) -> bool {
-    if path.starts_with(root) {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        fold_case(path).starts_with(fold_case(root))
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        fold_case(left) == fold_case(right)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    path.starts_with(root)
 }
 
 /// The key a document is matched by: the normalized spelling of its path
 /// and, when it was opened through a symbolic link, the normalized spelling
 /// of the resolved target.
 ///
-/// The key keeps the spelling's case. A caller matches the exact spelling
-/// first and only falls back to [`Self::reads_ignoring_case`] when no
-/// identity matches exactly, so a directory that keeps `Plan.md` and
-/// `plan.md` apart opens, watches and reloads both.
+/// The key keeps the spelling's case, and every match is by the exact
+/// spelling, so a directory that keeps `Plan.md` and `plan.md` apart opens,
+/// watches and reloads both.
 ///
 /// A key is a path as the document was opened (minus a Windows verbatim
 /// prefix), never a folded comparison value.
@@ -362,27 +347,6 @@ impl WatchIdentity {
     /// resolved target, with the exact spelling.
     pub fn reads_exactly(&self, key: &Path) -> bool {
         self.path == key || self.target.as_deref() == Some(key)
-    }
-
-    /// The Windows case-insensitive match, used only when no identity
-    /// matches `key` exactly. On other platforms this is
-    /// [`Self::reads_exactly`].
-    pub fn reads_ignoring_case(&self, key: &Path) -> bool {
-        if self.reads_exactly(key) {
-            return true;
-        }
-        #[cfg(windows)]
-        {
-            same_path(&self.path, key)
-                || self
-                    .target
-                    .as_deref()
-                    .is_some_and(|target| same_path(target, key))
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
     }
 }
 
@@ -443,6 +407,7 @@ impl Watcher {
             rx,
             problems: problem_rx,
             applied,
+            requested_root: None,
             context_paths: HashSet::new(),
         })
     }
@@ -452,15 +417,25 @@ impl Watcher {
     /// The root's recursive watch is the only recursive one: a document
     /// directory outside it is watched by
     /// [`Self::sync_document_directories`] non-recursively, and a document
-    /// directory that the new root now covers has its separate watch removed.
-    /// The registration runs on the worker: this returns once the command is
-    /// queued.
+    /// directory that the new root now covers has its separate watch removed
+    /// before the recursive one is registered, so the removal cannot take
+    /// the new recursive watch with it. The comparison is against the newest
+    /// requested root, so a fast root change that comes back keeps the
+    /// latest request queued. The registration runs on the worker: this
+    /// returns once the command is queued.
     pub fn set_root(&mut self, root: &Path) -> anyhow::Result<()> {
         let root = normalize_path(root);
-        if self.root() == Some(root.clone()) {
+        // Skip only when the request is queued or live *and* the worker
+        // applied it: a request the worker could not apply must be
+        // retryable, and a request that came back while an earlier one was
+        // still pending must be queued.
+        if self.root().as_deref() == Some(root.as_path())
+            && self.requested_root.as_deref() == Some(root.as_path())
+        {
             return Ok(());
         }
-        self.commands.send(Command::SetRoot(root))?;
+        self.commands.send(Command::SetRoot(root.clone()))?;
+        self.requested_root = Some(root);
         Ok(())
     }
 
@@ -600,9 +575,7 @@ fn classify(
         .enumerate()
         .map(|(index, path)| (index, normalize_path(path)))
         .filter(|(_, path)| {
-            if context_paths.contains(path.as_path())
-                || context_paths.iter().any(|context| same_path(context, path))
-            {
+            if context_paths.contains(path.as_path()) {
                 return true;
             }
             let covering = root
@@ -1036,6 +1009,103 @@ mod tests {
     }
 
     #[test]
+    fn upgrading_a_document_directory_to_the_root_keeps_the_recursive_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = normalize_path(&dir.path().canonicalize().unwrap());
+        let nested = root.join("notes");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(root.join("plan.md"), "one\n").unwrap();
+
+        let mut watcher = Watcher::new().unwrap();
+        watcher.sync_document_directories([root.clone()]).unwrap();
+        watcher.flush();
+        assert!(watcher.watched_document_directories().contains(&root));
+
+        watcher.set_root(&root).unwrap();
+        watcher.flush();
+        assert_eq!(watcher.root(), Some(root.clone()));
+        assert!(
+            watcher.watched_document_directories().is_empty(),
+            "the recursive root replaces the same path's document watch"
+        );
+
+        // The removed document watch took the recursive one with it unless
+        // the removal ran before the recursive registration.
+        let path = nested.join("later.md");
+        std::fs::write(&path, "two\n").unwrap();
+        assert_eq!(
+            receive_change(&watcher, &path, |change| matches!(
+                change,
+                Change::Created(_)
+            )),
+            Change::Created(path.clone())
+        );
+    }
+
+    #[test]
+    fn a_failed_root_registration_is_retried_by_a_later_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("later");
+        let mut watcher = Watcher::new().unwrap();
+        watcher.set_root(&missing).unwrap();
+        watcher.flush();
+        assert_eq!(watcher.root(), None);
+        assert!(
+            watcher
+                .drain_problems()
+                .iter()
+                .any(|problem| problem.contains("watch the workspace")),
+            "the failed registration is reported"
+        );
+
+        // The same path again, now that it exists, must reach the worker:
+        // the failed request is not a reason to skip the next one.
+        std::fs::create_dir(&missing).unwrap();
+        watcher.set_root(&missing).unwrap();
+        watcher.flush();
+        assert_eq!(watcher.root(), Some(normalize_path(&missing)));
+    }
+
+    #[test]
+    fn a_fast_root_round_trip_keeps_the_newest_root_watched() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_root = normalize_path(&first.path().canonicalize().unwrap());
+        let second_root = normalize_path(&second.path().canonicalize().unwrap());
+        let release = first.path().join("release-second-root-watch");
+        crate::test_probe::gate_watch_registration(&second_root, &release);
+
+        let mut watcher = rooted(&first_root);
+        watcher.set_root(&second_root).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !crate::test_probe::watch_registration_reached(&second_root) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second root's registration never reached its gate"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The worker is parked before applying B: the applied root is still A
+        // while the newest requested root is B. The request back to A must
+        // not be dropped just because A is still the applied root.
+        watcher.set_root(&first_root).unwrap();
+        std::fs::write(&release, b"").unwrap();
+        watcher.flush();
+        assert_eq!(watcher.root(), Some(first_root.clone()));
+
+        let path = first_root.join("after.md");
+        std::fs::write(&path, "one\n").unwrap();
+        assert_eq!(
+            receive_change(&watcher, &path, |change| matches!(
+                change,
+                Change::Created(_)
+            )),
+            Change::Created(path.clone())
+        );
+    }
+
+    #[test]
     fn a_canonical_spelling_of_a_rooted_directory_is_not_watched_twice() {
         let root = tempfile::tempdir().unwrap();
         let canonical = root.path().canonicalize().unwrap();
@@ -1139,7 +1209,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_keys_keep_case_and_match_it_only_after_an_exact_miss() {
+    fn windows_keys_keep_case_and_match_exactly() {
         let identity = WatchIdentity::of(
             Path::new(r"C:\Notes\Link.md"),
             Some(Path::new(r"\\?\C:\NOTES\Real.md")),
@@ -1147,9 +1217,9 @@ mod tests {
         assert!(identity.reads_exactly(&normalize_path(Path::new(r"C:\Notes\Link.md"))));
         assert!(identity.reads_exactly(&normalize_path(Path::new(r"C:\NOTES\Real.md"))));
         assert!(!identity.reads_exactly(&normalize_path(Path::new(r"c:\notes\link.md"))));
-        assert!(identity.reads_ignoring_case(&normalize_path(Path::new(r"c:\notes\link.MD"))));
-        assert!(identity.reads_ignoring_case(&normalize_path(Path::new(r"C:\notes\REAL.md"))));
-        assert!(!identity.reads_ignoring_case(&normalize_path(Path::new(r"c:\notes\other.md"))));
+        assert!(!identity.reads_exactly(&normalize_path(Path::new(r"c:\notes\link.MD"))));
+        assert!(!identity.reads_exactly(&normalize_path(Path::new(r"C:\notes\REAL.md"))));
+        assert!(!identity.reads_exactly(&normalize_path(Path::new(r"c:\notes\other.md"))));
     }
 
     #[cfg(windows)]
@@ -1164,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_match_wins_over_a_case_insensitive_one_when_both_would_match() {
+    fn an_exact_match_is_the_only_match_when_two_documents_differ_in_case() {
         let upper = WatchIdentity::of(Path::new("Plan.md"), None);
         let lower = WatchIdentity::of(Path::new("plan.md"), None);
         let identities = [upper, lower];
@@ -1181,31 +1251,20 @@ mod tests {
             !identities
                 .iter()
                 .any(|identity| identity.reads_exactly(&miss)),
-            "no document spells the miss exactly"
-        );
-        #[cfg(windows)]
-        assert!(
-            identities
-                .iter()
-                .any(|identity| identity.reads_ignoring_case(&miss)),
-            "the miss falls back to the case-insensitive match on Windows"
+            "a spelling no document matches exactly is never another document"
         );
     }
 
     #[test]
-    fn paths_match_exactly_first_and_cover_prefixes_the_same_way() {
+    fn paths_match_by_the_exact_spelling_and_cover_exact_prefixes() {
         assert!(paths_match(
             Path::new("/notes/plan.md"),
             Path::new("/notes/plan.md")
         ));
-        let case_only = paths_match(Path::new("/notes/plan.md"), Path::new("/notes/plan.MD"));
-        #[cfg(windows)]
         assert!(
-            case_only,
-            "Windows falls back to the case-insensitive match"
+            !paths_match(Path::new("/notes/plan.md"), Path::new("/notes/plan.MD")),
+            "a case-only difference is a different document"
         );
-        #[cfg(not(windows))]
-        assert!(!case_only, "Unix keeps its case");
         assert!(path_is_covered(
             Path::new("/notes/a/b.md"),
             Path::new("/notes")
@@ -1214,6 +1273,10 @@ mod tests {
             Path::new("/customize/a.md"),
             Path::new("/custom")
         ));
+        assert!(
+            !path_is_covered(Path::new("/notes/a.md"), Path::new("/NOTES")),
+            "a case-only difference is outside the root"
+        );
     }
 
     #[cfg(not(windows))]
@@ -1233,7 +1296,6 @@ mod tests {
         assert!(identity.reads_exactly(Path::new("/notes/Link.md")));
         assert!(identity.reads_exactly(Path::new("/Notes/Real.md")));
         assert!(!identity.reads_exactly(Path::new("/notes/link.md")));
-        assert!(!identity.reads_ignoring_case(Path::new("/notes/link.md")));
     }
 
     #[test]

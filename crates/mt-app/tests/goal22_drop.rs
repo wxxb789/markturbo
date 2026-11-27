@@ -934,6 +934,39 @@ fn a_superseded_drops_read_failure_publishes_no_notice() {
 }
 
 #[test]
+fn a_successful_mixed_drop_publishes_the_skipped_count() {
+    let dropped = tempfile::tempdir().expect("dropped folder");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = dropped.path().join("plan.md");
+    let picture = dropped.path().join("photo.png");
+    std::fs::write(&document, "# Plan\n").expect("write plan.md");
+    std::fs::write(&picture, b"\x89PNG").expect("write photo.png");
+
+    let mut app = start(config.path(), None);
+    app.wait_for("id:welcome-open-folder").expect("the welcome");
+
+    // The folder becomes the workspace; the picture is skipped. The drop's
+    // own folder open advances the request counter, which must not make the
+    // drop look superseded by itself.
+    app.drop_files(
+        "id:shell",
+        vec![
+            file_uri(&document),
+            file_uri(&picture),
+            folder_uri(dropped.path()),
+        ],
+    )
+    .expect("drop the mixed set");
+
+    app.wait_for("text:# Plan")
+        .expect("the dropped document opened");
+    app.wait_for("text:Skipped 1 file that can't be opened")
+        .expect("a successful folder drop still reports what it skipped");
+    app.wait_for("id:sidebar-file >> text:plan.md")
+        .expect("the dropped folder is the workspace");
+}
+
+#[test]
 fn a_file_dropped_twice_opens_one_tab() {
     let directory = tempfile::tempdir().expect("document dir");
     let config = tempfile::tempdir().expect("config dir");

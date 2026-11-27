@@ -1155,7 +1155,7 @@ fn under_reduced_motion_a_reload_does_not_slide_the_text() {
 
 #[cfg(windows)]
 #[test]
-fn a_differently_cased_workspace_still_sees_its_symlink_target_deleted() {
+fn a_differently_cased_workspace_misses_a_delete_by_event_spelling() {
     let parent = tempfile::tempdir().expect("workspace parent");
     let config = tempfile::tempdir().expect("config dir");
     let real = parent.path().join("Notes");
@@ -1176,8 +1176,18 @@ fn a_differently_cased_workspace_still_sees_its_symlink_target_deleted() {
     app.wait_for("text:# Real")
         .expect("the linked document is open");
 
+    // The accepted residual in docs/TODO.md: the root watch is registered in
+    // the workspace's spelling (`notes`), the tab's resolved target keeps the
+    // file system's (`Notes`), and exact matching does not fold the two, so
+    // the delete is missed. The same-case delete is covered by
+    // `deleting_a_symlink_target_inside_the_workspace_raises_the_missing_banner`.
     std::fs::remove_file(&target).expect("delete the target");
-    wait_for_text(&mut app, "Moved or deleted on disk", "the missing banner");
+    pump_for(&mut app, Duration::from_millis(2_500));
+    assert!(
+        !shows(app.screen(), "Moved or deleted on disk"),
+        "exact matching does not fold the event spelling into the tab's: {:?}",
+        app.screen().texts()
+    );
 }
 
 #[test]
@@ -1343,6 +1353,102 @@ fn a_tree_row_that_becomes_a_directory_renders_the_folder_control() {
                 .unwrap_or(false)
         },
     );
+}
+
+#[test]
+fn two_names_that_differ_only_in_case_stay_two_tabs() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    if !enable_case_sensitive_directory(workspace.path()) {
+        eprintln!("skipping case-sensitive tab test: the filesystem folds case");
+        return;
+    }
+    let upper = workspace.path().join("Plan.md");
+    let lower = workspace.path().join("plan.md");
+    std::fs::write(&upper, "# Upper\n").expect("write Plan.md");
+    std::fs::write(&lower, "# Lower\n").expect("write plan.md");
+    if std::fs::read_to_string(&upper).ok().as_deref() != Some("# Upper\n")
+        || std::fs::read_to_string(&lower).ok().as_deref() != Some("# Lower\n")
+    {
+        eprintln!("skipping case-sensitive tab test: the filesystem folds case");
+        return;
+    }
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "Plan.md");
+    app.wait_for("text:# Upper").expect("the upper document");
+    app.press("label:plan.md")
+        .expect("open the lower document from the tree");
+    app.wait_for("text:# Lower")
+        .expect("the lower document opens its own tab");
+    assert_eq!(
+        app.screen().count("id:rail-close").expect("selector"),
+        2,
+        "two names that differ only in case stay two tabs: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn opening_a_document_directory_as_the_workspace_keeps_its_recursive_watch() {
+    let parent = tempfile::tempdir().expect("workspace parent");
+    let config = tempfile::tempdir().expect("config dir");
+    let workspace = parent.path().join("A");
+    std::fs::create_dir_all(workspace.join("notes")).expect("create the workspace");
+    std::fs::write(workspace.join("plan.md"), "# Plan\n").expect("write plan.md");
+
+    // Open the document first: its own directory gets a non-recursive watch.
+    let mut app = start(config.path(), None);
+    app.drop_files("id:shell", vec![file_uri(&workspace.join("plan.md"))])
+        .expect("drop the document");
+    app.wait_for("text:# Plan").expect("the document");
+
+    // Now open the same directory as the workspace: the recursive root
+    // replaces the document watch on the same path.
+    app.on_pick_paths(vec![workspace.clone()])
+        .expect("answer the picker");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.wait_for("id:title-menu-open-folder")
+        .expect("the Open folder item");
+    app.press("id:title-menu-open-folder")
+        .expect("open the workspace");
+    app.wait_for("id:sidebar-file >> text:plan.md")
+        .expect("the workspace lists its file");
+    // Let the post-open scans settle, so only a live watch can list what the
+    // test writes next.
+    pump_for(&mut app, Duration::from_millis(2_000));
+
+    std::fs::write(workspace.join("notes/later.md"), "# Later\n").expect("write later.md");
+    wait_for_marker(
+        &mut app,
+        "the tree lists the subdirectory's new file",
+        Duration::from_secs(20),
+        |screen| tree_lists(screen, "later.md"),
+    );
+}
+
+// Make `dir` keep `Plan.md` and `plan.md` apart, where the platform and the
+// filesystem allow it; a filesystem that folds them reports false and the
+// caller skips its case-only test.
+fn enable_case_sensitive_directory(dir: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("fsutil")
+            .arg("file")
+            .arg("setCaseSensitiveInfo")
+            .arg(dir)
+            .arg("enable")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        true
+    }
 }
 
 #[test]

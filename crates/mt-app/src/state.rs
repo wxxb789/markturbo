@@ -210,22 +210,12 @@ impl Tab {
         }
     }
 
-    // Exact spelling first; the case-insensitive match is the Windows
-    // fallback a caller takes only when no tab matches exactly.
+    // The exact spelling only: `Plan.md` and `plan.md` are two documents,
+    // even where a case-sensitive directory keeps both.
     fn reads_key_exactly(&self, key: &Path) -> bool {
         !self.untitled
             && (self.watch.borrow().reads_exactly(key)
                 || self.detected_target.borrow().as_deref() == Some(key))
-    }
-
-    fn reads_key_ignoring_case(&self, key: &Path) -> bool {
-        !self.untitled
-            && (self.watch.borrow().reads_ignoring_case(key)
-                || self
-                    .detected_target
-                    .borrow()
-                    .as_deref()
-                    .is_some_and(|target| mt_core::workspace::paths_match(target, key)))
     }
 }
 
@@ -1808,18 +1798,16 @@ impl AppState {
 
     // The key covers the literal spelling, a symbolic link's resolved target
     // and a target a read detected before the conflict resolved, so a file
-    // reached through a relative path, a link or its target is one tab.
+    // reached through a relative path, a link or its target is one tab. The
+    // match is by the exact spelling, so two files that differ only in case
+    // stay two tabs.
     fn tab_showing(&self, path: &Path) -> Option<Tab> {
         let key = mt_core::workspace::normalize_path(path);
-        let tabs = self.tabs.get_untracked();
-        tabs.iter()
+        self.tabs
+            .get_untracked()
+            .iter()
             .find(|tab| tab.reads_key_exactly(&key))
             .cloned()
-            .or_else(|| {
-                tabs.iter()
-                    .find(|tab| tab.reads_key_ignoring_case(&key))
-                    .cloned()
-            })
     }
 
     pub(crate) fn outside_folder(&self, tab: &Tab) -> bool {
@@ -3343,8 +3331,11 @@ impl AppState {
         // The visible range names the first and last wrapped rows, so its
         // columns tell wrapped segments of one line apart: a caret the reader
         // scrolled past on the same line is not visible.
+        // `visible.end` is the exclusive end of the last visible row: when
+        // the next row is a wrapped continuation of the same line, a caret
+        // there sits at the first position of the off-screen row.
         let caret_visible = selections.last().is_none_or(|selection| {
-            visible.start <= selection.head && selection.head <= visible.end
+            visible.start <= selection.head && selection.head < visible.end
         });
         Some(EditorAnchor {
             editor,

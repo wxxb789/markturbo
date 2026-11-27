@@ -204,3 +204,28 @@
   - `document`'s new identity test mounts `document::column` directly, so it cannot catch a shell-level remount,
     and the old "a remounted editor cuts to the held line" oracle is gone; `shell`'s field-gap test measures the
     source screen rather than the Review column inside the dock.
+
+## Goal 22 lane 22-B residuals (owner accepted 2026-11-27)
+
+- [ ] **Registration-window recheck race** — when a document's watch is registered while its opening read's reload
+  is queued, the ticker's post-subscription recheck and the earlier recheck can commit out of order: one reads an
+  intermediate version and the other the final pre-registration write, and if the intermediate one commits later it
+  advances the generation and drops the final answer; no event remains to correct a clean tab. Fix by giving both
+  rechecks one generation so only the newest read commits.
+- [ ] **Symlink target inside an ignored directory** — `link.md` resolving into `.venv/target.md` (or another
+  `SKIP_DIRS` directory) inside the workspace: the recursive root covers the target's parent, so no separate document
+  watch is added, and the root's event for the target is discarded as noise. Editing the target never reloads the
+  clean tab or closes a stale Compare. Fix by registering the resolved target's parent as an exact context path when
+  it sits under an ignored directory.
+- [ ] **Directory rename holding a symlink's target** — a `Removed` event naming only the renamed parent of a link's
+  target (`drafts/`) does not match the link tab, which keeps its old content; moving the directory back reports only
+  a directory `Created`, which re-checks no child tabs, so the tab stays `Outside folder`. Fix by matching tabs whose
+  path or resolved target is a descendant of a directory event, and re-checking them on a directory creation.
+- [ ] **macOS FSEvents rename handling on the UI tick** — registration and `canonicalize` run on the worker, but the
+  UI ticker still calls `Watcher::poll`. notify 8.2.2's FSEvents backend reports renames as `RenameMode::Any`, whose
+  classification calls `path.exists()` synchronously; a queued event on a dropped network volume can still freeze the
+  window. Fix by moving the existence probe off the UI thread.
+- [ ] **Windows paths that differ only in case miss delete events** — with exact path identity (the fix for the
+  case-sensitive two-tabs defect), a delete event whose spelling differs only in case from the tab's path no longer
+  matches, so the tab is never marked missing. Fix by falling back to a case-insensitive lookup only to classify a
+  miss whose path is gone, never for opening or identity.

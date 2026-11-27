@@ -204,6 +204,12 @@ impl AppState {
         }
         let language = self.settings.get().language;
         let folder_started_at = self.folder_request.get();
+        // The request the skipped count belongs to: the workspace open in
+        // force when the drop landed, or the drop's own folder open once the
+        // folder commits. A drop's own `begin_folder_open` advances the
+        // request counter, so comparing against the pre-drop value would
+        // make the drop look superseded by itself.
+        let mut notice_request = folder_started_at;
         let uris = uris.to_vec();
         let state = self.clone();
         self.spawn_task(async move {
@@ -224,10 +230,10 @@ impl AppState {
                 && state.folder_request.get() == folder_started_at
             {
                 let request = state.begin_folder_open();
+                notice_request = request.token;
                 may_publish_skipped = state.finish_folder_open(folder, request, true).await;
             }
-            if skipped > 0 && may_publish_skipped && state.folder_request.get() == folder_started_at
-            {
+            if skipped > 0 && may_publish_skipped && state.folder_request.get() == notice_request {
                 state.notify_held(SharedString::from(s::skipped_files(language, skipped)));
             }
         });
