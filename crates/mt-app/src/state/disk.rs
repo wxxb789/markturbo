@@ -886,10 +886,10 @@ mod tests {
         }
     }
 
-    // A caret at `visible_range().end`: the exclusive end of the last
-    // visible row, which is the first position of the next wrapped row when
-    // that row is a continuation. A reload must treat it as off screen and
-    // not scroll the viewport to it.
+    // A caret at `visible_range().end` when a wrapped continuation follows:
+    // the exclusive end of the last visible row is the first position of the
+    // off-screen next row. A reload must treat it as off screen and not
+    // scroll the viewport to it.
     #[component]
     fn CaretAtVisibleEndProbe() -> impl IntoElement {
         let state = AppState::new();
@@ -978,6 +978,108 @@ mod tests {
         app.press("id:boundary-reload").expect("reload");
         app.wait_for("text:caret-visible:false view:0")
             .expect("the exclusive visible end is off screen and the viewport stays");
+    }
+
+    /// Lines short enough that the viewport's last visible row ends its line:
+    /// a caret at `visible_range().end` is the line's visible end, not the
+    /// first position of a wrapped continuation.
+    fn short_lines(marker: &str) -> String {
+        (0..60)
+            .map(|line| format!("{marker} line {line}\n"))
+            .collect()
+    }
+
+    // A caret at `visible_range().end` when the last visible row ends its
+    // line: the caret is visible, so a reload whose rows above push it out of
+    // the restored viewport must reveal it again.
+    #[component]
+    fn LineEndCaretProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().unwrap());
+        let path = directory.path().join("line-end.md");
+        std::fs::write(&path, short_lines("A")).unwrap();
+        let id = state.add_tab(io::load(&path).unwrap());
+        let editor_ref = component_ref::<Editor>();
+        state.attach_source_editor(id, editor_ref);
+        let tab = state
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .expect("the tab");
+        let readback = signal(SharedString::from("caret-visible:?"));
+        let press_state = state.clone();
+        let press_readback = readback;
+        let press_tab = tab.clone();
+        let keep = directory.clone();
+        let reloaded = format!("{}{}", wrapped_line('B'), short_lines("C"));
+        view()
+            .test_id("line-end-probe")
+            .child(
+                editor()
+                    .component_ref(&editor_ref)
+                    .value({
+                        let tab = tab.clone();
+                        move || Some(tab.text.get())
+                    })
+                    .font_family(tokens::FONT_SOURCE)
+                    .font_size(px(tokens::TYPE_SOURCE))
+                    .line_height(px(tokens::TYPE_SOURCE_LINE))
+                    .soft_wrap(true)
+                    .w(px(600.0))
+                    .h(px(400.0)),
+            )
+            .child(
+                view()
+                    .test_id("line-end-reload")
+                    .on_press(move |_: &PressEvent| {
+                        let _ = &keep;
+                        if let Some(api) = editor_ref.api::<EditorApi>() {
+                            let end = api.visible_range().end;
+                            api.set_selections(vec![EditorSelection::caret(end)]);
+                            let mut offset = api.scroll_offset();
+                            offset.y = px(0.0);
+                            api.set_scroll_offset(offset);
+                        }
+                        let caret_visible = press_state
+                            .mounted_editor_anchor(&press_tab)
+                            .is_none_or(|anchor| anchor.caret_visible);
+                        std::fs::write(&path, &reloaded).unwrap();
+                        let loaded = io::load(&path).unwrap();
+                        press_state.adopt_disk_version(&press_tab, loaded);
+                        let readback = press_readback;
+                        press_state.spawn_task(async move {
+                            for _ in 0..8 {
+                                request_animation_frame(|_| {}).await;
+                            }
+                            let shown = editor_ref
+                                .api::<EditorApi>()
+                                .map(|api| {
+                                    let caret =
+                                        api.selections().last().map(|selection| selection.head);
+                                    let visible = api.visible_range();
+                                    let in_view = caret.is_some_and(|caret| {
+                                        visible.start <= caret && caret <= visible.end
+                                    });
+                                    format!("caret-visible:{caret_visible} in-view:{in_view}")
+                                })
+                                .unwrap_or_else(|| "caret-visible:? in-view:?".to_owned());
+                            readback.set(SharedString::from(shown));
+                        });
+                    })
+                    .child(text(|| "Reload")),
+            )
+            .child(text(move || readback.get()))
+    }
+
+    #[test]
+    fn a_reload_with_the_caret_at_the_last_visible_lines_end_reveals_it() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<LineEndCaretProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:line-end-reload").expect("the probe");
+        app.press("id:line-end-reload").expect("reload");
+        app.wait_for("text:caret-visible:true in-view:true")
+            .expect("the line-end caret is visible and the reload reveals it");
     }
 
     /// Two versions of one document, so the editor's text can tell which

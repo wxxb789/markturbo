@@ -1428,6 +1428,51 @@ fn opening_a_document_directory_as_the_workspace_keeps_its_recursive_watch() {
     );
 }
 
+#[test]
+fn opening_a_workspace_over_a_documents_subdirectory_keeps_its_recursive_watch() {
+    let parent = tempfile::tempdir().expect("workspace parent");
+    let config = tempfile::tempdir().expect("config dir");
+    let workspace = parent.path().join("A");
+    let notes = workspace.join("notes");
+    std::fs::create_dir_all(&notes).expect("create the workspace");
+    let document = notes.join("plan.md");
+    std::fs::write(&document, "# Plan\n").expect("write plan.md");
+
+    // Open the document first: its own directory (`A/notes`) gets a
+    // non-recursive watch.
+    let mut app = start(config.path(), None);
+    app.drop_files("id:shell", vec![file_uri(&document)])
+        .expect("drop the document");
+    app.wait_for("text:# Plan").expect("the document");
+
+    // Now open its ancestor as the workspace. On inotify the recursive root
+    // and the document watch share `A/notes`'s descriptor, so the covered
+    // directory must lose its watch before the recursive registration.
+    app.on_pick_paths(vec![workspace.clone()])
+        .expect("answer the picker");
+    app.press("id:title-settings")
+        .expect("open the glyph's menu");
+    app.wait_for("id:title-menu-open-folder")
+        .expect("the Open folder item");
+    app.press("id:title-menu-open-folder")
+        .expect("open the workspace");
+    app.wait_for("id:sidebar-file >> text:plan.md")
+        .expect("the workspace lists its file");
+    // Let the post-open scans settle, so only a live watch can reload the
+    // document and list what the test writes next.
+    pump_for(&mut app, Duration::from_millis(2_000));
+
+    std::fs::write(&document, "# Plan two\n").expect("write plan.md");
+    wait_for_text(&mut app, "# Plan two", "the reloaded document");
+    std::fs::write(notes.join("later.md"), "# Later\n").expect("write later.md");
+    wait_for_marker(
+        &mut app,
+        "the tree lists the subdirectory's new file",
+        Duration::from_secs(20),
+        |screen| tree_lists(screen, "later.md"),
+    );
+}
+
 // Make `dir` keep `Plan.md` and `plan.md` apart, where the platform and the
 // filesystem allow it; a filesystem that folds them reports false and the
 // caller skips its case-only test.

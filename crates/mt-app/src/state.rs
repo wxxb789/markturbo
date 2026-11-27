@@ -59,7 +59,7 @@ use mt_core::{
         tree::{self, FileNode},
     },
 };
-use nsh_base::editor::{Editor, EditorApi, EditorSelection};
+use nsh_base::editor::{Editor, EditorApi, EditorPosition, EditorSelection};
 use nsh_core::{element::sample_easing, file_dialog::SaveDialog, prelude::*};
 
 use crate::ui::{motion, tokens::Layout};
@@ -3331,11 +3331,19 @@ impl AppState {
         // The visible range names the first and last wrapped rows, so its
         // columns tell wrapped segments of one line apart: a caret the reader
         // scrolled past on the same line is not visible.
-        // `visible.end` is the exclusive end of the last visible row: when
-        // the next row is a wrapped continuation of the same line, a caret
-        // there sits at the first position of the off-screen row.
+        // `visible.end` is the exclusive end of the last visible row. A caret
+        // there is visible only when that row ends its line: a wrapped
+        // continuation would draw the caret on the off-screen row below.
+        let last_row_ends_line = {
+            let line_end = api.offset_to_position(
+                api.position_to_offset(EditorPosition::new(visible.end.line, u32::MAX)),
+            );
+            line_end == visible.end
+        };
         let caret_visible = selections.last().is_none_or(|selection| {
-            visible.start <= selection.head && selection.head < visible.end
+            visible.start <= selection.head
+                && (selection.head < visible.end
+                    || (selection.head == visible.end && last_row_ends_line))
         });
         Some(EditorAnchor {
             editor,

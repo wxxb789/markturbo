@@ -126,18 +126,33 @@ impl WatchWorker {
                 "File watcher could not stop watching the workspace: {error}"
             ));
         }
-        // A document directory about to become the root holds a
-        // non-recursive watch on the same path. `notify` keeps one
-        // registration per path, so registering the recursive watch first
-        // and then removing the covered document directory would remove the
-        // recursive watch itself. Remove the old watch before the
-        // registration.
-        if self.document_directories.remove(&root)
-            && let Err(error) = self.unwatch(&root)
-        {
-            self.problem(format!(
-                "File watcher could not stop watching a document directory: {error}"
-            ));
+        // A document directory the recursive root will cover loses its own
+        // watch before the registration: on inotify two registrations of one
+        // directory share a descriptor, so removing a covered subdirectory
+        // after the recursive watch is live would remove the recursive
+        // coverage with it. ReadDirectoryChangesW and FSEvents lose nothing
+        // either way.
+        let canonical_root = std::fs::canonicalize(&root)
+            .ok()
+            .map(|canonical| normalize_path(&canonical));
+        let covered: Vec<PathBuf> = self
+            .document_directories
+            .iter()
+            .filter(|directory| {
+                covered_by(directory, &root)
+                    || canonical_root
+                        .as_deref()
+                        .is_some_and(|canonical| covered_by(directory, canonical))
+            })
+            .cloned()
+            .collect();
+        for directory in covered {
+            if let Err(error) = self.unwatch(&directory) {
+                self.problem(format!(
+                    "File watcher could not stop watching a document directory: {error}"
+                ));
+            }
+            self.document_directories.remove(&directory);
         }
         if let Err(error) = self.watch(&root, RecursiveMode::Recursive) {
             self.problem(format!(
@@ -146,12 +161,11 @@ impl WatchWorker {
             // A root that could not be watched is never kept; the desired
             // directories fall back to their own non-recursive watches.
             self.publish_root(None);
+            self.canonical_root = None;
             self.refresh_document_directories();
             return;
         }
-        self.canonical_root = std::fs::canonicalize(&root)
-            .ok()
-            .map(|canonical| normalize_path(&canonical));
+        self.canonical_root = canonical_root;
         self.root = Some(root.clone());
         self.refresh_document_directories();
         self.publish_root(Some(root));
@@ -1039,6 +1053,56 @@ mod tests {
                 Change::Created(_)
             )),
             Change::Created(path.clone())
+        );
+    }
+
+    #[test]
+    fn a_document_subdirectory_becoming_covered_keeps_the_recursive_watch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = normalize_path(&dir.path().canonicalize().unwrap());
+        let notes = root.join("notes");
+        std::fs::create_dir(&notes).unwrap();
+        let plan = notes.join("plan.md");
+        std::fs::write(&plan, "one\n").unwrap();
+
+        // A document opened before its ancestor is the workspace: `notes`
+        // holds its own non-recursive watch until the root arrives.
+        let mut watcher = Watcher::new().unwrap();
+        watcher.sync_document_directories([notes.clone()]).unwrap();
+        watcher.flush();
+        assert!(watcher.watched_document_directories().contains(&notes));
+
+        watcher.set_root(&root).unwrap();
+        watcher.flush();
+        assert_eq!(watcher.root(), Some(root.clone()));
+        assert!(
+            !watcher.watched_document_directories().contains(&notes),
+            "a directory the recursive root covers keeps no separate watch"
+        );
+
+        // On inotify the two registrations of `notes` share a descriptor:
+        // removing the document watch after the recursive registration would
+        // remove the recursive coverage with it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&plan)
+            .unwrap()
+            .write_all(b"two\n")
+            .unwrap();
+        let modified = receive_change(&watcher, &plan, |change| {
+            matches!(change, Change::Created(_) | Change::Modified(_))
+        });
+        assert_eq!(modified.path(), plan);
+        assert_eq!(std::fs::read(&plan).unwrap(), b"two\n");
+
+        let fresh = notes.join("later.md");
+        std::fs::write(&fresh, "three\n").unwrap();
+        assert_eq!(
+            receive_change(&watcher, &fresh, |change| matches!(
+                change,
+                Change::Created(_)
+            )),
+            Change::Created(fresh.clone())
         );
     }
 

@@ -225,7 +225,9 @@
   UI ticker still calls `Watcher::poll`. notify 8.2.2's FSEvents backend reports renames as `RenameMode::Any`, whose
   classification calls `path.exists()` synchronously; a queued event on a dropped network volume can still freeze the
   window. Fix by moving the existence probe off the UI thread.
-- [ ] **Windows paths that differ only in case miss delete events** — with exact path identity (the fix for the
-  case-sensitive two-tabs defect), a delete event whose spelling differs only in case from the tab's path no longer
-  matches, so the tab is never marked missing. Fix by falling back to a case-insensitive lookup only to classify a
-  miss whose path is gone, never for opening or identity.
+- [ ] **Windows case-only path spellings miss deletes, split one file into two tabs and miss symlink-target writes** — with
+  exact path identity, any spelling-only difference breaks the match: a delete event whose case differs from the tab's path
+  leaves the tab never marked missing; opening one case-insensitive file through two spellings (`Plan.md`, then `plan.md`)
+  yields two tabs writing the same file; and with a workspace root cased differently from the real directory, the root's
+  event spelling misses a symlink tab's resolved target, so a target write reloads no clean tab and raises no conflict on a
+  dirty one. Fix by identifying a file by its file ID (volume serial number plus file index) instead of its path spelling.
