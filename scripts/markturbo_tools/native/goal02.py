@@ -678,11 +678,17 @@ class Goal02Harness(BaseNativeHarness):
             OVERWRITE_SETTLE_SECONDS,
             "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
         )
-        # One more sample immediately before the press; the press itself does
-        # not move the pointer.
-        if sha256_file(document) != rewritten:
-            raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
-        self.click_aimed_control(app, "OVERWRITE_GUARD_OVERWRITE_CLICK_FAILED")
+
+        def last_sample() -> None:
+            # Runs after the foreground is verified and immediately before
+            # the press: a write landing during a foreground recovery is
+            # seen, never hidden under the press that confirms it.
+            if sha256_file(document) != rewritten:
+                raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+
+        self.click_aimed_control(
+            app, "OVERWRITE_GUARD_OVERWRITE_CLICK_FAILED", last_sample
+        )
         overwritten = self.wait_file(document, confirmed_edit, "OVERWRITE_SAVE_TIMEOUT")
         # The next phases start from a clean, conflict-free document.
         wait_until(

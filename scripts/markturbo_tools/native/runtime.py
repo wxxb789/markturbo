@@ -1538,10 +1538,10 @@ class Win32:
 
 CLIPBOARD_OPEN_TIMEOUT_SECONDS = 3.0
 CLIPBOARD_OPEN_RETRY_SECONDS = 0.02
-# An editor read resends Ctrl+C once when the clipboard has not changed this
-# long after the copy, and polls its sequence number this often.
+# An editor read resends Ctrl+C once when the copy has not landed this long
+# after the first, and polls the clipboard text this often.
 COPY_RESEND_SECONDS = 0.3
-CLIPBOARD_SEQUENCE_POLL_SECONDS = 0.01
+CLIPBOARD_POLL_SECONDS = 0.01
 
 
 def open_clipboard_with_retry(
@@ -1598,7 +1598,6 @@ class _ClipboardApi:
         user32.EmptyClipboard.restype = wt.BOOL
         user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
         user32.SetClipboardData.restype = wt.HANDLE
-        user32.GetClipboardSequenceNumber.restype = wt.DWORD
         kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
         kernel32.GlobalAlloc.restype = wt.HGLOBAL
         kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
@@ -1623,11 +1622,6 @@ class _ClipboardApi:
         )
 
 
-def clipboard_sequence_number() -> int:
-    """The clipboard's change count; reading it does not open the clipboard."""
-    return int(_ClipboardApi.get().user32.GetClipboardSequenceNumber())
-
-
 _CLIPBOARD_SENTINEL_COUNTER = itertools.count(1)
 
 
@@ -1636,7 +1630,7 @@ def clipboard_sentinel() -> str:
 
     The read accepts only text that differs from this sentinel, so a copy
     that never landed leaves a value it rejects; the Remote Desktop
-    clipboard relay can move the sequence number without the app copying.
+    clipboard relay can move the change count without the app copying.
     """
     return f"markturbo-harness-clipboard-{os.getpid()}-{next(_CLIPBOARD_SENTINEL_COUNTER)}"
 
@@ -2493,9 +2487,22 @@ class NativeHarness:
         self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
         self.win32.move_cursor(x, y)
 
-    def click_aimed_control(self, app: RunningApp, failure_code: str) -> None:
-        """Press at the aimed point, without moving the pointer."""
+    def click_aimed_control(
+        self,
+        app: RunningApp,
+        failure_code: str,
+        last_sample: Callable[[], None] | None = None,
+    ) -> None:
+        """Restore the foreground, run `last_sample`, then press the aimed point.
+
+        `last_sample` runs after the foreground is verified and with no wait
+        before the press: a write landing while the foreground is recovered
+        is seen by the sample, never hidden under the press that confirms
+        it. The press itself does not move the pointer.
+        """
         self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
+        if last_sample is not None:
+            last_sample()
         try:
             self.win32.send_inputs(
                 [mouse_input(MOUSEEVENTF_LEFTDOWN), mouse_input(MOUSEEVENTF_LEFTUP)]
@@ -2705,19 +2712,21 @@ class NativeHarness:
     def read_text_clipboard(self) -> str | None:
         return read_clipboard_text()
 
-    def clipboard_sequence(self) -> int:
-        return clipboard_sequence_number()
+    def _clipboard_copy_seen(self, sentinel: str, timeout: float) -> bool:
+        """Whether the clipboard holds text other than `sentinel` within
+        `timeout` (checked at least once).
 
-    def _clipboard_changed_since(self, sequence: int, timeout: float) -> bool:
-        """Whether the clipboard changes after `sequence` within `timeout`
-        (checked at least once)."""
+        Only a landed copy hides the sentinel: the Remote Desktop clipboard
+        relay moves the change count without the app copying anything.
+        """
         deadline = self.clock() + timeout
         while True:
-            if self.clipboard_sequence() != sequence:
+            value = self.read_text_clipboard()
+            if value is not None and value != sentinel:
                 return True
             if self.clock() >= deadline:
                 return False
-            self.sleep(CLIPBOARD_SEQUENCE_POLL_SECONDS)
+            self.sleep(CLIPBOARD_POLL_SECONDS)
 
     def write_text_clipboard(self, value: str | None) -> None:
         write_clipboard_text(value)
@@ -2763,14 +2772,14 @@ class NativeHarness:
         """The editor's exact document through its own Select All + Copy.
 
         A unique sentinel replaces the clipboard before every copy, and the
-        read accepts only text that differs from it: a sequence-number move
-        alone is not a landed copy (the Remote Desktop clipboard relay moves
-        it too), and a dropped copy cannot return the text the sentinel
-        replaced. The session saved the user's clipboard once and restores
-        it when the run ends. A copy not seen after `COPY_RESEND_SECONDS` is
-        asked for once more (`copy_resends`). Nothing read here is written
-        to evidence except its fingerprint. `editor` is the editor control a
-        caller already found; without one it is looked up here.
+        read accepts only text that differs from it: a dropped copy leaves
+        the sentinel in place, whatever the Remote Desktop clipboard relay
+        does to the change count. The session saved the user's clipboard
+        once and restores it when the run ends. A copy still not on the
+        clipboard after `COPY_RESEND_SECONDS` is asked for once more
+        (`copy_resends`). Nothing read here is written to evidence except
+        its fingerprint. `editor` is the editor control a caller already
+        found; without one it is looked up here.
         """
         count("editor_reads")
         if editor is None:
@@ -2781,14 +2790,13 @@ class NativeHarness:
         deadline = self.clock() + timeout
         sentinel = clipboard_sentinel()
         self.write_text_clipboard(sentinel)
-        sequence = self.clipboard_sequence()
         self.win32.send_shortcuts(app.hwnd, (VK_A, VK_C))
         self.last_editor_sample_at = self.clock()
-        if not self._clipboard_changed_since(sequence, min(COPY_RESEND_SECONDS, timeout)):
+        if not self._clipboard_copy_seen(sentinel, min(COPY_RESEND_SECONDS, timeout)):
             count("copy_resends")
             self.win32.send_shortcut(app.hwnd, VK_C)
             self.last_editor_sample_at = self.clock()
-            if not self._clipboard_changed_since(sequence, max(0.0, deadline - self.clock())):
+            if not self._clipboard_copy_seen(sentinel, max(0.0, deadline - self.clock())):
                 raise HarnessFailure("EDITOR_COPY_TIMEOUT")
         return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT", sentinel)
 
@@ -3502,7 +3510,6 @@ __all__ = [
     "artifact_contains",
     "build_launch_spec",
     "clipboard_sentinel",
-    "clipboard_sequence_number",
     "complete_evidence",
     "count",
     "elapsed_ms",

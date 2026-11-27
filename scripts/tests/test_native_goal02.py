@@ -200,6 +200,8 @@ class FakeWin32:
 
     def require_foreground(self, hwnd: int, _timeout: float) -> None:
         self.desk.events.append(("foreground", hwnd))
+        if self.desk.foreground_wait:
+            self.desk.sleep(self.desk.foreground_wait)
 
     def send_inputs(self, inputs: list[Any]) -> None:
         keys = [(item.ki.wVk, item.ki.dwFlags) for item in inputs]
@@ -230,6 +232,7 @@ class FakeDesk:
         second_keep_mine_writes: bool = False,
         second_keep_mine_delay: float | None = None,
         release_write_on_pointer_move: bool = False,
+        foreground_wait: float = 0.0,
         overwrite_writes: bool = True,
         overwrite_cancel_ignored: bool = False,
         overwrite_cancel_restores_editor: bool = False,
@@ -252,6 +255,7 @@ class FakeDesk:
         self.second_keep_mine_writes = second_keep_mine_writes
         self.second_keep_mine_delay = second_keep_mine_delay
         self.release_write_on_pointer_move = release_write_on_pointer_move
+        self.foreground_wait = foreground_wait
         self.overwrite_writes = overwrite_writes
         self.overwrite_cancel_ignored = overwrite_cancel_ignored
         self.overwrite_cancel_restores_editor = overwrite_cancel_restores_editor
@@ -289,7 +293,8 @@ class FakeDesk:
     def harness(self) -> HARNESS.Goal02Harness:
         harness = object.__new__(HARNESS.Goal02Harness)
         harness.ui_timeout = 0.2
-        harness.win32 = FakeWin32(self)
+        self.win32 = FakeWin32(self)
+        harness.win32 = self.win32
         harness.case_roots = self.case_roots
         harness.launch = self.launch
         harness.launch_app = self.launch_app
@@ -419,8 +424,13 @@ class FakeDesk:
             self.release_pending_write()
         self.press_control(control, code)
 
-    def click_aimed_control(self, _app: Any, code: str) -> None:
-        """The press after `aim_control`: no pointer move, no released write."""
+    def click_aimed_control(self, _app: Any, code: str, last_sample: Any = None) -> None:
+        """The press after `aim_control`: the foreground is verified first (a
+        deferred write can land while it is recovered), then the caller's
+        last sample, then the press without moving the pointer."""
+        self.win32.require_foreground(73, runtime.FOREGROUND_TIMEOUT_SECONDS)
+        if last_sample is not None:
+            last_sample()
         self.press_control(self.aimed_control, code)
 
     def aim_control(self, _app: Any, control: str, _code: str) -> None:
@@ -462,8 +472,12 @@ class FakeDesk:
                     self.clock_now + self.second_keep_mine_delay,
                 )
         elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]:
+            self.overwrite_open = False
             if self.overwrite_writes:
                 self.write_editor()
+            else:
+                # The press answers the conflict; only its written bytes matter.
+                self.conflict = False
         elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"]:
             if not self.overwrite_cancel_ignored:
                 self.overwrite_open = False
@@ -656,6 +670,19 @@ class ScenarioTests(unittest.TestCase):
             "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
             second_keep_mine_delay=30.0,
             release_write_on_pointer_move=True,
+            overwrite_writes=False,
+        )
+
+    def test_a_write_landing_during_the_overwrite_foreground_recovery_fails(self) -> None:
+        # The review probe: the final sample sees the prior bytes at 3.0 s,
+        # the second Keep mine's deferred write lands at 5.5 s while the
+        # foreground is recovered, and the press lands at 7.0 s. The final
+        # sample must follow the recovery, or wait_file credits that write
+        # as the confirmation.
+        self.assert_fails(
+            "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+            second_keep_mine_delay=4.0,
+            foreground_wait=4.0,
             overwrite_writes=False,
         )
 

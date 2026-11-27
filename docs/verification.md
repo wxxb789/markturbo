@@ -177,13 +177,13 @@ How nsh 0.7.1 exposes views to UIA, and so how the harnesses select them:
   strip's `rail-file-row` Buttons are named by tab title.
 - The editor's accessible element is the `Markdown source` IME input; its UIA
   Value is not the document. The harness reads the document with Ctrl+A, Ctrl+C
-  sent as one input batch, waits for the clipboard sequence number to advance
-  (resending Ctrl+C once after 300 ms), then reads the text. Another writer
-  can also advance the sequence, so before awaiting a text the harness
-  empties a clipboard that already holds it; otherwise a read never writes
-  the clipboard. The run saves the user's text clipboard once and
-  restores it once at its end. Selection and Review use the editor's own keys
-  (Ctrl+A, Ctrl+Enter).
+  sent as one input batch; before every copy it puts a unique sentinel on the
+  clipboard and accepts only text that differs from it, so a dropped copy
+  leaves a value the read rejects even when the Remote Desktop clipboard relay
+  moves the change count without copying, and a copy still missing after
+  300 ms is asked for once more. The run saves the user's text clipboard once
+  and restores it once at its end. Selection and Review use the editor's own
+  keys (Ctrl+A, Ctrl+Enter).
 - UIA Invoke is one tap. The consent card's `consent-send` sends only after a
   held press, so the harnesses hold the real pointer past the control's 900 ms
   threshold; an Invoke is never consent.

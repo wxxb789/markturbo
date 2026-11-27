@@ -323,7 +323,6 @@ def editor_harness(
     harness.win32 = win32
     harness.read_text_clipboard = lambda: win32.clipboard
     harness.write_text_clipboard = lambda value: setattr(win32, "clipboard", value)
-    harness.clipboard_sequence = lambda: win32.sequence
     return harness, editor
 
 
@@ -871,12 +870,18 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         harness.win32.send_inputs.assert_not_called()
         self.assertEqual((control.click_count, control.invoke_count), (0, 0))
 
-    def test_click_aimed_control_presses_without_moving_the_pointer(self) -> None:
+    def test_click_aimed_control_samples_after_the_foreground_and_before_the_press(self) -> None:
         harness = native_harness(FreshRootFactory([FakeRoot()]))
+        events: list[str] = []
         harness.win32 = mock.Mock()
+        harness.win32.require_foreground.side_effect = lambda *_args: events.append("foreground")
+        harness.win32.send_inputs.side_effect = lambda *_args: events.append("press")
 
-        harness.click_aimed_control(running_app(), "AIM_CLICK_FAILED")
+        harness.click_aimed_control(
+            running_app(), "AIM_CLICK_FAILED", lambda: events.append("sample")
+        )
 
+        self.assertEqual(events, ["foreground", "sample", "press"])
         harness.win32.require_foreground.assert_called_once_with(
             73, runtime.FOREGROUND_TIMEOUT_SECONDS
         )
@@ -1280,7 +1285,6 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         harness.win32 = win32
         harness.read_text_clipboard = lambda: win32.clipboard
         harness.write_text_clipboard = lambda value: setattr(win32, "clipboard", value)
-        harness.clipboard_sequence = lambda: win32.sequence
         metrics = runtime.RunMetrics()
         token = runtime._ACTIVE_METRICS.set(metrics)
         try:
@@ -1445,6 +1449,35 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(metrics.counters["copy_resends"], 1)
         self.assertGreaterEqual(now[0], runtime.COPY_RESEND_SECONDS)
         self.assertLess(now[0], runtime.COPY_RESEND_SECONDS + 0.05)
+
+    def test_a_relayed_sequence_move_never_suppresses_the_copy_resend(self) -> None:
+        # The review probe: the first copy is lost and the Remote Desktop
+        # clipboard relay moves the change count while the sentinel stays.
+        # The resend must still be sent, and the read must land the text
+        # within the budget.
+        class RelayDropsFirstCopy(FakeEditorWin32):
+            """The first copy is dropped while the relay moves the sequence."""
+
+            def send_shortcut(self, hwnd: int, key: int) -> None:
+                if key == runtime.VK_C and not self.shortcuts.count((hwnd, runtime.VK_C)):
+                    self.shortcuts.append((hwnd, key))
+                    self.sequence += 1
+                    return
+                super().send_shortcut(hwnd, key)
+
+        win32 = RelayDropsFirstCopy("text")
+        harness, _editor = editor_harness(win32, timeout=1.0)
+        now = [0.0]
+        harness.clock = lambda: now[0]
+        harness.sleep = lambda seconds: now.__setitem__(0, now[0] + seconds)
+
+        metrics, read = self.read_counting(harness)
+
+        self.assertEqual(read, runtime.fingerprint_text("text"))
+        self.assertEqual(
+            win32.shortcuts, [(73, runtime.VK_A), (73, runtime.VK_C), (73, runtime.VK_C)]
+        )
+        self.assertEqual(metrics.counters["copy_resends"], 1)
 
     def test_a_prompt_copy_is_never_resent(self) -> None:
         harness, win32, now = self.stalled_copy_harness(["text"])
@@ -1741,9 +1774,13 @@ class OverwriteGuardTests(unittest.TestCase):
         harness.aim_control = mock.Mock(
             side_effect=lambda _app, control, _code: aimed.append(control)
         )
-        harness.click_aimed_control = mock.Mock(
-            side_effect=lambda _app, code: pressed(aimed[-1], code)
-        )
+
+        def pressed_aimed(_app: object, code: str, last_sample: object = None) -> None:
+            if callable(last_sample):
+                last_sample()
+            pressed(aimed[-1], code)
+
+        harness.click_aimed_control = mock.Mock(side_effect=pressed_aimed)
         return harness, app, document
 
     def test_external_conflict_overwrites_only_after_the_guard_confirms(self) -> None:
@@ -1875,7 +1912,7 @@ class NestedTimeoutTests(unittest.TestCase):
         self.assertLessEqual(fake.now - started, 5.0 + 0.1 + 1e-6)
         self.assertGreater(len(copy_waits), 1)
         self.assertLessEqual(
-            max(copy_waits), runtime.INNER_WAIT_SECONDS + runtime.CLIPBOARD_SEQUENCE_POLL_SECONDS
+            max(copy_waits), runtime.INNER_WAIT_SECONDS + runtime.CLIPBOARD_POLL_SECONDS
         )
         self.assertIsNone(harness._deadline)
 
