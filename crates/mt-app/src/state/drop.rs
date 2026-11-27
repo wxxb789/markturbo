@@ -306,12 +306,7 @@ impl AppState {
                 break;
             }
             let opened = loaded.path.clone();
-            let resolved = loaded.resolved_target().map(Path::to_path_buf);
-            let existing = self.tab_showing(&opened).or_else(|| {
-                resolved
-                    .as_deref()
-                    .and_then(|target| self.tab_showing(target))
-            });
+            let existing = self.tab_showing_loaded(&loaded);
             if let Some(tab) = existing {
                 self.set_active(tab.id);
                 continue;

@@ -1771,17 +1771,11 @@ impl AppState {
                 }
             };
             let opened = loaded.path.clone();
-            let resolved = loaded.resolved_target().map(Path::to_path_buf);
             // Two quick opens of one path both pass the check above while
             // their reads are in flight: the read that lands first owns the
             // tab, and a later answer focuses it instead of inserting a
-            // duplicate no tree row could follow. A read through a symbolic
-            // link also matches the tab already showing its resolved target.
-            let existing = state.tab_showing(&opened).or_else(|| {
-                resolved
-                    .as_deref()
-                    .and_then(|target| state.tab_showing(target))
-            });
+            // duplicate no tree row could follow.
+            let existing = state.tab_showing_loaded(&loaded);
             if let Some(tab) = existing {
                 #[cfg(any(test, feature = "test-vault"))]
                 crate::test_vault::note_duplicate_open(&opened);
@@ -1808,6 +1802,27 @@ impl AppState {
             .iter()
             .find(|tab| tab.reads_key_exactly(&key))
             .cloned()
+    }
+
+    /// The tab already showing `loaded`: by the exact spelling of its path or
+    /// resolved target, or by the file object its opened handle read. The
+    /// object identity is what meets a Windows 8.3 short-name spelling with
+    /// the long form `canonicalize` returns for a symbolic link's target.
+    fn tab_showing_loaded(&self, loaded: &LoadedFile) -> Option<Tab> {
+        self.tab_showing(&loaded.path)
+            .or_else(|| {
+                loaded
+                    .resolved_target()
+                    .and_then(|target| self.tab_showing(target))
+            })
+            .or_else(|| {
+                let object_id = loaded.stamp.object_id?;
+                self.tabs
+                    .get_untracked()
+                    .iter()
+                    .find(|tab| tab.loaded.borrow().stamp.object_id == Some(object_id))
+                    .cloned()
+            })
     }
 
     pub(crate) fn outside_folder(&self, tab: &Tab) -> bool {

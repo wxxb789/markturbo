@@ -107,6 +107,36 @@ fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(target, link)
 }
 
+/// The 8.3 short spelling of `path`, when the volume keeps one: another
+/// spelling of the same filesystem object, which `canonicalize` returns in
+/// its long form.
+#[cfg(windows)]
+fn short_path(path: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, len: u32) -> u32;
+    }
+
+    let long: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut short = vec![0u16; 260];
+    loop {
+        // SAFETY: `long` is NUL-terminated and `short` is a live buffer whose
+        // capacity is passed in.
+        let written =
+            unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
+        if written == 0 {
+            return None;
+        }
+        if written < short.len() as u32 {
+            short.truncate(written as usize);
+            return Some(std::ffi::OsString::from_wide(&short).into());
+        }
+        short.resize(written as usize + 1, 0);
+    }
+}
+
 #[test]
 fn a_drop_opens_each_document_and_the_last_one_is_active() {
     let directory = tempfile::tempdir().expect("document dir");
@@ -856,19 +886,17 @@ fn a_slow_drop_never_overrides_a_newer_workspace_choice() {
         .expect("B stays the workspace");
 }
 
-#[test]
-fn dropping_a_symlink_to_an_open_target_focuses_the_existing_tab() {
-    let workspace = tempfile::tempdir().expect("workspace");
+fn a_link_to_an_open_target_focuses_its_tab(workspace: &Path) {
     let config = tempfile::tempdir().expect("config dir");
-    let target = workspace.path().join("real.md");
+    let target = workspace.join("real.md");
     std::fs::write(&target, "# Real\n").expect("write the target");
-    let link = workspace.path().join("link.md");
+    let link = workspace.join("link.md");
     if let Err(error) = symlink_file(&target, &link) {
         eprintln!("skipping file-symlink test: {error}");
         return;
     }
 
-    let mut app = start(config.path(), Some(workspace.path()));
+    let mut app = start(config.path(), Some(workspace));
     app.wait_for("id:workspace-home")
         .expect("the workspace home");
     app.press("id:workspace-home >> label:real.md")
@@ -886,6 +914,50 @@ fn dropping_a_symlink_to_an_open_target_focuses_the_existing_tab() {
         "a link to an open target focuses its tab: {:?}",
         app.screen().texts()
     );
+
+    app.press("id:sidebar-tree >> role:button[link.md]")
+        .expect("open the link from the sidebar");
+    app.wait(Duration::from_millis(800))
+        .expect("let the open land");
+    assert_eq!(
+        open_tabs(&app),
+        1,
+        "opening the link's own row keeps its tab: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn dropping_a_symlink_to_an_open_target_focuses_the_existing_tab() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    a_link_to_an_open_target_focuses_its_tab(workspace.path());
+}
+
+/// GitHub's Windows runners place their temp directory under a short name, and
+/// a path kept in that spelling must still meet its long canonical target.
+#[cfg(windows)]
+#[test]
+fn dropping_a_symlink_through_a_short_name_path_focuses_the_existing_tab() {
+    let directory = tempfile::tempdir().expect("short-name root");
+    let long = directory
+        .path()
+        .join("a-long-workspace-name-for-an-8-3-alias");
+    std::fs::create_dir(&long).expect("the long workspace name");
+    let Some(short) = short_path(&long) else {
+        eprintln!(
+            "skipping short-name test: no 8.3 alias for {}",
+            long.display()
+        );
+        return;
+    };
+    if short == long {
+        eprintln!(
+            "skipping short-name test: no 8.3 alias for {}",
+            long.display()
+        );
+        return;
+    }
+    a_link_to_an_open_target_focuses_its_tab(&short);
 }
 
 #[test]
