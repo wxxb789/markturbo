@@ -190,15 +190,23 @@ How nsh 0.7.1 exposes views to UIA, and so how the harnesses select them:
 - Ctrl+Enter depends on state: it starts Review from the title row, sends from
   the consent card, and is Done on the Revision field. The harnesses send it
   only in the state whose action they mean.
-- nsh system alerts (`alert_dialog()`) are not in the UIA tree: they are drawn
-  inside the window as hosted items, which have no accessibility hook. This
-  covers the Overwrite confirmation after Keep mine (goal 02). While an alert shows it
-  takes every key. Enter presses its first button, or the last regular
-  `.action` when it has one. The harnesses therefore check that the press alone changed
-  nothing, then send Enter from the main window's keyboard focus, and prove the
-  decision by its effect: the file holds the edited bytes, so an Enter that
-  cancels fails the case. Test-id'd,
-  in-window confirmation cards would let a harness select the button directly.
+- The in-window guard card (`ui/notices.rs` `guard_card`) is the app's own
+  confirmation for close/quit and for disk conflicts; Goal 20 removed the nsh
+  native alerts from those flows (`alert_dialog()` remains only inside the OS
+  file pickers). The heading Text names the decision and each action is a
+  Button with its own AutomationId. A tab's close card reads
+  `Close without saving?` and Save is `guard-save`; every window close and
+  Quit reads `Quit without saving?` with the same `guard-save`/
+  `guard-dont-save`/`guard-cancel` ids and Save as `Save all` (it saves every
+  dirty tab). Keep mine uses `guard-overwrite`/`guard-cancel`, Use disk version
+  `guard-reload`/`guard-cancel`. A harness locates the card by its heading,
+  presses the decision's own Button, and proves the effect: the file holds
+  the edited bytes only after `guard-overwrite`.
+- nsh 0.7.1 owns the IFileSaveDialog by the hidden window its surface draws
+  into, not the visible main window, so Goal 03 finds the picker among the
+  process's visible task dialogs (`#32770`) and the picker's own overwrite
+  prompt among the task dialogs the picker owns. An owner-of-main-window
+  lookup never sees the picker.
 
 The harness unit tests hold one source-contract check that the canonical
 selectors (`rail-file-row`, `rail-close`, `sidebar-panel`, `sidebar-file`,
@@ -225,8 +233,8 @@ the app only where the behaviour itself needs a restart.
   questions and the keyless Review variants are headless mt-core/mt-app tests.
 - Goal 02, one case `lifecycle-session`, two launches (the interruption is
   the only restart). First launch: `EXTERNAL_MODIFICATION` (a same-length
-  rewrite with the loaded mtime is refused, then Keep mine and the Overwrite
-  alert write the exact bytes), `TAB_CLOSE` (with the sidebar panel open, the
+  rewrite with the loaded mtime is refused, then Keep mine and the guard
+  card's Overwrite write the exact bytes), `TAB_CLOSE` (with the sidebar panel open, the
   open tab's row close raises the guard; Cancel keeps the file; the following
   Save writes the exact edited bytes) and
   `CHECKPOINT` (an encrypted canonical record within 10 000 ms, no sentinel
@@ -234,8 +242,8 @@ the app only where the behaviour itself needs a restart.
   (Restore brings back the exact checkpointed bytes), `KEYBOARD_CLOSE`
   (Ctrl+W, Don't save closes the tab without writing and retires the record)
   and `WINDOW_CLOSE` (the workspace home's row reopens the file; Alt+F4 and
-  WM_CLOSE raise the guard; Cancel keeps the file; Save writes the exact bytes
-  and the process exits 0; no recovery record survives). The editor is not
+  WM_CLOSE raise the quit guard; Cancel keeps the file; Save all writes the
+  exact bytes and the process exits 0; no recovery record survives). The editor is not
   read after a refusal or a Cancel: the exact bytes of the next write prove
   the buffer survived. Launch failures carry `FIRST_LAUNCH_` or
   `RESTORE_LAUNCH_`. Headless: `tests/conflict.rs` (the refused save leaves
@@ -252,6 +260,9 @@ the app only where the behaviour itself needs a restart.
   pre-navigation cell; the second detects no fixture cells, consistent with a
   browser block page. Exactly one app window remains, and the counted
   loopback listeners record no contacts, including on the final HTTPS port.
+  A second visible top-level window fails `APP_WINDOW_COUNT_UNEXPECTED` and
+  records each extra window's class, whether the main window owns it, and its
+  process image's file name (never a title).
   Browser argument-string tests verify configuration only.
   Edit mode then hands the keyboard back. `DECISIONS`:
   Accept(h1), the executable script value after the CJK/emoji line, writes at
@@ -260,7 +271,7 @@ the app only where the behaviour itself needs a restart.
   (`revision-copy`) puts exactly the approved text on the OS clipboard; an
   edit over the whole document shows `Can't apply — this section was edited since the review` with
   no Accept; `Done` leaves the file on disk unchanged. `QUIT`: one
-  guard, Discard, the process exits. A consent hold whose request never reaches the loopback
+  quit guard, Discard, the process exits. A consent hold whose request never reaches the loopback
   fails at once (`REVIEW_REQUEST_NOT_SENT` / `REVISION_REQUEST_NOT_SENT`).
   Headless: Reject and Undo restoring exact bytes after a write, reject-all
   and every hunk accepted (`tests/revision_flow.rs`); an edit over every hunk
@@ -277,7 +288,8 @@ the app only where the behaviour itself needs a restart.
   (CF_UNICODETEXT with CJK and a surrogate-pair emoji), `OVERWRITE_NO` (the
   native dialog's No, then the picker's Escape: the cancel proof; focus and
   the destination unchanged), `OVERWRITE_YES` (Yes writes the pasted bytes,
-  then `title-file` names the new file), `SUBSEQUENT_SAVE` (a typed edit
+  then the `title-file` Button reads `Show agent context for <name>`),
+  `SUBSEQUENT_SAVE` (a typed edit
   saved to the new path), `SAVED_CLOSE` (one recent row), `SAMPLE`
   (workspace home), `REOPEN` (argv: exact CJK/emoji text, no welcome, the
   10-entry bound) and `RECENTS` (five rows; the stale one disabled and named

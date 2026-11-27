@@ -186,19 +186,11 @@ class FakeWin32:
     def require_foreground(self, hwnd: int, _timeout: float) -> None:
         self.desk.events.append(("foreground", hwnd))
 
-    def foreground_focus(self, hwnd: int) -> int:
-        return hwnd
-
     def send_inputs(self, inputs: list[Any]) -> None:
         keys = [(item.ki.wVk, item.ki.dwFlags) for item in inputs]
         self.desk.events.append(("inputs", tuple(keys)))
         if keys[:2] == [(HARNESS.VK_MENU, 0), (HARNESS.VK_F4, 0)]:
             self.desk.guard = "window"
-
-    def send_key(self, _hwnd: int, key: int) -> None:
-        self.desk.events.append(("key", key))
-        if key == runtime.VK_RETURN and self.desk.enter_overwrites:
-            self.desk.write_editor()
 
     def send_shortcut(self, _hwnd: int, key: int) -> None:
         self.desk.events.append(("shortcut", key))
@@ -218,7 +210,7 @@ class FakeDesk:
         root: Path,
         *,
         keep_mine_writes: bool = False,
-        enter_overwrites: bool = True,
+        overwrite_writes: bool = True,
         home_opens: bool = True,
         discard_retires: bool = True,
         failing_guard: int | None = None,
@@ -230,7 +222,7 @@ class FakeDesk:
     ) -> None:
         self.root = root
         self.keep_mine_writes = keep_mine_writes
-        self.enter_overwrites = enter_overwrites
+        self.overwrite_writes = overwrite_writes
         self.home_opens = home_opens
         self.discard_retires = discard_retires
         self.failing_guard = failing_guard
@@ -267,8 +259,10 @@ class FakeDesk:
         harness.find_control = lambda _app, automation_id, *_args: automation_id
         harness.click_control = self.click_control
         harness.invoke_control = self.invoke_control
+        harness.guard_dialog = self.guard_dialog
         harness.close_tab_by_pointer = self.close_tab_by_pointer
         harness.click_lifecycle_decision = self.click_lifecycle_decision
+        harness.click_quit_decision = self.click_quit_decision
         harness.wait_process_exit = self.wait_process_exit
         harness.close_app = self.close_app
         harness.terminate = self.terminate
@@ -346,8 +340,12 @@ class FakeDesk:
 
     def click_control(self, control: str, _code: str) -> None:
         self.events.append(("click", control))
-        if control == HARNESS.KEEP_MINE_AUTOMATION_ID and self.keep_mine_writes:
-            self.write_editor()
+        if control == HARNESS.KEEP_MINE_AUTOMATION_ID:
+            if self.keep_mine_writes:
+                self.write_editor()
+        elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]:
+            if self.overwrite_writes:
+                self.write_editor()
         elif control == HARNESS.RESTORE_AUTOMATION_ID:
             self.editor = HARNESS.RECOVERY_EDIT.encode("utf-8")
             self.tabs += 1
@@ -362,11 +360,35 @@ class FakeDesk:
         self.events.append(("sidebar close", title))
         self.guard = "tab"
 
+    def guard_dialog(
+        self,
+        _app: Any,
+        heading: str,
+        button_names: dict[str, str],
+        button_automation_ids: dict[str, str],
+        _timeout: float | None = None,
+    ) -> dict[str, str]:
+        assert heading == HARNESS.OVERWRITE_GUARD_HEADING, heading
+        assert button_names == HARNESS.OVERWRITE_GUARD_BUTTON_NAMES, button_names
+        assert button_automation_ids == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS, (
+            button_automation_ids
+        )
+        return dict(button_automation_ids)
+
     def click_lifecycle_decision(self, app: Any, name: str) -> None:
+        """The dirty tab's card (`Close without saving?`); a window-close card
+        is the quit guard and cannot satisfy this lookup."""
+        self.press_guard_decision(app, "tab", name)
+
+    def click_quit_decision(self, app: Any, name: str) -> None:
+        """The quit card (`Quit without saving?`, Save all) of a window close."""
+        self.press_guard_decision(app, "window", name)
+
+    def press_guard_decision(self, app: Any, kind: str, name: str) -> None:
         self.guards += 1
-        if self.guards == self.failing_guard or self.guard is None:
+        if self.guards == self.failing_guard or self.guard != kind:
             raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT")
-        self.events.append(("guard", name))
+        self.events.append(("quit guard" if kind == "window" else "guard", name))
         guard, self.guard = self.guard, None
         if name == "Save" and guard == "window":
             self.write_editor()
@@ -407,14 +429,8 @@ class ScenarioTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         desk = FakeDesk(Path(directory.name), **desk_options)
         harness = desk.harness()
-        with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            mock.patch.object(
-                HARNESS,
-                "scan_runtime_artifacts",
-                side_effect=scans or [recovery_scan(), retired_scan()],
-            ),
-        ):
+        recorded = scans or [recovery_scan(), retired_scan()]
+        with mock.patch.object(HARNESS, "scan_runtime_artifacts", side_effect=recorded):
             return harness.scenario_lifecycle_session(), desk
 
     def assert_fails(self, code: str, **options: Any) -> None:
@@ -439,7 +455,7 @@ class ScenarioTests(unittest.TestCase):
                 ("edit",),
                 ("menu save",),
                 ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
-                ("key", runtime.VK_RETURN),
+                ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]),
                 ("edit",),
                 ("sidebar close", "guarded.md"),
                 ("guard", "Cancel"),
@@ -453,20 +469,20 @@ class ScenarioTests(unittest.TestCase):
                 ("invoke", HARNESS.WORKSPACE_HOME_FILE_AUTOMATION_ID),
                 ("edit",),
                 ("inputs", alt_f4),
-                ("guard", "Cancel"),
+                ("quit guard", "Cancel"),
                 ("wm_close",),
-                ("guard", "Save"),
+                ("quit guard", "Save"),
             ],
         )
         self.assertEqual(desk.document.read_bytes(), HARNESS.WINDOW_EDIT.encode("utf-8"))
         self.assertLessEqual(observations["checkpoint_ms"], 10_000)
         HARNESS.validate_evidence(evidence_with(observations))
 
-    def test_external_modification_overwrites_only_after_enter_confirms(self) -> None:
+    def test_external_modification_overwrites_only_after_the_guard_confirms(self) -> None:
         for options, code in (
-            (dict(keep_mine_writes=True, enter_overwrites=False),
+            (dict(keep_mine_writes=True, overwrite_writes=False),
              "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
-            (dict(enter_overwrites=False), "EXTERNAL_MODIFICATION_SYSTEM_ALERT_UNANSWERED"),
+            (dict(overwrite_writes=False), "EXTERNAL_MODIFICATION_OVERWRITE_SAVE_TIMEOUT"),
         ):
             with self.subTest(code=code):
                 self.assert_fails(code, **options)
@@ -504,7 +520,6 @@ class ScenarioTests(unittest.TestCase):
             return runtime.wait_until(predicate, min(timeout, 0.2), code, **options)
 
         with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
             mock.patch.object(HARNESS, "scan_runtime_artifacts", return_value=recovery_scan()),
             mock.patch.object(HARNESS, "wait_until", side_effect=short_wait),
             self.assertRaises(runtime.HarnessFailure) as raised,

@@ -12,6 +12,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import ntpath
 import os
 import platform
 import re
@@ -97,11 +98,6 @@ INTEGRITY_NAMES = {
 #   editor's own Select All + Copy, which writes the exact text
 #   (system.rs `set_clipboard_text`). SetFocus supports inputs and focusable
 #   views (access/uia.rs and access.rs).
-# * UIA cannot inspect system alerts; Enter selects the last Default-styled
-#   button or the first, so callers verify the effect after `confirm_system_alert`.
-SYSTEM_ALERT_SETTLE_SECONDS = 0.5
-# How long one Enter's effect is awaited before the alert is answered again.
-SYSTEM_ALERT_ANSWER_SECONDS = 1.0
 EDITOR_NAME = "Markdown source"
 MENU_BUTTON_AUTOMATION_ID = "title-settings"
 MENU_SAVE_AUTOMATION_ID = "title-menu-save"
@@ -131,6 +127,11 @@ GUARD_BUTTON_AUTOMATION_IDS = {
     "Discard": "guard-dont-save",
     "Cancel": "guard-cancel",
 }
+# The window-close and quit guard (`GuardKind::QuitApp`): the tab's card with
+# the quit heading and Save label; the buttons keep their automation ids.
+QUIT_GUARD_HEADING = "Quit without saving?"
+QUIT_GUARD_BUTTON_NAMES = {"Save": "Save all", "Discard": "Don't save", "Cancel": "Cancel"}
+QUIT_GUARD_BUTTON_AUTOMATION_IDS = dict(GUARD_BUTTON_AUTOMATION_IDS)
 CONFLICT_HEADING = "Changed on disk"
 LIFECYCLE_CLICK_FAILURE_CODES = {
     "Save": "LIFECYCLE_SAVE_CLICK_FAILED",
@@ -144,6 +145,10 @@ GMEM_MOVEABLE = 0x0002
 
 WM_CLOSE = 0x0010
 GW_OWNER = 4
+# `GetClassNameW`'s documented maximum class name, and a capacity above every
+# executable path's length.
+WINDOW_CLASS_CAPACITY = 256
+PROCESS_IMAGE_CAPACITY = 32768
 SW_RESTORE = 9
 VK_CONTROL = 0x11
 VK_MENU = 0x12
@@ -285,10 +290,18 @@ class HarnessBlocked(RuntimeError):
 
 
 class HarnessFailure(RuntimeError):
-    def __init__(self, code: str, detail: str = "") -> None:
+    def __init__(
+        self,
+        code: str,
+        detail: str = "",
+        observations: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.detail = detail
+        # Content-free facts for the failed case's evidence; the goal's own
+        # contract validates their shape like any other observation.
+        self.observations = observations or {}
 
 
 @dataclass(frozen=True)
@@ -881,6 +894,13 @@ class Win32:
         self.kernel32.ProcessIdToSessionId.restype = wt.BOOL
         self.kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
         self.kernel32.OpenProcess.restype = wt.HANDLE
+        self.kernel32.QueryFullProcessImageNameW.argtypes = [
+            wt.HANDLE,
+            wt.DWORD,
+            wt.LPWSTR,
+            ctypes.POINTER(wt.DWORD),
+        ]
+        self.kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
         self.kernel32.CloseHandle.argtypes = [wt.HANDLE]
         self.kernel32.CloseHandle.restype = wt.BOOL
         self.kernel32.WTSGetActiveConsoleSessionId.restype = wt.DWORD
@@ -1293,14 +1313,24 @@ class Win32:
     def foreground_window(self) -> int:
         return int(self.user32.GetForegroundWindow() or 0)
 
-    def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
+    def task_dialogs(self, process_id: int, owner_hwnd: int | None = None) -> list[int]:
+        """Visible task dialogs (`#32770`) of `process_id`.
+
+        nsh 0.7.1 gives the IFileSaveDialog an owner of the hidden surface
+        window, not the visible main window, so a picker is found by its
+        process. `owner_hwnd` narrows the search to one owner, for the
+        nested dialog the picker itself owns (its overwrite confirmation).
+        """
         dialogs: list[int] = []
         failure_code: str | None = None
 
         @self._enum_windows_proc
         def collect(hwnd: int, _lparam: int) -> bool:
             nonlocal failure_code
-            if int(self.user32.GetWindow(hwnd, GW_OWNER) or 0) != owner_hwnd:
+            if (
+                owner_hwnd is not None
+                and int(self.user32.GetWindow(hwnd, GW_OWNER) or 0) != owner_hwnd
+            ):
                 return True
             process = wt.DWORD()
             if not self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process)):
@@ -1347,6 +1377,48 @@ class Win32:
         if failure_code is not None:
             raise HarnessFailure(failure_code)
         return tuple(handles)
+
+    def window_facts(self, hwnd: int, main_hwnd: int) -> dict[str, Any]:
+        """Content-free identity of one extra top-level window.
+
+        Its class name, whether the main window owns it, and its process
+        image's base name; a field the OS cannot answer is None. Titles are
+        never read: they can contain document names.
+        """
+        process = wt.DWORD()
+        pid = (
+            int(process.value)
+            if self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process))
+            else None
+        )
+        class_buffer = ctypes.create_unicode_buffer(WINDOW_CLASS_CAPACITY)
+        class_name = (
+            class_buffer.value
+            if self.user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            else None
+        )
+        owner = int(self.user32.GetWindow(hwnd, GW_OWNER) or 0)
+        return {
+            "class_name": class_name,
+            "owned_by_main": owner == main_hwnd,
+            "process_image": self.process_image_name(pid) if pid is not None else None,
+        }
+
+    def process_image_name(self, pid: int) -> str | None:
+        """A process's executable file name alone; None when it is unreadable."""
+        process = self.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            return None
+        try:
+            capacity = wt.DWORD(PROCESS_IMAGE_CAPACITY)
+            buffer = ctypes.create_unicode_buffer(capacity.value)
+            if not self.kernel32.QueryFullProcessImageNameW(
+                process, 0, buffer, ctypes.byref(capacity)
+            ):
+                return None
+            return ntpath.basename(buffer.value)
+        finally:
+            self.kernel32.CloseHandle(process)
 
     def post_close(self, hwnd: int) -> None:
         if not self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
@@ -1695,7 +1767,9 @@ def phase(prefix: str) -> Iterator[None]:
     except HarnessFailure as error:
         if error.code.startswith(f"{prefix}_"):
             raise
-        raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
+        raise HarnessFailure(
+            f"{prefix}_{error.code}", error.detail, error.observations
+        ) from None
     finally:
         metrics = _ACTIVE_METRICS.get()
         if metrics is not None:
@@ -2311,55 +2385,6 @@ class NativeHarness:
         except Exception as error:
             raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
-    def confirm_system_alert(
-        self,
-        app: RunningApp,
-        still_undecided: Callable[[], bool],
-        early_code: str,
-        confirmed: Callable[[], bool] | None = None,
-    ) -> None:
-        """Answer the nsh system alert that the last press opened with Enter.
-
-        The alert is invisible to UIA (see the mapping above), so it is proven
-        by effect: `still_undecided` must hold after the press alone (else
-        `early_code`: the action ran without its confirmation), and the caller
-        must then wait for the confirmed effect. The alert opens from an async
-        task after the press; the settle delay keeps Enter from reaching the
-        app's own views first, where it could at most open the alert again.
-        Keys reach the alert only through the main window's own keyboard focus,
-        not a WebView's.
-
-        With `confirmed` (the effect the alert's confirming button has), an
-        Enter sent before the alert showed is sent again until that effect
-        appears, within `ui_timeout`: the async task that opens the alert can
-        outlast the settle delay. A retry is only sent while the source editor
-        lacks the keyboard focus, where a lost Enter cannot edit the document.
-        """
-        time.sleep(SYSTEM_ALERT_SETTLE_SECONDS)
-        if not still_undecided():
-            raise HarnessFailure(early_code)
-        deadline = time.perf_counter() + self.ui_timeout
-        while True:
-            self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
-            wait_until(
-                lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
-                self.ui_timeout,
-                "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT",
-            )
-            self.win32.send_key(app.hwnd, VK_RETURN)
-            if confirmed is None:
-                return
-            try:
-                wait_until(confirmed, SYSTEM_ALERT_ANSWER_SECONDS, "SYSTEM_ALERT_UNANSWERED")
-                return
-            except HarnessFailure as error:
-                if error.code != "SYSTEM_ALERT_UNANSWERED":
-                    raise
-            if time.perf_counter() >= deadline:
-                raise HarnessFailure("SYSTEM_ALERT_UNANSWERED")
-            if self.source_editor_has_focus(app):
-                raise HarnessFailure("SYSTEM_ALERT_EDITOR_FOCUSED")
-
     def hold_control(
         self, app: RunningApp, control: Any, seconds: float, failure_code: str
     ) -> None:
@@ -2720,8 +2745,20 @@ class NativeHarness:
         self.wait_editor_fingerprint(app, fingerprint_text("\n"), self.ui_timeout)
         return fingerprint_text("")
 
-    def lifecycle_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
-        """The in-window guard card (`ui/notices.rs` `guard_card`) and its decisions."""
+    def guard_dialog(
+        self,
+        app: RunningApp,
+        heading: str,
+        button_names: dict[str, str],
+        button_automation_ids: dict[str, str],
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """One in-window guard card (`ui/notices.rs` `guard_card`): its decisions.
+
+        The heading Text names the card's kind. Each decision is a Button with
+        its own AutomationId and label; `button_names` and
+        `button_automation_ids` share their keys.
+        """
         last_failure_type: str | None = None
 
         def locate() -> dict[str, Any] | None:
@@ -2730,17 +2767,17 @@ class NativeHarness:
                 raise HarnessFailure("PROCESS_EXITED_BEFORE_GUARD")
             try:
                 if self.control_by_name(
-                    app.hwnd, GUARD_HEADING, "Text", "GUARD_CARD_UIA_CONTRACT_MISMATCH"
+                    app.hwnd, heading, "Text", "GUARD_CARD_UIA_CONTRACT_MISMATCH"
                 ) is None:
                     return None
                 buttons = {}
-                for decision, automation_id in GUARD_BUTTON_AUTOMATION_IDS.items():
+                for decision, automation_id in button_automation_ids.items():
                     button = self.control_by_id(
                         app.hwnd,
                         automation_id,
                         "Button",
                         "GUARD_BUTTON_UIA_CONTRACT_MISMATCH",
-                        expected_name=GUARD_BUTTON_NAMES[decision],
+                        expected_name=button_names[decision],
                     )
                     if button is None:
                         return None
@@ -2763,8 +2800,29 @@ class NativeHarness:
                 raise HarnessFailure(error.code, last_failure_type) from None
             raise
 
+    def lifecycle_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
+        """The dirty tab's close guard card and its decisions."""
+        return self.guard_dialog(
+            app, GUARD_HEADING, GUARD_BUTTON_NAMES, GUARD_BUTTON_AUTOMATION_IDS, timeout
+        )
+
     def click_lifecycle_decision(self, app: RunningApp, name: str) -> None:
         button = self.lifecycle_dialog(app)[name]
+        self.click_control(button, LIFECYCLE_CLICK_FAILURE_CODES[name])
+
+    def quit_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
+        """The quit guard card (`GuardKind::QuitApp`) of every window close and
+        Quit; its Save is Save all, which saves every dirty tab."""
+        return self.guard_dialog(
+            app,
+            QUIT_GUARD_HEADING,
+            QUIT_GUARD_BUTTON_NAMES,
+            QUIT_GUARD_BUTTON_AUTOMATION_IDS,
+            timeout,
+        )
+
+    def click_quit_decision(self, app: RunningApp, name: str) -> None:
+        button = self.quit_dialog(app)[name]
         self.click_control(button, LIFECYCLE_CLICK_FAILURE_CODES[name])
 
     def wait_process_exit(self, app: RunningApp, timeout: float | None = None) -> None:
@@ -3173,6 +3231,10 @@ def _run_goal(
                     failure_code = (
                         error.code if isinstance(error, HarnessFailure) else "INTERNAL_FAILURE"
                     )
+                    if isinstance(error, HarnessFailure):
+                        # Content-free failure diagnostics; the goal's contract
+                        # validates them on evidence write.
+                        case["observations"].update(error.observations)
                     case.update(
                         status="FAIL",
                         reason_code=failure_code,

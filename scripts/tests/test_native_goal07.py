@@ -230,6 +230,42 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected value"):
                     HARNESS.validate_evidence(evidence)
 
+    def test_extra_window_facts_are_typed_and_path_free(self) -> None:
+        fact = {
+            "class_name": "NshWindow",
+            "owned_by_main": True,
+            "process_image": "markturbo.exe",
+        }
+        accepted = [fact, {"class_name": None, "owned_by_main": False, "process_image": None}]
+
+        def failed(facts: Any) -> dict:
+            evidence = HARNESS.new_evidence(HASH)
+            evidence["cases"][0].update(
+                status="FAIL",
+                reason_code="APP_WINDOW_COUNT_UNEXPECTED",
+                failure_type="HarnessFailure",
+                duration_ms=1.0,
+                observations={HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: facts},
+            )
+            HARNESS.complete_evidence(evidence, "FAIL")
+            return evidence
+
+        HARNESS.validate_evidence(failed(accepted))
+        HARNESS.validate_evidence(failed([]))
+        for facts, message in (
+            ({}, "invalid extra-window observations"),
+            ([{**fact, "extra": 1}], "invalid extra-window observations"),
+            ([{**fact, "class_name": "x" * 129}], "invalid extra-window class"),
+            ([{**fact, "class_name": "two words\n"}], "invalid extra-window class"),
+            ([{**fact, "owned_by_main": 1}], "invalid extra-window owner"),
+            ([{**fact, "process_image": "C:\\dir\\app.exe"}], "invalid extra-window process image"),
+        ):
+            with (
+                self.subTest(message=message, facts=facts),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                HARNESS.validate_evidence(failed(facts))
+
     def test_the_session_needs_exactly_one_review_and_one_revision(self) -> None:
         for count in (1, 4):
             with self.subTest(count=count):
@@ -365,6 +401,30 @@ class EvidenceFinalizationTests(unittest.TestCase):
         self.assertEqual((returncode, evidence["status"], reason), (1, "FAIL", "UTF8_DOCUMENT_SENTINEL_LEAKED"))
         self.assertEqual(evidence["cases"][0]["observations"], {})
         self.assertEqual(evidence["transport"]["request_count"], 0)
+
+    def test_the_extra_window_facts_reach_the_failed_case_evidence(self) -> None:
+        facts = [
+            {"class_name": "NshWindow", "owned_by_main": True, "process_image": "markturbo.exe"}
+        ]
+
+        def failed() -> dict:
+            raise runtime.HarnessFailure(
+                "APP_WINDOW_COUNT_UNEXPECTED",
+                observations={HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: facts},
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            returncode, evidence, reason = self.run_native_cases(Path(temporary), failed)
+
+        self.assertEqual(
+            (returncode, evidence["status"], reason),
+            (1, "FAIL", "APP_WINDOW_COUNT_UNEXPECTED"),
+        )
+        self.assertEqual(
+            evidence["cases"][0]["observations"],
+            {HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: facts},
+        )
+        HARNESS.validate_evidence(evidence)
 
     def test_selected_case_run_is_partial(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -576,7 +636,7 @@ class SessionTests(unittest.TestCase):
             phase_web_security=order.phase_web_security,
             phase_decisions=order.phase_decisions,
             quit_via_menu=order.quit_via_menu,
-            click_lifecycle_decision=order.click_lifecycle_decision,
+            click_quit_decision=order.click_quit_decision,
             wait_process_exit=order.wait_process_exit,
             reap=order.reap,
             _finalize_observations=lambda _provider, _root, _app, observations: observations,
@@ -606,7 +666,7 @@ class SessionTests(unittest.TestCase):
                 mock.call.phase_web_security(app, provider, source),
                 mock.call.phase_decisions(app, provider, source),
                 mock.call.quit_via_menu(app),
-                mock.call.click_lifecycle_decision(app, "Discard"),
+                mock.call.click_quit_decision(app, "Discard"),
                 mock.call.wait_process_exit(app),
                 mock.call.reap(app),
             ],
@@ -1575,11 +1635,22 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
     def test_web_phase_fails_if_a_popup_creates_an_extra_owned_window(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
         harness.win32.visible_top_level_windows.return_value = (app.hwnd, 93)
+        harness.win32.window_facts.return_value = {
+            "class_name": "NshWindow",
+            "owned_by_main": True,
+            "process_image": "markturbo.exe",
+        }
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_COUNT_UNEXPECTED"),
+            self.assertRaises(runtime.HarnessFailure) as raised,
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        self.assertEqual(raised.exception.code, "APP_WINDOW_COUNT_UNEXPECTED")
+        harness.win32.window_facts.assert_called_once_with(93, app.hwnd)
+        self.assertEqual(
+            raised.exception.observations,
+            {HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: [harness.win32.window_facts()]},
+        )
         order.set_compatibility.assert_called_once_with(app, True)
         order.view_command.assert_called_once_with(app, "Preview")
         order.editor_control.assert_not_called()

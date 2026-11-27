@@ -7,8 +7,9 @@ observations contain only UTF-8 byte counts, SHA-256 digests, and timings.
 
 One case, two launches; only the interruption needs the restart. The first
 launch opens the document: a same-length external rewrite (mtime restored)
-must be refused by menu Save until Keep mine is confirmed; the sidebar opens
-before a pointer hover reveals the tab's close, which must raise the guard card
+must be refused by menu Save until Keep mine's Overwrite guard card confirms;
+the sidebar opens before a pointer hover reveals the tab's close, which must
+raise the guard card
 (Save / Don't save / Cancel), whose Cancel keeps the text, then menu Save
 writes it; an edited buffer (CJK + emoji) must then leave a canonical recovery
 record within 10 000 ms before TerminateProcess interrupts it. The relaunch is
@@ -16,8 +17,9 @@ given the workspace folder, so no document opens beside the recovered one: it
 offers the record to Restore; Ctrl+W's guard Don't save closes the restored tab
 without writing and retires the record; the workspace home's file row reopens
 the document, and Alt+F4 and the native window close (WM_CLOSE) must raise the
-guard, never close it unasked, and the guard's Save writes the exact bytes,
-retires the recovery record and exits 0.
+quit guard (`Quit without saving?`, Save all), never close it unasked, and the
+guard's Save all writes the exact bytes, retires the recovery record and exits
+0.
 
 The unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
 which nsh 0.7.1's Windows UIA folds away, so the guard's Cancel keeping the
@@ -75,8 +77,8 @@ CASE_FLOWS = {
         "Overwrite; pointer rail close -> guard Cancel -> menu Save; "
         "edit -> recovery record -> TerminateProcess -> relaunch on the workspace -> "
         "Restore; SendInput Ctrl+W -> guard Don't save -> recovery record retired; "
-        "workspace home file -> SendInput Alt+F4 -> guard Cancel -> WM_CLOSE -> "
-        "guard Save -> exit"
+        "workspace home file -> SendInput Alt+F4 -> quit guard Cancel -> WM_CLOSE -> "
+        "quit guard Save all -> exit"
     ),
 }
 REQUIRED_CASE_IDS = tuple(CASE_FLOWS)
@@ -140,11 +142,18 @@ RECOVERY_ARTIFACT_PREFIX = ".markturbo-recovery-"
 PANIC_RE = re.compile(rb"\bpanic(?:ked)?\b")
 
 # The conflict and recovery actions (`ui/notices.rs`), each a Button with its
-# own id and its label as Name. The one recovered record is row 0. Keep mine's
-# confirmation is an nsh system alert outside the UIA tree, answered with
-# Enter (`runtime.py` `confirm_system_alert`).
+# own id and its label as Name. The one recovered record is row 0. Keep mine
+# opens the Overwrite guard card (`GuardKind::OverwriteDisk`), whose Overwrite
+# is the only thing that writes.
 KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
 RESTORE_AUTOMATION_ID = "recovery-restore-0"
+# The Overwrite guard card's heading, decisions and their own ids.
+OVERWRITE_GUARD_HEADING = "Overwrite external changes on disk?"
+OVERWRITE_GUARD_BUTTON_NAMES = {"Overwrite": "Overwrite", "Cancel": "Cancel"}
+OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS = {
+    "Overwrite": "guard-overwrite",
+    "Cancel": "guard-cancel",
+}
 # The workspace home's file rows (`ui/welcome.rs` `workspace_home`), shown
 # while a workspace is open and no document is; the workspace holds one file.
 WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
@@ -519,14 +528,18 @@ class Goal02Harness(BaseNativeHarness):
             "KEEP_MINE_UIA_CONTRACT_MISMATCH",
         )
         self.click_control(keep_mine, "KEEP_MINE_CLICK_FAILED")
-        # Keep mine opens the Overwrite alert, which UIA cannot see; Enter
-        # answers it with Overwrite, proven by the written file.
-        self.confirm_system_alert(
+        # Keep mine opens the Overwrite guard card; its Overwrite is the only
+        # press that writes, proven by the file still holding the external
+        # rewrite while the card is up.
+        guard = self.guard_dialog(
             app,
-            lambda: sha256_file(document) == rewritten,
-            "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
-            confirmed=lambda: sha256_file(document) == dirty,
+            OVERWRITE_GUARD_HEADING,
+            OVERWRITE_GUARD_BUTTON_NAMES,
+            OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
         )
+        if sha256_file(document) != rewritten:
+            raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+        self.click_control(guard["Overwrite"], "OVERWRITE_GUARD_OVERWRITE_CLICK_FAILED")
         overwritten = self.wait_file(document, dirty, "OVERWRITE_SAVE_TIMEOUT")
         # The next phases start from a clean, conflict-free document.
         wait_until(
@@ -578,7 +591,7 @@ class Goal02Harness(BaseNativeHarness):
         self.activate_source_layout(app)
 
     def window_close(self, app: RunningApp, document: Path) -> dict[str, Any]:
-        """Alt+F4 and WM_CLOSE raise the guard; its Save writes and exits.
+        """Alt+F4 and WM_CLOSE raise the quit guard; its Save all writes and exits.
 
         `wait_process_exit` fails with PROCESS_EXIT_NONZERO unless the code is 0.
         """
@@ -586,14 +599,14 @@ class Goal02Harness(BaseNativeHarness):
         editor = self.replace_editor(app, WINDOW_EDIT)
         source = sha256_file(document)
         self.send_alt_f4(app)
-        self.click_lifecycle_decision(app, "Cancel")
+        self.click_quit_decision(app, "Cancel")
         self.require_running(app, "ALT_F4_CANCEL_CLOSED_PROCESS")
         untouched = sha256_file(document)
         if untouched != source:
             raise HarnessFailure("ALT_F4_CANCEL_CHANGED_SOURCE")
-        # The platform close must raise the guard, not close the window.
+        # The platform close must raise the quit guard, not close the window.
         self.win32.post_close(app.hwnd)
-        self.click_lifecycle_decision(app, "Save")
+        self.click_quit_decision(app, "Save")
         self.wait_process_exit(app, max(self.ui_timeout, 20.0))
         saved = sha256_file(document)
         if saved != editor:

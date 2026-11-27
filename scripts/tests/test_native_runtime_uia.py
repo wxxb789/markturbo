@@ -562,6 +562,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
     def test_selectors_match_the_nsh_production_source(self) -> None:
         self.assertEqual(runtime.TAB_CLOSE_AUTOMATION_ID, "rail-close")
         self.assertEqual(runtime.EDITOR_NAME, "Markdown source")
+        self.assertEqual(runtime.GUARD_HEADING, "Close without saving?")
         self.assertEqual(
             runtime.GUARD_BUTTON_NAMES,
             {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"},
@@ -570,12 +571,29 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             runtime.GUARD_BUTTON_AUTOMATION_IDS,
             {"Save": "guard-save", "Discard": "guard-dont-save", "Cancel": "guard-cancel"},
         )
+        self.assertEqual(runtime.QUIT_GUARD_HEADING, "Quit without saving?")
+        self.assertEqual(
+            runtime.QUIT_GUARD_BUTTON_NAMES,
+            {"Save": "Save all", "Discard": "Don't save", "Cancel": "Cancel"},
+        )
+        self.assertEqual(runtime.QUIT_GUARD_BUTTON_AUTOMATION_IDS, runtime.GUARD_BUTTON_AUTOMATION_IDS)
+        self.assertEqual(
+            HARNESS.OVERWRITE_GUARD_HEADING, "Overwrite external changes on disk?"
+        )
+        self.assertEqual(
+            HARNESS.OVERWRITE_GUARD_BUTTON_NAMES,
+            {"Overwrite": "Overwrite", "Cancel": "Cancel"},
+        )
+        self.assertEqual(
+            HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
+            {"Overwrite": "guard-overwrite", "Cancel": "guard-cancel"},
+        )
 
     def test_sidebar_and_view_selectors_are_in_the_product_ui(self) -> None:
         ui = Path(__file__).resolve().parents[2] / "crates" / "mt-app" / "src" / "ui"
         source = "\n".join(
             (ui / name).read_text(encoding="utf-8").split("\n#[cfg(test)]\nmod tests", 1)[0]
-            for name in ("rail.rs", "shell.rs", "titlebar.rs")
+            for name in ("rail.rs", "shell.rs", "titlebar.rs", "notices.rs")
         )
         for automation_id in (
             runtime.RAIL_FILE_ROW_AUTOMATION_ID,
@@ -585,9 +603,13 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             runtime.SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID,
             runtime.VIEW_BUTTON_AUTOMATION_ID,
             runtime.MENU_WEB_AUTOMATION_ID,
+            *HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS.values(),
         ):
             with self.subTest(automation_id=automation_id):
                 self.assertIn(f'"{automation_id}"', source)
+        self.assertIn(f'"{HARNESS.OVERWRITE_GUARD_HEADING}"', source)
+        self.assertIn(f'"{runtime.QUIT_GUARD_HEADING}"', source)
+        self.assertIn(f'"{runtime.QUIT_GUARD_BUTTON_NAMES["Save"]}"', source)
 
     def test_source_layout_waits_for_the_editor_without_pressing_edit_again(self) -> None:
         for name in ("View: Edit — switch to Split", "视图：编辑 — 切换到分栏"):
@@ -782,6 +804,43 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.lifecycle_dialog(running_app())
         self.assertEqual(raised.exception.code, "GUARD_BUTTON_UIA_CONTRACT_MISMATCH")
+
+    def quit_guard_root(self) -> tuple[FakeRoot, dict[str, FakeControl]]:
+        buttons = {
+            decision: FakeControl(
+                runtime.QUIT_GUARD_BUTTON_AUTOMATION_IDS[decision], "Button", name=name
+            )
+            for decision, name in runtime.QUIT_GUARD_BUTTON_NAMES.items()
+        }
+        heading = FakeControl("", "Text", name=runtime.QUIT_GUARD_HEADING)
+        return FakeRoot([heading, *buttons.values()]), buttons
+
+    def test_quit_guard_card_is_read_by_its_own_heading_and_save_all(self) -> None:
+        root, buttons = self.quit_guard_root()
+        harness = native_harness(FreshRootFactory([root]))
+
+        found = harness.quit_dialog(running_app())
+        harness.click_quit_decision(running_app(), "Save")
+
+        self.assertEqual(found["Save"].element_info.name, "Save all")
+        self.assertEqual(buttons["Save"].click_count, 1)
+
+    def test_the_quit_guard_is_not_the_close_tab_guard(self) -> None:
+        # A window close raises `GuardKind::QuitApp`: the close-tab card's
+        # heading and Save label do not match, so the tab lookup must time out.
+        buttons = {
+            decision: FakeControl(
+                runtime.GUARD_BUTTON_AUTOMATION_IDS[decision], "Button", name=name
+            )
+            for decision, name in runtime.GUARD_BUTTON_NAMES.items()
+        }
+        root = FakeRoot(
+            [FakeControl("", "Text", name=runtime.GUARD_HEADING), *buttons.values()]
+        )
+        harness = native_harness(FreshRootFactory([root]), timeout=0.001)
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.quit_dialog(running_app())
+        self.assertEqual(raised.exception.code, "GUARD_CARD_UIA_TIMEOUT")
 
     def test_hold_control_presses_the_pointer_at_the_control_centre(self) -> None:
         control = FakeControl("consent-send", "Button", bounds=(100, 40, 264, 76))
@@ -1515,99 +1574,29 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertTrue(0 < x < 84 and 0 < y < 32)
 
 
-class AlertWin32:
-    """Keyboard ownership and the keys that reach an nsh system alert."""
+class OverwriteGuardTests(unittest.TestCase):
+    """Keep mine's Overwrite guard card: only its Overwrite press writes."""
 
-    def __init__(self, focus: int = 73, on_enter=None) -> None:
-        self.focus = focus
-        self.on_enter = on_enter
-        self.events: list[tuple[object, ...]] = []
-
-    def require_foreground(self, hwnd: int, _timeout: float = 2.0) -> None:
-        self.events.append(("foreground", hwnd))
-
-    def foreground_focus(self, _hwnd: int) -> int:
-        return self.focus
-
-    def send_key(self, hwnd: int, key: int) -> None:
-        self.events.append(("key", hwnd, key))
-        if key == runtime.VK_RETURN and self.on_enter is not None:
-            self.on_enter()
-
-
-class SystemAlertTests(unittest.TestCase):
-    """nsh 0.7.1 alerts are outside UIA: Enter answers them, effects prove them."""
-
-    def harness(self, win32: AlertWin32) -> object:
-        harness = native_harness(FreshRootFactory([FakeRoot()]))
-        harness.win32 = win32
-        return harness
-
-    def test_enter_answers_the_alert_from_the_main_windows_keyboard_focus(self) -> None:
-        win32 = AlertWin32()
-        with mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0):
-            self.harness(win32).confirm_system_alert(running_app(), lambda: True, "EARLY")
-        self.assertEqual(win32.events, [("foreground", 73), ("key", 73, runtime.VK_RETURN)])
-
-    def test_an_effect_before_enter_fails_without_sending_enter(self) -> None:
-        win32 = AlertWin32()
-        with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            self.assertRaises(runtime.HarnessFailure) as raised,
-        ):
-            self.harness(win32).confirm_system_alert(running_app(), lambda: False, "EARLY")
-        self.assertEqual(raised.exception.code, "EARLY")
-        self.assertEqual(win32.events, [])
-
-    def test_enter_is_withheld_while_another_window_owns_the_keyboard(self) -> None:
-        win32 = AlertWin32(focus=99)
-        with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            self.assertRaises(runtime.HarnessFailure) as raised,
-        ):
-            self.harness(win32).confirm_system_alert(running_app(), lambda: True, "EARLY")
-        self.assertEqual(raised.exception.code, "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT")
-        self.assertNotIn(("key", 73, runtime.VK_RETURN), win32.events)
-
-    def test_an_enter_sent_before_the_alert_showed_is_sent_again(self) -> None:
-        # The alert opens from a task: the first Enter can come before it.
-        answered = {"enters": 0}
-
-        def enter() -> None:
-            answered["enters"] += 1
-
-        win32 = AlertWin32(on_enter=enter)
-        harness = self.harness(win32)
-        harness.ui_timeout = 5.0
-        harness.source_editor_has_focus = lambda _app: False
-        with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            mock.patch.object(runtime, "SYSTEM_ALERT_ANSWER_SECONDS", 0.05),
-        ):
-            harness.confirm_system_alert(
-                running_app(), lambda: True, "EARLY", confirmed=lambda: answered["enters"] >= 2
-            )
-        self.assertEqual(answered["enters"], 2)
-
-    def test_no_second_enter_while_the_source_editor_has_the_keyboard(self) -> None:
-        # A lost Enter in the editor would edit the very text being decided.
-        win32 = AlertWin32()
-        harness = self.harness(win32)
-        harness.ui_timeout = 5.0
-        harness.source_editor_has_focus = lambda _app: True
-        with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            mock.patch.object(runtime, "SYSTEM_ALERT_ANSWER_SECONDS", 0.05),
-            self.assertRaises(runtime.HarnessFailure) as raised,
-        ):
-            harness.confirm_system_alert(running_app(), lambda: True, "EARLY", confirmed=lambda: False)
-        self.assertEqual(raised.exception.code, "SYSTEM_ALERT_EDITOR_FOCUSED")
-        self.assertEqual(win32.events.count(("key", 73, runtime.VK_RETURN)), 1)
-
-    def conflict_scenario(self, *, overwrite_on_keep_mine: bool, overwrite_on_enter: bool):
+    def conflict_scenario(
+        self, *, overwrite_on_keep_mine: bool, overwrite_on_overwrite: bool
+    ) -> tuple[object, object, Path]:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        harness = self.harness(AlertWin32())
+        keep_mine = FakeControl(HARNESS.KEEP_MINE_AUTOMATION_ID, "Button", name="Keep mine")
+        overwrite = FakeControl(
+            HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"],
+            "Button",
+            name=HARNESS.OVERWRITE_GUARD_BUTTON_NAMES["Overwrite"],
+        )
+        cancel = FakeControl(
+            HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"],
+            "Button",
+            name=HARNESS.OVERWRITE_GUARD_BUTTON_NAMES["Cancel"],
+        )
+        heading = FakeControl("", "Text", name=HARNESS.OVERWRITE_GUARD_HEADING)
+        harness = native_harness(
+            FreshRootFactory([FakeRoot([keep_mine, overwrite, cancel, heading])])
+        )
         harness.root = Path(directory.name)
         app = running_app()
         workspace = harness.root / "cases" / HARNESS.CASE_LIFECYCLE_SESSION / "workspace"
@@ -1616,7 +1605,6 @@ class SystemAlertTests(unittest.TestCase):
         runtime.write_durable(document, HARNESS.ORIGINAL_BYTES)
         mine = HARNESS.CONFLICT_EDIT.encode("utf-8")
         dirty = runtime.fingerprint_bytes(mine)
-        keep_mine = object()
         harness.replace_editor = mock.Mock(return_value=dirty)
         harness.save_via_menu = mock.Mock()
         harness.wait_name = mock.Mock()
@@ -1624,50 +1612,50 @@ class SystemAlertTests(unittest.TestCase):
         harness.find_control = mock.Mock(return_value=keep_mine)
         harness.name_present = mock.Mock(return_value=False)
 
-        def keep_mine_pressed(control: object, _code: str) -> None:
-            self.assertIs(control, keep_mine)
-            if overwrite_on_keep_mine:
+        def pressed(control: object, _code: str) -> None:
+            source = getattr(control, "control", control)
+            if source is keep_mine and overwrite_on_keep_mine:
+                runtime.write_durable(document, mine)
+            if source is overwrite and overwrite_on_overwrite:
                 runtime.write_durable(document, mine)
 
-        harness.click_control = mock.Mock(side_effect=keep_mine_pressed)
-        if overwrite_on_enter:
-            harness.win32.on_enter = lambda: runtime.write_durable(document, mine)
-        patches = contextlib.ExitStack()
-        self.addCleanup(patches.close)
-        patches.enter_context(mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0))
+        harness.click_control = mock.Mock(side_effect=pressed)
         return harness, app, document
 
-    def test_external_conflict_overwrites_only_after_enter_confirms_the_alert(self) -> None:
+    def test_external_conflict_overwrites_only_after_the_guard_confirms(self) -> None:
         harness, app, document = self.conflict_scenario(
-            overwrite_on_keep_mine=False, overwrite_on_enter=True
+            overwrite_on_keep_mine=False, overwrite_on_overwrite=True
         )
         observations = harness.external_modification(app, document)
         self.assertEqual(
             observations["external_modification_overwritten_source"],
             observations["external_modification_dirty_editor"],
         )
-        self.assertIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
         harness.find_control.assert_called_once()
         self.assertEqual(
             harness.find_control.call_args.args[1:3], (HARNESS.KEEP_MINE_AUTOMATION_ID, "Button")
         )
+        pressed = [call.args[0] for call in harness.click_control.call_args_list]
+        self.assertEqual(len(pressed), 2)
+        self.assertIs(pressed[0], harness.find_control.return_value)
+        self.assertEqual(pressed[1].element_info.name, "Overwrite")
 
-    def test_external_conflict_fails_when_keep_mine_writes_without_the_alert(self) -> None:
+    def test_external_conflict_fails_when_keep_mine_writes_without_the_guard(self) -> None:
         harness, app, document = self.conflict_scenario(
-            overwrite_on_keep_mine=True, overwrite_on_enter=False
+            overwrite_on_keep_mine=True, overwrite_on_overwrite=False
         )
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.external_modification(app, document)
         self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
-        self.assertNotIn(("key", app.hwnd, runtime.VK_RETURN), harness.win32.events)
+        self.assertEqual(harness.click_control.call_count, 1)
 
-    def test_external_conflict_fails_when_enter_never_confirms(self) -> None:
+    def test_external_conflict_fails_when_the_guard_overwrite_never_writes(self) -> None:
         harness, app, document = self.conflict_scenario(
-            overwrite_on_keep_mine=False, overwrite_on_enter=False
+            overwrite_on_keep_mine=False, overwrite_on_overwrite=False
         )
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.external_modification(app, document)
-        self.assertEqual(raised.exception.code, "SYSTEM_ALERT_UNANSWERED")
+        self.assertEqual(raised.exception.code, "OVERWRITE_SAVE_TIMEOUT")
 
 
 class SourceEditorTests(unittest.TestCase):

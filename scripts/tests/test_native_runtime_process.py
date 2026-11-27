@@ -357,6 +357,80 @@ class OwnedProcessTests(unittest.TestCase):
         )
         self.assertEqual(win32.visible_top_level_windows((73, 89)), (101, 103))
 
+    def test_window_facts_name_the_class_owner_and_process_image(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        calls: list[str] = []
+
+        class User32:
+            def GetWindowThreadProcessId(self, _hwnd, output):
+                ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 4242
+                return 1
+
+            def GetClassNameW(self, _hwnd, buffer, _length):
+                buffer.value = "NshWindow"
+                return len("NshWindow") + 1
+
+            def GetWindow(self, _hwnd, index):
+                calls.append(f"owner:{index}")
+                return 73
+
+        class Kernel32:
+            def OpenProcess(self, access, inherit, pid):
+                calls.append(f"open:{access}:{inherit}:{pid}")
+                return 55
+
+            def QueryFullProcessImageNameW(self, process, flags, buffer, _size):
+                calls.append(f"image:{process}:{flags}")
+                buffer.value = r"C:\Program Files\MarkTurbo\markturbo.exe"
+                return 1
+
+            def CloseHandle(self, handle):
+                calls.append(f"close:{handle}")
+                return 1
+
+        win32.user32 = User32()
+        win32.kernel32 = Kernel32()
+
+        self.assertEqual(
+            win32.window_facts(90, 73),
+            {
+                "class_name": "NshWindow",
+                "owned_by_main": True,
+                "process_image": "markturbo.exe",
+            },
+        )
+        self.assertEqual(
+            calls,
+            [
+                f"owner:{runtime.GW_OWNER}",
+                f"open:{runtime.PROCESS_QUERY_LIMITED_INFORMATION}:False:4242",
+                "image:55:0",
+                "close:55",
+            ],
+        )
+
+    def test_window_facts_degrade_an_unreadable_field_to_none(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        process = mock.Mock(return_value=0)
+        win32.kernel32 = SimpleNamespace(OpenProcess=process)
+        win32.user32 = SimpleNamespace(
+            GetWindowThreadProcessId=lambda _hwnd, _output: 0,
+            GetClassNameW=lambda _hwnd, _buffer, _length: 0,
+            GetWindow=lambda _hwnd, _index: 0,
+        )
+
+        self.assertEqual(
+            win32.window_facts(90, 73),
+            {"class_name": None, "owned_by_main": False, "process_image": None},
+        )
+        process.assert_not_called()
+
+    def test_process_image_without_a_queryable_handle_is_none(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        win32.kernel32 = SimpleNamespace(OpenProcess=lambda *_args: 0)
+
+        self.assertIsNone(win32.process_image_name(4242))
+
     def test_launch_subscribes_and_assigns_before_resuming(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             harness, kernel = owned_harness(Path(directory))

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import re
 import socket
 import time
 import uuid
@@ -293,6 +294,9 @@ OBSERVATION_KEYS = (
         "provider_request_count",
     }
 )
+# Recorded only when the visible window set is not exactly the main window,
+# so a PASS never carries it.
+EXTRA_WINDOW_OBSERVATION_KEY = "web_security_extra_windows"
 REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
 
@@ -520,6 +524,34 @@ def validate_cell_results(value: Any) -> None:
 def validate_post_navigation_cell_results(value: Any) -> None:
     if not isinstance(value, list) or any(type(cell) is not bool for cell in value):
         raise ValueError("invalid post-navigation pixel-cell observations")
+
+
+# Extra-window diagnostics: printable class names and a path-free process
+# image file name. The ANSI class of an app window is a fixed name; a window
+# title is never read, because it can contain a document name.
+WINDOW_CLASS_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
+PROCESS_IMAGE_RE = re.compile(r"^[^\\/\x00-\x1f]{1,128}$")
+EXTRA_WINDOW_KEYS = frozenset({"class_name", "owned_by_main", "process_image"})
+
+
+def validate_extra_windows(value: Any) -> None:
+    if not isinstance(value, list):
+        raise ValueError("invalid extra-window observations")
+    for fact in value:
+        if not isinstance(fact, dict) or set(fact) != EXTRA_WINDOW_KEYS:
+            raise ValueError("invalid extra-window observations")
+        class_name = fact["class_name"]
+        if class_name is not None and not (
+            isinstance(class_name, str) and WINDOW_CLASS_RE.fullmatch(class_name)
+        ):
+            raise ValueError("invalid extra-window class")
+        if type(fact["owned_by_main"]) is not bool:
+            raise ValueError("invalid extra-window owner")
+        process_image = fact["process_image"]
+        if process_image is not None and not (
+            isinstance(process_image, str) and PROCESS_IMAGE_RE.fullmatch(process_image)
+        ):
+            raise ValueError("invalid extra-window process image")
 
 
 def canonicalize_fixture_source(
@@ -781,7 +813,7 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
 CONTRACT = evidence.EvidenceContract(
     schema=SCHEMA,
     case_flows=CASE_FLOWS,
-    observation_keys=OBSERVATION_KEYS,
+    observation_keys=OBSERVATION_KEYS | {EXTRA_WINDOW_OBSERVATION_KEY},
     fingerprint_keys=FINGERPRINT_OBSERVATION_KEYS,
     required_observations=REQUIRED_OBSERVATIONS,
     validate_runtime_scan=validate_runtime_scan,
@@ -789,6 +821,7 @@ CONTRACT = evidence.EvidenceContract(
     structured={
         "web_security_cell_results": validate_cell_results,
         "web_security_post_navigation_cell_results": validate_post_navigation_cell_results,
+        EXTRA_WINDOW_OBSERVATION_KEY: validate_extra_windows,
     },
     private_sentinels=(
         DOCUMENT_SENTINEL,
@@ -1248,7 +1281,15 @@ class Goal07Harness(NativeHarness):
         record_network_contacts(observed, network_probes)
         windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
         if windows != (app.hwnd,):
-            raise HarnessFailure("APP_WINDOW_COUNT_UNEXPECTED")
+            # The next run sees what the extra window is, without leaking a
+            # title that could name a document.
+            extras = [
+                self.win32.window_facts(hwnd, app.hwnd) for hwnd in windows if hwnd != app.hwnd
+            ]
+            raise HarnessFailure(
+                "APP_WINDOW_COUNT_UNEXPECTED",
+                observations={EXTRA_WINDOW_OBSERVATION_KEY: extras},
+            )
         if self.win32.foreground_window() != app.hwnd:
             raise HarnessFailure("APP_WINDOW_FOREGROUND_LOST")
         record(observed, "web_security_window_count", len(windows))
@@ -1350,7 +1391,7 @@ class Goal07Harness(NativeHarness):
                         observations.update(run(app, provider, source))
                 with phase("QUIT"):
                     self.quit_via_menu(app)
-                    self.click_lifecycle_decision(app, "Discard")
+                    self.click_quit_decision(app, "Discard")
                     self.wait_process_exit(app)
                 return self._finalize_observations(provider, case_root, app, observations)
             finally:
