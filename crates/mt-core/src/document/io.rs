@@ -87,7 +87,7 @@ impl FileStamp {
 /// useful; fall back to canonical paths while both ends still exist so
 /// equivalent link spellings identify the same on-disk source.
 pub fn paths_match(left: &Path, right: &Path) -> bool {
-    crate::workspace::normalize_path(left) == crate::workspace::normalize_path(right) || {
+    crate::workspace::paths_match(left, right) || {
         #[cfg(any(test, feature = "test-support"))]
         crate::test_probe::note_path_resolution();
         std::fs::canonicalize(left)

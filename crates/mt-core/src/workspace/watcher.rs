@@ -6,7 +6,10 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{Receiver, Sender, channel},
+};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
@@ -39,21 +42,184 @@ impl Change {
 /// Watches a workspace directory.
 ///
 /// The watcher must be kept alive; dropping it stops the notifications.
+/// Watches a workspace directory.
+///
+/// The watcher must be kept alive; dropping it stops the notifications.
+///
+/// Registration and removal run on one worker thread: `notify` queries the
+/// directory and waits for its platform registration to complete, and a
+/// volume that stops responding must block only that thread. The public
+/// methods enqueue a command and return; the worker publishes what it
+/// applied, and the UI classifies events by that applied state. A failed
+/// registration is reported through [`Self::drain_problems`] instead of a
+/// return value, so a caller on the UI thread never waits for the file
+/// system.
 pub struct Watcher {
-    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    commands: Sender<Command>,
     rx: Receiver<Vec<DebouncedEvent>>,
-    root: Option<PathBuf>,
-    /// The root's canonical spelling, resolved once when the root is set: a
-    /// document directory covered under that spelling keeps no separate
-    /// watch, and no subscription re-resolves a path on the UI thread.
-    canonical_root: Option<PathBuf>,
-    document_directories: HashSet<PathBuf>,
+    problems: Receiver<String>,
+    /// What the worker applied: `poll` classifies events by this, never by a
+    /// watch that is not live yet.
+    applied: Arc<Mutex<AppliedWatches>>,
     context_paths: HashSet<PathBuf>,
+}
+
+enum Command {
+    SetRoot(PathBuf),
+    SyncDocumentDirectories(HashSet<PathBuf>),
+    #[cfg(any(test, feature = "test-support"))]
+    Flush(Sender<()>),
+}
+
+#[derive(Default)]
+struct AppliedWatches {
+    root: Option<PathBuf>,
+    document_directories: HashSet<PathBuf>,
+    root_generation: u64,
+    directory_generation: u64,
+}
+
+struct WatchWorker {
+    debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    root: Option<PathBuf>,
+    canonical_root: Option<PathBuf>,
+    desired_directories: HashSet<PathBuf>,
+    document_directories: HashSet<PathBuf>,
+    applied: Arc<Mutex<AppliedWatches>>,
+    problems: Sender<String>,
 }
 
 /// Debounce window. Long enough to coalesce an agent's multi-file write, short
 /// enough that a human save feels immediate.
 const DEBOUNCE: Duration = Duration::from_millis(300);
+
+impl WatchWorker {
+    fn run(mut self, commands: Receiver<Command>) {
+        while let Ok(command) = commands.recv() {
+            match command {
+                Command::SetRoot(root) => self.set_root(root),
+                Command::SyncDocumentDirectories(directories) => {
+                    self.desired_directories = directories;
+                    self.refresh_document_directories();
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                Command::Flush(done) => {
+                    let _ = done.send(());
+                }
+            }
+        }
+    }
+
+    fn set_root(&mut self, root: PathBuf) {
+        if self.root.as_deref() == Some(root.as_path()) {
+            return;
+        }
+        if let Some(previous) = self.root.take()
+            && let Err(error) = self.unwatch(&previous)
+        {
+            self.problem(format!(
+                "File watcher could not stop watching the workspace: {error}"
+            ));
+        }
+        if let Err(error) = self.watch(&root, RecursiveMode::Recursive) {
+            self.problem(format!(
+                "File watcher could not watch the workspace: {error}"
+            ));
+            // A root that could not be watched is never kept; the desired
+            // directories fall back to their own non-recursive watches.
+            self.publish_root(None);
+            self.refresh_document_directories();
+            return;
+        }
+        self.canonical_root = std::fs::canonicalize(&root)
+            .ok()
+            .map(|canonical| normalize_path(&canonical));
+        self.root = Some(root.clone());
+        self.refresh_document_directories();
+        self.publish_root(Some(root));
+    }
+
+    fn refresh_document_directories(&mut self) {
+        let wanted: HashSet<PathBuf> = self
+            .desired_directories
+            .iter()
+            .filter(|directory| !self.covered(directory))
+            .cloned()
+            .collect();
+
+        let removed: Vec<PathBuf> = self
+            .document_directories
+            .difference(&wanted)
+            .cloned()
+            .collect();
+        for directory in removed {
+            if let Err(error) = self.unwatch(&directory) {
+                self.problem(format!(
+                    "File watcher could not stop watching a document directory: {error}"
+                ));
+            }
+            self.document_directories.remove(&directory);
+        }
+
+        let added: Vec<PathBuf> = wanted
+            .difference(&self.document_directories)
+            .cloned()
+            .collect();
+        for directory in added {
+            if let Err(error) = self.watch(&directory, RecursiveMode::NonRecursive) {
+                self.problem(format!(
+                    "File watcher could not watch a document directory: {error}"
+                ));
+                continue;
+            }
+            self.document_directories.insert(directory);
+        }
+
+        let mut applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if applied.document_directories != self.document_directories {
+            applied.document_directories = self.document_directories.clone();
+            applied.directory_generation = applied.directory_generation.wrapping_add(1);
+        }
+    }
+
+    fn covered(&self, directory: &Path) -> bool {
+        self.root
+            .as_deref()
+            .is_some_and(|root| covered_by(directory, root))
+            || self
+                .canonical_root
+                .as_deref()
+                .is_some_and(|root| covered_by(directory, root))
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_probe::wait_for_watch_registration(path);
+        self.debouncer.watch(path, mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        crate::test_probe::wait_for_watch_registration(path);
+        self.debouncer.unwatch(path)
+    }
+
+    fn publish_root(&self, root: Option<PathBuf>) {
+        let mut applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        applied.root = root;
+        applied.root_generation = applied.root_generation.wrapping_add(1);
+    }
+
+    fn problem(&self, problem: String) {
+        let _ = self.problems.send(problem);
+    }
+}
 
 /// The one spelling watches are registered and events are matched by.
 ///
@@ -62,19 +228,20 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 /// use the plain form. A literal comparison of the two fails exactly where it
 /// matters most — a removed path has no canonical spelling left — so the
 /// verbatim prefix is stripped before anything is registered or matched. The
-/// same Windows file systems are case-insensitive, so the plain spelling is
-/// case-folded too: `C:\Notes` and `C:\notes` are one path, and a delete
-/// event that spells the directory differently still matches the tab that
-/// opened through it. Unix keeps its case.
+/// spelling's case is kept: a directory with the case-sensitivity attribute
+/// turned on spells `Plan.md` and `plan.md` as two different files, and
+/// folding them would let a watch register — or a tab open — the wrong one.
+/// The case-insensitive comparison on Windows is a fallback, used only when
+/// no exact spelling matches ([`paths_match`], [`path_is_covered`]).
 ///
-/// The result is a comparison key, never a path for I/O by itself: a caller
-/// registers or opens with the original spelling.
+/// The result is a path: a caller registers or opens with it as it was given,
+/// minus a Windows verbatim prefix.
 pub fn normalize_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
 
-        let plain = if let Some(Component::Prefix(prefix)) = path.components().next() {
+        if let Some(Component::Prefix(prefix)) = path.components().next() {
             match prefix.kind() {
                 Prefix::VerbatimDisk(letter) => {
                     let mut plain = PathBuf::from(format!("{}:\\", letter as char));
@@ -98,8 +265,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
             }
         } else {
             path.to_path_buf()
-        };
-        PathBuf::from(plain.to_string_lossy().to_lowercase())
+        }
     }
     #[cfg(not(windows))]
     {
@@ -107,14 +273,64 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
-/// The one key a document is matched by: the normalized spelling of its
-/// path and, when it was opened through a symbolic link, the normalized
-/// spelling of the resolved target.
+#[cfg(windows)]
+fn fold_case(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+/// Whether two paths name the same entry: the exact spelling first and, on
+/// Windows only when the exact spelling does not match, the case-insensitive
+/// one. `Plan.md` and `plan.md` in a case-sensitive directory stay two
+/// paths.
+pub fn paths_match(left: &Path, right: &Path) -> bool {
+    same_path(&normalize_path(left), &normalize_path(right))
+}
+
+/// Whether `path` is `root` or below it, with the same exact-first,
+/// Windows-only case-insensitive fallback as [`paths_match`].
+pub fn path_is_covered(path: &Path, root: &Path) -> bool {
+    covered_by(&normalize_path(path), &normalize_path(root))
+}
+
+fn covered_by(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        fold_case(path).starts_with(fold_case(root))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        fold_case(left) == fold_case(right)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// The key a document is matched by: the normalized spelling of its path
+/// and, when it was opened through a symbolic link, the normalized spelling
+/// of the resolved target.
 ///
-/// A key is a comparison value, never a path for I/O: on Windows it may name
-/// no file system entry under the key's casing. Watcher events, drop
-/// de-duplication and `open_file` compare these keys, so matching never
-/// resolves a path while the UI thread dispatches.
+/// The key keeps the spelling's case. A caller matches the exact spelling
+/// first and only falls back to [`Self::reads_ignoring_case`] when no
+/// identity matches exactly, so a directory that keeps `Plan.md` and
+/// `plan.md` apart opens, watches and reloads both.
+///
+/// A key is a path as the document was opened (minus a Windows verbatim
+/// prefix), never a folded comparison value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchIdentity {
     path: PathBuf,
@@ -142,10 +358,31 @@ impl WatchIdentity {
         self.target.as_deref()
     }
 
-    /// Whether `key` (already normalized) names the document's path or, for
-    /// a symbolic link, its resolved target.
-    pub fn reads(&self, key: &Path) -> bool {
+    /// Whether `key` names the document's path or, for a symbolic link, its
+    /// resolved target, with the exact spelling.
+    pub fn reads_exactly(&self, key: &Path) -> bool {
         self.path == key || self.target.as_deref() == Some(key)
+    }
+
+    /// The Windows case-insensitive match, used only when no identity
+    /// matches `key` exactly. On other platforms this is
+    /// [`Self::reads_exactly`].
+    pub fn reads_ignoring_case(&self, key: &Path) -> bool {
+        if self.reads_exactly(key) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            same_path(&self.path, key)
+                || self
+                    .target
+                    .as_deref()
+                    .is_some_and(|target| same_path(target, key))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     }
 }
 
@@ -186,12 +423,26 @@ impl Watcher {
             NoCache,
             notify::Config::default(),
         )?;
-        Ok(Self {
-            _debouncer: debouncer,
-            rx,
+        let (commands, command_rx) = channel();
+        let (problems, problem_rx) = channel();
+        let applied = Arc::new(Mutex::new(AppliedWatches::default()));
+        let worker = WatchWorker {
+            debouncer,
             root: None,
             canonical_root: None,
+            desired_directories: HashSet::new(),
             document_directories: HashSet::new(),
+            applied: applied.clone(),
+            problems,
+        };
+        std::thread::Builder::new()
+            .name("markturbo-watcher".to_owned())
+            .spawn(move || worker.run(command_rx))?;
+        Ok(Self {
+            commands,
+            rx,
+            problems: problem_rx,
+            applied,
             context_paths: HashSet::new(),
         })
     }
@@ -202,29 +453,14 @@ impl Watcher {
     /// directory outside it is watched by
     /// [`Self::sync_document_directories`] non-recursively, and a document
     /// directory that the new root now covers has its separate watch removed.
+    /// The registration runs on the worker: this returns once the command is
+    /// queued.
     pub fn set_root(&mut self, root: &Path) -> anyhow::Result<()> {
         let root = normalize_path(root);
-        if self.root.as_deref() == Some(root.as_path()) {
+        if self.root() == Some(root.clone()) {
             return Ok(());
         }
-        if let Some(previous) = self.root.take() {
-            self._debouncer.unwatch(&previous)?;
-        }
-        let covered: Vec<PathBuf> = self
-            .document_directories
-            .iter()
-            .filter(|directory| directory.starts_with(&root))
-            .cloned()
-            .collect();
-        for directory in covered {
-            self._debouncer.unwatch(&directory)?;
-            self.document_directories.remove(&directory);
-        }
-        self._debouncer.watch(&root, RecursiveMode::Recursive)?;
-        self.canonical_root = std::fs::canonicalize(&root)
-            .ok()
-            .map(|canonical| normalize_path(&canonical));
-        self.root = Some(root);
+        self.commands.send(Command::SetRoot(root))?;
         Ok(())
     }
 
@@ -232,46 +468,18 @@ impl Watcher {
     ///
     /// Save As and Open File can give a document a path outside the workspace
     /// tree. Those parents remain bounded by the open tab set and disappear
-    /// when the last document using them closes or moves.
+    /// when the last document using them closes or moves. The diff and the
+    /// registrations run on the worker: this returns once the set is queued.
     pub fn sync_document_directories(
         &mut self,
         directories: impl IntoIterator<Item = PathBuf>,
     ) -> anyhow::Result<()> {
-        // The caller may hold the canonical spelling (`\\?\C:\…` on Windows,
-        // from `canonicalize`) while `set_root` was handed the spelling the
-        // user's folder picker produced; a directory covered under either
-        // spelling is already watched recursively. Both are stored keys: the
-        // comparison touches no file system.
-        let root = self.root.as_deref();
-        let canonical_root = self.canonical_root.as_deref();
-        let desired: HashSet<_> = directories
+        let desired: HashSet<PathBuf> = directories
             .into_iter()
             .map(|directory| normalize_path(&directory))
-            .filter(|directory| {
-                !root.is_some_and(|root| directory.starts_with(root))
-                    && !canonical_root.is_some_and(|root| directory.starts_with(root))
-            })
             .collect();
-
-        let removed: Vec<_> = self
-            .document_directories
-            .difference(&desired)
-            .cloned()
-            .collect();
-        for directory in removed {
-            self._debouncer.unwatch(&directory)?;
-            self.document_directories.remove(&directory);
-        }
-
-        let added: Vec<_> = desired
-            .difference(&self.document_directories)
-            .cloned()
-            .collect();
-        for directory in added {
-            self._debouncer
-                .watch(&directory, RecursiveMode::NonRecursive)?;
-            self.document_directories.insert(directory);
-        }
+        self.commands
+            .send(Command::SyncDocumentDirectories(desired))?;
         Ok(())
     }
 
@@ -294,13 +502,20 @@ impl Watcher {
     /// Returns an empty vec when nothing happened, so this is safe to poll from
     /// a UI tick.
     pub fn poll(&self) -> Vec<Change> {
+        let (root, directories) = {
+            let applied = self
+                .applied
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (applied.root.clone(), applied.document_directories.clone())
+        };
         let mut changes = Vec::new();
         while let Ok(events) = self.rx.try_recv() {
             for event in events {
                 changes.extend(classify(
                     &event,
-                    self.root.as_deref(),
-                    &self.document_directories,
+                    root.as_deref(),
+                    &directories,
                     &self.context_paths,
                 ));
             }
@@ -308,15 +523,55 @@ impl Watcher {
         dedup(changes)
     }
 
-    pub fn root(&self) -> Option<&Path> {
-        self.root.as_deref()
+    pub fn root(&self) -> Option<PathBuf> {
+        self.applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .root
+            .clone()
+    }
+
+    /// Take the registration failures the worker recorded, oldest first.
+    ///
+    /// A caller drains this on its own tick; a failure never blocks the file
+    /// operations that continue to work without live watching.
+    pub fn drain_problems(&self) -> Vec<String> {
+        self.problems.try_iter().collect()
+    }
+
+    /// The applied watch generations: the root's and the document
+    /// directories'. A change tells the caller to re-derive what the watch
+    /// now covers.
+    pub fn applied_generations(&self) -> (u64, u64) {
+        let applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (applied.root_generation, applied.directory_generation)
+    }
+
+    /// Wait until the worker applied every earlier command. Test-only: the
+    /// production callers never block on registration.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn flush(&self) {
+        let (done, wait) = channel();
+        if self.commands.send(Command::Flush(done)).is_ok() {
+            let _ = wait.recv();
+        }
     }
 
     /// The non-recursive document directories watched right now, for a probe
     /// that pins a tab's watch being added and removed.
     #[cfg(any(test, feature = "test-support"))]
     pub fn watched_document_directories(&self) -> Vec<PathBuf> {
-        self.document_directories.iter().cloned().collect()
+        self.flush();
+        self.applied
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .document_directories
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -345,13 +600,15 @@ fn classify(
         .enumerate()
         .map(|(index, path)| (index, normalize_path(path)))
         .filter(|(_, path)| {
-            if context_paths.contains(path.as_path()) {
+            if context_paths.contains(path.as_path())
+                || context_paths.iter().any(|context| same_path(context, path))
+            {
                 return true;
             }
             let covering = root
                 .into_iter()
                 .chain(document_directories.iter().map(PathBuf::as_path))
-                .filter(|root| path.starts_with(root))
+                .filter(|root| covered_by(path, root))
                 .max_by_key(|root| root.components().count());
             match covering {
                 Some(root) => !is_noise(path, root),
@@ -392,9 +649,9 @@ fn classify(
         .collect()
 }
 
-/// Collapse repeats, keeping the last verdict per path.
-///
-/// A save often arrives as create+modify; reporting both would prompt twice.
+// Collapse repeats, keeping the last verdict per path: a save arrives as
+// create+modify, while two Windows paths that differ only in case are two
+// files and each keeps its own verdict.
 fn dedup(changes: Vec<Change>) -> Vec<Change> {
     let mut seen: Vec<Change> = Vec::with_capacity(changes.len());
     for change in changes {
@@ -419,10 +676,13 @@ mod tests {
     }
 
     /// The watcher shape every rooted test had before the root became
-    /// optional: no watches, then one recursive root watch.
+    /// optional: no watches, then one recursive root watch. The flush waits
+    /// for the worker to apply it, so a write that follows cannot race the
+    /// registration.
     fn rooted(root: &Path) -> Watcher {
         let mut watcher = Watcher::new().unwrap();
         watcher.set_root(root).unwrap();
+        watcher.flush();
         watcher
     }
 
@@ -563,10 +823,14 @@ mod tests {
                 events
                     .iter()
                     .flat_map(|event| {
+                        let applied = watcher
+                            .applied
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         classify(
                             event,
-                            watcher.root.as_deref(),
-                            &watcher.document_directories,
+                            applied.root.as_deref(),
+                            &applied.document_directories,
                             &watcher.context_paths,
                         )
                     })
@@ -629,6 +893,7 @@ mod tests {
         watcher
             .sync_document_directories([external_root.clone()])
             .unwrap();
+        watcher.flush();
         std::fs::write(&path, "one\n").unwrap();
         let created = Change::Created(path.clone());
         assert_eq!(
@@ -643,6 +908,7 @@ mod tests {
         drop(watcher);
         let mut watcher = rooted(&primary_root);
         watcher.sync_document_directories([external_root]).unwrap();
+        watcher.flush();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -684,17 +950,14 @@ mod tests {
         watcher
             .sync_document_directories([first.path().to_path_buf(), second.path().to_path_buf()])
             .unwrap();
-        assert_eq!(watcher.document_directories.len(), 2);
+        assert_eq!(watcher.watched_document_directories().len(), 2);
 
         watcher
             .sync_document_directories([second.path().to_path_buf()])
             .unwrap();
-        assert_eq!(watcher.document_directories.len(), 1);
-        assert!(
-            watcher
-                .document_directories
-                .contains(&normalize_path(second.path()))
-        );
+        let watched = watcher.watched_document_directories();
+        assert_eq!(watched.len(), 1);
+        assert!(watched.contains(&normalize_path(second.path())));
     }
 
     #[test]
@@ -729,6 +992,7 @@ mod tests {
         let mut watcher = Watcher::new().unwrap();
         assert_eq!(watcher.root(), None);
         watcher.sync_document_directories([root.clone()]).unwrap();
+        watcher.flush();
         std::fs::write(&path, "one\n").unwrap();
         assert_eq!(
             receive_change(&watcher, &path, |change| matches!(
@@ -750,12 +1014,13 @@ mod tests {
 
         let mut watcher = rooted(&first_root);
         watcher.sync_document_directories([inner.clone()]).unwrap();
-        assert!(watcher.document_directories.contains(&inner));
+        assert!(watcher.watched_document_directories().contains(&inner));
 
         watcher.set_root(&second_root).unwrap();
-        assert_eq!(watcher.root(), Some(second_root.as_path()));
+        watcher.flush();
+        assert_eq!(watcher.root(), Some(second_root.clone()));
         assert!(
-            !watcher.document_directories.contains(&inner),
+            !watcher.watched_document_directories().contains(&inner),
             "a directory the new root covers keeps no separate watch"
         );
 
@@ -782,7 +1047,7 @@ mod tests {
             .sync_document_directories([canonical.clone()])
             .unwrap();
         assert!(
-            watcher.document_directories.is_empty(),
+            watcher.watched_document_directories().is_empty(),
             "one directory must not hold a recursive and a non-recursive watch"
         );
     }
@@ -804,11 +1069,19 @@ mod tests {
     }
 
     #[test]
-    fn setting_a_root_that_cannot_be_watched_is_an_error_the_callers_record() {
+    fn setting_a_root_that_cannot_be_watched_is_a_problem_the_callers_drain() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such-folder");
         let mut watcher = Watcher::new().unwrap();
-        assert!(watcher.set_root(&missing).is_err());
+        watcher.set_root(&missing).unwrap();
+        watcher.flush();
+        assert!(
+            watcher
+                .drain_problems()
+                .iter()
+                .any(|problem| problem.contains("watch the workspace")),
+            "a failed root watch is reported to the caller"
+        );
         assert_eq!(
             watcher.root(),
             None,
@@ -845,35 +1118,102 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn verbatim_windows_paths_normalize_to_the_plain_folded_spelling() {
+    fn verbatim_windows_paths_normalize_to_the_plain_spelling_keeping_case() {
         assert_eq!(
             normalize_path(Path::new(r"\\?\C:\notes\plan.md")),
-            PathBuf::from(r"c:\notes\plan.md")
+            PathBuf::from(r"C:\notes\plan.md")
         );
         assert_eq!(
             normalize_path(Path::new(r"\\?\UNC\server\share\Plan.MD")),
-            PathBuf::from(r"\\server\share\plan.md")
+            PathBuf::from(r"\\server\share\Plan.MD")
         );
         assert_eq!(
             normalize_path(Path::new(r"C:\Notes\Plan.MD")),
-            PathBuf::from(r"c:\notes\plan.md")
+            PathBuf::from(r"C:\Notes\Plan.MD")
         );
         assert_eq!(
             normalize_path(Path::new(r"\\?\Volume{8f2a}\Plan.MD")),
-            PathBuf::from(r"\\?\volume{8f2a}\plan.md")
+            PathBuf::from(r"\\?\Volume{8f2a}\Plan.MD")
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn windows_keys_fold_case_through_a_link_and_its_target() {
+    fn windows_keys_keep_case_and_match_it_only_after_an_exact_miss() {
         let identity = WatchIdentity::of(
             Path::new(r"C:\Notes\Link.md"),
             Some(Path::new(r"\\?\C:\NOTES\Real.md")),
         );
-        assert!(identity.reads(&normalize_path(Path::new(r"c:\notes\link.MD"))));
-        assert!(identity.reads(&normalize_path(Path::new(r"C:\notes\REAL.md"))));
-        assert!(!identity.reads(&normalize_path(Path::new(r"c:\notes\other.md"))));
+        assert!(identity.reads_exactly(&normalize_path(Path::new(r"C:\Notes\Link.md"))));
+        assert!(identity.reads_exactly(&normalize_path(Path::new(r"C:\NOTES\Real.md"))));
+        assert!(!identity.reads_exactly(&normalize_path(Path::new(r"c:\notes\link.md"))));
+        assert!(identity.reads_ignoring_case(&normalize_path(Path::new(r"c:\notes\link.MD"))));
+        assert!(identity.reads_ignoring_case(&normalize_path(Path::new(r"C:\notes\REAL.md"))));
+        assert!(!identity.reads_ignoring_case(&normalize_path(Path::new(r"c:\notes\other.md"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn two_names_that_differ_only_in_case_are_two_documents() {
+        let upper = WatchIdentity::of(Path::new(r"C:\Notes\Plan.md"), None);
+        let lower = WatchIdentity::of(Path::new(r"C:\Notes\plan.md"), None);
+        assert_ne!(upper, lower, "a case-sensitive directory holds two files");
+        assert!(upper.reads_exactly(&normalize_path(Path::new(r"C:\Notes\Plan.md"))));
+        assert!(!upper.reads_exactly(&normalize_path(Path::new(r"C:\Notes\plan.md"))));
+        assert!(lower.reads_exactly(&normalize_path(Path::new(r"C:\Notes\plan.md"))));
+    }
+
+    #[test]
+    fn an_exact_match_wins_over_a_case_insensitive_one_when_both_would_match() {
+        let upper = WatchIdentity::of(Path::new("Plan.md"), None);
+        let lower = WatchIdentity::of(Path::new("plan.md"), None);
+        let identities = [upper, lower];
+        let key = normalize_path(Path::new("Plan.md"));
+        assert_eq!(
+            identities
+                .iter()
+                .position(|identity| identity.reads_exactly(&key)),
+            Some(0),
+            "the exact spelling names the first document only"
+        );
+        let miss = normalize_path(Path::new("PLAN.MD"));
+        assert!(
+            !identities
+                .iter()
+                .any(|identity| identity.reads_exactly(&miss)),
+            "no document spells the miss exactly"
+        );
+        #[cfg(windows)]
+        assert!(
+            identities
+                .iter()
+                .any(|identity| identity.reads_ignoring_case(&miss)),
+            "the miss falls back to the case-insensitive match on Windows"
+        );
+    }
+
+    #[test]
+    fn paths_match_exactly_first_and_cover_prefixes_the_same_way() {
+        assert!(paths_match(
+            Path::new("/notes/plan.md"),
+            Path::new("/notes/plan.md")
+        ));
+        let case_only = paths_match(Path::new("/notes/plan.md"), Path::new("/notes/plan.MD"));
+        #[cfg(windows)]
+        assert!(
+            case_only,
+            "Windows falls back to the case-insensitive match"
+        );
+        #[cfg(not(windows))]
+        assert!(!case_only, "Unix keeps its case");
+        assert!(path_is_covered(
+            Path::new("/notes/a/b.md"),
+            Path::new("/notes")
+        ));
+        assert!(!path_is_covered(
+            Path::new("/customize/a.md"),
+            Path::new("/custom")
+        ));
     }
 
     #[cfg(not(windows))]
@@ -890,9 +1230,10 @@ mod tests {
             Path::new("/notes/Link.md"),
             Some(Path::new("/Notes/Real.md")),
         );
-        assert!(identity.reads(Path::new("/notes/Link.md")));
-        assert!(identity.reads(Path::new("/Notes/Real.md")));
-        assert!(!identity.reads(Path::new("/notes/link.md")));
+        assert!(identity.reads_exactly(Path::new("/notes/Link.md")));
+        assert!(identity.reads_exactly(Path::new("/Notes/Real.md")));
+        assert!(!identity.reads_exactly(Path::new("/notes/link.md")));
+        assert!(!identity.reads_ignoring_case(Path::new("/notes/link.md")));
     }
 
     #[test]
@@ -905,6 +1246,17 @@ mod tests {
             Change::Created(b.clone()),
         ]);
         assert_eq!(out, vec![Change::Modified(a), Change::Created(b)]);
+    }
+
+    #[test]
+    fn dedup_keeps_paths_that_differ_only_in_case_separate() {
+        let upper = PathBuf::from("Plan.md");
+        let lower = PathBuf::from("plan.md");
+        let out = dedup(vec![
+            Change::Modified(upper.clone()),
+            Change::Modified(lower.clone()),
+        ]);
+        assert_eq!(out, vec![Change::Modified(upper), Change::Modified(lower)]);
     }
 
     #[test]

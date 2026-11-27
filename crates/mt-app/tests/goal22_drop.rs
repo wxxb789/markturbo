@@ -97,6 +97,16 @@ fn drag_leave(app: &mut Headless) {
     dispatch(app, EventKind::FileDragLeave, EventPayload::None);
 }
 
+#[cfg(windows)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(unix)]
+fn symlink_file(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
 #[test]
 fn a_drop_opens_each_document_and_the_last_one_is_active() {
     let directory = tempfile::tempdir().expect("document dir");
@@ -677,6 +687,52 @@ fn a_superseded_mixed_drop_publishes_no_skipped_notice() {
 }
 
 #[test]
+fn a_superseded_document_only_drop_publishes_no_skipped_notice() {
+    let first = tempfile::tempdir().expect("dropped dir");
+    let other = tempfile::tempdir().expect("picked folder");
+    let config = tempfile::tempdir().expect("config dir");
+    let doc = first.path().join("slow.md");
+    let picture = first.path().join("photo.png");
+    let release = config.path().join("release-slow-doc-only-drop");
+    std::fs::write(&doc, "# Slow\n").expect("write slow.md");
+    std::fs::write(&picture, b"\x89PNG").expect("write photo.png");
+    std::fs::write(other.path().join("other.md"), "# Other\n").expect("write other.md");
+
+    let mut app = start(config.path(), None);
+    app.wait_for("id:welcome-open-folder").expect("the welcome");
+
+    // A document-only drop: no folder follows it, but the skipped picture
+    // would normally be counted once the slow read lands.
+    mt_app::test_vault::gate_read(&doc, &release);
+    app.drop_files("id:shell", vec![file_uri(&doc), file_uri(&picture)])
+        .expect("drop the slow document and the picture");
+    support::wait_for_marker(
+        &mut app,
+        "the dropped read to reach its gate",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::gate_reads_started(&doc) >= 1,
+    );
+
+    app.on_pick_paths(vec![other.path().to_path_buf()])
+        .expect("answer the picker");
+    app.press("id:welcome-open-folder").expect("open folder B");
+    app.wait_for("id:workspace-home-file >> text:other.md")
+        .expect("B is the workspace");
+
+    std::fs::write(&release, b"").expect("let the slow read finish");
+    app.wait(Duration::from_millis(1_500))
+        .expect("let the drop land");
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Skipped")),
+        "a superseded document-only drop publishes no skipped count: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
 fn a_drop_behind_the_review_consent_changes_nothing() {
     let directory = tempfile::tempdir().expect("document dir");
     let config = tempfile::tempdir().expect("config dir");
@@ -798,6 +854,83 @@ fn a_slow_drop_never_overrides_a_newer_workspace_choice() {
         .expect("filter to B's file");
     app.wait_for("text:other.md")
         .expect("B stays the workspace");
+}
+
+#[test]
+fn dropping_a_symlink_to_an_open_target_focuses_the_existing_tab() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let target = workspace.path().join("real.md");
+    std::fs::write(&target, "# Real\n").expect("write the target");
+    let link = workspace.path().join("link.md");
+    if let Err(error) = symlink_file(&target, &link) {
+        eprintln!("skipping file-symlink test: {error}");
+        return;
+    }
+
+    let mut app = start(config.path(), Some(workspace.path()));
+    app.wait_for("id:workspace-home")
+        .expect("the workspace home");
+    app.press("id:workspace-home >> label:real.md")
+        .expect("open the target");
+    app.wait_for("text:# Real").expect("the target document");
+    assert_eq!(open_tabs(&app), 1, "the target is one tab");
+
+    app.drop_files("id:shell", vec![file_uri(&link)])
+        .expect("drop the link");
+    app.wait(Duration::from_millis(800))
+        .expect("let the drop commit");
+    assert_eq!(
+        open_tabs(&app),
+        1,
+        "a link to an open target focuses its tab: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_superseded_drops_read_failure_publishes_no_notice() {
+    let first = tempfile::tempdir().expect("dropped dir");
+    let other = tempfile::tempdir().expect("picked folder");
+    let config = tempfile::tempdir().expect("config dir");
+    let doc = first.path().join("slow.md");
+    let release = config.path().join("release-failing-drop-read");
+    std::fs::write(&doc, "# Slow\n").expect("write slow.md");
+    std::fs::write(other.path().join("other.md"), "# Other\n").expect("write other.md");
+
+    let mut app = start(config.path(), None);
+    app.wait_for("id:welcome-open-folder").expect("the welcome");
+
+    // The drop's read parks, then fails once released — after folder B was
+    // opened, so the older drop no longer owns any notice.
+    mt_core::test_probe::fail_next_read(&doc);
+    mt_app::test_vault::gate_read(&doc, &release);
+    app.drop_files("id:shell", vec![file_uri(&doc)])
+        .expect("drop the slow document");
+    support::wait_for_marker(
+        &mut app,
+        "the dropped read to reach its gate",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::gate_reads_started(&doc) >= 1,
+    );
+
+    app.on_pick_paths(vec![other.path().to_path_buf()])
+        .expect("answer the picker");
+    app.press("id:welcome-open-folder").expect("open folder B");
+    app.wait_for("id:workspace-home-file >> text:other.md")
+        .expect("B is the workspace");
+
+    std::fs::write(&release, b"").expect("let the failing read return");
+    app.wait(Duration::from_millis(1_500))
+        .expect("let the drop land");
+    assert!(
+        !app.screen()
+            .texts()
+            .iter()
+            .any(|text| text.contains("Open failed")),
+        "a superseded drop publishes no read failure: {:?}",
+        app.screen().texts()
+    );
 }
 
 #[test]

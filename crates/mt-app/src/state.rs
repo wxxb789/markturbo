@@ -210,13 +210,22 @@ impl Tab {
         }
     }
 
-    /// Whether `key` (a normalized path) names this tab's document: its own
-    /// path, a symbolic link's resolved target, or a target a read detected
-    /// before the conflict resolved.
-    fn reads_key(&self, key: &Path) -> bool {
+    // Exact spelling first; the case-insensitive match is the Windows
+    // fallback a caller takes only when no tab matches exactly.
+    fn reads_key_exactly(&self, key: &Path) -> bool {
         !self.untitled
-            && (self.watch.borrow().reads(key)
+            && (self.watch.borrow().reads_exactly(key)
                 || self.detected_target.borrow().as_deref() == Some(key))
+    }
+
+    fn reads_key_ignoring_case(&self, key: &Path) -> bool {
+        !self.untitled
+            && (self.watch.borrow().reads_ignoring_case(key)
+                || self
+                    .detected_target
+                    .borrow()
+                    .as_deref()
+                    .is_some_and(|target| mt_core::workspace::paths_match(target, key)))
     }
 }
 
@@ -525,16 +534,20 @@ pub struct AppState {
     /// The latest folder open's request token: a slower earlier scan must
     /// not commit its root, files, context, recents or status.
     folder_request: Rc<Cell<u64>>,
-    /// The latest workspace-tree refresh's request token: a slower earlier
-    /// scan must not commit its entries over a newer one.
+    // Shared by the watcher's refresh and Save As: a slower earlier scan of
+    // either kind must not commit its entries over a newer one.
     tree_refresh: Rc<Cell<u64>>,
+    // The root watch going live re-scans the tree; a document-directory
+    // watch-set change re-checks open tabs once their watches are live.
+    watcher_generations: Rc<Cell<(u64, u64)>>,
     /// The filesystem watcher, created when the first folder or document
     /// needs one. `None` until then, and after a watcher that could not
     /// start (saves keep their own check).
     watcher: Rc<RefCell<Option<mt_core::workspace::Watcher>>>,
     /// Why live watching is off, when it is: a diagnostic, never a blocking
-    /// error.
-    watcher_issue: Rc<RefCell<Option<String>>>,
+    /// error. A signal so a surface that shows it re-renders when the
+    /// watcher reports a failure after the fact.
+    watcher_issue: Signal<Option<String>>,
     /// What a file drag hovering over the window offers; `None` when none is.
     /// The drop screen draws it.
     pub drop_offer: Signal<Option<drop::DropOffer>>,
@@ -542,9 +555,6 @@ pub struct AppState {
     /// the source editor plays its slip once per new marker.
     pub reload_slip: Signal<Option<(u64, u64)>>,
     slip_generation: Rc<Cell<u64>>,
-    /// The latest Save As inventory refresh's request token, so a slower
-    /// earlier scan never commits its entries over a newer one.
-    folder_refresh_request: Rc<Cell<u64>>,
     #[cfg(test)]
     pub(crate) focus_last: Signal<Option<FocusTarget>>,
     next_id: Rc<Cell<u64>>,
@@ -1173,12 +1183,12 @@ impl AppState {
             settings_scroll_offset: Rc::new(Cell::new(0.0)),
             folder_request: Rc::new(Cell::new(0)),
             tree_refresh: Rc::new(Cell::new(0)),
+            watcher_generations: Rc::new(Cell::new((0, 0))),
             watcher: Rc::new(RefCell::new(None)),
-            watcher_issue: Rc::new(RefCell::new(None)),
+            watcher_issue: signal(None),
             drop_offer: signal(None),
             reload_slip: signal(None),
             slip_generation: Rc::new(Cell::new(0)),
-            folder_refresh_request: Rc::new(Cell::new(0)),
             #[cfg(test)]
             focus_last: signal(None),
             next_id: Rc::new(Cell::new(1)),
@@ -1700,7 +1710,8 @@ impl AppState {
         }
     }
 
-    /// Save As changes the inventory, not the workspace or its Context.
+    // The scan shares one request counter with the watcher's tree refresh:
+    // an older scan of either kind never commits over a newer one.
     fn refresh_workspace_entries(&self, saved: &Path) {
         let Some(root) = self
             .root
@@ -1710,8 +1721,8 @@ impl AppState {
             return;
         };
         let workspace_request = self.folder_request.get();
-        let refresh = self.folder_refresh_request.get().wrapping_add(1);
-        self.folder_refresh_request.set(refresh);
+        let refresh = self.tree_refresh.get().wrapping_add(1);
+        self.tree_refresh.set(refresh);
         let state = self.clone();
         self.spawn_task(async move {
             let scanned = blocking({
@@ -1719,10 +1730,10 @@ impl AppState {
                 move || scan_workspace_entries(&root)
             })
             .await;
-            // A newer refresh wins, but a refresh never supersedes a folder
+            // A newer scan wins, but a refresh never supersedes a folder
             // open (including one already in flight when Save As finished).
             if state.folder_request.get() == workspace_request
-                && state.folder_refresh_request.get() == refresh
+                && state.tree_refresh.get() == refresh
                 && state
                     .root
                     .with_untracked(|current| current.as_ref() == Some(&root))
@@ -1770,11 +1781,18 @@ impl AppState {
                 }
             };
             let opened = loaded.path.clone();
+            let resolved = loaded.resolved_target().map(Path::to_path_buf);
             // Two quick opens of one path both pass the check above while
             // their reads are in flight: the read that lands first owns the
             // tab, and a later answer focuses it instead of inserting a
-            // duplicate no tree row could follow.
-            if let Some(tab) = state.tab_showing(&opened) {
+            // duplicate no tree row could follow. A read through a symbolic
+            // link also matches the tab already showing its resolved target.
+            let existing = state.tab_showing(&opened).or_else(|| {
+                resolved
+                    .as_deref()
+                    .and_then(|target| state.tab_showing(target))
+            });
+            if let Some(tab) = existing {
                 #[cfg(any(test, feature = "test-vault"))]
                 crate::test_vault::note_duplicate_open(&opened);
                 state.set_active(tab.id);
@@ -1788,16 +1806,20 @@ impl AppState {
         });
     }
 
-    /// The open tab that reads `path`: the normalized key names the literal
-    /// spelling, a symbolic link's resolved target, or a target a read
-    /// detected before the conflict resolved, so a file reached through a
-    /// relative path, a link or its target is one tab.
+    // The key covers the literal spelling, a symbolic link's resolved target
+    // and a target a read detected before the conflict resolved, so a file
+    // reached through a relative path, a link or its target is one tab.
     fn tab_showing(&self, path: &Path) -> Option<Tab> {
         let key = mt_core::workspace::normalize_path(path);
-        self.tabs
-            .get_untracked()
-            .into_iter()
-            .find(|tab| tab.reads_key(&key))
+        let tabs = self.tabs.get_untracked();
+        tabs.iter()
+            .find(|tab| tab.reads_key_exactly(&key))
+            .cloned()
+            .or_else(|| {
+                tabs.iter()
+                    .find(|tab| tab.reads_key_ignoring_case(&key))
+                    .cloned()
+            })
     }
 
     pub(crate) fn outside_folder(&self, tab: &Tab) -> bool {
@@ -3318,8 +3340,11 @@ impl AppState {
         let api = editor.api::<EditorApi>()?;
         let selections = api.selections();
         let visible = api.visible_range();
+        // The visible range names the first and last wrapped rows, so its
+        // columns tell wrapped segments of one line apart: a caret the reader
+        // scrolled past on the same line is not visible.
         let caret_visible = selections.last().is_none_or(|selection| {
-            visible.start.line <= selection.head.line && selection.head.line <= visible.end.line
+            visible.start <= selection.head && selection.head <= visible.end
         });
         Some(EditorAnchor {
             editor,

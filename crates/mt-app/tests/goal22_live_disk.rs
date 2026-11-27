@@ -95,6 +95,13 @@ fn wait_for_text(app: &mut Headless, text: &str, what: &str) {
     });
 }
 
+/// Whether the sidebar lists `name` as a tree row.
+fn tree_lists(screen: &Screen, name: &str) -> bool {
+    screen
+        .matches(&format!("id:sidebar-file >> text:{name}"))
+        .unwrap_or(false)
+}
+
 /// The laid-out view with test id `id`.
 fn node_id(app: &Headless, id: &str) -> NodeId {
     app.screen()
@@ -186,6 +193,181 @@ impl SlipMarks {
     fn starts_on(&self, node: NodeId) -> bool {
         self.starts.iter().any(|(started, _)| *started == node)
     }
+}
+
+#[test]
+fn a_blocked_watch_registration_does_not_freeze_the_ui() {
+    let document_dir = tempfile::tempdir().expect("document dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = document_dir.path().join("dropped.md");
+    std::fs::write(&path, "# Dropped\n").expect("write dropped.md");
+    let release = config.path().join("release-watch-registration");
+    let document_root = std::path::absolute(document_dir.path()).expect("absolute document dir");
+    mt_core::test_probe::gate_watch_registration(&document_root, &release);
+
+    let mut app = start(config.path(), None);
+    app.drop_files("id:shell", vec![file_uri(&path)])
+        .expect("drop the document");
+    app.wait_for("text:# Dropped")
+        .expect("the document opens while the watch is being registered");
+    wait_for_marker(
+        &mut app,
+        "the watch registration to reach its gate",
+        Duration::from_secs(20),
+        |_| mt_core::test_probe::watch_registration_reached(&document_root),
+    );
+
+    // The worker is parked inside the registration; the UI still answers.
+    app.press_key("mod+p").expect("open the palette");
+    app.wait_for("id:palette-input")
+        .expect("the palette opens while the registration is blocked");
+    app.press_key("escape").expect("close the palette");
+
+    // Let the released registration land, then write: only the live watch
+    // answers, so this also proves the registration completed.
+    std::fs::write(&release, b"").expect("release the registration");
+    pump_for(&mut app, Duration::from_millis(2_000));
+    std::fs::write(&path, "# External\n").expect("external write");
+    wait_for_text(
+        &mut app,
+        "# External",
+        "the reload only a live watch can raise",
+    );
+}
+
+#[test]
+fn a_renamed_parent_directory_tab_moves_to_outside_folder() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::create_dir(workspace.path().join("drafts")).expect("create drafts");
+    std::fs::write(workspace.path().join("drafts/plan.md"), "# Draft plan\n")
+        .expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "drafts/plan.md");
+    app.wait_for("text:# Draft plan").expect("the document");
+
+    std::fs::rename(
+        workspace.path().join("drafts"),
+        workspace.path().join("archive"),
+    )
+    .expect("rename drafts");
+    wait_for_text(&mut app, "Moved or deleted on disk", "the missing banner");
+    wait_for_marker(
+        &mut app,
+        "the tab under the renamed directory in Outside folder",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:sidebar-outside >> id:sidebar-outside-row")
+                .unwrap_or(false)
+        },
+    );
+    assert_eq!(
+        app.screen().count("id:sidebar-unlisted").expect("selector"),
+        0,
+        "a missing tab is not in Unlisted: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_save_as_scan_never_overwrites_a_newer_watcher_scan() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::write(workspace.path().join("plan.md"), "# Plan\n").expect("write plan.md");
+    let root = std::path::absolute(workspace.path()).expect("absolute root");
+    let release = config.path().join("release-save-as-scan");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.wait_for("text:# Plan").expect("the document");
+    wait_for_marker(
+        &mut app,
+        "the file's tree row",
+        Duration::from_secs(20),
+        |screen| tree_lists(screen, "plan.md"),
+    );
+
+    // The Save As scan reads the folder and parks before committing.
+    mt_app::test_vault::gate_commit(&root, &release);
+    app.press_key("mod+n").expect("new draft");
+    app.type_text(EDITOR, "# Saved later")
+        .expect("edit the draft");
+    app.on_pick_save_path(Some(root.join("saved.md")))
+        .expect("save into the workspace");
+    app.press_key("mod+shift+s").expect("Save As");
+    wait_for_marker(
+        &mut app,
+        "the Save As scan to reach its commit",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::commit_gate_reached(&root),
+    );
+
+    // A newer watcher scan commits while the Save As scan waits.
+    std::fs::write(workspace.path().join("appeared.md"), "# Appeared\n").expect("create a file");
+    wait_for_marker(
+        &mut app,
+        "the watcher's tree lists the new file",
+        Duration::from_secs(20),
+        |screen| tree_lists(screen, "appeared.md"),
+    );
+
+    // The older Save As scan's commit must not remove it again.
+    std::fs::write(&release, b"").expect("let the Save As scan commit");
+    pump_for(&mut app, Duration::from_millis(800));
+    assert!(
+        tree_lists(app.screen(), "appeared.md"),
+        "the older Save As scan never overwrites the newer tree: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_retargeted_link_back_to_its_baseline_closes_the_comparison() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let first = tempfile::tempdir().expect("first target dir");
+    let second = tempfile::tempdir().expect("second target dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let target_one = first.path().join("target.md");
+    std::fs::write(&target_one, "# Target one\n").expect("write the first target");
+    let target_two = second.path().join("target.md");
+    std::fs::write(&target_two, "# Target two\n").expect("write the second target");
+    let link = workspace.path().join("link.md");
+    if let Err(error) = symlink_file(&target_one, &link) {
+        eprintln!("skipping file-symlink test: {error}");
+        return;
+    }
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "link.md");
+    app.wait_for("text:# Target one")
+        .expect("the linked document is open");
+    app.type_text(EDITOR, "\nLocal edit.")
+        .expect("edit the buffer");
+
+    // Retarget to B: the conflict goes up and the comparison reads B.
+    std::fs::remove_file(&link).expect("unlink");
+    symlink_file(&target_two, &link).expect("retarget the link");
+    wait_for_text(&mut app, "Changed on disk", "the conflict banner");
+    pump_for(&mut app, Duration::from_millis(1_500));
+    app.press("label:Compare").expect("compare");
+    app.wait_for("id:conflict-previous")
+        .expect("the comparison panel");
+    assert!(
+        shows(app.screen(), "Target two"),
+        "the comparison reads the new target: {:?}",
+        app.screen().texts()
+    );
+
+    // Back to the untouched baseline without a pause between the two halves,
+    // so they debounce into one batch and no missing state interrupts the
+    // comparison. The read's stamp equals the tab's own version; the
+    // comparison of B can no longer stay on screen as the disk's.
+    std::fs::remove_file(&link).expect("unlink again");
+    symlink_file(&target_one, &link).expect("retarget back");
+    app.wait_for_gone("id:conflict-previous", Duration::from_secs(20))
+        .expect("the comparison closes when the disk returns to the baseline");
 }
 
 #[test]

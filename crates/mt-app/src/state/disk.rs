@@ -16,7 +16,7 @@ impl AppState {
     /// Why live watching is off, when it could not start. `None` once the
     /// watcher runs.
     pub fn watcher_diagnostic(&self) -> Option<String> {
-        self.watcher_issue.borrow().clone()
+        self.watcher_issue.get()
     }
 
     /// Create the watcher on first need. A watcher that cannot start is
@@ -29,7 +29,7 @@ impl AppState {
         match Watcher::new() {
             Ok(watcher) => {
                 *self.watcher.borrow_mut() = Some(watcher);
-                *self.watcher_issue.borrow_mut() = None;
+                self.watcher_issue.set(None);
                 true
             }
             Err(error) => {
@@ -41,7 +41,7 @@ impl AppState {
 
     fn record_watcher_issue(&self, issue: String) {
         log::warn!("{issue}; external changes are checked on save only");
-        *self.watcher_issue.borrow_mut() = Some(issue);
+        self.watcher_issue.set(Some(issue));
     }
 
     fn watcher_error(&self, action: &str, error: &dyn std::fmt::Display) {
@@ -127,16 +127,41 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// Drain the watcher's debounced batches. Called from the app's disk
-    /// ticker; an empty poll is a channel read, nothing more.
+    /// Drain the watcher's debounced batches, its registration failures and
+    /// its applied watch generations. Called from the app's disk ticker; an
+    /// empty poll is a channel read, nothing more.
     pub fn disk_tick(&self) {
-        let changes = {
+        let (changes, generations, problems) = {
             let watcher = self.watcher.borrow();
             match watcher.as_ref() {
-                Some(watcher) => watcher.poll(),
+                Some(watcher) => (
+                    watcher.poll(),
+                    watcher.applied_generations(),
+                    watcher.drain_problems(),
+                ),
                 None => return,
             }
         };
+        for problem in problems {
+            self.record_watcher_issue(problem);
+        }
+        let seen = self.watcher_generations.get();
+        if generations.0 != seen.0 {
+            // The root watch just went live; a file created between the first
+            // scan and the watch left no event behind.
+            self.refresh_tree_from_disk();
+        }
+        if generations.1 != seen.1 {
+            // The document-directory watch set changed: re-read each open tab
+            // once its watch is live, so a write between the opening read and
+            // the subscription still reaches it.
+            for tab in self.tabs.get_untracked() {
+                if !tab.untitled {
+                    self.reload_after_subscribe(&tab);
+                }
+            }
+        }
+        self.watcher_generations.set(generations);
         if changes.is_empty() {
             return;
         }
@@ -153,14 +178,51 @@ impl AppState {
     fn apply_disk_change(&self, change: &Change) -> bool {
         let path = normalize_path(change.path());
         let root = self.root.get_untracked().map(|root| normalize_path(&root));
-        let in_root = root.as_deref().is_some_and(|root| path.starts_with(root));
+        let in_root = root
+            .as_deref()
+            .is_some_and(|root| mt_core::workspace::path_is_covered(&path, root));
         let affects_tree = in_root && change.affects_tree();
-        for tab in self.tabs.get_untracked() {
-            if tab.reads_key(&path) {
-                self.handle_document_change(&tab);
+        let tabs = self.tabs.get_untracked();
+        let exact: Vec<Tab> = tabs
+            .iter()
+            .filter(|tab| tab.reads_key_exactly(&path))
+            .cloned()
+            .collect();
+        let matched: Vec<Tab> = if exact.is_empty() {
+            tabs.iter()
+                .filter(|tab| tab.reads_key_ignoring_case(&path))
+                .cloned()
+                .collect()
+        } else {
+            exact
+        };
+        for tab in &matched {
+            self.handle_document_change(tab);
+        }
+        // A removed directory takes every open document under it with it: the
+        // platform reports the directory path, which no document's full path
+        // matches, so the tabs under it are marked missing here and the tree
+        // re-scan lists them outside the folder.
+        if matches!(change, Change::Removed(_)) {
+            for tab in &tabs {
+                if tab.untitled
+                    || matched.iter().any(|matched| matched.id == tab.id)
+                    || mt_core::workspace::paths_match(&tab.path, &path)
+                    || !mt_core::workspace::path_is_covered(&tab.path, &path)
+                {
+                    continue;
+                }
+                self.mark_directory_missing(tab);
             }
         }
         affects_tree
+    }
+
+    fn mark_directory_missing(&self, tab: &Tab) {
+        let generation = tab.disk_generation.get().wrapping_add(1);
+        tab.disk_generation.set(generation);
+        tab.disk_missing.set(true);
+        self.invalidate_comparison(tab);
     }
 
     /// Record the identity a completed disk read resolved to when it differs
@@ -274,6 +336,14 @@ impl AppState {
                 loaded_before.stamp == loaded.stamp
             };
             if own_write {
+                // The disk holds the tab's own version again; an open
+                // comparison of another version no longer shows the disk.
+                if state
+                    .compared_stamp(current.id)
+                    .is_some_and(|stored| stored != loaded.stamp)
+                {
+                    state.invalidate_comparison(&current);
+                }
                 return;
             }
             if current.revision.get() != revision {
@@ -331,7 +401,8 @@ mod tests {
     use crate::ui::tokens;
 
     /// Renders what the watcher recorded, so a headless test can see the
-    /// diagnostic the app deliberately keeps off its UI.
+    /// diagnostic the app deliberately keeps off its UI. The probe drives
+    /// the drain the app's ticker would.
     #[component]
     fn WatcherIssueProbe() -> impl IntoElement {
         let state = AppState::new();
@@ -340,10 +411,22 @@ mod tests {
         let missing = std::env::temp_dir().join("markturbo-22b-no-such-folder");
         assert!(!missing.exists());
         state.watch_workspace_root(&missing);
-        let shown = state.clone();
-        view().test_id("watcher-issue").child(text(move || {
-            SharedString::from(shown.watcher_diagnostic().unwrap_or_default())
-        }))
+        let shown = signal(SharedString::from(""));
+        let drain_state = state.clone();
+        let drain_shown = shown;
+        state.spawn_task(async move {
+            for _ in 0..200 {
+                drain_state.disk_tick();
+                if let Some(diagnostic) = drain_state.watcher_diagnostic() {
+                    drain_shown.set(SharedString::from(diagnostic));
+                    return;
+                }
+                request_animation_frame(|_| {}).await;
+            }
+        });
+        view()
+            .test_id("watcher-issue")
+            .child(text(move || shown.get()))
     }
 
     #[test]
@@ -506,6 +589,59 @@ mod tests {
             .expect("the caret stays on its line and inside the viewport after the reload");
     }
 
+    /// A tab under `drafts/`, with a press that reports the removal of the
+    /// `drafts` directory the way a platform event that names only the
+    /// directory reports it.
+    #[component]
+    fn RemovedDirectoryProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().unwrap());
+        let drafts = directory.path().join("drafts");
+        std::fs::create_dir(&drafts).unwrap();
+        let path = drafts.join("plan.md");
+        std::fs::write(&path, "# Plan\n").unwrap();
+        let id = state.add_tab(io::load(&path).unwrap());
+        let tab = state
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .expect("the tab");
+        let press_state = state.clone();
+        let press_drafts = drafts.clone();
+        let keep = directory.clone();
+        view()
+            .test_id("removed-dir-probe")
+            .child(
+                view()
+                    .test_id("remove-parent-dir")
+                    .on_press(move |_: &PressEvent| {
+                        let _ = &keep;
+                        press_state.apply_disk_change(&Change::Removed(press_drafts.clone()));
+                    })
+                    .child(text(|| "Remove")),
+            )
+            .child(text(move || {
+                if tab.disk_missing.get() {
+                    "missing"
+                } else {
+                    "present"
+                }
+            }))
+    }
+
+    #[test]
+    fn a_removed_parent_directory_marks_its_open_tabs_missing() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<RemovedDirectoryProbe>()))
+            .expect("start the probe");
+        app.wait_for("text:present")
+            .expect("the tab starts present");
+        app.press("id:remove-parent-dir")
+            .expect("remove the directory");
+        app.wait_for("text:missing")
+            .expect("a directory event marks the tab under it missing");
+    }
+
     /// A long document whose first line carries the version marker.
     fn viewport_version(marker: &str) -> String {
         let mut text = format!("{marker} start\n");
@@ -625,6 +761,133 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the viewport keeps its place instead of revealing the caret: {shown:?}"
+            );
+            app.wait(std::time::Duration::from_millis(25))
+                .expect("the probe keeps running");
+        }
+    }
+
+    /// One logical line long enough to wrap far past the viewport, so the
+    /// caret at its start and the visible rows are segments of one line.
+    fn wrapped_line(fill: char) -> String {
+        let mut text: String = std::iter::repeat_n(fill, 6_000).collect();
+        text.push('\n');
+        text
+    }
+
+    /// Scrolls within the wrapped first line so the caret at its start is off
+    /// screen, adopts a new version, and reads the visible range back after
+    /// the anchor restore's frames.
+    #[component]
+    fn WrappedCaretProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().unwrap());
+        let path = directory.path().join("wrapped.md");
+        std::fs::write(&path, wrapped_line('A')).unwrap();
+        let id = state.add_tab(io::load(&path).unwrap());
+        let editor_ref = component_ref::<Editor>();
+        state.attach_source_editor(id, editor_ref);
+        let tab = state
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .expect("the tab");
+        let readback = signal(SharedString::from("view:?"));
+        let press_state = state.clone();
+        let press_readback = readback;
+        let press_tab = tab.clone();
+        let keep = directory.clone();
+        view()
+            .test_id("wrapped-probe")
+            .child(
+                editor()
+                    .component_ref(&editor_ref)
+                    .value({
+                        let tab = tab.clone();
+                        move || Some(tab.text.get())
+                    })
+                    .font_family(tokens::FONT_SOURCE)
+                    .font_size(px(tokens::TYPE_SOURCE))
+                    .line_height(px(tokens::TYPE_SOURCE_LINE))
+                    .soft_wrap(true)
+                    .w(px(600.0))
+                    .h(px(400.0)),
+            )
+            .child(
+                view()
+                    .test_id("wrapped-reload")
+                    .on_press(move |_: &PressEvent| {
+                        let _ = &keep;
+                        if let Some(api) = editor_ref.api::<EditorApi>() {
+                            api.set_selections(vec![EditorSelection::caret(EditorPosition::new(
+                                0, 0,
+                            ))]);
+                            let mut offset = api.scroll_offset();
+                            offset.y = px(15.0 * tokens::TYPE_SOURCE_LINE);
+                            api.set_scroll_offset(offset);
+                        }
+                        std::fs::write(&path, wrapped_line('B')).unwrap();
+                        let loaded = io::load(&path).unwrap();
+                        press_state.adopt_disk_version(&press_tab, loaded);
+                        let readback = press_readback;
+                        press_state.spawn_task(async move {
+                            for _ in 0..6 {
+                                request_animation_frame(|_| {}).await;
+                            }
+                            let shown = editor_ref
+                                .api::<EditorApi>()
+                                .map(|api| {
+                                    let caret = api
+                                        .selections()
+                                        .pop()
+                                        .map(|selection| {
+                                            format!(
+                                                "caret:{}:{}",
+                                                selection.head.line, selection.head.column
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "caret:none".to_owned());
+                                    let visible = api.visible_range();
+                                    format!("view:{} {caret}", visible.start.column)
+                                })
+                                .unwrap_or_else(|| "view:? caret:none".to_owned());
+                            readback.set(SharedString::from(shown));
+                        });
+                    })
+                    .child(text(|| "Reload")),
+            )
+            .child(text(move || readback.get()))
+    }
+
+    #[test]
+    fn a_reload_with_the_caret_scrolled_past_on_a_wrapped_line_keeps_the_viewport() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<WrappedCaretProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:wrapped-reload").expect("the probe");
+        app.press("id:wrapped-reload").expect("reload");
+        // The caret stays at the line's start; the viewport stays on a later
+        // wrapped row of the same line instead of revealing the caret.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.catch_up();
+            let shown = app
+                .screen()
+                .texts()
+                .iter()
+                .find(|text| text.starts_with("view:"))
+                .cloned()
+                .unwrap_or_default();
+            let column = shown
+                .strip_prefix("view:")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|column| column.parse::<u32>().ok());
+            if column.is_some_and(|column| column > 100) && shown.contains("caret:0:0") {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wrapped viewport keeps its place instead of revealing the caret: {shown:?}"
             );
             app.wait(std::time::Duration::from_millis(25))
                 .expect("the probe keeps running");

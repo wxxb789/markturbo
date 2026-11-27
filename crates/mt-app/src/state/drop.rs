@@ -226,7 +226,8 @@ impl AppState {
                 let request = state.begin_folder_open();
                 may_publish_skipped = state.finish_folder_open(folder, request, true).await;
             }
-            if skipped > 0 && may_publish_skipped {
+            if skipped > 0 && may_publish_skipped && state.folder_request.get() == folder_started_at
+            {
                 state.notify_held(SharedString::from(s::skipped_files(language, skipped)));
             }
         });
@@ -240,15 +241,9 @@ impl AppState {
             || crate::ui::settings::is_open(self)
     }
 
-    /// Open each path in a tab, or focus the tab already showing it. One task
-    /// in order, so the last one ends up active and its load never races
-    /// another's. Each path is confirmed a regular file at the load boundary,
-    /// so a FIFO or a path that changed kind is skipped, never read; the
-    /// tab lookup is repeated after the load, so two concurrent drops of one
-    /// file end in one tab. Every `Opened …` notice is bound to
-    /// `workspace_request`, the folder request in force when the drop
-    /// happened: a drop the user superseded by opening another workspace
-    /// publishes nothing.
+    // One task in order, so the last path ends up active; the tab lookup is
+    // repeated after the load by path and resolved target; every notice is
+    // bound to the folder request in force when the drop happened.
     async fn open_dropped_documents(&self, paths: Vec<PathBuf>, workspace_request: u64) -> usize {
         let mut skipped = 0;
         for path in paths {
@@ -267,6 +262,10 @@ impl AppState {
                     if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
                         return Ok(None);
                     }
+                    #[cfg(any(test, feature = "test-vault"))]
+                    if let Some(error) = mt_core::test_probe::injected_read_error(&path) {
+                        return Err(error);
+                    }
                     let loaded = io::load(&path).map(Some);
                     #[cfg(any(test, feature = "test-vault"))]
                     crate::test_vault::wait_for_commit(&path);
@@ -284,13 +283,15 @@ impl AppState {
                             // The opened handle refused a non-regular file: a
                             // FIFO or device counts as skipped, never read.
                             skipped += 1;
-                        } else {
+                        } else if self.folder_request.get() == workspace_request {
                             self.notify_failure(crate::i18n::Key::OpenFailed, &error);
                         }
                         continue;
                     }
                     Err(error) => {
-                        self.notify_failure(crate::i18n::Key::OpenFailed, &error);
+                        if self.folder_request.get() == workspace_request {
+                            self.notify_failure(crate::i18n::Key::OpenFailed, &error);
+                        }
                         continue;
                     }
                 }
@@ -299,7 +300,13 @@ impl AppState {
                 break;
             }
             let opened = loaded.path.clone();
-            if let Some(tab) = self.tab_showing(&opened) {
+            let resolved = loaded.resolved_target().map(Path::to_path_buf);
+            let existing = self.tab_showing(&opened).or_else(|| {
+                resolved
+                    .as_deref()
+                    .and_then(|target| self.tab_showing(target))
+            });
+            if let Some(tab) = existing {
                 self.set_active(tab.id);
                 continue;
             }
