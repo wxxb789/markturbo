@@ -368,7 +368,9 @@ pub fn conflict_banner(state: AppState, language: Language) -> impl IntoElement 
                 .gap(px(SPACE_3))
                 .child(
                     view()
+                        .test_id("conflict-label")
                         .flex_1()
+                        .min_w(px(tokens::CONFLICT_LABEL_MIN_W))
                         .child(prims::ink(s(S::ChangedOnDisk, language))),
                 )
                 .child(compare_action(&state, language, disabled.clone()))

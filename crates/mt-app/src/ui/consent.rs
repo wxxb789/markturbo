@@ -1460,12 +1460,12 @@ impl Hold {
         if !changed {
             // The same binding, a new body: the charge it may have started is
             // gone with the old controls, and the card says so again.
-            self.label.set(HoldLabel::Idle);
+            self.label.try_set(HoldLabel::Idle);
             return;
         }
         *self.manifest.borrow_mut() = manifest.cloned();
         self.spent.set(false);
-        self.label.set(HoldLabel::Idle);
+        self.label.try_set(HoldLabel::Idle);
     }
 
     /// A pointer press starts a hold from zero: one press, one charge, and
@@ -1503,7 +1503,7 @@ impl Hold {
             ));
             return;
         }
-        self.label.set(HoldLabel::Holding);
+        self.label.try_set(HoldLabel::Holding);
         self.heat
             .timing_with(1.0, Timing::new(motion::FILAMENT_CHARGE_MS, motion::LINEAR));
         *slot.borrow_mut() = Some(set_timeout(
@@ -1546,7 +1546,7 @@ impl Hold {
         }
         self.heat.stop();
         self.heat.set(f32::from(step) / 3.0);
-        self.label.set(if step == 1 {
+        self.label.try_set(if step == 1 {
             HoldLabel::StepOne
         } else {
             HoldLabel::StepTwo
@@ -1568,7 +1568,7 @@ impl Hold {
         self.cancel_completion();
         self.cancel_steps();
         self.cool(value);
-        self.label.set(HoldLabel::Released);
+        self.label.try_set(HoldLabel::Released);
         let hold = self.clone();
         let slot = self.notice.clone();
         *slot.borrow_mut() = Some(set_timeout(
@@ -1576,7 +1576,7 @@ impl Hold {
             move || {
                 hold.notice.borrow_mut().take();
                 if hold.charging.get().is_none() && !hold.spent.get() {
-                    hold.label.set(HoldLabel::Idle);
+                    hold.label.try_set(HoldLabel::Idle);
                 }
             },
         ));
@@ -1596,7 +1596,7 @@ impl Hold {
         self.end_notice();
         self.heat.stop();
         self.heat.set(0.0);
-        self.label.set(HoldLabel::Idle);
+        self.label.try_set(HoldLabel::Idle);
     }
 
     /// One raw `KeyDown` on the focused card. A watched key (Enter, Space or
@@ -1672,7 +1672,7 @@ impl Hold {
         self.end_notice();
         self.heat.stop();
         self.heat.set(1.0);
-        self.label.set(if motion::reduced_motion() {
+        self.label.try_set(if motion::reduced_motion() {
             HoldLabel::StepThree
         } else {
             HoldLabel::Sent
@@ -2608,6 +2608,86 @@ mod tests {
         let mut app = start_harness();
         hold_send(&mut app);
         assert!(app.shows("Sent"), "a full hold authorized one send");
+    }
+
+    #[test]
+    fn every_cancel_path_leaves_no_disposed_signal_write() {
+        // The engine catches a binding's panic and reports it, so the engine
+        // thread survives a cancel; the test watches the panics themselves.
+        // Before the fix, every cancel path wrote the hold's label after the
+        // card's owner was disposed (`consent.rs`: `cancel_hold`).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DISPOSED_WRITES: AtomicUsize = AtomicUsize::new(0);
+
+        type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+        struct Restore(Option<PanicHook>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(hook) = self.0.take() {
+                    std::panic::set_hook(hook);
+                }
+            }
+        }
+
+        DISPOSED_WRITES.store(0, Ordering::SeqCst);
+        let restore = Restore(Some(std::panic::take_hook()));
+        std::panic::set_hook(Box::new(|info| {
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            if message.contains("after its owner was disposed") {
+                DISPOSED_WRITES.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        // Escape on the focused card.
+        let mut app = start_harness();
+        app.press_key("escape").expect("escape");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("the card closed");
+        assert!(!app.shows("Sent"), "Escape authorized nothing");
+
+        // Enter with Cancel focused: the ring's first stop in this harness.
+        app.press("id:harness-reopen").expect("reopen");
+        app.wait_for("id:consent-card").expect("the card");
+        app.press_key("tab").expect("tab to Cancel");
+        app.press_key("enter").expect("enter on Cancel");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("the card closed");
+
+        // A hold in flight when the card leaves: its charge and its timers
+        // go with it, and its completion never fires after the close.
+        app.press("id:harness-reopen").expect("reopen");
+        app.wait_for("id:consent-card").expect("the card");
+        use nsh_core::geometry::point;
+        app.drag_and_hold(
+            "id:consent-send",
+            point(px(0.0), px(0.0)),
+            DragOptions::default(),
+        )
+        .expect("hold the send control");
+        app.press_key("escape").expect("escape mid-hold");
+        app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+            .expect("the card closed");
+        app.run_for(Duration::from_millis(1_100))
+            .expect("the full charge's time passes");
+        assert!(!app.shows("Sent"), "a cancelled hold sent nothing");
+
+        // The engine is still answering after all three cancels.
+        app.press("id:harness-reopen").expect("reopen again");
+        app.wait_for("id:consent-card").expect("the card again");
+
+        drop(restore);
+        assert_eq!(
+            DISPOSED_WRITES.load(Ordering::SeqCst),
+            0,
+            "a cancel wrote a signal whose owner was disposed"
+        );
     }
 
     #[test]
