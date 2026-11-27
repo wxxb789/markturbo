@@ -204,3 +204,17 @@ do not change a decision's requirement.
 3. **Drop-screen motion.** The screen enters and leaves over `motion::ENTER_MS`/`motion::EXIT_MS` with the ease-out
    curve, like the app's other entering surfaces; decision 6 assigns the camera duration to the divider and the
    rail-widen duration to the sidebar and leaves the screen's own duration to this lane.
+## Lane 22-A decisions
+The source and dock share a numeric track at 1, 0.5, or 0; a touch can drag
+the divider to the nearest stop, and Review, Revision, and Context keep the
+measured source and field instead of using the track. The sidebar and divider
+retarget from their drawn positions, fade instead of sliding with reduced
+motion, and the under-1040 px sidebar overlay never changes the saved push
+preference. The titlebar cycles three views without remounting the source;
+the five stored panes still distinguish native from Web Preview and Split.
+Below 1040 px there is no divider, and Split and the docked tools keep the
+existing field-overlay geometry. The sidebar is the tab list in this tree:
+ink dots mark open files in the tree, Outside folder holds the rest (and open
+files the tree does not list yet have their own group), and the panel uses the
+existing afterimage plate over the room; deleted-file state belongs to lane
+22-B.

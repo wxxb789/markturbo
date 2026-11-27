@@ -262,6 +262,25 @@ pub(crate) fn note_superseded_open(path: &Path) {
         .push(path.to_path_buf());
 }
 
+static DUPLICATE_OPENS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Whether a late read of `path` found its tab already open and focused it
+/// instead of inserting a duplicate.
+pub fn duplicate_open_focused(path: &Path) -> bool {
+    DUPLICATE_OPENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|seen| seen == path)
+}
+
+pub(crate) fn note_duplicate_open(path: &Path) {
+    DUPLICATE_OPENS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(path.to_path_buf());
+}
+
 static SUPERSEDED_RELOADS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Whether a reload of `path` was dropped after a newer request took its

@@ -4,8 +4,8 @@
 //!   long it is held; a fresh hold after a release does;
 //! * `Ctrl+S` saves the active document from the focused editor;
 //! * the title row's `Review` is underlined, `Settings` is a word that says
-//!   whether its menu is open, and the menu names its shortcuts and the pane
-//!   on screen.
+//!   whether its menu is open, the menu names its shortcuts, and the view
+//!   button names its current and next views.
 
 mod support;
 
@@ -359,7 +359,8 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
     );
 
     app.press("id:title-settings").expect("open the menu");
-    app.press("id:title-menu-edit").expect("Source");
+    app.press("id:title-menu-web")
+        .expect("toggle compatibility");
     app.wait_for_gone("id:title-menu", Duration::from_secs(5))
         .expect("the panel dismounts after the exit");
 
@@ -381,21 +382,15 @@ fn the_title_row_reads_review_settings_and_a_menu_of_shortcuts() {
         app.wait_for(&format!("id:{row} >> text:{keys}"))
             .unwrap_or_else(|why| panic!("`{row}` names {keys}: {why}"));
     }
-    assert!(
+    app.wait_for("id:title-view >> text:Edit")
+        .expect("the toggle does not cycle Edit");
+    assert_eq!(
         app.screen()
-            .accessibility_state("id:title-menu-edit")
-            .expect("Source's state")
-            .current
-            .is_some(),
-        "the pane on screen is marked"
-    );
-    assert!(
-        app.screen()
-            .accessibility_state("id:title-menu-split")
-            .expect("Split's state")
-            .current
-            .is_none(),
-        "a pane not on screen is not"
+            .accessibility_state("id:title-menu-web")
+            .expect("compatibility state")
+            .checked,
+        Some(nsh_core::Checked::True),
+        "the menu exposes the compatibility preference"
     );
 
     // Every row is one line, in a menu at least 240 wide.

@@ -38,6 +38,7 @@ fn assert_row_fits(app: &Headless, width: f32) {
             .unwrap_or_else(|| panic!("`{id}` on screen at {width}"))
     };
     let name = bounds("title-file");
+    let view = bounds("title-view");
     let review = bounds("title-review");
     let settings = bounds("title-settings");
     assert!(
@@ -45,8 +46,12 @@ fn assert_row_fits(app: &Headless, width: f32) {
         "the name has room at {width}: {name:?}"
     );
     assert!(
-        name.origin.x.0 + name.size.width.0 <= review.origin.x.0,
-        "the name overlaps Review at {width}: {name:?} {review:?}"
+        name.origin.x.0 + name.size.width.0 <= view.origin.x.0,
+        "the name overlaps the view control at {width}: {name:?} {view:?}"
+    );
+    assert!(
+        view.origin.x.0 + view.size.width.0 <= review.origin.x.0,
+        "the view control overlaps Review at {width}: {view:?} {review:?}"
     );
     assert!(
         review.origin.x.0 + review.size.width.0 <= settings.origin.x.0,
@@ -88,28 +93,22 @@ fn the_title_row_holds_the_name_review_and_settings() {
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
-    // Exactly three controls: the name, Review and the glyph named Settings.
+    // Exactly four controls: the name, the view button, Review and Settings.
     assert_eq!(
         count(&app, "id:title-row >> role:button"),
-        3,
+        4,
         "the row's controls: {:?}",
         app.screen().texts()
     );
     for control in [
         format!("id:title-row >> role:button[Show agent context for {NAME}]"),
+        "id:title-row >> role:button[View: Edit — switch to Split]".to_owned(),
         "id:title-row >> role:button[Review]".to_owned(),
         "id:title-row >> role:button[Settings]".to_owned(),
     ] {
         assert_eq!(count(&app, &control), 1, "`{control}` on the row");
     }
-    for moved in [
-        "Edit",
-        "Preview",
-        "Split",
-        "Context",
-        "Save",
-        "Save As\u{2026}",
-    ] {
+    for moved in ["Preview", "Split", "Context", "Save", "Save As\u{2026}"] {
         assert_eq!(
             count(&app, &format!("id:title-row >> text:{moved}")),
             0,
@@ -154,33 +153,37 @@ fn the_title_row_holds_the_name_review_and_settings() {
     app.wait_for_gone("id:context-field", Duration::from_secs(5))
         .expect("the menu's Context closes it");
 
-    // The five pane modes, each from the menu. The document opens in Split.
-    from_menu(&mut app, "title-menu-edit");
-    app.wait_for_gone("id:preview-field", Duration::from_secs(5))
-        .expect("Edit drops the field's preview");
-    app.wait_for("id:source-editor").expect("Edit: the editor");
-
-    from_menu(&mut app, "title-menu-preview");
-    app.wait_for("id:preview-column")
-        .expect("Preview: the rendered column");
-    app.wait_for_gone("id:source-editor", Duration::from_secs(5))
-        .expect("Preview replaces the editor");
-
-    from_menu(&mut app, "title-menu-split");
-    app.wait_for("id:source-editor").expect("Split: the editor");
+    // The view button cycles three modes. The menu toggles the renderer
+    // independently, and both Web views keep the source mounted.
+    app.press("id:title-view").expect("choose Split");
     app.wait_for("id:preview-field")
         .expect("Split: the preview in the field");
-
+    app.press("id:title-view").expect("choose Preview");
+    app.wait_for("id:preview-column")
+        .expect("Preview: the rendered screen");
     from_menu(&mut app, "title-menu-web");
-    app.wait_for("id:web-pane").expect("Web preview: the page");
-    app.wait_for_gone("id:source-editor", Duration::from_secs(5))
-        .expect("Web preview replaces the editor");
-
-    from_menu(&mut app, "title-menu-split-web");
-    app.wait_for("id:source-editor")
-        .expect("Split \u{00B7} Web: the editor");
-    app.wait_for("id:preview-field >> id:web-pane")
-        .expect("Split \u{00B7} Web: the page in the field");
+    app.wait_for("id:stage-dock >> id:web-pane")
+        .expect("Web preview: the page");
+    app.wait_for("id:title-view >> text:Preview")
+        .expect("changing renderer keeps the Preview stop");
+    assert!(
+        !app.screen().matches("id:preview-field").unwrap(),
+        "Preview has no Split caption"
+    );
+    assert!(
+        !app.screen()
+            .matches("id:preview-field >> id:web-pane")
+            .unwrap()
+    );
+    app.press("id:title-view").expect("return to Edit");
+    app.wait_for_gone("id:web-pane", Duration::from_secs(5))
+        .expect("Edit closes the reading screen");
+    app.wait_for("id:source-editor").expect("Edit: the editor");
+    app.press("id:title-view").expect("choose Split again");
+    app.wait_for("id:preview-field")
+        .expect("the Split caption returns");
+    app.wait_for("id:stage-dock >> id:web-pane")
+        .expect("the compatibility preference also applies to Split");
 
     // Save writes the buffer; Save As writes it to the picked path.
     app.type_text("label:Markdown source", "\nSaved from the menu.")

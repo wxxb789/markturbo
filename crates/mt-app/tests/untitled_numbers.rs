@@ -54,7 +54,7 @@ fn new_drafts_take_the_smallest_free_number() {
     app.wait_for("id:title-file >> text:Untitled 2")
         .expect("the smallest free number is reused");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        app.screen().count("id:rail-close").expect("selector"),
         3,
         "still three drafts open"
     );

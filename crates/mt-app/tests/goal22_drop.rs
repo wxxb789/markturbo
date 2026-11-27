@@ -66,6 +66,14 @@ fn node_id(app: &Headless, id: &str) -> NodeId {
         .id
 }
 
+/// The open tabs the sidebar lists: one close affordance per open row — the
+/// tree marks an open file's row, and the outside and unlisted groups list
+/// their tabs. These tests run with the sidebar open, where every tab has its
+/// row; the collapsed strip's ticks are not part of the count.
+fn open_tabs(app: &Headless) -> usize {
+    app.screen().count("id:rail-close").expect("selector")
+}
+
 /// One raw event on the shell, as a platform would deliver it.
 fn dispatch(app: &mut Headless, kind: EventKind, payload: EventPayload) {
     let id = node_id(app, "shell");
@@ -106,7 +114,7 @@ fn a_drop_opens_each_document_and_the_last_one_is_active() {
         .expect("the last dropped document is the active one");
     app.wait_for("text:b.md").expect("the active tab's title");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        open_tabs(&app),
         2,
         "each dropped document holds a tab: {:?}",
         app.screen().texts()
@@ -131,7 +139,7 @@ fn a_drop_with_no_position_opens_documents_too() {
 
     app.wait_for("text:# No position")
         .expect("the dropped document opened");
-    assert_eq!(app.screen().count("id:rail-file-row").expect("selector"), 1);
+    assert_eq!(open_tabs(&app), 1);
 }
 
 #[test]
@@ -157,7 +165,7 @@ fn a_folder_drop_opens_it_as_the_workspace_and_keeps_the_tabs() {
     app.wait_for("text:inside.md")
         .expect("the dropped folder became the workspace");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        open_tabs(&app),
         1,
         "the open tab stays open: {:?}",
         app.screen().texts()
@@ -185,11 +193,7 @@ fn an_unsupported_drop_shows_one_count_notice_and_names_no_path() {
         "the notice never names the skipped path: {:?}",
         app.screen().texts()
     );
-    assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
-        0,
-        "nothing opened for an unsupported file"
-    );
+    assert_eq!(open_tabs(&app), 0, "nothing opened for an unsupported file");
 }
 
 #[test]
@@ -450,7 +454,7 @@ fn a_drop_behind_a_card_changes_nothing() {
     app.wait(Duration::from_millis(800))
         .expect("let a drop commit");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        open_tabs(&app),
         1,
         "no tab opens behind the card: {:?}",
         app.screen().texts()
@@ -501,7 +505,7 @@ fn a_drop_that_lands_behind_settings_does_not_open() {
     app.wait_for("id:welcome-open-folder")
         .expect("the drop opened nothing: the welcome is back");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        open_tabs(&app),
         0,
         "the drop commits nothing behind Settings: {:?}",
         app.screen().texts()
@@ -702,7 +706,7 @@ fn a_drop_behind_the_review_consent_changes_nothing() {
     app.wait(Duration::from_millis(800))
         .expect("let a drop commit");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        open_tabs(&app),
         1,
         "no tab opens behind the consent: {:?}",
         app.screen().texts()
@@ -807,7 +811,7 @@ fn a_file_dropped_twice_opens_one_tab() {
     app.wait(Duration::from_millis(800))
         .expect("let the second drop commit");
     assert_eq!(
-        app.screen().count("id:rail-file-row").expect("selector"),
+        open_tabs(&app),
         1,
         "one file is one tab: {:?}",
         app.screen().texts()

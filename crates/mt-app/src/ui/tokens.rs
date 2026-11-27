@@ -269,11 +269,27 @@ pub const SPACE_7: f32 = 88.0;
 /// The opaque title row.
 pub const TITLE_ROW_H: f32 = 32.0;
 pub const SETTINGS_HEADER_H: f32 = SPACE_4 + SPACE_2 + SPACE_1;
-/// The rail: a 44px strip that widens to 240px on hover.
+/// The collapsed sidebar's 44px tick strip.
 pub const RAIL_W: f32 = 44.0;
-pub const RAIL_HOVER_W: f32 = 240.0;
 /// The rail's one-dot-per-file mark.
 pub const RAIL_DOT: f32 = 6.0;
+/// Shoji sidebar geometry, in points.
+pub const SIDEBAR_W: f32 = 240.0;
+pub const SIDEBAR_MARK_W: f32 = 14.0;
+pub const SIDEBAR_ROW_H: f32 = 26.0;
+pub const SIDEBAR_TICK_W: f32 = 2.0;
+pub const SIDEBAR_TICK_H: f32 = 10.0;
+pub const SIDEBAR_TICK_INSET: f32 = 18.0;
+pub const SIDEBAR_TICK_LABEL_X: f32 = 34.0;
+pub const SIDEBAR_TICK_LABEL_SHIFT: f32 = 6.0;
+pub const SIDEBAR_CAPTION: f32 = 11.0;
+/// View track controls.
+pub const VIEW_GLYPH_W: f32 = SPACE_4;
+pub const VIEW_GLYPH_H: f32 = 11.0;
+pub const VIEW_NEEDLE_W: f32 = 1.5;
+pub const DIVIDER_HIT_W: f32 = SPACE_3;
+pub const DIVIDER_HANDLE_W: f32 = 3.0;
+pub const DIVIDER_HANDLE_H: f32 = SPACE_4 + SPACE_1;
 /// The gap between the rail and the text column.
 pub const COLUMN_GAP: f32 = 40.0;
 /// The gap between the text column and the field.
@@ -360,10 +376,15 @@ impl Layout {
     /// The field's left edge at `client_width`: where the overlay begins
     /// below 1040, and the field's own column above it.
     pub fn field_left(self, client_width: f32) -> f32 {
+        self.field_left_at(client_width, RAIL_W)
+    }
+
+    /// The field's nominal leading edge with the sidebar at its drawn width.
+    pub fn field_left_at(self, client_width: f32, sidebar_width: f32) -> f32 {
         if self.field_overlays() {
             client_width * (1.0 - Self::OVERLAY_FRACTION)
         } else {
-            RAIL_W + COLUMN_GAP + self.measure() + FIELD_GAP
+            sidebar_width + COLUMN_GAP + self.measure() + FIELD_GAP
         }
     }
 

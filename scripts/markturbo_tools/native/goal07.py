@@ -17,8 +17,6 @@ from .evidence import credential_target, leak_codes
 from .runtime import (
     EDITOR_NAME,
     INTEGRITY_NAMES,
-    MENU_EDIT_AUTOMATION_ID,
-    MENU_WEB_AUTOMATION_ID,
     VK_RETURN,
     Fingerprint,
     HarnessFailure,
@@ -1163,7 +1161,8 @@ class Goal07Harness(NativeHarness):
         observed: dict[str, Any] = {}
         network_probes = self.network_probes
         record(observed, "web_security_disk_before", fixture_fingerprint(source, network_probes))
-        self.menu_command(app, MENU_WEB_AUTOMATION_ID)
+        self.set_compatibility(app, True)
+        self.view_command(app, "Preview")
 
         about_to_navigate_index = len(FIXTURE_ATTEMPT_SOURCE) + 1
         assigned_index = len(FIXTURE_ATTEMPT_SOURCE) + 2
@@ -1254,14 +1253,16 @@ class Goal07Harness(NativeHarness):
             raise HarnessFailure("APP_WINDOW_FOREGROUND_LOST")
         record(observed, "web_security_window_count", len(windows))
         # Leaving the Web pane hands keyboard ownership back to the main
-        # window before the Review shortcut is sent, without a refocus.
-        self.menu_command(app, MENU_EDIT_AUTOMATION_ID)
+        # window without a refocus. Prove that before the renderer switch,
+        # which also sends focus back to the editor.
+        self.view_command(app, "Edit")
         self.editor_control(app)
         wait_until(
             lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
             self.ui_timeout,
             "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT",
         )
+        self.set_compatibility(app, False)
         return observed
 
     def phase_decisions(

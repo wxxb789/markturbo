@@ -183,8 +183,7 @@ fn recovery_actions_stay_pressable_at_narrow_widths() {
         app.press("id:title-menu-new-file").expect("new document");
         app.wait_for(EDITOR).expect("the editor");
         if split {
-            app.press("id:title-settings").expect("open the title menu");
-            app.press("id:title-menu-split").expect("split pane");
+            app.press("id:title-view").expect("choose Split");
             app.wait_for("id:preview-field").expect("the preview");
         }
         app.settle();

@@ -138,6 +138,10 @@ class FakeElementInfo:
         )
         self.control_type = element.control_type if control_type is SAME_AS_RAW else control_type
 
+    @property
+    def name(self) -> str:
+        return self.element.CurrentName
+
 
 class FakeNoPatternError(Exception):
     pass
@@ -196,6 +200,10 @@ class FakeUIAWrapper:
         if self.control.value_pattern_missing:
             raise FakeNoPatternError()
         return FakeValuePattern(self.control)
+
+    @property
+    def iface_toggle(self) -> object:
+        return self.control.toggle_pattern
 
 
 class FakeIUIA:
@@ -552,7 +560,7 @@ class NativeFocusTests(unittest.TestCase):
 
 class SelectorAndOrchestrationTests(unittest.TestCase):
     def test_selectors_match_the_nsh_production_source(self) -> None:
-        self.assertEqual(HARNESS.TAB_CLOSE_AUTOMATION_ID, "rail-close")
+        self.assertEqual(runtime.TAB_CLOSE_AUTOMATION_ID, "rail-close")
         self.assertEqual(runtime.EDITOR_NAME, "Markdown source")
         self.assertEqual(
             runtime.GUARD_BUTTON_NAMES,
@@ -563,34 +571,164 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
             {"Save": "guard-save", "Discard": "guard-dont-save", "Cancel": "guard-cancel"},
         )
 
-    def test_source_layout_waits_for_the_editor_without_the_menu(self) -> None:
-        anchor = FakeControl(runtime.MENU_BUTTON_AUTOMATION_ID, "Button")
-        harness = native_harness(FreshRootFactory([FakeRoot([editor_control(), anchor])]))
+    def test_sidebar_and_view_selectors_are_in_the_product_ui(self) -> None:
+        ui = Path(__file__).resolve().parents[2] / "crates" / "mt-app" / "src" / "ui"
+        source = "\n".join(
+            (ui / name).read_text(encoding="utf-8").split("\n#[cfg(test)]\nmod tests", 1)[0]
+            for name in ("rail.rs", "shell.rs", "titlebar.rs")
+        )
+        for automation_id in (
+            runtime.RAIL_FILE_ROW_AUTOMATION_ID,
+            runtime.TAB_CLOSE_AUTOMATION_ID,
+            runtime.SIDEBAR_PANEL_AUTOMATION_ID,
+            runtime.SIDEBAR_ROW_AUTOMATION_ID,
+            runtime.SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID,
+            runtime.VIEW_BUTTON_AUTOMATION_ID,
+            runtime.MENU_WEB_AUTOMATION_ID,
+        ):
+            with self.subTest(automation_id=automation_id):
+                self.assertIn(f'"{automation_id}"', source)
 
-        harness.activate_source_layout(running_app())
+    def test_source_layout_waits_for_the_editor_without_pressing_edit_again(self) -> None:
+        for name in ("View: Edit — switch to Split", "视图：编辑 — 切换到分栏"):
+            with self.subTest(name=name):
+                view = FakeControl("title-view", "Button", name=name)
+                harness = native_harness(FreshRootFactory([FakeRoot([editor_control(), view])]))
 
-        self.assertEqual(anchor.invoke_count, 0)
+                harness.activate_source_layout(running_app())
 
-    def test_source_layout_opens_the_edit_mode_from_the_title_menu(self) -> None:
-        anchor = FakeControl(runtime.MENU_BUTTON_AUTOMATION_ID, "Button")
-        edit = FakeControl(runtime.MENU_EDIT_AUTOMATION_ID, "Button")
+                self.assertEqual(view.invoke_count, 0)
+
+    def test_source_layout_cycles_split_through_preview_even_if_the_editor_is_mounted(self) -> None:
+        view = FakeControl("title-view", "Button", name="View: Split — switch to Preview")
         editor = editor_control()
-        root = FakeRoot([anchor])
-        edit.click_error = None
+        root = FakeRoot([view, editor])
         harness = native_harness(FreshRootFactory([root]), timeout=0.05)
         original = FakeUIAWrapper.invoke
 
         def invoke(wrapper: FakeUIAWrapper) -> None:
             original(wrapper)
-            if wrapper.control is anchor:
-                root.controls.append(edit)
-            elif wrapper.control is edit:
-                root.controls[:] = [anchor, editor]
+            if view.invoke_count == 1:
+                view.name = "View: Preview — switch to Edit"
+                editor.visible = False
+            else:
+                view.name = "View: Edit — switch to Split"
+                editor.visible = True
 
         with mock.patch.object(FakeUIAWrapper, "invoke", invoke):
             harness.activate_source_layout(running_app())
 
-        self.assertEqual((anchor.invoke_count, edit.invoke_count), (1, 1))
+        self.assertEqual(view.invoke_count, 2)
+        self.assertEqual(harness.view_button_name(running_app()), "View: Edit — switch to Split")
+
+    def test_stalled_view_press_times_out_without_pressing_twice(self) -> None:
+        view = FakeControl("title-view", "Button", name="View: Edit — switch to Split")
+        harness = native_harness(FreshRootFactory([FakeRoot([view])]), timeout=0.001)
+
+        with self.assertRaisesRegex(runtime.HarnessFailure, "TITLE_VIEW_UIA_TIMEOUT"):
+            harness.view_command(running_app(), "Split")
+
+        self.assertEqual(view.invoke_count, 1)
+
+    def test_view_command_gives_up_after_three_presses_on_an_incomplete_cycle(self) -> None:
+        view = FakeControl("title-view", "Button", name="View: Edit — switch to Split")
+        harness = native_harness(FreshRootFactory([FakeRoot([view])]))
+        original = FakeUIAWrapper.invoke
+
+        def invoke(wrapper: FakeUIAWrapper) -> None:
+            original(wrapper)
+            view.name = (
+                "View: Split — switch to Preview" if view.invoke_count % 2
+                else "View: Edit — switch to Split"
+            )
+
+        with (
+            mock.patch.object(FakeUIAWrapper, "invoke", invoke),
+            self.assertRaisesRegex(runtime.HarnessFailure, "TITLE_VIEW_UIA_CONTRACT_MISMATCH"),
+        ):
+            harness.view_command(running_app(), "Preview")
+
+        self.assertEqual(view.invoke_count, 3)
+
+    def test_compatibility_is_read_from_toggle_and_pressed_only_on_a_difference(self) -> None:
+        anchor = FakeControl(runtime.MENU_BUTTON_AUTOMATION_ID, "Button")
+        switch = FakeControl("title-menu-web", "Button", enabled=False)
+        toggle = switch.toggle_pattern = mock.Mock(CurrentToggleState=0)
+        harness = native_harness(FreshRootFactory([FakeRoot([anchor, switch])]))
+        harness.win32 = mock.Mock()
+        app = running_app()
+        original = FakeUIAWrapper.invoke
+
+        def invoke(wrapper: FakeUIAWrapper) -> None:
+            original(wrapper)
+            self.assertIs(wrapper.control, anchor)
+            switch.enabled = True
+
+        def toggle_switch() -> None:
+            self.assertTrue(switch.enabled)
+            toggle.CurrentToggleState = 1 - toggle.CurrentToggleState
+            switch.enabled = False
+
+        toggle.Toggle.side_effect = toggle_switch
+        harness.win32.send_key.side_effect = lambda *_args: setattr(switch, "enabled", False)
+        with mock.patch.object(FakeUIAWrapper, "invoke", invoke):
+            self.assertFalse(harness.compatibility_state(app))
+            harness.set_compatibility(app, True)
+            harness.set_compatibility(app, True)
+            toggle.Toggle.assert_called_once_with()
+            self.assertTrue(harness.compatibility_state(app))
+            harness.set_compatibility(app, False)
+            self.assertFalse(harness.compatibility_state(app))
+
+        self.assertEqual(toggle.Toggle.call_count, 2)
+        self.assertEqual(switch.invoke_count, 0)
+        self.assertEqual(harness.win32.send_key.call_args_list, [mock.call(73, runtime.VK_ESCAPE)] * 4)
+
+    def test_sidebar_open_sends_ctrl_b_once_only_if_the_panel_is_absent(self) -> None:
+        root = FakeRoot()
+        panel = FakeControl("sidebar-panel", "Group")
+        harness = native_harness(FreshRootFactory([root]))
+        harness.win32 = mock.Mock()
+        harness.win32.send_shortcuts.side_effect = lambda *_args: root.controls.append(panel)
+        app = running_app()
+
+        self.assertTrue(harness.sidebar_collapsed(app))
+        harness.ensure_sidebar_open(app)
+        self.assertFalse(harness.sidebar_collapsed(app))
+        harness.ensure_sidebar_open(app)
+
+        harness.win32.send_shortcuts.assert_called_once_with(73, (runtime.VK_B,))
+
+    def test_sidebar_open_times_out_without_repeating_ctrl_b(self) -> None:
+        harness = native_harness(FreshRootFactory([FakeRoot()]), timeout=0.001)
+        harness.win32 = mock.Mock()
+
+        with self.assertRaisesRegex(runtime.HarnessFailure, "SIDEBAR_PANEL_UIA_TIMEOUT"):
+            harness.ensure_sidebar_open(running_app())
+
+        harness.win32.send_shortcuts.assert_called_once_with(73, (runtime.VK_B,))
+
+    def test_pointer_close_hovers_the_named_sidebar_row_before_clicking_its_close(self) -> None:
+        for row_id in ("sidebar-file", "sidebar-outside-row"):
+            with self.subTest(row_id=row_id):
+                row = FakeControl(row_id, "Button", name="note.md", bounds=(20, 40, 100, 60))
+                close = FakeControl("rail-close", "Button", name="Close note.md", visible=False)
+                wrong = FakeControl("rail-close", "Button", name="Close other.md")
+                strip = FakeControl("rail-file-row", "Button", name="note.md")
+                root = FakeRoot([wrong, strip])
+                harness = native_harness(FreshRootFactory([root]))
+                harness.win32 = mock.Mock()
+                harness.win32.send_shortcuts.side_effect = lambda *_args: root.controls.extend(
+                    [FakeControl("sidebar-panel", "Group"), row, close]
+                )
+                harness.win32.move_cursor.side_effect = lambda *_args: setattr(close, "visible", True)
+
+                harness.close_tab_by_pointer(running_app(), "note.md")
+
+                self.assertEqual(harness.win32.mock_calls, [
+                    mock.call.send_shortcuts(73, (runtime.VK_B,)), mock.call.move_cursor(60, 50),
+                ])
+                self.assertEqual((close.click_count, close.invoke_count, wrong.click_count), (1, 0, 0))
 
     def test_menu_command_reuses_an_open_menu(self) -> None:
         anchor = FakeControl(runtime.MENU_BUTTON_AUTOMATION_ID, "Button")
@@ -736,14 +874,14 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
 
     def test_find_control_refreshes_root_after_a_stale_lookup(self) -> None:
         stale = FakeRoot()
-        current_control = FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")
+        current_control = FakeControl(runtime.TAB_CLOSE_AUTOMATION_ID, "Edit")
         current = FakeRoot([current_control])
         factory = FreshRootFactory([stale, current])
         harness = native_harness(factory)
 
         control = harness.find_control(
             running_app(),
-            HARNESS.TAB_CLOSE_AUTOMATION_ID,
+            runtime.TAB_CLOSE_AUTOMATION_ID,
             "Edit",
             "SOURCE_EDITOR_UIA_TIMEOUT",
             "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -761,7 +899,7 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.find_control(
                 running_app(),
-                HARNESS.TAB_CLOSE_AUTOMATION_ID,
+                runtime.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "SOURCE_EDITOR_UIA_TIMEOUT",
                 "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -770,18 +908,18 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "SOURCE_EDITOR_UIA_TIMEOUT")
         self.assertEqual(
             root.find_calls[0],
-            ("descendants", ("automation-id", HARNESS.TAB_CLOSE_AUTOMATION_ID)),
+            ("descendants", ("automation-id", runtime.TAB_CLOSE_AUTOMATION_ID)),
         )
 
     def test_find_control_fails_immediately_on_id_or_type_mismatch(self) -> None:
-        mismatched = FakeRoot([FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Button")])
+        mismatched = FakeRoot([FakeControl(runtime.TAB_CLOSE_AUTOMATION_ID, "Button")])
         factory = FreshRootFactory([mismatched])
         harness = native_harness(factory)
 
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.find_control(
                 running_app(),
-                HARNESS.TAB_CLOSE_AUTOMATION_ID,
+                runtime.TAB_CLOSE_AUTOMATION_ID,
                 "Edit",
                 "SOURCE_EDITOR_UIA_TIMEOUT",
                 "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",
@@ -795,19 +933,19 @@ class SelectorAndOrchestrationTests(unittest.TestCase):
         stale = FakeRoot(
             [
                 FakeControl(
-                    HARNESS.TAB_CLOSE_AUTOMATION_ID,
+                    runtime.TAB_CLOSE_AUTOMATION_ID,
                     "Edit",
                     property_error=RuntimeError(secret),
                 )
             ]
         )
-        current_control = FakeControl(HARNESS.TAB_CLOSE_AUTOMATION_ID, "Edit")
+        current_control = FakeControl(runtime.TAB_CLOSE_AUTOMATION_ID, "Edit")
         factory = FreshRootFactory([stale, FakeRoot([current_control])])
         harness = native_harness(factory)
 
         control = harness.find_control(
             running_app(),
-            HARNESS.TAB_CLOSE_AUTOMATION_ID,
+            runtime.TAB_CLOSE_AUTOMATION_ID,
             "Edit",
             "SOURCE_EDITOR_UIA_TIMEOUT",
             "SOURCE_EDITOR_UIA_CONTRACT_MISMATCH",

@@ -866,7 +866,7 @@ class PhaseTests(unittest.TestCase):
             list(PIXEL_CELL_RESULTS),
             *([[]] * 8),
         ]
-        for name in ("menu_command", "read_fixture_cell_results", "editor_control"):
+        for name in ("set_compatibility", "view_command", "read_fixture_cell_results", "editor_control"):
             setattr(harness, name, getattr(order, name))
         return harness, order, app
 
@@ -883,10 +883,12 @@ class PhaseTests(unittest.TestCase):
         self.assertEqual(
             order.mock_calls,
             [
-                mock.call.menu_command(app, runtime.MENU_WEB_AUTOMATION_ID),
+                mock.call.set_compatibility(app, True),
+                mock.call.view_command(app, "Preview"),
                 *([mock.call.read_fixture_cell_results(app)] * 6),
-                mock.call.menu_command(app, runtime.MENU_EDIT_AUTOMATION_ID),
+                mock.call.view_command(app, "Edit"),
                 mock.call.editor_control(app),
+                mock.call.set_compatibility(app, False),
             ],
         )
         self.assertEqual(monotonic.call_count, 4)
@@ -1164,7 +1166,8 @@ class PhaseTests(unittest.TestCase):
         harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
         order.editor_control.assert_not_called()
-        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.set_compatibility.assert_called_once_with(app, True)
+        order.view_command.assert_called_once_with(app, "Preview")
 
     def test_web_phase_fails_when_final_self_navigation_contacts_the_counted_listener(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
@@ -1182,7 +1185,8 @@ class PhaseTests(unittest.TestCase):
                 harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
 
         harness.win32.visible_top_level_windows.assert_not_called()
-        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.set_compatibility.assert_called_once_with(app, True)
+        order.view_command.assert_called_once_with(app, "Preview")
         order.editor_control.assert_not_called()
 
     def test_fixture_attempts_use_only_the_run_targets(self) -> None:
@@ -1562,7 +1566,8 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
             ),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
-        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.set_compatibility.assert_called_once_with(app, True)
+        order.view_command.assert_called_once_with(app, "Preview")
         order.read_fixture_cell_results.assert_called_once_with(app)
         harness.network_probes.snapshot.assert_not_called()
         harness.win32.visible_top_level_windows.assert_not_called()
@@ -1575,7 +1580,8 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
             self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_COUNT_UNEXPECTED"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
-        order.menu_command.assert_called_once_with(app, runtime.MENU_WEB_AUTOMATION_ID)
+        order.set_compatibility.assert_called_once_with(app, True)
+        order.view_command.assert_called_once_with(app, "Preview")
         order.editor_control.assert_not_called()
 
     def test_web_phase_fails_when_a_new_window_leaves_the_app_foreground(self) -> None:
@@ -1599,6 +1605,8 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
             self.assertRaisesRegex(runtime.HarnessFailure, "WEB_TO_SOURCE_NATIVE_FOCUS_TIMEOUT"),
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+
+        order.set_compatibility.assert_called_once_with(app, True)
 
     def decisions_harness(self, accept_offered: bool = False) -> tuple[HARNESS.Goal07Harness, mock.Mock]:
         order = mock.Mock()

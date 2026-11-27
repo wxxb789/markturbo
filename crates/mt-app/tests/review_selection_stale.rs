@@ -103,17 +103,38 @@ fn a_selection_the_editor_no_longer_shows_is_not_reviewed() {
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
-    // Source -> Preview -> Source remounts the editor with a fresh caret.
+    // After Edit → Split → Preview, the mounted editor's selection is hidden
+    // and may not be reviewed. Cycling back makes that same selection visible.
     select_line_five(&mut app);
-    menu(&mut app, "title-menu-preview");
-    app.wait_for_gone("label:Markdown source", Duration::from_secs(5))
-        .expect("the preview took the column");
-    // In Preview there is no source editor, so there is no selection.
+    app.press("id:title-view").expect("choose Split");
+    app.press("id:title-view").expect("choose Preview");
+    app.wait_for("id:stage-dock >> id:preview-column")
+        .expect("the preview took the stage");
     assert_no_selection_review(&mut app, "the Preview pane");
-    menu(&mut app, "title-menu-edit");
+    // Context over Preview shows the source screen again, so the selection
+    // the mounted editor still holds is on screen and is reviewable.
+    app.press("id:title-file")
+        .expect("open Context over Preview");
+    app.wait_for("id:context-field")
+        .expect("Context occupies the dock");
+    menu(&mut app, "title-menu-review-selection");
+    app.wait_for("id:consent-scope-selection")
+        .expect("the visible source selection is reviewable");
+    app.press("id:consent-cancel-button").expect("cancel");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the card closed");
+    app.press_key("escape").expect("close Context");
+    app.wait_for_gone("id:context-field", Duration::from_secs(2))
+        .expect("Context closed");
+    app.press("id:title-view").expect("return to Edit");
     app.wait_for("label:Markdown source")
-        .expect("the source editor again");
-    assert_no_selection_review(&mut app, "a pane round trip");
+        .expect("the editor is visible again");
+    menu(&mut app, "title-menu-review-selection");
+    app.wait_for("id:consent-scope-selection")
+        .expect("the visible selection was retained");
+    app.press("id:consent-cancel-button").expect("cancel");
+    app.wait_for_gone("id:consent-card", Duration::from_secs(2))
+        .expect("the card closed");
 
     // Another tab and back remounts the editor too.
     select_line_five(&mut app);

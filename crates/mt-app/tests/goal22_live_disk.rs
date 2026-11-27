@@ -66,7 +66,9 @@ fn start_workspace(config: &Path, workspace: &Path) -> Headless {
 }
 
 fn open_from_home(app: &mut Headless, name: &str) {
-    app.press(&format!("label:{name}"))
+    // The sidebar lists the same file with the same label; the workspace home
+    // is the surface this helper opens from.
+    app.press(&format!("id:workspace-home >> label:{name}"))
         .unwrap_or_else(|why| panic!("open `{name}` from the workspace home: {why}"));
     app.wait_for(EDITOR).expect("the source editor");
 }
@@ -946,16 +948,20 @@ fn under_reduced_motion_a_reload_does_not_slide_the_text() {
 
     let editor = node_id(&app, "source-editor");
     let marks = marks.lock().unwrap();
-    let offset = marks
-        .translate_of(editor)
-        .expect("the editor binds a slide offset");
-    assert_eq!(marks.created_for(offset), Some(0.0));
+    assert!(
+        marks.translate_of(editor).is_none(),
+        "reduced motion binds no slide offset for the editor"
+    );
     assert!(
         marks.node_set_to(SLIP_OFFSET_PX).is_none(),
         "reduced motion never moves the text"
     );
+    // The fade alone still carries the slip after a successful adoption.
+    let ink = marks
+        .node_set_to(SLIP_DIM)
+        .expect("reduced motion dims the arriving text");
     assert!(
-        !marks.starts_on(offset),
-        "reduced motion starts no slide for the editor"
+        marks.starts_to(ink, 1.0),
+        "reduced motion fades the arriving text back up"
     );
 }
