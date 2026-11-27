@@ -145,7 +145,7 @@ fn notice_line(state: AppState) -> impl IntoElement {
     let color_state = state;
     view()
         .test_id("settings-notice")
-        .h(px(SPACE_3 + TYPE_UI_LINE))
+        .min_h(px(SPACE_3 + TYPE_UI_LINE))
         .child(when(
             move || !condition_state.settings_notice.get().is_empty(),
             move || {

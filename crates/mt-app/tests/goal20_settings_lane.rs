@@ -28,7 +28,13 @@ fn start_with_manual_clock() -> (Headless, tempfile::TempDir, tempfile::TempDir)
 fn start_with(
     clock: Option<nsh_core::time::Clock>,
 ) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
-    let config = tempfile::tempdir().expect("config dir");
+    start_with_config(tempfile::tempdir().expect("config dir"), clock)
+}
+
+fn start_with_config(
+    config: tempfile::TempDir,
+    clock: Option<nsh_core::time::Clock>,
+) -> (Headless, tempfile::TempDir, tempfile::TempDir) {
     let codex_home = tempfile::tempdir().expect("Codex home");
     let data_dir = config.path().join("data");
     // SAFETY: TEST_LOCK serializes app lifetimes and environment changes.
@@ -942,16 +948,30 @@ fn a_slow_folder_shows_beside_the_named_undo() {
         .expect("the Undo restores the captured counts");
 }
 
-fn y_of(app: &Headless, id: &str) -> f32 {
+fn node_bounds(app: &Headless, id: &str) -> nsh_core::geometry::Bounds<Points> {
     app.screen()
         .layout_nodes()
         .into_iter()
         .find(|node| node.test_id.as_deref() == Some(id))
         .unwrap_or_else(|| panic!("`{id}` on screen"))
         .bounds
-        .origin
-        .y
-        .0
+}
+
+fn text_bounds(app: &Headless, content: &str) -> nsh_core::geometry::Bounds<Points> {
+    app.screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == content)
+        })
+        .unwrap_or_else(|| panic!("`{content}` on screen"))
+        .bounds
+}
+
+fn y_of(app: &Headless, id: &str) -> f32 {
+    node_bounds(app, id).origin.y.0
 }
 
 #[test]
@@ -1050,4 +1070,66 @@ fn the_settings_status_line_clears_the_usage_actions() {
     .expect("the first press reaches the action");
     app.wait_for("text:Hide details")
         .expect("the first Show details press registered");
+}
+
+#[test]
+fn a_wrapped_settings_notice_grows_the_notice_line_and_keeps_the_undo_pressable() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::create_dir(config.path().join("settings.toml"))
+        .expect("a settings path that refuses the write");
+    let (mut app, _config, _codex_home) = start_with_config(config, None);
+    app.set_viewport(Size::new(
+        Points(mt_app::ui::tokens::WINDOW_MIN_W),
+        Points(mt_app::ui::tokens::WINDOW_MIN_H),
+    ))
+    .expect("the minimum viewport");
+    open_settings(&mut app);
+    app.scroll("id:settings-scroll", Points(10_000.0))
+        .expect("scroll to the usage counters");
+    app.settle();
+    app.press("id:usage-clear").expect("clear the counts");
+    app.wait_for("id:settings-page >> id:status-undo")
+        .expect("the Undo");
+    app.press("id:usage-on")
+        .expect("save a preference that cannot persist");
+    let notice = "Could not save the preference. Recording is off for this session; try again before restarting.";
+    app.wait_for(&format!("text:{notice}"))
+        .expect("the failed-save notice");
+    app.settle();
+
+    let text = text_bounds(&app, notice);
+    assert!(
+        text.size.height.0 >= 2.0 * mt_app::ui::tokens::TYPE_UI_LINE - 0.5,
+        "the notice did not wrap at the minimum width: {text:?}"
+    );
+    let line = node_bounds(&app, "settings-notice");
+    assert!(
+        line.size.height.0 >= mt_app::ui::tokens::SPACE_3 + text.size.height.0 - 0.5,
+        "the notice line did not grow for the wrapped notice: line {line:?}, text {text:?}"
+    );
+    let status = node_bounds(&app, "status");
+    assert!(
+        text.origin.y.0 + text.size.height.0 <= status.origin.y.0 + 0.5,
+        "the wrapped notice overflows into the status row: notice ends at {}, status starts at {}",
+        text.origin.y.0 + text.size.height.0,
+        status.origin.y.0
+    );
+
+    let undo = node_bounds(&app, "status-undo");
+    assert!(
+        undo.origin.y.0 >= -0.5
+            && undo.origin.y.0 + undo.size.height.0 <= mt_app::ui::tokens::WINDOW_MIN_H + 0.5,
+        "the Undo left the minimum window under the wrapped notice: {undo:?}"
+    );
+    let undo_control = app.screen().id("id:status-undo").expect("the Undo control");
+    assert_eq!(
+        app.screen()
+            .press_target("id:status-action")
+            .expect("a valid selector"),
+        Some(undo_control),
+        "the Undo's own control does not hear the press under the wrapped notice"
+    );
+    app.press("id:status-undo").expect("press the Undo");
+    app.wait_for("text:Undone.").expect("the Undo ran");
 }
