@@ -231,3 +231,10 @@
   yields two tabs writing the same file; and with a workspace root cased differently from the real directory, the root's
   event spelling misses a symlink tab's resolved target, so a target write reloads no clean tab and raises no conflict on a
   dirty one. Fix by identifying a file by its file ID (volume serial number plus file index) instead of its path spelling.
+- [ ] **A directory alias shares an inotify descriptor with the real path** — on Linux, a tab opened through `alias/plan.md`
+  where `alias` (outside the workspace) points at `A/notes`, then `A` opened as the workspace: both registrations share one
+  inotify descriptor, and closing the last `alias` tab unwatches it, so `A/notes` loses live updates. Fix by keying watch
+  registrations by the resolved directory and reference-counting them.
+- [ ] **A failed recursive registration restores the old watch without a recheck** — if registering the new root fails, the
+  rollback re-registers the old document-directory watch with an unchanged generation, so a write made in the gap is never
+  read. Fix by advancing the generation on rollback so affected tabs re-check.

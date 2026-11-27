@@ -229,7 +229,7 @@ fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
     };
 
     unsafe extern "C" {
-        fn open(path: *const c_char, flags: c_int) -> c_int;
+        fn open(path: *const c_char, flags: c_int, ...) -> c_int;
         fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     }
 
