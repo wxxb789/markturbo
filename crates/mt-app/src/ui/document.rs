@@ -245,10 +245,11 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
 
     // The clean-reload slip (Goal 22, decision 6, lane 22-B): the changed
     // text arrives from a few points to the right with a short ink fade, over
-    // the motion tokens. Only a successful adoption sets the marker, so a
-    // conflict or a failed read never plays it, and a tab that mounts after
-    // an adoption never replays the last one.
-    let slip_offset = animated_value(RELOAD_SLIP_PX);
+    // the motion tokens. The offset starts at zero, so a normal open and
+    // reduced motion never move the text; only a successful adoption sets the
+    // marker, so a conflict or a failed read never plays it, and a tab that
+    // mounts after an adoption never replays the last one.
+    let slip_offset = animated_value(0.0);
     let slip_opacity = animated_value(1.0);
     let slip_state = state.clone();
     let slip_tab = tab.id;

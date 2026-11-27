@@ -526,8 +526,8 @@ fn disk_text(state: &AppState, tab: &Tab) -> Option<String> {
         .conflict_disks
         .get()
         .into_iter()
-        .find(|(id, _)| *id == tab.id)
-        .map(|(_, text)| text)
+        .find(|(id, ..)| *id == tab.id)
+        .map(|(_, text, _)| text)
 }
 
 pub(crate) fn close_compare(state: &AppState) {

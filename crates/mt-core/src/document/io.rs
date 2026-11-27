@@ -14,7 +14,7 @@
 
 use std::{
     fs::File,
-    io::Read,
+    io::{Read, Seek},
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -102,9 +102,10 @@ struct FileSnapshot {
 /// Read one internally consistent view of a path.
 ///
 /// The bytes, metadata, digest, and object identity all come from one open
-/// handle, and a second handle proves the path still resolves to the same
-/// object — with the same length and modification time — before the snapshot is
-/// accepted. The read handle shares writes and deletes (see
+/// handle: a second handle proves the path still resolves to the same object —
+/// same identity, length and modification time — and a second read through the
+/// first handle proves the bytes did not change under it, before the snapshot
+/// is accepted. The read handle shares writes and deletes (see
 /// [`open_snapshot_file`]), so that proof is what turns a concurrent external
 /// replace into a retry instead of a torn or stale snapshot; it also lets
 /// another editor's atomic save replace the path while this read is live
@@ -162,6 +163,15 @@ fn read_snapshot_once(path: &Path) -> std::io::Result<Option<FileSnapshot>> {
     {
         return Ok(None);
     }
+    // An in-place overwrite keeps the object, the length and the modification
+    // time, so the digest of a second read through the same handle is what
+    // tells a torn snapshot from a whole one.
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut again = Vec::with_capacity(bytes.len());
+    file.read_to_end(&mut again)?;
+    if Sha256::digest(&again).as_slice() != stamp.digest.as_slice() {
+        return Ok(None);
+    }
     drop(file);
 
     Ok(Some(FileSnapshot { bytes, stamp }))
@@ -178,9 +188,9 @@ fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
     // rename it over this path) needs write and delete access to the path, and
     // denying them made that save fail while this read held the handle.
     // Consistency does not come from the sharing mode but from
-    // [`read_snapshot_once`] re-checking the object identity, length and
-    // modification time after the read, and from [`load`] re-checking the
-    // source identity around it.
+    // [`read_snapshot_once`] re-checking the identity, length and modification
+    // time and re-reading the bytes before accepting a snapshot, and from
+    // [`load`] re-checking the source identity around it.
     std::fs::OpenOptions::new()
         .read(true)
         .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
@@ -237,7 +247,20 @@ pub fn file_object_id(file: &File) -> std::io::Result<Option<FileObjectId>> {
     }))
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn file_object_id(file: &File) -> std::io::Result<Option<FileObjectId>> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    let mut file_id = [0u8; 16];
+    file_id[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+    Ok(Some(FileObjectId {
+        volume_serial_number: metadata.dev(),
+        file_id,
+    }))
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn file_object_id(_file: &File) -> std::io::Result<Option<FileObjectId>> {
     Ok(None)
 }
@@ -632,6 +655,12 @@ fn try_load_skill_source(path: &Path) -> Option<(FileSnapshot, SourceIdentity, S
         || reopened_metadata.len() != after.len()
         || reopened_metadata.modified().ok() != after.modified().ok()
     {
+        return None;
+    }
+    entrypoint.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let mut again = Vec::with_capacity(bytes.len());
+    entrypoint.read_to_end(&mut again).ok()?;
+    if Sha256::digest(&again).as_slice() != stamp.digest.as_slice() {
         return None;
     }
 
@@ -1729,6 +1758,8 @@ fn run_recovery_source_match_hook() {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     fn write_file(dir: &Path, name: &str, content: &[u8]) -> PathBuf {
@@ -1789,11 +1820,65 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"bbbb bbbb\n");
         // A later read never races and must see the writer's bytes.
         assert_eq!(load(&path).unwrap().text, "bbbb bbbb\n");
-        // The Windows check is exact: the second handle named a different
-        // object, so the snapshot was retried. Unix compares length and
-        // modification time instead, which a fast rename can defeat.
-        #[cfg(windows)]
+        // The rename changed the object on every platform: Windows by its
+        // object id, Unix by its device and inode. The snapshot must be the
+        // replacement, not the object the first handle kept open.
         assert_eq!(loaded.text, "bbbb bbbb\n");
+    }
+
+    /// Write `bytes` into `path` in place (the same object) and put its
+    /// modification time back, while the read between its bytes and its
+    /// verification is live: object id, length and mtime all still match.
+    fn overwrite_in_place_during_read(path: &Path, bytes: &[u8]) {
+        let path = path.to_path_buf();
+        let bytes = bytes.to_vec();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        install_read_race_hook(move || {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.write_all(&bytes).unwrap();
+            file.set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        });
+    }
+
+    /// The defect: an in-place overwrite that preserves the object, the
+    /// length and the modification time passes every metadata check, so the
+    /// snapshot kept the bytes read before the write.
+    #[test]
+    fn an_in_place_overwrite_with_the_same_length_and_mtime_is_read_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = write_file(directory.path(), "plan.md", b"aaaa aaaa\n");
+
+        overwrite_in_place_during_read(&path, b"bbbb bbbb\n");
+        let loaded = load(&path).expect("the read retries and completes");
+
+        assert_eq!(
+            loaded.text, "bbbb bbbb\n",
+            "the retry must return the bytes that are on disk now"
+        );
+        assert_eq!(loaded.stamp, FileStamp::of(&path).unwrap());
+    }
+
+    /// The same in-place race through the Agent Skill entrypoint: the
+    /// snapshot is refused and the fallback read carries the new bytes and no
+    /// provenance.
+    #[test]
+    fn an_in_place_overwrite_of_a_skill_entrypoint_during_a_read_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill_root = directory.path().join("skill");
+        std::fs::create_dir(&skill_root).unwrap();
+        let path = write_file(&skill_root, "SKILL.md", b"aaaa aaaa\n");
+
+        overwrite_in_place_during_read(&path, b"bbbb bbbb\n");
+        let loaded = load(&path).expect("the read retries and completes");
+
+        assert_eq!(loaded.text, "bbbb bbbb\n");
+        assert!(
+            loaded.skill_origin().is_none(),
+            "the entrypoint's bytes stopped matching the package, so the \
+             fallback must carry no provenance"
+        );
+        assert_eq!(load(&path).unwrap().text, "bbbb bbbb\n");
     }
 
     /// The same race through the Agent Skill entrypoint, which `SKILL.md`

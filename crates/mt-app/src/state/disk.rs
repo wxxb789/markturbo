@@ -184,21 +184,20 @@ impl AppState {
         if !std::fs::metadata(&tab.path).is_ok_and(|metadata| metadata.is_file()) {
             // Moved or deleted: the banner offers Save As and keeps the
             // buffer. The generation bump above drops any read still in
-            // flight, so an older read cannot clear this notice.
+            // flight, so an older read cannot clear this notice, and an open
+            // comparison loses the version that no longer exists.
             tab.disk_missing.set(true);
+            self.invalidate_comparison(tab);
             return;
         }
         tab.disk_missing.set(false);
-        if tab.dirty.get() {
-            // Unsaved edits: raise the conflict at once, not at save.
-            self.note_conflict(tab);
-            return;
-        }
         self.start_disk_reload(tab);
     }
 
     /// Read `tab`'s file and adopt it if nothing about the tab moved while
-    /// the read was in flight.
+    /// the read was in flight. The read decides what kind of change this is:
+    /// the stamp compared against the tab's last read or write is what tells
+    /// the app's own save from an external one, before any dirty flag does.
     fn start_disk_reload(&self, tab: &Tab) {
         let generation = tab.disk_generation.get();
         let revision = tab.revision.get();
@@ -245,18 +244,22 @@ impl AppState {
                     return;
                 }
             };
-            if current.revision.get() != revision {
-                state.note_conflict(&current);
-                return;
-            }
-            let unchanged = {
+            // Our own last read or write: the app's save is never an external
+            // change, even when the user typed again before the save's event
+            // was drained, so this check comes before the revision one.
+            let own_write = {
                 let loaded_before = current.loaded.borrow();
                 loaded_before.stamp == loaded.stamp
             };
-            if unchanged {
-                // The stamp matches our own last write: the app's save is
-                // never an external change, so there is nothing to reload and
-                // nothing to say.
+            if own_write {
+                return;
+            }
+            if current.revision.get() != revision {
+                state.note_conflict_of(&current, Some(&loaded.stamp));
+                return;
+            }
+            if current.dirty.get() {
+                state.note_conflict_of(&current, Some(&loaded.stamp));
                 return;
             }
             state.adopt_disk_version(&current, loaded);
@@ -296,9 +299,12 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use nsh_base::editor::{EditorPosition, editor};
     use nsh_engine::{EngineConfig, Root};
     use nsh_testing::Headless;
+
+    use super::*;
+    use crate::ui::tokens;
 
     /// Renders what the watcher recorded, so a headless test can see the
     /// diagnostic the app deliberately keeps off its UI.
@@ -372,5 +378,97 @@ mod tests {
         app.press("id:close-watched").expect("close the tab");
         app.wait_for("text:watched:0")
             .expect("the last tab's directory loses its watch");
+    }
+
+    const ANCHOR_OLD: &str = "line zero\nline one\nline two\nline three\nline four\ntail\n";
+
+    /// Line 4 stays, but the four lines above it grow far past the caret's
+    /// old byte offset: offset mapping would leave the caret on line 0.
+    fn anchor_new() -> String {
+        let long = "A".repeat(120);
+        format!("{long}\n{long}\n{long}\n{long}\nline four\ntail\n")
+    }
+
+    /// Mounts one document's editor, sets a caret, adopts a new disk version,
+    /// and renders the caret read back after the anchor restore's frames.
+    #[component]
+    fn ReloadAnchorProbe() -> impl IntoElement {
+        let state = AppState::new();
+        let directory = std::rc::Rc::new(tempfile::tempdir().unwrap());
+        let path = directory.path().join("anchor.md");
+        std::fs::write(&path, ANCHOR_OLD).unwrap();
+        let id = state.add_tab(io::load(&path).unwrap());
+        let editor_ref = component_ref::<Editor>();
+        state.attach_source_editor(id, editor_ref);
+        let tab = state
+            .tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| tab.id == id)
+            .expect("the tab");
+        let readback = signal(SharedString::from("caret:?"));
+        let press_state = state.clone();
+        let press_readback = readback;
+        let press_tab = tab.clone();
+        let keep = directory.clone();
+        view()
+            .test_id("anchor-probe")
+            .child(
+                editor()
+                    .component_ref(&editor_ref)
+                    .value({
+                        let tab = tab.clone();
+                        move || Some(tab.text.get())
+                    })
+                    .font_family(tokens::FONT_SOURCE)
+                    .font_size(px(tokens::TYPE_SOURCE))
+                    .line_height(px(tokens::TYPE_SOURCE_LINE))
+                    .w(px(600.0))
+                    .h(px(400.0)),
+            )
+            .child(
+                view()
+                    .test_id("anchor-reload")
+                    .on_press(move |_: &PressEvent| {
+                        let _ = &keep;
+                        if let Some(api) = editor_ref.api::<EditorApi>() {
+                            api.set_selections(vec![EditorSelection::caret(EditorPosition::new(
+                                4, 1,
+                            ))]);
+                        }
+                        std::fs::write(&path, anchor_new()).unwrap();
+                        let loaded = io::load(&path).unwrap();
+                        press_state.adopt_disk_version(&press_tab, loaded);
+                        let readback = press_readback;
+                        press_state.spawn_task(async move {
+                            for _ in 0..6 {
+                                request_animation_frame(|_| {}).await;
+                            }
+                            let shown = editor_ref
+                                .api::<EditorApi>()
+                                .and_then(|api| api.selections().pop())
+                                .map(|selection| {
+                                    format!(
+                                        "caret:{}:{}",
+                                        selection.head.line, selection.head.column
+                                    )
+                                })
+                                .unwrap_or_else(|| "caret:none".to_owned());
+                            readback.set(SharedString::from(shown));
+                        });
+                    })
+                    .child(text(|| "Reload")),
+            )
+            .child(text(move || readback.get()))
+    }
+
+    #[test]
+    fn a_reload_keeps_the_caret_line_by_row_and_column() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<ReloadAnchorProbe>()))
+            .expect("start the probe");
+        app.wait_for("id:anchor-reload").expect("the probe");
+        app.press("id:anchor-reload").expect("reload");
+        app.wait_for("text:caret:4:1")
+            .expect("the caret stays on its line after the reload");
     }
 }

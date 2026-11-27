@@ -171,6 +171,55 @@ pub fn gate_reads_started(path: &Path) -> usize {
         .map_or(0, |gate| gate.next)
 }
 
+static COMMIT_GATES: LazyLock<Mutex<Vec<PathGate>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Hold the next reload of `path` after its snapshot was read and before the
+/// answer is committed, until the release path exists, so a test can let the
+/// disk change at the moment the answer is about to be applied.
+pub fn gate_commit(path: impl Into<PathBuf>, release: impl Into<PathBuf>) {
+    COMMIT_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(PathGate {
+            path: path.into(),
+            releases: vec![release.into()],
+            next: 0,
+        });
+}
+
+/// Whether a commit gate for `path` has been reached.
+pub fn commit_gate_reached(path: &Path) -> bool {
+    COMMIT_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|gate| gate.path == path)
+        .is_some_and(|gate| gate.next > 0)
+}
+
+pub(crate) fn wait_for_commit(path: &Path) {
+    let release = {
+        let mut gates = COMMIT_GATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(gate) = gates.iter_mut().find(|gate| gate.path == path) else {
+            return;
+        };
+        let release = gate
+            .releases
+            .get(gate.next)
+            .or_else(|| gate.releases.last())
+            .cloned();
+        gate.next += 1;
+        release
+    };
+    if let Some(release) = release {
+        while !release.exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
 static SAVE_GATE_REACHED: AtomicBool = AtomicBool::new(false);
 
 /// Whether the Save As test gate has been reached: the save is waiting for

@@ -13,7 +13,7 @@ use std::time::Duration;
 use nsh_core::element::{Idiom, Os};
 use nsh_core::{
     MountItem, NodeId,
-    animation::{AnimationOp, Driver},
+    animation::{AnimationOp, AnimationProp, Driver},
 };
 use nsh_engine::{EngineConfig, Points, Root};
 use nsh_testing::{Headless, Screen};
@@ -93,6 +93,16 @@ fn wait_for_text(app: &mut Headless, text: &str, what: &str) {
     });
 }
 
+/// The laid-out view with test id `id`.
+fn node_id(app: &Headless, id: &str) -> NodeId {
+    app.screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| node.test_id.as_deref() == Some(id))
+        .unwrap_or_else(|| panic!("no `{id}` on screen: {:?}", app.screen().texts()))
+        .id
+}
+
 /// The clean-reload slip's own animation values (`ui/document.rs`): the text
 /// arrives 6 points off its place and at part ink, and settles to both at
 /// once. Its nodes are the ones a batch sets to these values, so the test
@@ -104,6 +114,8 @@ const SLIP_DIM: f32 = 0.35;
 struct SlipMarks {
     sets: Vec<(NodeId, f32)>,
     starts: Vec<(NodeId, f32)>,
+    created: Vec<(NodeId, f32)>,
+    bindings: Vec<(NodeId, AnimationProp, NodeId)>,
 }
 
 impl SlipMarks {
@@ -124,6 +136,14 @@ impl SlipMarks {
                     }) => {
                         marks.starts.push((*node, *to));
                     }
+                    MountItem::Animation(AnimationOp::CreateValue { node, value }) => {
+                        marks.created.push((*node, *value));
+                    }
+                    MountItem::AnimationBindings { id, bindings } => {
+                        for (prop, node) in bindings {
+                            marks.bindings.push((*id, *prop, *node));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -139,10 +159,30 @@ impl SlipMarks {
             .map(|(node, _)| *node)
     }
 
+    /// The value node `view` binds to a horizontal translation, as mounted.
+    fn translate_of(&self, view: NodeId) -> Option<NodeId> {
+        self.bindings
+            .iter()
+            .find(|(id, prop, _)| *id == view && matches!(prop, AnimationProp::Transform(_)))
+            .map(|(_, _, node)| *node)
+    }
+
+    /// The initial value a node was created with, when it was created.
+    fn created_for(&self, node: NodeId) -> Option<f32> {
+        self.created
+            .iter()
+            .find(|(created, _)| *created == node)
+            .map(|(_, value)| *value)
+    }
+
     fn starts_to(&self, node: NodeId, to: f32) -> bool {
         self.starts
             .iter()
             .any(|(started, value)| *started == node && *value == to)
+    }
+
+    fn starts_on(&self, node: NodeId) -> bool {
+        self.starts.iter().any(|(started, _)| *started == node)
     }
 }
 
@@ -469,5 +509,281 @@ fn an_external_write_to_a_symlink_target_raises_the_banner_on_a_dirty_tab() {
         shows(app.screen(), "Local edit."),
         "the edits stay in the buffer: {:?}",
         app.screen().texts()
+    );
+}
+
+#[test]
+fn a_retargeted_symlink_watch_follows_the_new_target() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let first = tempfile::tempdir().expect("first target dir");
+    let second = tempfile::tempdir().expect("second target dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let target_one = first.path().join("target.md");
+    std::fs::write(&target_one, "# Target one\n").expect("write the first target");
+    let target_two = second.path().join("target.md");
+    std::fs::write(&target_two, "# Target two\n").expect("write the second target");
+    let link = workspace.path().join("link.md");
+    if let Err(error) = symlink_file(&target_one, &link) {
+        eprintln!("skipping file-symlink test: {error}");
+        return;
+    }
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "link.md");
+    app.wait_for("text:# Target one")
+        .expect("the linked document is open");
+
+    // The link is retargeted outside the app; the reload adopts the new
+    // target, and the watch must follow it to its own directory.
+    std::fs::remove_file(&link).expect("unlink");
+    symlink_file(&target_two, &link).expect("retarget the link");
+    wait_for_text(&mut app, "# Target two", "the adopted new target");
+
+    std::fs::write(&target_two, "# Target two changed\n").expect("write the new target");
+    wait_for_text(
+        &mut app,
+        "# Target two changed",
+        "the new target's own event",
+    );
+}
+
+#[test]
+fn typing_right_after_a_save_does_not_raise_a_conflict() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = workspace.path().join("plan.md");
+    std::fs::write(&path, "# Original\n").expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.type_text(EDITOR, "\nSaved edit.")
+        .expect("edit the buffer");
+    app.press_key("mod+s").expect("save");
+    wait_for_text(&mut app, "Saved plan.md", "the save notice");
+    // The user keeps typing before the save's own event is drained.
+    app.type_text(EDITOR, "\nTyped on.")
+        .expect("keep typing after the save");
+
+    pump_for(&mut app, Duration::from_millis(2_400));
+    assert_eq!(
+        app.screen().count("id:conflict-banner").expect("selector"),
+        0,
+        "the save's own event is not a conflict: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        shows(app.screen(), "Typed on."),
+        "the newer typing stays in the buffer: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        !shows(app.screen(), "Updated from disk"),
+        "the save reloads nothing: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_manual_reload_answer_after_a_delete_keeps_the_missing_banner() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = workspace.path().join("plan.md");
+    let release = config.path().join("release-commit");
+    std::fs::write(&path, "# Original\n").expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.type_text(EDITOR, "\nLocal edit.")
+        .expect("edit the buffer");
+    std::fs::write(&path, "# External\n").expect("external write");
+    wait_for_text(&mut app, "Changed on disk", "the conflict banner");
+
+    // The manual reload's snapshot is read, then held before it commits.
+    mt_app::test_vault::gate_commit(&path, &release);
+    app.press("id:conflict-use-disk")
+        .expect("ask for the disk version");
+    app.wait_for("id:guard-reload").expect("the reload guard");
+    app.press("id:guard-reload").expect("confirm the reload");
+    wait_for_marker(
+        &mut app,
+        "the manual read to reach its commit",
+        Duration::from_secs(20),
+        |_| mt_app::test_vault::commit_gate_reached(&path),
+    );
+
+    // The file disappears while the read's answer waits to commit.
+    std::fs::remove_file(&path).expect("delete the file");
+    wait_for_text(&mut app, "Moved or deleted on disk", "the Save As banner");
+
+    std::fs::write(&release, b"").expect("let the stale answer commit");
+    pump_for(&mut app, Duration::from_millis(800));
+    assert!(
+        shows(app.screen(), "Moved or deleted on disk"),
+        "the newer delete notice survives the older read: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        !shows(app.screen(), "Updated from disk"),
+        "the stale read never reloads: {:?}",
+        app.screen().texts()
+    );
+    assert!(
+        shows(app.screen(), "Local edit."),
+        "the buffer keeps the edit: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_newer_external_write_closes_an_open_comparison() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = workspace.path().join("plan.md");
+    std::fs::write(&path, "# Original\n").expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    open_from_home(&mut app, "plan.md");
+    app.type_text(EDITOR, "\nLocal edit.")
+        .expect("edit the buffer");
+    std::fs::write(&path, "# Alpha disk\n").expect("external write");
+    wait_for_text(&mut app, "Changed on disk", "the conflict banner");
+
+    app.press("label:Compare").expect("compare");
+    app.wait_for("id:conflict-previous")
+        .expect("the comparison panel");
+    assert!(
+        shows(app.screen(), "Alpha"),
+        "the first disk version shows: {:?}",
+        app.screen().texts()
+    );
+
+    // A newer version on disk: the comparison may not keep the older one as
+    // the current disk version.
+    std::fs::write(&path, "# Beta disk has more words\n").expect("a newer external write");
+    app.wait_for_gone("id:conflict-previous", Duration::from_secs(20))
+        .expect("the older comparison closes on the newer disk version");
+    assert!(
+        !shows(app.screen(), "Alpha"),
+        "the compared version is gone: {:?}",
+        app.screen().texts()
+    );
+
+    app.press("label:Compare").expect("compare again");
+    app.wait_for("id:conflict-previous")
+        .expect("the fresh comparison panel");
+    assert!(
+        shows(app.screen(), "Beta"),
+        "the fresh disk version shows: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn a_relative_workspace_path_still_matches_its_own_tree_events() {
+    let parent = tempfile::tempdir().expect("workspace parent");
+    let config = tempfile::tempdir().expect("config dir");
+    let workspace = parent.path().join("notes");
+    std::fs::create_dir(&workspace).expect("create the workspace");
+    std::fs::write(workspace.join("plan.md"), "# Plan\n").expect("write plan.md");
+
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+    }
+    std::env::set_current_dir(parent.path()).expect("enter the parent");
+    let mut app = start(config.path(), Some(Path::new("notes")));
+    app.wait_for("id:workspace-home-file >> text:plan.md")
+        .expect("the relative workspace lists its file");
+
+    std::fs::write(workspace.join("appeared.md"), "# Appeared\n").expect("create a file");
+    wait_for_marker(
+        &mut app,
+        "the tree lists the new file",
+        Duration::from_secs(20),
+        |screen| {
+            screen
+                .matches("id:workspace-home-file >> text:appeared.md")
+                .unwrap_or(false)
+        },
+    );
+}
+
+#[test]
+fn a_normal_open_leaves_the_editor_at_its_place() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    std::fs::write(workspace.path().join("plan.md"), "# Original\n").expect("write plan.md");
+
+    let mut app = start_workspace(config.path(), workspace.path());
+    let marks = SlipMarks::observe(&mut app);
+    open_from_home(&mut app, "plan.md");
+    app.wait_for("text:# Original").expect("the document");
+
+    let editor = node_id(&app, "source-editor");
+    let marks = marks.lock().unwrap();
+    let offset = marks
+        .translate_of(editor)
+        .expect("the editor binds a slide offset");
+    assert_eq!(
+        marks.created_for(offset),
+        Some(0.0),
+        "a normal open starts the text at its place"
+    );
+    assert!(
+        !marks.starts_on(offset),
+        "a normal open starts no slide: {:?}",
+        app.screen().texts()
+    );
+}
+
+#[test]
+fn under_reduced_motion_a_reload_does_not_slide_the_text() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = tempfile::tempdir().expect("config dir");
+    let path = workspace.path().join("plan.md");
+    std::fs::write(&path, "# Original\n").expect("write plan.md");
+
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", workspace.path());
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+    }
+    let mut engine = EngineConfig::new(Root::of::<mt_app::App>());
+    engine.environment.os = Os::Windows;
+    engine.environment.idiom = Idiom::Desktop;
+    engine.environment.reduce_motion = true;
+    let mut app = Headless::start(engine).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(Points(1280.0), Points(800.0)))
+        .expect("viewport");
+    app.wait_for("id:workspace-home")
+        .expect("the workspace home");
+    let marks = SlipMarks::observe(&mut app);
+    open_from_home(&mut app, "plan.md");
+    app.wait_for("text:# Original").expect("the document");
+
+    std::fs::write(&path, "# External\n").expect("external write");
+    wait_for_text(&mut app, "# External", "the reloaded text");
+
+    let editor = node_id(&app, "source-editor");
+    let marks = marks.lock().unwrap();
+    let offset = marks
+        .translate_of(editor)
+        .expect("the editor binds a slide offset");
+    assert_eq!(marks.created_for(offset), Some(0.0));
+    assert!(
+        marks.node_set_to(SLIP_OFFSET_PX).is_none(),
+        "reduced motion never moves the text"
+    );
+    assert!(
+        !marks.starts_on(offset),
+        "reduced motion starts no slide for the editor"
     );
 }

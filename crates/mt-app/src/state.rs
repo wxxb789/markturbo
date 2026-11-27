@@ -56,7 +56,7 @@ use mt_core::{
         tree::{self, FileNode},
     },
 };
-use nsh_base::editor::{Editor, EditorApi};
+use nsh_base::editor::{Editor, EditorApi, EditorSelection};
 use nsh_core::{file_dialog::SaveDialog, prelude::*};
 
 pub(crate) mod disk;
@@ -355,9 +355,10 @@ pub struct AppState {
     /// Which difference the open comparison shows (`ui::notices`).
     pub conflict_difference: Signal<usize>,
     /// The file-on-disk text of each conflicted document (`ui::notices`),
-    /// keyed by its tab and read when the comparison opens. A tab's entry is
-    /// ignored while its `conflict` is false.
-    pub conflict_disks: Signal<Vec<(u64, String)>>,
+    /// keyed by its tab, with the stamp it was read at: read when the
+    /// comparison opens and dropped when a new conflict is noticed. A tab's
+    /// entry is ignored while its `conflict` is false.
+    pub conflict_disks: Signal<Vec<(u64, String, FileStamp)>>,
     /// The companion CJK face the settings page downloads on request.
     pub companion_font: crate::ui::fonts::Companion,
     owner: Owner,
@@ -1395,15 +1396,8 @@ impl AppState {
         let request = self.begin_folder_open();
         let state = self.clone();
         self.spawn_task(async move {
-            state.finish_folder_open(path, request).await;
+            state.finish_folder_open(path, request, false).await;
         });
-    }
-
-    /// The open's own work, awaitable so a caller that must say something
-    /// after the folder lands (a drop's skipped-files notice) can order it.
-    pub(crate) async fn open_folder_now(&self, path: PathBuf) {
-        let request = self.begin_folder_open();
-        self.finish_folder_open(path, request).await;
     }
 
     /// The request token and the held "Opening folder…" line, both in place
@@ -1418,8 +1412,15 @@ impl AppState {
     }
 
     /// The scan and its commit, once the token and the status are in place. A
-    /// superseded open writes nothing.
-    async fn finish_folder_open(&self, path: PathBuf, request: u64) {
+    /// superseded open writes nothing. The root is registered in one absolute
+    /// spelling — the same the watcher reports events in — so a workspace
+    /// opened as a relative path still matches its own tree updates; nothing
+    /// is canonicalized, because a removed path has no canonical spelling.
+    /// `from_drop` re-checks the open surfaces once the scan returns: a card
+    /// that went up while the folder was scanned owns the interaction, and
+    /// the drop commits nothing behind it.
+    async fn finish_folder_open(&self, path: PathBuf, request: u64, from_drop: bool) {
+        let path = absolute_path(path);
         let state = self.clone();
         let scanned = blocking({
             let path = path.clone();
@@ -1435,6 +1436,9 @@ impl AppState {
             // the stale scan returned this way.
             #[cfg(any(test, feature = "test-vault"))]
             crate::test_vault::note_superseded_open(&path);
+            return;
+        }
+        if from_drop && state.drop_blocked() {
             return;
         }
         match scanned {
@@ -1456,9 +1460,12 @@ impl AppState {
         }
     }
 
-    /// Opens `path` in a tab, or activates the tab already showing it.
+    /// Opens `path` in a tab, or activates the tab already showing it. The
+    /// path is registered in the one absolute spelling, so a relative start
+    /// path still matches the events of the directory watched for it.
     pub fn open_file(&self, path: PathBuf) {
-        if let Some(tab) = self.tabs.get().iter().find(|tab| tab.path == path) {
+        let path = absolute_path(path);
+        if let Some(tab) = self.tab_showing(&path) {
             self.set_active(tab.id);
             self.focus_editor();
             return;
@@ -1478,11 +1485,27 @@ impl AppState {
                 }
             };
             let opened = loaded.path.clone();
+            if let Some(tab) = state.tab_showing(&opened) {
+                state.set_active(tab.id);
+                state.focus_editor();
+                return;
+            }
             state.add_tab(loaded);
             state.record_usage(UsageEvent::ArtifactOpened);
             state.notify_named(crate::i18n::Key::Opened, &opened);
             state.focus_editor();
         });
+    }
+
+    /// The open tab that reads `path`: the literal spelling first, then the
+    /// canonical one while both ends still exist, so a file reached through a
+    /// relative path, a different link spelling or an absolute one is one
+    /// tab.
+    fn tab_showing(&self, path: &Path) -> Option<Tab> {
+        self.tabs
+            .get_untracked()
+            .into_iter()
+            .find(|tab| !tab.untitled && (tab.path == path || io::paths_match(&tab.path, path)))
     }
 
     /// Whether this tab holds live Review or Revision work: a request out for
@@ -2502,8 +2525,8 @@ impl AppState {
         let loaded = io::load(&tab.path)?;
         let id = tab.id;
         self.conflict_disks.update(|disks| {
-            disks.retain(|(entry, _)| *entry != id);
-            disks.push((id, loaded.text));
+            disks.retain(|(entry, ..)| *entry != id);
+            disks.push((id, loaded.text, loaded.stamp));
         });
         Ok(())
     }
@@ -2513,19 +2536,52 @@ impl AppState {
     /// show — or mark lines against — a read that predates this conflict.
     /// The text is read when the comparison is asked for
     /// ([`Self::refresh_conflict_disk`]).
+    ///
+    /// Only a disk version identical to the one the open comparison already
+    /// shows is a repeat: a newer version closes that comparison instead of
+    /// leaving it on screen as the current disk version.
     fn note_conflict(&self, tab: &Tab) {
+        self.note_conflict_of(tab, None);
+    }
+
+    /// [`Self::note_conflict`] with the disk version the caller just read, so
+    /// the comparison's stamp is checked against the bytes in hand instead of
+    /// a second read.
+    fn note_conflict_of(&self, tab: &Tab, disk: Option<&FileStamp>) {
         let repeated = tab.conflict.get_untracked();
         tab.conflict.set(true);
         if repeated && self.conflict_compare.get_untracked() == Some(tab.id) {
-            // The user is looking at this conflict's comparison. A repeated
-            // notice for the same conflict window — a disk event the refused
-            // save already reported — must not fold the read they asked for;
-            // a folded comparison still drops it.
+            let same = self.compared_stamp(tab.id).is_some_and(|stored| {
+                disk.map_or_else(|| stored.matches(&tab.path), |now| stored == *now)
+            });
+            if same {
+                return;
+            }
+            crate::ui::notices::close_compare(self);
+        }
+        let id = tab.id;
+        self.conflict_disks
+            .update(|disks| disks.retain(|(entry, ..)| *entry != id));
+    }
+
+    fn compared_stamp(&self, id: u64) -> Option<FileStamp> {
+        self.conflict_disks
+            .get_untracked()
+            .into_iter()
+            .find(|(entry, ..)| *entry == id)
+            .map(|(_, _, stamp)| stamp)
+    }
+
+    /// Drop the open comparison when it no longer shows what is on disk: the
+    /// file is gone, or a disk event moved past the version it read.
+    fn invalidate_comparison(&self, tab: &Tab) {
+        if self.conflict_compare.get_untracked() != Some(tab.id) {
             return;
         }
         let id = tab.id;
         self.conflict_disks
-            .update(|disks| disks.retain(|(entry, _)| *entry != id));
+            .update(|disks| disks.retain(|(entry, ..)| *entry != id));
+        crate::ui::notices::close_compare(self);
     }
 
     /// Run `f` under the state's own owner: what it makes (a new tab's
@@ -2738,9 +2794,12 @@ impl AppState {
         let Some(tab) = self.tabs.get().iter().find(|tab| tab.id == id).cloned() else {
             return;
         };
-        // The confirmation was for this revision: an edit made while the
-        // disk was read refuses it, keeping the buffer and its recovery.
+        // The confirmation was for this revision and for the disk event it
+        // was shown under: an edit made while the disk was read refuses it,
+        // keeping the buffer and its recovery, and so does a newer delete or
+        // move, whose notice the older read must never clear.
         let confirmed_revision = tab.revision.get();
+        let confirmed_generation = tab.disk_generation.get();
         let request = tab.reload.get().wrapping_add(1);
         tab.reload.set(request);
         let state = self.clone();
@@ -2751,7 +2810,10 @@ impl AppState {
                 move || {
                     #[cfg(any(test, feature = "test-vault"))]
                     crate::test_vault::wait_for_read(&path);
-                    io::load(&path)
+                    let loaded = io::load(&path);
+                    #[cfg(any(test, feature = "test-vault"))]
+                    crate::test_vault::wait_for_commit(&path);
+                    loaded
                 }
             })
             .await;
@@ -2783,8 +2845,14 @@ impl AppState {
             else {
                 return;
             };
+            // A disk event that moved this tab on while the read was in
+            // flight — a delete, a move, another write — owns the tab now:
+            // the answer predates it and must not clear its notice.
+            if current.disk_generation.get() != confirmed_generation {
+                return;
+            }
             if current.revision.get() != confirmed_revision {
-                state.note_conflict(&current);
+                state.note_conflict_of(&current, Some(&loaded.stamp));
                 state.focus_editor();
                 return;
             }
@@ -2868,14 +2936,13 @@ impl AppState {
     }
 
     fn adopt_disk_version(&self, tab: &Tab, loaded: LoadedFile) {
-        // Where the mounted editor was scrolled to, so the adopted text is met
-        // as closely as it allows (decision 4). The editor keeps its own caret
-        // and selection across the text change, mapped onto the text they were
-        // on, and nothing here overrides them: the old line is not the old
-        // words, and a live selection has to survive a reload (see
-        // `review_selection_stale`). A tab that is not mounted has nothing to
+        // The mounted editor's caret, selection and scroll offset are read
+        // before the swap; the caret is met where the reader was even when a
+        // line above it changed length, while a live selection keeps the
+        // editor's own mapping. A tab that is not mounted has nothing to
         // return to.
-        let anchor = self.mounted_editor_scroll(tab);
+        let anchor = self.mounted_editor_anchor(tab);
+        let identity_changed = tab.loaded.borrow().source_identity != loaded.source_identity;
         let restored = loaded.text.clone();
         let text = loaded.text.clone();
         *tab.loaded.borrow_mut() = loaded;
@@ -2887,6 +2954,9 @@ impl AppState {
             tab.disk_missing.set(false);
         });
         tab.revision.update(|revision| *revision += 1);
+        // The reloaded text is not the text the Review read: its result goes
+        // stale, without a dirty mark or a new recovery record.
+        self.mark_review_stale(tab.id);
         // The slip plays for a successful adoption only: a conflict or a
         // failed read never reaches this.
         let generation = self.slip_generation.get().wrapping_add(1);
@@ -2894,20 +2964,29 @@ impl AppState {
         self.reload_slip.set(Some((tab.id, generation)));
         self.retire_tab_recovery(tab);
         self.recovery_tracks.borrow_mut().remove(&tab.id);
-        if let Some((editor, scroll)) = anchor {
-            restore_editor_scroll(editor, scroll, restored, 2);
+        // A retargeted symbolic link reads from a directory the old identity
+        // never named: the watch list has to follow the new target.
+        if identity_changed {
+            self.sync_document_watches();
+        }
+        if let Some(anchor) = anchor {
+            restore_editor_anchor(anchor, restored, 2);
         }
     }
 
-    /// The mounted source editor's scroll offset, when it edits `tab`.
-    fn mounted_editor_scroll(&self, tab: &Tab) -> Option<(ComponentRef<Editor>, Point<Points>)> {
+    /// The mounted source editor's caret, selection and scroll offset, when
+    /// it edits `tab`.
+    fn mounted_editor_anchor(&self, tab: &Tab) -> Option<EditorAnchor> {
         let (id, editor) = self.source_editor.get()?;
         if id != tab.id {
             return None;
         }
         let api = editor.api::<EditorApi>()?;
-        let scroll = api.scroll_offset();
-        Some((editor, scroll))
+        Some(EditorAnchor {
+            editor,
+            selections: api.selections(),
+            scroll: api.scroll_offset(),
+        })
     }
 
     fn write_model_text(&self, tab: &Tab, text: String) {
@@ -5596,28 +5675,47 @@ fn flatten(nodes: &[FileNode], depth: usize, out: &mut Vec<Entry>) {
     }
 }
 
-/// Puts the mounted editor's scroll offset back once the adopted text is in
-/// it. The caret and the selection are the editor's own: it maps them onto
-/// the text they were on, which the adopted text's line numbers are not. The
-/// new value commits on a later frame, so a few frames are spent waiting for
-/// it; the offset is restored unchanged, the text usually differing by a line
-/// or two, which is the closest honest answer.
-fn restore_editor_scroll(
+/// The mounted editor's place in `tab`: its caret and selection in
+/// line/column terms, and the scroll offset it was read at.
+struct EditorAnchor {
     editor: ComponentRef<Editor>,
+    selections: Vec<EditorSelection>,
     scroll: Point<Points>,
-    text: String,
-    frames_left: u8,
-) {
+}
+
+/// Puts the mounted editor's anchor back once the adopted text is in it. The
+/// new value commits on a later frame, so a few frames are spent waiting for
+/// it; then a caret is restored by line and column — the editor's own offset
+/// mapping would land it on another line when the text above it changed
+/// length — while a non-empty selection keeps the editor's own mapping, which
+/// the Selection review scope reads as it shows it (see
+/// `review_selection_stale`), and the scroll offset is restored unchanged.
+fn restore_editor_anchor(anchor: EditorAnchor, text: String, frames_left: u8) {
     request_animation_frame(move |_| {
-        let Some(api) = editor.api::<EditorApi>() else {
+        let Some(api) = anchor.editor.api::<EditorApi>() else {
             return;
         };
         if api.value() != text && frames_left > 0 {
-            restore_editor_scroll(editor, scroll, text, frames_left - 1);
+            restore_editor_anchor(anchor, text, frames_left - 1);
             return;
         }
-        api.set_scroll_offset(scroll);
+        if !anchor.selections.is_empty()
+            && anchor
+                .selections
+                .iter()
+                .all(|selection| selection.anchor == selection.head)
+        {
+            api.set_selections(anchor.selections.clone());
+        }
+        api.set_scroll_offset(anchor.scroll);
     });
+}
+
+/// The one absolute spelling the app registers and matches paths by: a path
+/// already absolute is unchanged, and a relative one joins the process's
+/// current directory, as `MARKTURBO_OPEN=notes` names one.
+fn absolute_path(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// The editor language for a path, by extension.

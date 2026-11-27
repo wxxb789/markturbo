@@ -1,11 +1,12 @@
 //! Files and folders dropped on the window: what a hover offers, what a drop
 //! opens, and what it counts as skipped.
 //!
-//! The event carries names (absolute `file:` URIs) and inferred MIME types,
-//! nothing else. Only what a name confirms is acted on: a name the app's
+//! The event carries names (absolute `file:` URIs) and inferred MIME types.
+//! When a name is a local path the file system answers for, its kind and
+//! document type decide; otherwise only the name can: a name the app's
 //! document types accept, or a folder the event marked as one with a trailing
-//! slash. A name with no extension might be a folder the event did not type,
-//! so it is never treated as an unsupported file.
+//! slash. A name that confirms neither may still be a folder, so it is never
+//! treated as an unsupported file.
 
 use super::*;
 use mt_core::DocType;
@@ -25,7 +26,8 @@ pub enum DropOffer {
 }
 
 impl DropOffer {
-    /// Classify the items a drag offers, by their names alone.
+    /// Classify the items a drag offers: by the file system for local paths,
+    /// by the name otherwise.
     pub fn of(uris: &[String]) -> Self {
         let mut confirmed = 0usize;
         let mut single: Option<SharedString> = None;
@@ -83,19 +85,41 @@ impl DropOffer {
     }
 }
 
-/// What one offered item's name confirms.
+/// What one offered item's name and, when it names a local path, the file
+/// system confirm.
+///
+/// A name alone never confirms a file: on a file drag the event carries names
+/// and inferred MIME types only, and a folder named `archive.v1` gets a MIME
+/// type from that name. A path the file system answers for does confirm its
+/// kind; without that answer nothing is called unsupported.
 enum Offered {
-    /// A supported document, or a folder the event marked with a trailing
-    /// slash, with the name to show.
+    /// A supported document, or a folder, with the name to show.
     Openable(SharedString),
-    /// No extension (or no name): it might be a folder the event did not
-    /// type, so nothing is confirmed and nothing is refused.
+    /// No reliable answer: it might be a folder, or nothing the app can read.
     Unknown,
-    /// A name whose type the app's document types reject.
+    /// A regular file whose type the app's document types reject.
     Unsupported,
 }
 
 fn offered_kind(uri: &str) -> Offered {
+    if let Some(path) = file_path_of_uri(uri)
+        && let Ok(metadata) = std::fs::metadata(&path)
+    {
+        let Some(name) = path_name(&path) else {
+            return Offered::Unknown;
+        };
+        if metadata.is_dir() {
+            return Offered::Openable(SharedString::from(name));
+        }
+        if metadata.is_file() {
+            return if DocType::of(&path).is_document() {
+                Offered::Openable(SharedString::from(name))
+            } else {
+                Offered::Unsupported
+            };
+        }
+        return Offered::Unknown;
+    }
     if uri.ends_with('/') || uri.ends_with('\\') {
         return match uri_name(uri) {
             Some(name) => Offered::Openable(SharedString::from(name)),
@@ -108,31 +132,25 @@ fn offered_kind(uri: &str) -> Offered {
     if DocType::of(Path::new(&name)).is_document() {
         return Offered::Openable(SharedString::from(name));
     }
-    if has_extension(&name) {
-        Offered::Unsupported
-    } else {
-        Offered::Unknown
-    }
+    Offered::Unknown
 }
 
-/// The last path segment of `uri`, percent-decoded when it parses as a URL.
+fn path_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_string_lossy();
+    (!name.is_empty()).then(|| name.into_owned())
+}
+
+/// The last path segment of `uri`, decoded when the URI names a local file.
 fn uri_name(uri: &str) -> Option<String> {
     if let Ok(url) = url::Url::parse(uri)
-        && let Some(mut segments) = url.path_segments()
-        && let Some(name) = segments.rfind(|segment| !segment.is_empty())
+        && let Ok(path) = url.to_file_path()
+        && let Some(name) = path_name(&path)
     {
-        return Some(name.to_owned());
+        return Some(name);
     }
     let trimmed = uri.trim_end_matches(['/', '\\']);
     let name = trimmed.rsplit(['/', '\\']).next()?;
     (!name.is_empty()).then(|| name.to_owned())
-}
-
-/// A trailing extension: `.env` is a name, not an extension, as the MIME
-/// table treats it.
-fn has_extension(name: &str) -> bool {
-    name.rsplit_once('.')
-        .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
 }
 
 /// The path behind a dropped `file:` URI; anything else is nothing the app
@@ -164,20 +182,25 @@ pub(crate) fn plan_drop(uris: &[String]) -> DropPlan {
             plan.skipped += 1;
             continue;
         };
-        if path.is_dir() {
-            plan.folder = Some(path);
-        } else if DocType::of(&path).is_document() {
-            plan.documents.push(path);
-        } else {
-            plan.skipped += 1;
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => plan.folder = Some(path),
+            Ok(metadata) if metadata.is_file() && DocType::of(&path).is_document() => {
+                plan.documents.push(path);
+            }
+            _ => plan.skipped += 1,
         }
     }
     plan
 }
 
 impl AppState {
-    /// A drag entered: offer what its names confirm.
+    /// A drag entered: offer what its names confirm. A card, Settings or
+    /// another surface that replaces the workspace owns the interaction, so a
+    /// drag behind it offers nothing.
     pub fn drop_hover(&self, uris: &[String]) {
+        if self.drop_blocked() {
+            return;
+        }
         self.drop_offer.set(Some(DropOffer::of(uris)));
     }
 
@@ -188,32 +211,55 @@ impl AppState {
 
     /// A drop: open its documents in order in one task, make the last folder
     /// the workspace, and report the skipped count once, last, naming no
-    /// paths.
+    /// paths. The folder's request token is claimed here, before the task's
+    /// first await, so a workspace the user opens while the documents load is
+    /// never overwritten by the older drop; the same check closes the task if
+    /// a card or Settings is up by the time it commits.
     pub fn drop_files(&self, uris: &[String]) {
         self.drop_offer.set(None);
+        if self.drop_blocked() {
+            return;
+        }
         let language = self.settings.get().language;
         let plan = plan_drop(uris);
+        let folder = plan.folder.map(|folder| (folder, self.begin_folder_open()));
         let state = self.clone();
         self.spawn_task(async move {
-            state.open_dropped_documents(plan.documents).await;
-            if let Some(folder) = plan.folder {
-                state.open_folder_now(folder).await;
+            let mut skipped = state.open_dropped_documents(plan.documents).await;
+            skipped += plan.skipped;
+            if let Some((folder, request)) = folder {
+                if state.drop_blocked() {
+                    return;
+                }
+                state.finish_folder_open(folder, request, true).await;
             }
-            if plan.skipped > 0 {
-                state.notify_held(SharedString::from(s::skipped_files(language, plan.skipped)));
+            if skipped > 0 {
+                state.notify_held(SharedString::from(s::skipped_files(language, skipped)));
             }
         });
     }
 
+    /// Whether a card, Settings, or another surface that replaces the
+    /// workspace is up: a drag must neither offer nor commit behind it.
+    pub(crate) fn drop_blocked(&self) -> bool {
+        crate::ui::consent::is_open(self)
+            || crate::ui::notices::guard_is_open(self)
+            || crate::ui::settings::is_open(self)
+    }
+
     /// Open each path in a tab, or focus the tab already showing it. One task
     /// in order, so the last one ends up active and its load never races
-    /// another's.
-    async fn open_dropped_documents(&self, paths: Vec<PathBuf>) {
-        if paths.is_empty() {
-            return;
-        }
+    /// another's. Each path is confirmed a regular file at the load boundary,
+    /// so a FIFO or a path that changed kind is skipped, never read; the
+    /// tab lookup is repeated after the load, so two concurrent drops of one
+    /// file end in one tab.
+    async fn open_dropped_documents(&self, paths: Vec<PathBuf>) -> usize {
+        let mut skipped = 0;
         for path in paths {
-            if let Some(tab) = self.tabs.get().iter().find(|tab| tab.path == path) {
+            if self.drop_blocked() {
+                break;
+            }
+            if let Some(tab) = self.tab_showing(&path) {
                 self.set_active(tab.id);
                 continue;
             }
@@ -222,11 +268,18 @@ impl AppState {
                 match blocking(move || {
                     #[cfg(any(test, feature = "test-vault"))]
                     crate::test_vault::wait_for_read(&path);
-                    io::load(&path)
+                    if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+                        return Ok(None);
+                    }
+                    io::load(&path).map(Some)
                 })
                 .await
                 {
-                    Ok(Ok(loaded)) => loaded,
+                    Ok(Ok(Some(loaded))) => loaded,
+                    Ok(Ok(None)) => {
+                        skipped += 1;
+                        continue;
+                    }
                     Ok(Err(error)) => {
                         self.notify_failure(crate::i18n::Key::OpenFailed, &error);
                         continue;
@@ -237,12 +290,20 @@ impl AppState {
                     }
                 }
             };
+            if self.drop_blocked() {
+                break;
+            }
             let opened = loaded.path.clone();
+            if let Some(tab) = self.tab_showing(&opened) {
+                self.set_active(tab.id);
+                continue;
+            }
             self.add_tab(loaded);
             self.record_usage(UsageEvent::ArtifactOpened);
             self.notify_named(crate::i18n::Key::Opened, &opened);
         }
         self.focus_editor();
+        skipped
     }
 }
 
@@ -283,25 +344,57 @@ mod tests {
     }
 
     #[test]
-    fn only_all_confirmed_unsupported_types_read_as_unsupported() {
+    fn only_a_confirmed_file_reads_as_unsupported() {
+        let directory = tempfile::tempdir().unwrap();
+        let picture = directory.path().join("photo.png");
+        std::fs::write(&picture, b"\x89PNG").unwrap();
+        let document = directory.path().join("plan.md");
+        std::fs::write(&document, "# plan\n").unwrap();
+        let picture_uri = url::Url::from_file_path(&picture).unwrap().to_string();
+        let document_uri = url::Url::from_file_path(&document).unwrap().to_string();
+
         assert_eq!(
-            DropOffer::of(&["file:///w/photo.png".to_owned()]),
+            DropOffer::of(std::slice::from_ref(&picture_uri)),
             DropOffer::Unsupported
         );
         assert_eq!(
-            DropOffer::of(&[
-                "file:///w/photo.png".to_owned(),
-                "file:///w/binary-blob".to_owned()
-            ]),
+            DropOffer::of(&[picture_uri.clone(), "file:///w/binary-blob".to_owned()]),
             DropOffer::Unknown
         );
         assert_eq!(
-            DropOffer::of(&[
-                "file:///w/photo.png".to_owned(),
-                "file:///w/plan.md".to_owned()
-            ]),
+            DropOffer::of(&[picture_uri, document_uri]),
             DropOffer::One {
                 name: SharedString::from("plan.md")
+            }
+        );
+    }
+
+    #[test]
+    fn a_folder_named_like_a_file_is_confirmed_openable() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("archive.v1");
+        std::fs::create_dir(&folder).unwrap();
+        let uri = url::Url::from_directory_path(&folder).unwrap().to_string();
+        // A Windows folder URI does not have to end in a slash: the kind has
+        // to come from the file system, not the name.
+        assert_eq!(
+            DropOffer::of(&[uri.trim_end_matches('/').to_owned()]),
+            DropOffer::One {
+                name: SharedString::from("archive.v1")
+            }
+        );
+    }
+
+    #[test]
+    fn the_offered_name_is_decoded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("My Plan.md");
+        let uri = url::Url::from_file_path(&path).unwrap().to_string();
+
+        assert_eq!(
+            DropOffer::of(&[uri]),
+            DropOffer::One {
+                name: SharedString::from("My Plan.md")
             }
         );
     }
@@ -351,5 +444,34 @@ mod tests {
         assert_eq!(plan.documents, vec![document]);
         assert_eq!(plan.folder, Some(second_folder));
         assert_eq!(plan.skipped, 2, "the picture and the non-file URI");
+    }
+
+    #[test]
+    fn a_plan_skips_a_path_that_is_not_a_regular_file_or_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.md");
+
+        let plan = plan_drop(&[url::Url::from_file_path(&missing).unwrap().to_string()]);
+
+        assert!(plan.documents.is_empty());
+        assert_eq!(plan.skipped, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plan_skips_a_fifo_with_a_document_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("notes.md");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            status.is_ok_and(|status| status.success()),
+            "mkfifo must create {fifo:?}"
+        );
+
+        let uri = url::Url::from_file_path(&fifo).unwrap().to_string();
+        let plan = plan_drop(&[uri.clone()]);
+        assert!(plan.documents.is_empty(), "a FIFO is never opened");
+        assert_eq!(plan.skipped, 1);
+        assert_eq!(DropOffer::of(&[uri]), DropOffer::Unknown);
     }
 }
