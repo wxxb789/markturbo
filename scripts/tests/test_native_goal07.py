@@ -230,6 +230,107 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, f"{key} does not hold the expected value"):
                     HARNESS.validate_evidence(evidence)
 
+    def test_extra_window_facts_are_categories_not_raw_names(self) -> None:
+        fact = {
+            "category": "app_window",
+            "owned_by_main": True,
+            "process_image": "markturbo",
+        }
+        accepted = [fact, {"category": "unknown", "owned_by_main": False, "process_image": "other"}]
+
+        def failed(facts: Any) -> dict:
+            evidence = HARNESS.new_evidence(HASH)
+            evidence["cases"][0].update(
+                status="FAIL",
+                reason_code="APP_WINDOW_COUNT_UNEXPECTED",
+                failure_type="HarnessFailure",
+                duration_ms=1.0,
+                observations={HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: facts},
+            )
+            HARNESS.complete_evidence(evidence, "FAIL")
+            return evidence
+
+        HARNESS.validate_evidence(failed(accepted))
+        HARNESS.validate_evidence(failed([]))
+        for facts, message in (
+            ({}, "invalid extra-window observations"),
+            ([{**fact, "extra": 1}], "invalid extra-window observations"),
+            ([{**fact, "class_name": "NshWindow", "category": None}],
+             "invalid extra-window observations"),
+            ([{**fact, "category": "NshWindow"}], "invalid extra-window category"),
+            ([{**fact, "category": "\u4e2d\u6587 \u7c7b\u540d"}],
+             "invalid extra-window category"),
+            ([{**fact, "category": None}], "invalid extra-window category"),
+            ([{**fact, "owned_by_main": 1}], "invalid extra-window owner"),
+            ([{**fact, "process_image": "markturbo.exe"}],
+             "invalid extra-window process image"),
+            ([{**fact, "process_image": r"C:\dir\app.exe"}],
+             "invalid extra-window process image"),
+        ):
+            with (
+                self.subTest(message=message, facts=facts),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                HARNESS.validate_evidence(failed(facts))
+
+    def test_passed_evidence_cannot_carry_extra_windows(self) -> None:
+        fact = {"category": "app_window", "owned_by_main": True, "process_image": "markturbo"}
+        evidence = valid_evidence()
+        evidence["cases"][0]["observations"][HARNESS.EXTRA_WINDOW_OBSERVATION_KEY] = [fact]
+
+        with self.assertRaisesRegex(ValueError, "extra windows"):
+            HARNESS.validate_evidence(evidence)
+
+    def test_window_count_is_consistent_with_the_extra_window_list(self) -> None:
+        fact = {"category": "unknown", "owned_by_main": False, "process_image": "other"}
+
+        def failed(
+            facts: list[dict] | None,
+            count: int | None,
+            reason: str = "APP_WINDOW_COUNT_UNEXPECTED",
+        ) -> dict:
+            observations: dict[str, Any] = {}
+            if facts is not None:
+                observations[HARNESS.EXTRA_WINDOW_OBSERVATION_KEY] = facts
+            if count is not None:
+                observations["web_security_window_count"] = count
+            evidence = HARNESS.new_evidence(HASH)
+            evidence["cases"][0].update(
+                status="FAIL",
+                reason_code=reason,
+                failure_type="HarnessFailure",
+                duration_ms=1.0,
+                observations=observations,
+            )
+            HARNESS.complete_evidence(evidence, "FAIL")
+            return evidence
+
+        # The main window may itself be missing from the visible list, so the
+        # count is the extras plus zero or one main window; a record may also
+        # omit the count.
+        for facts, count in (
+            (None, None),
+            ([], 0),
+            ([fact], 1),
+            ([fact], 2),
+            ([fact, fact], 2),
+            ([fact, fact], 3),
+        ):
+            with self.subTest(facts=facts, count=count):
+                HARNESS.validate_evidence(failed(facts, count))
+        # Only the main window visible would have passed the collector's count
+        # check, so it cannot be the state a window-count failure records; a
+        # different failure reason may hold it.
+        with self.assertRaisesRegex(ValueError, "cannot observe the main window alone"):
+            HARNESS.validate_evidence(failed([], 1))
+        HARNESS.validate_evidence(failed([], 1, reason="APP_WINDOW_FOREGROUND_LOST"))
+        # Any count beside the list outside those states contradicts it.
+        for facts, count in (([], 2), ([fact], 3), ([fact, fact], 1)):
+            with self.subTest(facts=facts, count=count), self.assertRaisesRegex(
+                ValueError, "does not match the window count"
+            ):
+                HARNESS.validate_evidence(failed(facts, count))
+
     def test_the_session_needs_exactly_one_review_and_one_revision(self) -> None:
         for count in (1, 4):
             with self.subTest(count=count):
@@ -365,6 +466,61 @@ class EvidenceFinalizationTests(unittest.TestCase):
         self.assertEqual((returncode, evidence["status"], reason), (1, "FAIL", "UTF8_DOCUMENT_SENTINEL_LEAKED"))
         self.assertEqual(evidence["cases"][0]["observations"], {})
         self.assertEqual(evidence["transport"]["request_count"], 0)
+
+    def test_the_extra_window_facts_reach_the_failed_case_evidence(self) -> None:
+        facts = [
+            {"category": "app_window", "owned_by_main": True, "process_image": "markturbo"}
+        ]
+
+        def failed() -> dict:
+            raise runtime.HarnessFailure(
+                "APP_WINDOW_COUNT_UNEXPECTED",
+                observations={HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: facts},
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            returncode, evidence, reason = self.run_native_cases(Path(temporary), failed)
+
+        self.assertEqual(
+            (returncode, evidence["status"], reason),
+            (1, "FAIL", "APP_WINDOW_COUNT_UNEXPECTED"),
+        )
+        self.assertEqual(
+            evidence["cases"][0]["observations"],
+            {HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: facts},
+        )
+        HARNESS.validate_evidence(evidence)
+
+    def test_a_chinese_or_spaced_class_name_still_writes_its_fail_record(self) -> None:
+        # Win32 accepts arbitrary strings as a window class; the harness maps
+        # each window to a category before evidence, so an unusual class can
+        # no longer turn the failure into EVIDENCE_WRITE_FAILED.
+        fact = {
+            "category": runtime.window_fact_category("\u4e2d\u6587 \u7c7b\u540d", "other.exe"),
+            "owned_by_main": False,
+            "process_image": runtime.process_image_category("other.exe"),
+        }
+
+        def failed() -> dict:
+            raise runtime.HarnessFailure(
+                "APP_WINDOW_COUNT_UNEXPECTED",
+                observations={HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: [fact]},
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            returncode, evidence, reason = self.run_native_cases(Path(temporary), failed)
+            path = Path(temporary) / "evidence.json"
+            runtime.write_evidence(path, evidence, HARNESS.validate_evidence)
+            written = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            (returncode, written["status"], reason),
+            (1, "FAIL", "APP_WINDOW_COUNT_UNEXPECTED"),
+        )
+        self.assertEqual(
+            written["cases"][0]["observations"],
+            {HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: [fact]},
+        )
 
     def test_selected_case_run_is_partial(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -576,7 +732,7 @@ class SessionTests(unittest.TestCase):
             phase_web_security=order.phase_web_security,
             phase_decisions=order.phase_decisions,
             quit_via_menu=order.quit_via_menu,
-            click_lifecycle_decision=order.click_lifecycle_decision,
+            click_quit_decision=order.click_quit_decision,
             wait_process_exit=order.wait_process_exit,
             reap=order.reap,
             _finalize_observations=lambda _provider, _root, _app, observations: observations,
@@ -606,7 +762,7 @@ class SessionTests(unittest.TestCase):
                 mock.call.phase_web_security(app, provider, source),
                 mock.call.phase_decisions(app, provider, source),
                 mock.call.quit_via_menu(app),
-                mock.call.click_lifecycle_decision(app, "Discard"),
+                mock.call.click_quit_decision(app, "Discard"),
                 mock.call.wait_process_exit(app),
                 mock.call.reap(app),
             ],
@@ -1575,11 +1731,22 @@ main().catch(error => { console.error(error.message); process.exitCode = 1; });
     def test_web_phase_fails_if_a_popup_creates_an_extra_owned_window(self) -> None:
         harness, order, app = self.web_security_harness(focus_returns=True)
         harness.win32.visible_top_level_windows.return_value = (app.hwnd, 93)
+        harness.win32.window_facts.return_value = {
+            "category": "app_window",
+            "owned_by_main": True,
+            "process_image": "markturbo",
+        }
         with (
             mock.patch.object(HARNESS, "fixture_fingerprint", return_value=DISK),
-            self.assertRaisesRegex(runtime.HarnessFailure, "APP_WINDOW_COUNT_UNEXPECTED"),
+            self.assertRaises(runtime.HarnessFailure) as raised,
         ):
             harness.phase_web_security(app, order.provider, Path(HARNESS.FIXTURE_FILE))
+        self.assertEqual(raised.exception.code, "APP_WINDOW_COUNT_UNEXPECTED")
+        harness.win32.window_facts.assert_called_once_with(93, app.hwnd)
+        self.assertEqual(
+            raised.exception.observations,
+            {HARNESS.EXTRA_WINDOW_OBSERVATION_KEY: [harness.win32.window_facts()]},
+        )
         order.set_compatibility.assert_called_once_with(app, True)
         order.view_command.assert_called_once_with(app, "Preview")
         order.editor_control.assert_not_called()

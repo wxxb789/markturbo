@@ -691,9 +691,11 @@ class RecentControlBehaviorTests(unittest.TestCase):
         self.assertEqual(harness.open_tab_count(app), 2)
         harness.ensure_sidebar_open.assert_called_once_with(app)
 
-    def test_the_title_file_wait_ends_when_the_active_tab_is_named(self) -> None:
+    def test_the_title_file_wait_needs_the_context_labeled_name(self) -> None:
         app = type("App", (), {"hwnd": 42})()
-        names = iter(["Untitled", "replace.md"])
+        label = HARNESS.TITLE_FILE_NAME_LABEL.format(name="replace.md")
+        served = ["Untitled", "replace.md", label]
+        polls: list[str] = []
 
         def control_by_id(hwnd, automation_id, control_type, code):
             self.assertEqual(
@@ -701,15 +703,23 @@ class RecentControlBehaviorTests(unittest.TestCase):
                 (42, "title-file", "Button", "TITLE_FILE_UIA_CONTRACT_MISMATCH"),
             )
             control = mock.Mock()
-            control.element_info.name = next(names, "replace.md")
+            control.element_info.name = served[min(len(polls), len(served) - 1)]
+            polls.append(control.element_info.name)
             return control
 
         harness = self.harness([])
         harness.control_by_id = control_by_id
         harness.wait_title_file(app, "replace.md")
+        self.assertEqual(polls, ["Untitled", "replace.md", label])
+        polls.clear()
         with self.assertRaises(HARNESS_FAILURE) as raised:
             harness.wait_title_file(app, "other.md")
         self.assertEqual(raised.exception.code, "TITLE_FILE_TIMEOUT")
+
+    def test_title_file_label_matches_the_titlebar_source(self) -> None:
+        ui = Path(__file__).resolve().parents[2] / "crates" / "mt-app" / "src" / "ui"
+        source = (ui / "titlebar.rs").read_text(encoding="utf-8")
+        self.assertIn(f'"{HARNESS.TITLE_FILE_NAME_LABEL}"', source)
 
     def test_recent_query_returns_every_recent_row_button(self) -> None:
         elements = [
@@ -752,6 +762,140 @@ class RecentControlBehaviorTests(unittest.TestCase):
             harness.recent_controls(type("App", (), {"hwnd": 42})())
 
         self.assertIs(raised.exception, failure)
+
+
+class SaveAsPickerTests(unittest.TestCase):
+    """The picker is the process's visible task dialog whose filename combo
+    holds one ready Edit; nsh 0.7.1 owns it by the hidden surface window, so
+    an owner-of-main-window lookup would never see it. The picker's nested
+    overwrite confirmation is the task dialog the picker itself owns."""
+
+    MAIN = 73
+    PICKER = 11404732
+    PROMPT = 7276972
+
+    @staticmethod
+    def edit() -> mock.Mock:
+        edit = mock.Mock()
+        edit.element_info.automation_id = "1001"
+        edit.element_info.control_type = "Edit"
+        edit.is_visible.return_value = True
+        edit.is_enabled.return_value = True
+        return edit
+
+    @classmethod
+    def combo(cls) -> mock.Mock:
+        combo = mock.Mock()
+        combo.descendants.return_value = [cls.edit()]
+        return combo
+
+    @staticmethod
+    def harness(
+        *,
+        process_dialogs: list[int],
+        nested: dict[int, list[int]],
+        combos: dict[int, mock.Mock | None],
+        buttons: dict[tuple[int, str], mock.Mock] | None = None,
+    ) -> tuple[HARNESS.Goal03Harness, list[tuple[int, int | None]]]:
+        harness = object.__new__(HARNESS.Goal03Harness)
+        harness.ui_timeout = 0.05
+        calls: list[tuple[int, int | None]] = []
+
+        class Win32:
+            def task_dialogs(self, process_id: int, owner_hwnd: int | None = None) -> list[int]:
+                calls.append((process_id, owner_hwnd))
+                if owner_hwnd is None:
+                    return list(process_dialogs)
+                return list(nested.get(owner_hwnd, []))
+
+        harness.win32 = Win32()
+        served = buttons or {}
+
+        def control_by_id(
+            hwnd: int, automation_id: str, control_type: str, _code: str,
+            expected_name: str | None = None, expected_class_name: str | None = None,
+        ) -> mock.Mock | None:
+            if automation_id == "FileNameControlHost":
+                return combos.get(hwnd)
+            return served.get((hwnd, automation_id))
+
+        harness.control_by_id = control_by_id
+        return harness, calls
+
+    def app(self) -> object:
+        return type("App", (), {"hwnd": self.MAIN, "process": type("P", (), {"pid": 4242})()})()
+
+    def test_picker_is_found_by_process_when_its_owner_is_a_hidden_surface_window(self) -> None:
+        # The live arrangement: visible #32770 of the process, owned by a
+        # hidden NshWindow; no task dialog is owned by the main window.
+        combo = self.combo()
+        harness, calls = self.harness(
+            process_dialogs=[self.PICKER], nested={}, combos={self.PICKER: combo}
+        )
+        hwnd, edit = harness.common_file_dialog(self.app())
+
+        self.assertEqual(hwnd, self.PICKER)
+        self.assertIs(edit, combo.descendants.return_value[0])
+        self.assertEqual(calls, [(4242, None)])
+
+    def test_nested_overwrite_prompt_is_skipped_while_the_picker_waits(self) -> None:
+        harness, _calls = self.harness(
+            process_dialogs=[self.PICKER, self.PROMPT],
+            nested={self.PROMPT: []},
+            combos={self.PICKER: self.combo(), self.PROMPT: None},
+        )
+        hwnd, _edit = harness.common_file_dialog(self.app())
+        self.assertEqual(hwnd, self.PICKER)
+
+    def test_two_ready_pickers_are_a_contract_mismatch(self) -> None:
+        harness, _calls = self.harness(
+            process_dialogs=[self.PICKER, self.PROMPT],
+            nested={},
+            combos={self.PICKER: self.combo(), self.PROMPT: self.combo()},
+        )
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.common_file_dialog(self.app())
+        self.assertEqual(raised.exception.code, "MULTIPLE_SAVE_AS_FILE_DIALOGS")
+
+    def test_no_picker_times_out_with_the_dialog_code(self) -> None:
+        harness, _calls = self.harness(process_dialogs=[], nested={}, combos={})
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.common_file_dialog(self.app())
+        self.assertEqual(raised.exception.code, "SAVE_AS_FILE_DIALOG_TIMEOUT")
+
+    def test_overwrite_confirmation_is_the_dialog_the_picker_owns(self) -> None:
+        yes = mock.Mock()
+        no = mock.Mock()
+        harness, calls = self.harness(
+            process_dialogs=[self.PICKER, self.PROMPT],
+            nested={self.PICKER: [self.PROMPT]},
+            combos={},
+            buttons={(self.PROMPT, "CommandButton_6"): yes, (self.PROMPT, "CommandButton_7"): no},
+        )
+
+        found = harness.native_overwrite_confirmation(self.app(), self.PICKER)
+
+        self.assertEqual(found, {"Yes": yes, "No": no})
+        self.assertEqual(calls, [(4242, self.PICKER)])
+
+    def test_overwrite_confirmation_reports_a_closed_picker(self) -> None:
+        harness, _calls = self.harness(process_dialogs=[], nested={}, combos={})
+        with self.assertRaises(HARNESS_FAILURE) as raised:
+            harness.native_overwrite_confirmation(self.app(), self.PICKER)
+        self.assertEqual(raised.exception.code, "NATIVE_OVERWRITE_CONFIRMATION_MISSING")
+
+    def test_wait_file_dialog_closed_watches_the_process_task_dialogs(self) -> None:
+        harness, calls = self.harness(process_dialogs=[], nested={}, combos={})
+        harness.win32.require_foreground = mock.Mock()
+
+        harness.wait_file_dialog_closed(
+            self.app(), self.PROMPT, "SAVE_AS_FILE_DIALOG_CLOSE_TIMEOUT"
+        )
+
+        self.assertIn((4242, None), calls)
+        harness.win32.require_foreground.assert_called_once_with(
+            self.MAIN, harness.ui_timeout
+        )
 
 
 class RestartRecentsTests(unittest.TestCase):

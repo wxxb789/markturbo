@@ -42,7 +42,8 @@ def retired_scan() -> dict[str, int]:
 def observations(case_id: str = HARNESS.CASE_LIFECYCLE_SESSION) -> dict:
     original = fingerprint(HARNESS.ORIGINAL_BYTES)
     external = fingerprint(HARNESS.EXTERNAL_BYTES)
-    conflict = fingerprint(b"conflict")
+    cancelled = fingerprint(HARNESS.CANCEL_EDIT.encode("utf-8"))
+    confirmed = fingerprint(HARNESS.CONFIRM_EDIT.encode("utf-8"))
     pointer = fingerprint(b"pointer")
     window = fingerprint(b"window")
     edited = fingerprint(b"recovered")
@@ -50,12 +51,15 @@ def observations(case_id: str = HARNESS.CASE_LIFECYCLE_SESSION) -> dict:
         HARNESS.CASE_FLOWS[case_id],
         external_modification_loaded_source=original,
         external_modification_rewritten_source=external,
-        external_modification_dirty_editor=conflict,
+        external_modification_cancel_editor=cancelled,
+        external_modification_source_after_cancel=external,
+        external_modification_cancel_kept_editor=True,
+        external_modification_confirmed_editor=confirmed,
         external_modification_source_after_refused_save=external,
-        external_modification_overwritten_source=conflict,
+        external_modification_overwritten_source=confirmed,
         external_modification_conflict_ms=12.0,
         tab_close_editor=pointer,
-        tab_close_source_after_cancel=conflict,
+        tab_close_source_after_cancel=confirmed,
         tab_close_saved_source=pointer,
         checkpoint_editor=edited,
         checkpoint_ms=9999.0,
@@ -118,8 +122,19 @@ class EvidenceSchemaTests(unittest.TestCase):
             ("external_modification_rewritten_source", fingerprint(b"longer external"),
              "not same-length"),
             ("external_modification_conflict_ms", -1.0, "nonnegative timing"),
-            ("external_modification_source_after_refused_save", fingerprint(b"conflict"),
+            ("external_modification_source_after_refused_save", other,
              "refused Save changed"),
+            ("external_modification_source_after_cancel", other,
+             "Keep mine's Cancel changed"),
+            ("external_modification_cancel_kept_editor", False,
+             "did not keep the first edit"),
+            ("external_modification_cancel_editor", fingerprint(HARNESS.EXTERNAL_BYTES),
+             "disk bytes it must differ"),
+            ("external_modification_confirmed_editor", fingerprint(HARNESS.EXTERNAL_BYTES),
+             "disk bytes it must differ"),
+            ("external_modification_confirmed_editor",
+             fingerprint(HARNESS.CANCEL_EDIT.encode("utf-8")),
+             "same edit bytes"),
             ("external_modification_overwritten_source", other, "explicit overwrite"),
             ("tab_close_source_after_cancel", other, "tab close Cancel changed"),
             ("tab_close_saved_source", other, "Cancel did not preserve"),
@@ -185,20 +200,14 @@ class FakeWin32:
 
     def require_foreground(self, hwnd: int, _timeout: float) -> None:
         self.desk.events.append(("foreground", hwnd))
-
-    def foreground_focus(self, hwnd: int) -> int:
-        return hwnd
+        if self.desk.foreground_wait:
+            self.desk.sleep(self.desk.foreground_wait)
 
     def send_inputs(self, inputs: list[Any]) -> None:
         keys = [(item.ki.wVk, item.ki.dwFlags) for item in inputs]
         self.desk.events.append(("inputs", tuple(keys)))
         if keys[:2] == [(HARNESS.VK_MENU, 0), (HARNESS.VK_F4, 0)]:
             self.desk.guard = "window"
-
-    def send_key(self, _hwnd: int, key: int) -> None:
-        self.desk.events.append(("key", key))
-        if key == runtime.VK_RETURN and self.desk.enter_overwrites:
-            self.desk.write_editor()
 
     def send_shortcut(self, _hwnd: int, key: int) -> None:
         self.desk.events.append(("shortcut", key))
@@ -207,7 +216,8 @@ class FakeWin32:
 
     def post_close(self, _hwnd: int) -> None:
         self.desk.events.append(("wm_close",))
-        self.desk.guard = "window"
+        if not self.desk.wm_close_ignored:
+            self.desk.guard = "window"
 
 
 class FakeDesk:
@@ -218,7 +228,15 @@ class FakeDesk:
         root: Path,
         *,
         keep_mine_writes: bool = False,
-        enter_overwrites: bool = True,
+        keep_mine_delay: float | None = None,
+        second_keep_mine_writes: bool = False,
+        second_keep_mine_delay: float | None = None,
+        release_write_on_pointer_move: bool = False,
+        foreground_wait: float = 0.0,
+        overwrite_writes: bool = True,
+        overwrite_cancel_ignored: bool = False,
+        overwrite_cancel_restores_editor: bool = False,
+        overwrite_cancel_drops_conflict: bool = False,
         home_opens: bool = True,
         discard_retires: bool = True,
         failing_guard: int | None = None,
@@ -227,10 +245,21 @@ class FakeDesk:
         window_exit_code: int = 0,
         discard_writes: bool = False,
         failing_launch: int | None = None,
+        tab_cancel_ignored: bool = False,
+        quit_cancel_ignored: bool = False,
+        wm_close_ignored: bool = False,
     ) -> None:
         self.root = root
         self.keep_mine_writes = keep_mine_writes
-        self.enter_overwrites = enter_overwrites
+        self.keep_mine_delay = keep_mine_delay
+        self.second_keep_mine_writes = second_keep_mine_writes
+        self.second_keep_mine_delay = second_keep_mine_delay
+        self.release_write_on_pointer_move = release_write_on_pointer_move
+        self.foreground_wait = foreground_wait
+        self.overwrite_writes = overwrite_writes
+        self.overwrite_cancel_ignored = overwrite_cancel_ignored
+        self.overwrite_cancel_restores_editor = overwrite_cancel_restores_editor
+        self.overwrite_cancel_drops_conflict = overwrite_cancel_drops_conflict
         self.home_opens = home_opens
         self.discard_retires = discard_retires
         self.failing_guard = failing_guard
@@ -239,11 +268,20 @@ class FakeDesk:
         self.window_exit_code = window_exit_code
         self.discard_writes = discard_writes
         self.failing_launch = failing_launch
+        self.tab_cancel_ignored = tab_cancel_ignored
+        self.quit_cancel_ignored = quit_cancel_ignored
+        self.wm_close_ignored = wm_close_ignored
         self.guards = 0
+        self.keep_mine_clicks = 0
         self.events: list[tuple[Any, ...]] = []
         self.editor = b""
         self.conflict = False
         self.guard: str | None = None
+        self.overwrite_open = False
+        self.aimed_control: str | None = None
+        self.pending_write: tuple[bytes, float] | None = None
+        self.clock_now = 0.0
+        self.sleeps: list[float] = []
         # Open tabs: an argv document opens one (a folder none), Restore and
         # the workspace home's row add one more each (the app does not merge
         # them), and Don't save closes the active one.
@@ -255,20 +293,27 @@ class FakeDesk:
     def harness(self) -> HARNESS.Goal02Harness:
         harness = object.__new__(HARNESS.Goal02Harness)
         harness.ui_timeout = 0.2
-        harness.win32 = FakeWin32(self)
+        self.win32 = FakeWin32(self)
+        harness.win32 = self.win32
         harness.case_roots = self.case_roots
         harness.launch = self.launch
         harness.launch_app = self.launch_app
         harness.activate_source_layout = self.activate_source_layout
         harness.replace_editor = self.replace_editor
-        harness.name_present = lambda _app, _name, _type: self.conflict
+        harness.name_present = self.name_present
+        harness.clock = self.clock
+        harness.sleep = self.sleep
         harness.wait_name = self.wait_name
         harness.save_via_menu = self.save_via_menu
         harness.find_control = lambda _app, automation_id, *_args: automation_id
+        harness.aim_control = self.aim_control
         harness.click_control = self.click_control
+        harness.click_aimed_control = self.click_aimed_control
         harness.invoke_control = self.invoke_control
+        harness.guard_dialog = self.guard_dialog
         harness.close_tab_by_pointer = self.close_tab_by_pointer
         harness.click_lifecycle_decision = self.click_lifecycle_decision
+        harness.click_quit_decision = self.click_quit_decision
         harness.wait_process_exit = self.wait_process_exit
         harness.close_app = self.close_app
         harness.terminate = self.terminate
@@ -327,9 +372,34 @@ class FakeDesk:
         return runtime.fingerprint_bytes(self.editor)
 
     def write_editor(self) -> None:
-        runtime.write_durable(self.document, self.editor)
-        self.known = self.editor
+        self.write_bytes(self.editor)
+
+    def write_bytes(self, value: bytes) -> None:
+        runtime.write_durable(self.document, value)
+        self.known = value
         self.conflict = self.conflict and self.conflict_sticks
+
+    def clock(self) -> float:
+        return self.clock_now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.clock_now += seconds
+        pending = self.pending_write
+        if pending is not None and self.clock_now >= pending[1]:
+            self.pending_write = None
+            self.write_bytes(pending[0])
+
+    def name_present(self, _app: Any, name: str, _type: str) -> bool:
+        if name == runtime.CONFLICT_HEADING:
+            return self.conflict
+        if name == runtime.GUARD_HEADING:
+            return self.guard == "tab"
+        if name == runtime.QUIT_GUARD_HEADING:
+            return self.guard == "window"
+        if name == HARNESS.OVERWRITE_GUARD_HEADING:
+            return self.overwrite_open
+        raise AssertionError(f"unexpected name query: {name}")
 
     def wait_name(self, _app: Any, _name: str, _type: str, code: str) -> None:
         if not self.conflict:
@@ -344,10 +414,77 @@ class FakeDesk:
         else:
             self.write_editor()
 
-    def click_control(self, control: str, _code: str) -> None:
+    def click_control(self, control: str, code: str) -> None:
+        if (
+            control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]
+            and self.release_write_on_pointer_move
+        ):
+            # click_input moves the pointer before it presses, as it did
+            # when the review probe passed an unconfirmed write.
+            self.release_pending_write()
+        self.press_control(control, code)
+
+    def click_aimed_control(self, _app: Any, code: str, last_sample: Any = None) -> None:
+        """The press after `aim_control`: the foreground is verified first (a
+        deferred write can land while it is recovered), then the caller's
+        last sample, then the press without moving the pointer."""
+        self.win32.require_foreground(73, runtime.FOREGROUND_TIMEOUT_SECONDS)
+        if last_sample is not None:
+            last_sample()
+        self.press_control(self.aimed_control, code)
+
+    def aim_control(self, _app: Any, control: str, _code: str) -> None:
+        self.aimed_control = control
+        self.events.append(("aim", control))
+        if self.release_write_on_pointer_move:
+            self.release_pending_write()
+
+    def release_pending_write(self) -> None:
+        """The app's queued write lands while the pointer travels."""
+        pending = self.pending_write
+        if pending is not None:
+            self.pending_write = None
+            self.write_bytes(pending[0])
+
+    def press_control(self, control: str, _code: str) -> None:
         self.events.append(("click", control))
-        if control == HARNESS.KEEP_MINE_AUTOMATION_ID and self.keep_mine_writes:
-            self.write_editor()
+        if control == HARNESS.KEEP_MINE_AUTOMATION_ID:
+            self.keep_mine_clicks += 1
+            self.overwrite_open = True
+            if self.keep_mine_writes or (
+                self.second_keep_mine_writes and self.keep_mine_clicks >= 2
+            ):
+                self.write_editor()
+            if self.keep_mine_delay is not None and self.pending_write is None:
+                # The deferred write holds the bytes Keep mine acted on; a
+                # second click cannot schedule over the one already queued.
+                self.pending_write = (
+                    bytes(self.editor),
+                    self.clock_now + self.keep_mine_delay,
+                )
+            if (
+                self.second_keep_mine_delay is not None
+                and self.keep_mine_clicks >= 2
+                and self.pending_write is None
+            ):
+                self.pending_write = (
+                    bytes(self.editor),
+                    self.clock_now + self.second_keep_mine_delay,
+                )
+        elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]:
+            self.overwrite_open = False
+            if self.overwrite_writes:
+                self.write_editor()
+            else:
+                # The press answers the conflict; only its written bytes matter.
+                self.conflict = False
+        elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"]:
+            if not self.overwrite_cancel_ignored:
+                self.overwrite_open = False
+            if self.overwrite_cancel_restores_editor:
+                self.editor = self.document.read_bytes()
+            if self.overwrite_cancel_drops_conflict:
+                self.conflict = False
         elif control == HARNESS.RESTORE_AUTOMATION_ID:
             self.editor = HARNESS.RECOVERY_EDIT.encode("utf-8")
             self.tabs += 1
@@ -362,13 +499,44 @@ class FakeDesk:
         self.events.append(("sidebar close", title))
         self.guard = "tab"
 
-    def click_lifecycle_decision(self, app: Any, name: str) -> None:
-        self.guards += 1
-        if self.guards == self.failing_guard or self.guard is None:
+    def guard_dialog(
+        self,
+        _app: Any,
+        heading: str,
+        button_names: dict[str, str],
+        button_automation_ids: dict[str, str],
+        _timeout: float | None = None,
+    ) -> dict[str, str]:
+        assert heading == HARNESS.OVERWRITE_GUARD_HEADING, heading
+        assert button_names == HARNESS.OVERWRITE_GUARD_BUTTON_NAMES, button_names
+        assert button_automation_ids == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS, (
+            button_automation_ids
+        )
+        if not self.overwrite_open:
             raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT")
-        self.events.append(("guard", name))
-        guard, self.guard = self.guard, None
-        if name == "Save" and guard == "window":
+        return dict(button_automation_ids)
+
+    def click_lifecycle_decision(self, app: Any, name: str) -> None:
+        """The dirty tab's card (`Close without saving?`); a window-close card
+        is the quit guard and cannot satisfy this lookup."""
+        self.press_guard_decision(app, "tab", name)
+
+    def click_quit_decision(self, app: Any, name: str) -> None:
+        """The quit card (`Quit without saving?`, Save all) of a window close."""
+        self.press_guard_decision(app, "window", name)
+
+    def press_guard_decision(self, app: Any, kind: str, name: str) -> None:
+        self.guards += 1
+        if self.guards == self.failing_guard or self.guard != kind:
+            raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT")
+        self.events.append(("quit guard" if kind == "window" else "guard", name))
+        ignored = name == "Cancel" and (
+            (kind == "window" and self.quit_cancel_ignored)
+            or (kind == "tab" and self.tab_cancel_ignored)
+        )
+        if not ignored:
+            self.guard = None
+        if name == "Save" and kind == "window":
             self.write_editor()
             app.process.returncode = self.window_exit_code
         elif name == "Discard":
@@ -407,14 +575,8 @@ class ScenarioTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         desk = FakeDesk(Path(directory.name), **desk_options)
         harness = desk.harness()
-        with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
-            mock.patch.object(
-                HARNESS,
-                "scan_runtime_artifacts",
-                side_effect=scans or [recovery_scan(), retired_scan()],
-            ),
-        ):
+        recorded = scans or [recovery_scan(), retired_scan()]
+        with mock.patch.object(HARNESS, "scan_runtime_artifacts", side_effect=recorded):
             return harness.scenario_lifecycle_session(), desk
 
     def assert_fails(self, code: str, **options: Any) -> None:
@@ -439,7 +601,11 @@ class ScenarioTests(unittest.TestCase):
                 ("edit",),
                 ("menu save",),
                 ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
-                ("key", runtime.VK_RETURN),
+                ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"]),
+                ("edit",),
+                ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
+                ("aim", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]),
+                ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]),
                 ("edit",),
                 ("sidebar close", "guarded.md"),
                 ("guard", "Cancel"),
@@ -453,23 +619,111 @@ class ScenarioTests(unittest.TestCase):
                 ("invoke", HARNESS.WORKSPACE_HOME_FILE_AUTOMATION_ID),
                 ("edit",),
                 ("inputs", alt_f4),
-                ("guard", "Cancel"),
+                ("quit guard", "Cancel"),
                 ("wm_close",),
-                ("guard", "Save"),
+                ("quit guard", "Save"),
             ],
         )
         self.assertEqual(desk.document.read_bytes(), HARNESS.WINDOW_EDIT.encode("utf-8"))
         self.assertLessEqual(observations["checkpoint_ms"], 10_000)
         HARNESS.validate_evidence(evidence_with(observations))
 
-    def test_external_modification_overwrites_only_after_enter_confirms(self) -> None:
+    def test_external_modification_overwrites_only_after_the_guard_confirms(self) -> None:
         for options, code in (
-            (dict(keep_mine_writes=True, enter_overwrites=False),
+            (dict(keep_mine_writes=True, overwrite_writes=False),
              "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
-            (dict(enter_overwrites=False), "EXTERNAL_MODIFICATION_SYSTEM_ALERT_UNANSWERED"),
+            (dict(keep_mine_delay=0.6, overwrite_writes=False),
+             "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
+            (dict(overwrite_writes=False), "EXTERNAL_MODIFICATION_OVERWRITE_SAVE_TIMEOUT"),
         ):
             with self.subTest(code=code):
                 self.assert_fails(code, **options)
+
+    def test_keep_mine_cancel_must_keep_the_edit_and_the_conflict(self) -> None:
+        # The review probes: Cancel quietly restoring the disk version (or
+        # dropping the notice) without writing must fail the next check.
+        for options, code in (
+            (dict(overwrite_cancel_restores_editor=True),
+             "EXTERNAL_MODIFICATION_KEEP_MINE_CANCEL_LOST_EDITOR"),
+            (dict(overwrite_cancel_drops_conflict=True),
+             "EXTERNAL_MODIFICATION_KEEP_MINE_CANCEL_DROPPED_CONFLICT"),
+        ):
+            with self.subTest(code=code):
+                self.assert_fails(code, **options)
+
+    def test_second_keep_mine_cannot_write_before_its_overwrite(self) -> None:
+        # The review probe: only the second Keep mine writes the second edit
+        # at once and Overwrite closes the card without writing. Scenario A's
+        # window ends before that click, so scenario B must sample its own.
+        self.assert_fails(
+            "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+            second_keep_mine_writes=True,
+            overwrite_writes=False,
+        )
+
+    def test_a_write_landing_during_the_pointer_move_fails_before_the_press(self) -> None:
+        # The review probe: the second Keep mine's write outlasts both settle
+        # windows and lands during the pointer move to Overwrite, which
+        # itself writes nothing. The samples after the move must catch it;
+        # wait_file must never credit it as the confirmation.
+        self.assert_fails(
+            "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+            second_keep_mine_delay=30.0,
+            release_write_on_pointer_move=True,
+            overwrite_writes=False,
+        )
+
+    def test_a_write_landing_during_the_overwrite_foreground_recovery_fails(self) -> None:
+        # The review probe: the final sample sees the prior bytes at 3.0 s,
+        # the second Keep mine's deferred write lands at 5.5 s while the
+        # foreground is recovered, and the press lands at 7.0 s. The final
+        # sample must follow the recovery, or wait_file credits that write
+        # as the confirmation.
+        self.assert_fails(
+            "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+            second_keep_mine_delay=4.0,
+            foreground_wait=4.0,
+            overwrite_writes=False,
+        )
+
+    def test_a_deferred_keep_mine_write_is_caught_before_the_confirmation(self) -> None:
+        # The adversarial model: Keep mine's write lands 600 ms after its
+        # click and Overwrite writes nothing. The settle window must sample
+        # it, so wait_file cannot credit it as the confirmation.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        desk = FakeDesk(Path(directory.name), keep_mine_delay=0.6, overwrite_writes=False)
+        harness = desk.harness()
+        data, config, workspace, stderr = desk.case_roots(HARNESS.CASE_LIFECYCLE_SESSION)
+        document = (workspace / "guarded.md").resolve()
+        runtime.write_durable(document, HARNESS.ORIGINAL_BYTES)
+        app = desk.launch(document, data, config, workspace, stderr)
+
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            harness.external_modification(app, document)
+
+        self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+
+    def test_guard_cancel_must_dismiss_the_card_before_the_next_step(self) -> None:
+        for options, code in (
+            (dict(tab_cancel_ignored=True),
+             "TAB_CLOSE_GUARD_NOT_DISMISSED_AFTER_CANCEL"),
+            (dict(overwrite_cancel_ignored=True),
+             "EXTERNAL_MODIFICATION_GUARD_NOT_DISMISSED_AFTER_CANCEL"),
+            (dict(quit_cancel_ignored=True, wm_close_ignored=True),
+             "WINDOW_CLOSE_GUARD_NOT_DISMISSED_AFTER_CANCEL"),
+        ):
+            with self.subTest(code=code):
+                self.assert_fails(code, **options)
+
+    def test_the_no_write_window_samples_the_disk_repeatedly(self) -> None:
+        _, desk = self.run_session()
+
+        # A deferred Keep mine write landed 600 ms after its click in the
+        # adversarial case; both Keep mine windows must be sampled beyond it.
+        self.assertGreaterEqual(HARNESS.OVERWRITE_SETTLE_SECONDS, 1.5)
+        self.assertGreaterEqual(desk.clock_now, 2 * HARNESS.OVERWRITE_SETTLE_SECONDS)
+        self.assertGreaterEqual(len(desk.sleeps), 2)
 
     def test_every_failure_names_its_phase(self) -> None:
         for options, code in (
@@ -504,7 +758,6 @@ class ScenarioTests(unittest.TestCase):
             return runtime.wait_until(predicate, min(timeout, 0.2), code, **options)
 
         with (
-            mock.patch.object(runtime, "SYSTEM_ALERT_SETTLE_SECONDS", 0),
             mock.patch.object(HARNESS, "scan_runtime_artifacts", return_value=recovery_scan()),
             mock.patch.object(HARNESS, "wait_until", side_effect=short_wait),
             self.assertRaises(runtime.HarnessFailure) as raised,

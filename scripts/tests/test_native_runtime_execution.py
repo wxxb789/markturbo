@@ -22,11 +22,13 @@ from ._native_support import HASH
 
 class PhaseTests(unittest.TestCase):
     def test_a_phase_prefixes_failures_once_and_leaves_blocks_alone(self) -> None:
+        facts = {"web_security_extra_windows": []}
         with self.assertRaises(runtime.HarnessFailure) as raised:
             with runtime.phase("TAB_CLOSE"):
-                raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT", "TimeoutError")
+                raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT", "TimeoutError", facts)
         self.assertEqual(raised.exception.code, "TAB_CLOSE_GUARD_CARD_UIA_TIMEOUT")
         self.assertEqual(raised.exception.detail, "TimeoutError")
+        self.assertEqual(raised.exception.observations, facts)
 
         with self.assertRaises(runtime.HarnessFailure) as raised:
             with runtime.phase("TAB_CLOSE"):

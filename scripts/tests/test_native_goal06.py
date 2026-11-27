@@ -507,7 +507,7 @@ class CleanCloseTests(unittest.TestCase):
         def name_present(_app, name, _type):
             if query_fails and process.closed:
                 raise runtime.HarnessFailure("UIA_NAME_QUERY_FAILED")
-            return guard and process.closed and name == runtime.GUARD_HEADING
+            return guard and process.closed and name == runtime.QUIT_GUARD_HEADING
 
         harness = object.__new__(HARNESS.Goal06Harness)
         harness.ui_timeout = 0.2

@@ -357,6 +357,243 @@ class OwnedProcessTests(unittest.TestCase):
         )
         self.assertEqual(win32.visible_top_level_windows((73, 89)), (101, 103))
 
+    def test_visible_top_level_windows_skip_a_window_that_disappears(self) -> None:
+        windows = {101: 73, 102: 0, 103: 89}
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = windows[hwnd]
+            return 1 if windows[hwnd] else 0
+
+        def enum_windows(callback, _lparam):
+            for hwnd in windows:
+                if not callback(hwnd, 0):
+                    return False
+            return True
+
+        win32.user32 = SimpleNamespace(
+            IsWindowVisible=lambda _hwnd: True,
+            GetWindowThreadProcessId=process_id,
+            EnumWindows=enum_windows,
+        )
+        self.assertEqual(win32.visible_top_level_windows((73, 89)), (101, 103))
+
+    def test_task_dialogs_skip_a_window_that_disappears_before_the_process_query(self) -> None:
+        process_ids = {101: 41, 102: 0, 103: 41}
+        class_names = {
+            101: runtime.TASK_DIALOG_CLASS,
+            102: runtime.TASK_DIALOG_CLASS,
+            103: "NshWindow",
+        }
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = process_ids[hwnd]
+            return 1 if process_ids[hwnd] else 0
+
+        def class_name(hwnd, buffer, _length):
+            buffer.value = class_names[hwnd]
+            return len(class_names[hwnd]) + 1
+
+        def enum_windows(callback, _lparam):
+            for hwnd in process_ids:
+                if not callback(hwnd, 0):
+                    return False
+            return True
+
+        win32.user32 = SimpleNamespace(
+            GetWindow=lambda _hwnd, _index: 0,
+            GetWindowThreadProcessId=process_id,
+            IsWindowVisible=lambda _hwnd: True,
+            GetClassNameW=class_name,
+            EnumWindows=enum_windows,
+        )
+        self.assertEqual(win32.task_dialogs(41), [101])
+
+    def test_task_dialogs_skip_a_window_that_disappears_before_the_class_query(self) -> None:
+        class_names = {101: runtime.TASK_DIALOG_CLASS, 102: None}
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(_hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 41
+            return 1
+
+        def class_name(hwnd, buffer, _length):
+            name = class_names[hwnd]
+            if name is None:
+                buffer.value = ""
+                return 0
+            buffer.value = name
+            return len(name) + 1
+
+        def enum_windows(callback, _lparam):
+            for hwnd in class_names:
+                if not callback(hwnd, 0):
+                    return False
+            return True
+
+        win32.user32 = SimpleNamespace(
+            GetWindow=lambda _hwnd, _index: 0,
+            GetWindowThreadProcessId=process_id,
+            IsWindowVisible=lambda _hwnd: True,
+            IsWindow=lambda hwnd: hwnd != 102,
+            GetClassNameW=class_name,
+            EnumWindows=enum_windows,
+        )
+        self.assertEqual(win32.task_dialogs(41), [101])
+
+    def test_task_dialogs_fail_closed_when_a_live_windows_class_is_unreadable(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        win32._enum_windows_proc = lambda callback: callback
+
+        def process_id(_hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 41
+            return 1
+
+        def enum_windows(callback, _lparam):
+            callback(101, 0)
+            return True
+
+        win32.user32 = SimpleNamespace(
+            GetWindow=lambda _hwnd, _index: 0,
+            GetWindowThreadProcessId=process_id,
+            IsWindowVisible=lambda _hwnd: True,
+            IsWindow=lambda _hwnd: True,
+            GetClassNameW=lambda _hwnd, _buffer, _length: 0,
+            EnumWindows=enum_windows,
+        )
+        with self.assertRaises(runtime.HarnessFailure) as raised:
+            win32.task_dialogs(41)
+        self.assertEqual(raised.exception.code, "TASK_DIALOG_CLASS_QUERY_FAILED")
+
+    def test_window_facts_categorize_the_class_owner_and_process_image(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        calls: list[str] = []
+
+        class User32:
+            def GetWindowThreadProcessId(self, _hwnd, output):
+                ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 4242
+                return 1
+
+            def GetClassNameW(self, _hwnd, buffer, _length):
+                buffer.value = "NshWindow"
+                return len("NshWindow") + 1
+
+            def GetWindow(self, _hwnd, index):
+                calls.append(f"owner:{index}")
+                return 73
+
+        class Kernel32:
+            def OpenProcess(self, access, inherit, pid):
+                calls.append(f"open:{access}:{inherit}:{pid}")
+                return 55
+
+            def QueryFullProcessImageNameW(self, process, flags, buffer, _size):
+                calls.append(f"image:{process}:{flags}")
+                buffer.value = r"C:\Program Files\MarkTurbo\markturbo.exe"
+                return 1
+
+            def CloseHandle(self, handle):
+                calls.append(f"close:{handle}")
+                return 1
+
+        win32.user32 = User32()
+        win32.kernel32 = Kernel32()
+
+        self.assertEqual(
+            win32.window_facts(90, 73),
+            {
+                "category": "app_window",
+                "owned_by_main": True,
+                "process_image": "markturbo",
+            },
+        )
+        self.assertEqual(
+            calls,
+            [
+                f"owner:{runtime.GW_OWNER}",
+                f"open:{runtime.PROCESS_QUERY_LIMITED_INFORMATION}:False:4242",
+                "image:55:0",
+                "close:55",
+            ],
+        )
+
+    def test_window_facts_never_carry_a_raw_class_name_or_image_path(self) -> None:
+        class_name = "\u4e2d\u6587 \u7c7b\u540d"
+        image = "C:\\Users\\lhan\\AppData\\Local\\Temp\\secret viewer.exe"
+        win32 = object.__new__(runtime.Win32)
+        user32 = SimpleNamespace()
+
+        def process_id(_hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 4242
+            return 1
+
+        def class_name_of(_hwnd, buffer, _length):
+            buffer.value = class_name
+            return len(class_name) + 1
+
+        user32.GetWindowThreadProcessId = process_id
+        user32.GetClassNameW = class_name_of
+        user32.GetWindow = lambda _hwnd, _index: 0
+        win32.user32 = user32
+        win32.kernel32 = SimpleNamespace(
+            OpenProcess=lambda *_args: 55,
+            QueryFullProcessImageNameW=lambda _process, _flags, buffer, _size: (
+                setattr(buffer, "value", image) or 1
+            ),
+            CloseHandle=lambda _handle: 1,
+        )
+
+        self.assertEqual(
+            win32.window_facts(90, 73),
+            {
+                "category": "unknown",
+                "owned_by_main": False,
+                "process_image": "other",
+            },
+        )
+
+    def test_window_fact_categories_cover_the_known_windows(self) -> None:
+        cases = (
+            (runtime.WEBVIEW2_POPUP_CLASS, runtime.WEBVIEW2_POPUP_PROCESS_IMAGE,
+             "webview2_popup", "msedgewebview2"),
+            (runtime.TASK_DIALOG_CLASS, "markturbo.exe", "dialog", "markturbo"),
+            (runtime.NSH_WINDOW_CLASS, "other.exe", "app_window", "other"),
+            (runtime.WEBVIEW2_POPUP_CLASS, "other.exe", "unknown", "other"),
+            (None, None, "unknown", "other"),
+        )
+        for class_name, image, category, image_category in cases:
+            with self.subTest(class_name=class_name, image=image):
+                self.assertEqual(runtime.window_fact_category(class_name, image), category)
+                self.assertEqual(runtime.process_image_category(image), image_category)
+                self.assertIn(category, runtime.WINDOW_FACT_CATEGORIES)
+                self.assertIn(image_category, runtime.PROCESS_IMAGE_FACT_CATEGORIES)
+
+    def test_window_facts_degrade_an_unreadable_field_to_a_category(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        process = mock.Mock(return_value=0)
+        win32.kernel32 = SimpleNamespace(OpenProcess=process)
+        win32.user32 = SimpleNamespace(
+            GetWindowThreadProcessId=lambda _hwnd, _output: 0,
+            GetClassNameW=lambda _hwnd, _buffer, _length: 0,
+            GetWindow=lambda _hwnd, _index: 0,
+        )
+
+        self.assertEqual(
+            win32.window_facts(90, 73),
+            {"category": "unknown", "owned_by_main": False, "process_image": "other"},
+        )
+        process.assert_not_called()
+
+    def test_process_image_without_a_queryable_handle_is_none(self) -> None:
+        win32 = object.__new__(runtime.Win32)
+        win32.kernel32 = SimpleNamespace(OpenProcess=lambda *_args: 0)
+
+        self.assertIsNone(win32.process_image_name(4242))
+
     def test_launch_subscribes_and_assigns_before_resuming(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             harness, kernel = owned_harness(Path(directory))
