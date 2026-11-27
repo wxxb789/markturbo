@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import functools
 import json
-import re
 import socket
 import time
 import uuid
@@ -18,7 +17,9 @@ from .evidence import credential_target, leak_codes
 from .runtime import (
     EDITOR_NAME,
     INTEGRITY_NAMES,
+    PROCESS_IMAGE_FACT_CATEGORIES,
     VK_RETURN,
+    WINDOW_FACT_CATEGORIES,
     Fingerprint,
     HarnessFailure,
     NativeHarness,
@@ -526,12 +527,11 @@ def validate_post_navigation_cell_results(value: Any) -> None:
         raise ValueError("invalid post-navigation pixel-cell observations")
 
 
-# Extra-window diagnostics: printable class names and a path-free process
-# image file name. The ANSI class of an app window is a fixed name; a window
+# Extra-window diagnostics: the window category and the process-image
+# category (`runtime.window_facts`), the main window's ownership, and nothing
+# else. A raw class name or image path never reaches evidence, and a window
 # title is never read, because it can contain a document name.
-WINDOW_CLASS_RE = re.compile(r"^[\x21-\x7e]{1,128}$")
-PROCESS_IMAGE_RE = re.compile(r"^[^\\/\x00-\x1f]{1,128}$")
-EXTRA_WINDOW_KEYS = frozenset({"class_name", "owned_by_main", "process_image"})
+EXTRA_WINDOW_KEYS = frozenset({"category", "owned_by_main", "process_image"})
 
 
 def validate_extra_windows(value: Any) -> None:
@@ -540,17 +540,13 @@ def validate_extra_windows(value: Any) -> None:
     for fact in value:
         if not isinstance(fact, dict) or set(fact) != EXTRA_WINDOW_KEYS:
             raise ValueError("invalid extra-window observations")
-        class_name = fact["class_name"]
-        if class_name is not None and not (
-            isinstance(class_name, str) and WINDOW_CLASS_RE.fullmatch(class_name)
-        ):
-            raise ValueError("invalid extra-window class")
+        category = fact["category"]
+        if not isinstance(category, str) or category not in WINDOW_FACT_CATEGORIES:
+            raise ValueError("invalid extra-window category")
         if type(fact["owned_by_main"]) is not bool:
             raise ValueError("invalid extra-window owner")
         process_image = fact["process_image"]
-        if process_image is not None and not (
-            isinstance(process_image, str) and PROCESS_IMAGE_RE.fullmatch(process_image)
-        ):
+        if not isinstance(process_image, str) or process_image not in PROCESS_IMAGE_FACT_CATEGORIES:
             raise ValueError("invalid extra-window process image")
 
 
@@ -794,7 +790,21 @@ def validate_runtime_scan(value: Any) -> None:
     evidence.validate_runtime_scan(value, require_config=True)
 
 
+def validate_extra_window_count(observations: dict[str, Any]) -> None:
+    """A window count that disagrees with the extra-window list is invalid
+    even when each part alone is well-formed; a FAIL record may omit the
+    count (the list itself fails the case), but never contradict it."""
+    windows = observations.get(EXTRA_WINDOW_OBSERVATION_KEY)
+    if not isinstance(windows, list):
+        return
+    count = observations.get("web_security_window_count")
+    if count is not None and count != len(windows) + 1:
+        raise ValueError("extra-window count does not match the window count")
+
+
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
+    if EXTRA_WINDOW_OBSERVATION_KEY in observations:
+        raise ValueError("a passed case cannot carry extra windows")
     for key, expected in expected_observations().items():
         actual = (
             validate_fingerprint(observations[key])
@@ -818,6 +828,7 @@ CONTRACT = evidence.EvidenceContract(
     required_observations=REQUIRED_OBSERVATIONS,
     validate_runtime_scan=validate_runtime_scan,
     validate_passed_case=validate_passed_case,
+    validate_case_observations=validate_extra_window_count,
     structured={
         "web_security_cell_results": validate_cell_results,
         "web_security_post_navigation_cell_results": validate_post_navigation_cell_results,

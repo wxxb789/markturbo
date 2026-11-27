@@ -138,6 +138,15 @@ LIFECYCLE_CLICK_FAILURE_CODES = {
     "Discard": "LIFECYCLE_DISCARD_CLICK_FAILED",
     "Cancel": "LIFECYCLE_CANCEL_CLICK_FAILED",
 }
+# The app's own class (`nsh-platform-windows` `window.rs`), the WebView2 host
+# popup pair, and the Windows dialog class. `window_facts` maps them to fixed
+# categories: a class name is a free-form string and an image is a local path.
+NSH_WINDOW_CLASS = "NshWindow"
+WEBVIEW2_POPUP_CLASS = "Chrome_WidgetWin_1"
+WEBVIEW2_POPUP_PROCESS_IMAGE = "msedgewebview2.exe"
+MARKTURBO_PROCESS_IMAGE = "markturbo.exe"
+WINDOW_FACT_CATEGORIES = frozenset({"webview2_popup", "dialog", "app_window", "unknown"})
+PROCESS_IMAGE_FACT_CATEGORIES = frozenset({"markturbo", "msedgewebview2", "other"})
 TASK_DIALOG_CLASS = "#32770"
 TASK_DIALOG_BUTTON_CLASS = "CCPushButton"
 CF_UNICODETEXT = 13
@@ -878,6 +887,31 @@ class OwnedProcess:
             raise self._cleanup_failure
 
 
+def window_fact_category(class_name: str | None, process_image: str | None) -> str:
+    """The fixed category of one extra top-level window.
+
+    The WebView2 popup is the class and the process image together; a dialog
+    or the app's own class stands alone; any other class string -- the OS
+    accepts arbitrary ones -- is unknown.
+    """
+    if class_name == WEBVIEW2_POPUP_CLASS and process_image == WEBVIEW2_POPUP_PROCESS_IMAGE:
+        return "webview2_popup"
+    if class_name == TASK_DIALOG_CLASS:
+        return "dialog"
+    if class_name == NSH_WINDOW_CLASS:
+        return "app_window"
+    return "unknown"
+
+
+def process_image_category(process_image: str | None) -> str:
+    """The application family of one process image's executable base name."""
+    if process_image == MARKTURBO_PROCESS_IMAGE:
+        return "markturbo"
+    if process_image == WEBVIEW2_POPUP_PROCESS_IMAGE:
+        return "msedgewebview2"
+    return "other"
+
+
 class Win32:
     def __init__(self) -> None:
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1381,9 +1415,9 @@ class Win32:
     def window_facts(self, hwnd: int, main_hwnd: int) -> dict[str, Any]:
         """Content-free identity of one extra top-level window.
 
-        Its class name, whether the main window owns it, and its process
-        image's base name; a field the OS cannot answer is None. Titles are
-        never read: they can contain document names.
+        Its class and process image are mapped to fixed categories; the raw
+        class name and image path never leave this method. Titles are never
+        read: they can contain document names.
         """
         process = wt.DWORD()
         pid = (
@@ -1398,10 +1432,11 @@ class Win32:
             else None
         )
         owner = int(self.user32.GetWindow(hwnd, GW_OWNER) or 0)
+        image = self.process_image_name(pid) if pid is not None else None
         return {
-            "class_name": class_name,
+            "category": window_fact_category(class_name, image),
             "owned_by_main": owner == main_hwnd,
-            "process_image": self.process_image_name(pid) if pid is not None else None,
+            "process_image": process_image_category(image),
         }
 
     def process_image_name(self, pid: int) -> str | None:

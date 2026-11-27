@@ -357,7 +357,7 @@ class OwnedProcessTests(unittest.TestCase):
         )
         self.assertEqual(win32.visible_top_level_windows((73, 89)), (101, 103))
 
-    def test_window_facts_name_the_class_owner_and_process_image(self) -> None:
+    def test_window_facts_categorize_the_class_owner_and_process_image(self) -> None:
         win32 = object.__new__(runtime.Win32)
         calls: list[str] = []
 
@@ -394,9 +394,9 @@ class OwnedProcessTests(unittest.TestCase):
         self.assertEqual(
             win32.window_facts(90, 73),
             {
-                "class_name": "NshWindow",
+                "category": "app_window",
                 "owned_by_main": True,
-                "process_image": "markturbo.exe",
+                "process_image": "markturbo",
             },
         )
         self.assertEqual(
@@ -409,7 +409,58 @@ class OwnedProcessTests(unittest.TestCase):
             ],
         )
 
-    def test_window_facts_degrade_an_unreadable_field_to_none(self) -> None:
+    def test_window_facts_never_carry_a_raw_class_name_or_image_path(self) -> None:
+        class_name = "\u4e2d\u6587 \u7c7b\u540d"
+        image = "C:\\Users\\lhan\\AppData\\Local\\Temp\\secret viewer.exe"
+        win32 = object.__new__(runtime.Win32)
+        user32 = SimpleNamespace()
+
+        def process_id(_hwnd, output):
+            ctypes.cast(output, ctypes.POINTER(wt.DWORD)).contents.value = 4242
+            return 1
+
+        def class_name_of(_hwnd, buffer, _length):
+            buffer.value = class_name
+            return len(class_name) + 1
+
+        user32.GetWindowThreadProcessId = process_id
+        user32.GetClassNameW = class_name_of
+        user32.GetWindow = lambda _hwnd, _index: 0
+        win32.user32 = user32
+        win32.kernel32 = SimpleNamespace(
+            OpenProcess=lambda *_args: 55,
+            QueryFullProcessImageNameW=lambda _process, _flags, buffer, _size: (
+                setattr(buffer, "value", image) or 1
+            ),
+            CloseHandle=lambda _handle: 1,
+        )
+
+        self.assertEqual(
+            win32.window_facts(90, 73),
+            {
+                "category": "unknown",
+                "owned_by_main": False,
+                "process_image": "other",
+            },
+        )
+
+    def test_window_fact_categories_cover_the_known_windows(self) -> None:
+        cases = (
+            (runtime.WEBVIEW2_POPUP_CLASS, runtime.WEBVIEW2_POPUP_PROCESS_IMAGE,
+             "webview2_popup", "msedgewebview2"),
+            (runtime.TASK_DIALOG_CLASS, "markturbo.exe", "dialog", "markturbo"),
+            (runtime.NSH_WINDOW_CLASS, "other.exe", "app_window", "other"),
+            (runtime.WEBVIEW2_POPUP_CLASS, "other.exe", "unknown", "other"),
+            (None, None, "unknown", "other"),
+        )
+        for class_name, image, category, image_category in cases:
+            with self.subTest(class_name=class_name, image=image):
+                self.assertEqual(runtime.window_fact_category(class_name, image), category)
+                self.assertEqual(runtime.process_image_category(image), image_category)
+                self.assertIn(category, runtime.WINDOW_FACT_CATEGORIES)
+                self.assertIn(image_category, runtime.PROCESS_IMAGE_FACT_CATEGORIES)
+
+    def test_window_facts_degrade_an_unreadable_field_to_a_category(self) -> None:
         win32 = object.__new__(runtime.Win32)
         process = mock.Mock(return_value=0)
         win32.kernel32 = SimpleNamespace(OpenProcess=process)
@@ -421,7 +472,7 @@ class OwnedProcessTests(unittest.TestCase):
 
         self.assertEqual(
             win32.window_facts(90, 73),
-            {"class_name": None, "owned_by_main": False, "process_image": None},
+            {"category": "unknown", "owned_by_main": False, "process_image": "other"},
         )
         process.assert_not_called()
 

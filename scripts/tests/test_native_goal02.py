@@ -199,7 +199,8 @@ class FakeWin32:
 
     def post_close(self, _hwnd: int) -> None:
         self.desk.events.append(("wm_close",))
-        self.desk.guard = "window"
+        if not self.desk.wm_close_ignored:
+            self.desk.guard = "window"
 
 
 class FakeDesk:
@@ -210,7 +211,9 @@ class FakeDesk:
         root: Path,
         *,
         keep_mine_writes: bool = False,
+        keep_mine_delayed: bool = False,
         overwrite_writes: bool = True,
+        overwrite_cancel_ignored: bool = False,
         home_opens: bool = True,
         discard_retires: bool = True,
         failing_guard: int | None = None,
@@ -219,10 +222,15 @@ class FakeDesk:
         window_exit_code: int = 0,
         discard_writes: bool = False,
         failing_launch: int | None = None,
+        tab_cancel_ignored: bool = False,
+        quit_cancel_ignored: bool = False,
+        wm_close_ignored: bool = False,
     ) -> None:
         self.root = root
         self.keep_mine_writes = keep_mine_writes
+        self.keep_mine_delayed = keep_mine_delayed
         self.overwrite_writes = overwrite_writes
+        self.overwrite_cancel_ignored = overwrite_cancel_ignored
         self.home_opens = home_opens
         self.discard_retires = discard_retires
         self.failing_guard = failing_guard
@@ -231,11 +239,18 @@ class FakeDesk:
         self.window_exit_code = window_exit_code
         self.discard_writes = discard_writes
         self.failing_launch = failing_launch
+        self.tab_cancel_ignored = tab_cancel_ignored
+        self.quit_cancel_ignored = quit_cancel_ignored
+        self.wm_close_ignored = wm_close_ignored
         self.guards = 0
         self.events: list[tuple[Any, ...]] = []
         self.editor = b""
         self.conflict = False
         self.guard: str | None = None
+        self.overwrite_open = False
+        self.pending_write = False
+        self.clock_now = 0.0
+        self.sleeps: list[float] = []
         # Open tabs: an argv document opens one (a folder none), Restore and
         # the workspace home's row add one more each (the app does not merge
         # them), and Don't save closes the active one.
@@ -253,7 +268,9 @@ class FakeDesk:
         harness.launch_app = self.launch_app
         harness.activate_source_layout = self.activate_source_layout
         harness.replace_editor = self.replace_editor
-        harness.name_present = lambda _app, _name, _type: self.conflict
+        harness.name_present = self.name_present
+        harness.clock = self.clock
+        harness.sleep = self.sleep
         harness.wait_name = self.wait_name
         harness.save_via_menu = self.save_via_menu
         harness.find_control = lambda _app, automation_id, *_args: automation_id
@@ -325,6 +342,27 @@ class FakeDesk:
         self.known = self.editor
         self.conflict = self.conflict and self.conflict_sticks
 
+    def clock(self) -> float:
+        return self.clock_now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.clock_now += seconds
+        if self.pending_write:
+            self.pending_write = False
+            self.write_editor()
+
+    def name_present(self, _app: Any, name: str, _type: str) -> bool:
+        if name == runtime.CONFLICT_HEADING:
+            return self.conflict
+        if name == runtime.GUARD_HEADING:
+            return self.guard == "tab"
+        if name == runtime.QUIT_GUARD_HEADING:
+            return self.guard == "window"
+        if name == HARNESS.OVERWRITE_GUARD_HEADING:
+            return self.overwrite_open
+        raise AssertionError(f"unexpected name query: {name}")
+
     def wait_name(self, _app: Any, _name: str, _type: str, code: str) -> None:
         if not self.conflict:
             raise runtime.HarnessFailure(code)
@@ -341,11 +379,17 @@ class FakeDesk:
     def click_control(self, control: str, _code: str) -> None:
         self.events.append(("click", control))
         if control == HARNESS.KEEP_MINE_AUTOMATION_ID:
+            self.overwrite_open = True
             if self.keep_mine_writes:
                 self.write_editor()
+            if self.keep_mine_delayed:
+                self.pending_write = True
         elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]:
             if self.overwrite_writes:
                 self.write_editor()
+        elif control == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"]:
+            if not self.overwrite_cancel_ignored:
+                self.overwrite_open = False
         elif control == HARNESS.RESTORE_AUTOMATION_ID:
             self.editor = HARNESS.RECOVERY_EDIT.encode("utf-8")
             self.tabs += 1
@@ -373,6 +417,8 @@ class FakeDesk:
         assert button_automation_ids == HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS, (
             button_automation_ids
         )
+        if not self.overwrite_open:
+            raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT")
         return dict(button_automation_ids)
 
     def click_lifecycle_decision(self, app: Any, name: str) -> None:
@@ -389,8 +435,13 @@ class FakeDesk:
         if self.guards == self.failing_guard or self.guard != kind:
             raise runtime.HarnessFailure("GUARD_CARD_UIA_TIMEOUT")
         self.events.append(("quit guard" if kind == "window" else "guard", name))
-        guard, self.guard = self.guard, None
-        if name == "Save" and guard == "window":
+        ignored = name == "Cancel" and (
+            (kind == "window" and self.quit_cancel_ignored)
+            or (kind == "tab" and self.tab_cancel_ignored)
+        )
+        if not ignored:
+            self.guard = None
+        if name == "Save" and kind == "window":
             self.write_editor()
             app.process.returncode = self.window_exit_code
         elif name == "Discard":
@@ -455,6 +506,8 @@ class ScenarioTests(unittest.TestCase):
                 ("edit",),
                 ("menu save",),
                 ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
+                ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"]),
+                ("click", HARNESS.KEEP_MINE_AUTOMATION_ID),
                 ("click", HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"]),
                 ("edit",),
                 ("sidebar close", "guarded.md"),
@@ -482,10 +535,30 @@ class ScenarioTests(unittest.TestCase):
         for options, code in (
             (dict(keep_mine_writes=True, overwrite_writes=False),
              "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
+            (dict(keep_mine_delayed=True, overwrite_writes=False),
+             "EXTERNAL_MODIFICATION_KEEP_MINE_WROTE_BEFORE_CONFIRMATION"),
             (dict(overwrite_writes=False), "EXTERNAL_MODIFICATION_OVERWRITE_SAVE_TIMEOUT"),
         ):
             with self.subTest(code=code):
                 self.assert_fails(code, **options)
+
+    def test_guard_cancel_must_dismiss_the_card_before_the_next_step(self) -> None:
+        for options, code in (
+            (dict(tab_cancel_ignored=True),
+             "TAB_CLOSE_GUARD_NOT_DISMISSED_AFTER_CANCEL"),
+            (dict(overwrite_cancel_ignored=True),
+             "EXTERNAL_MODIFICATION_GUARD_NOT_DISMISSED_AFTER_CANCEL"),
+            (dict(quit_cancel_ignored=True, wm_close_ignored=True),
+             "WINDOW_CLOSE_GUARD_NOT_DISMISSED_AFTER_CANCEL"),
+        ):
+            with self.subTest(code=code):
+                self.assert_fails(code, **options)
+
+    def test_the_no_write_window_samples_the_disk_repeatedly(self) -> None:
+        _, desk = self.run_session()
+
+        self.assertGreaterEqual(desk.clock_now, HARNESS.OVERWRITE_SETTLE_SECONDS)
+        self.assertGreaterEqual(len(desk.sleeps), 2)
 
     def test_every_failure_names_its_phase(self) -> None:
         for options, code in (

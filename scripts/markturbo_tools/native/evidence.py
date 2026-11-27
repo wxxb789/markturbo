@@ -160,6 +160,9 @@ class EvidenceContract:
     # Top-level keys beyond the shared envelope, checked by `validate_extra`.
     extra_keys: frozenset[str] = frozenset()
     validate_extra: Callable[[dict[str, Any]], None] | None = None
+    # A goal's cross-observation invariants, checked for PASS and non-PASS
+    # cases alike; PASS-only facts stay in `validate_passed_case`.
+    validate_case_observations: Callable[[dict[str, Any]], None] | None = None
 
     @property
     def case_ids(self) -> tuple[str, ...]:
@@ -310,6 +313,13 @@ def validate_observations(observations: Any, contract: EvidenceContract) -> None
             raise ValueError("invalid observation value")
 
 
+def _validate_case_observations(
+    contract: EvidenceContract, observations: dict[str, Any]
+) -> None:
+    if contract.validate_case_observations is not None:
+        contract.validate_case_observations(observations)
+
+
 def validate_case(
     contract: EvidenceContract,
     case_id: str,
@@ -334,6 +344,7 @@ def validate_case(
         if validate_context(context) != parent:
             raise ValueError("case process context differs from harness context")
     contract.validate_passed_case(case_id, observations)
+    _validate_case_observations(contract, observations)
 
 
 def _validate_executable(executable: Any, passed: bool) -> None:
@@ -446,6 +457,7 @@ def validate_evidence(evidence: Any, contract: EvidenceContract) -> None:
             validate_case(contract, case["id"], case["observations"], parent)
         else:
             validate_observations(case["observations"], contract)
+            _validate_case_observations(contract, case["observations"])
     if status == "PASS" and any(case["status"] != "PASS" for case in cases):
         raise ValueError("PASS requires every required case to pass")
     require_exact_keys(evidence["summary"], SUMMARY_KEYS, "case summary")

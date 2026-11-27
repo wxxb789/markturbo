@@ -1631,14 +1631,22 @@ class OverwriteGuardTests(unittest.TestCase):
             observations["external_modification_overwritten_source"],
             observations["external_modification_dirty_editor"],
         )
-        harness.find_control.assert_called_once()
+        self.assertEqual(harness.find_control.call_count, 2)
         self.assertEqual(
-            harness.find_control.call_args.args[1:3], (HARNESS.KEEP_MINE_AUTOMATION_ID, "Button")
+            [call.args[1:3] for call in harness.find_control.call_args_list],
+            [(HARNESS.KEEP_MINE_AUTOMATION_ID, "Button")] * 2,
         )
         pressed = [call.args[0] for call in harness.click_control.call_args_list]
-        self.assertEqual(len(pressed), 2)
+        self.assertEqual(len(pressed), 4)
         self.assertIs(pressed[0], harness.find_control.return_value)
-        self.assertEqual(pressed[1].element_info.name, "Overwrite")
+        self.assertIs(pressed[2], harness.find_control.return_value)
+        self.assertEqual(
+            [pressed[1].element_info.automation_id, pressed[3].element_info.automation_id],
+            [
+                HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Cancel"],
+                HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS["Overwrite"],
+            ],
+        )
 
     def test_external_conflict_fails_when_keep_mine_writes_without_the_guard(self) -> None:
         harness, app, document = self.conflict_scenario(
@@ -1647,7 +1655,7 @@ class OverwriteGuardTests(unittest.TestCase):
         with self.assertRaises(runtime.HarnessFailure) as raised:
             harness.external_modification(app, document)
         self.assertEqual(raised.exception.code, "KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
-        self.assertEqual(harness.click_control.call_count, 1)
+        self.assertEqual(harness.click_control.call_count, 3)
 
     def test_external_conflict_fails_when_the_guard_overwrite_never_writes(self) -> None:
         harness, app, document = self.conflict_scenario(

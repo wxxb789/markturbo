@@ -49,6 +49,9 @@ from .runtime import (
     VK_MENU,
     VK_W,
     CONFLICT_HEADING,
+    GUARD_HEADING,
+    QUIT_GUARD_HEADING,
+    Fingerprint,
     HarnessFailure,
     NativeHarness as BaseNativeHarness,
     NativeRunPlan,
@@ -154,6 +157,11 @@ OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS = {
     "Overwrite": "guard-overwrite",
     "Cancel": "guard-cancel",
 }
+# Keep mine's Cancel must leave the disk untouched over this window; the disk
+# is sampled throughout it, not once, so a write queued behind the card is
+# caught before the confirmed Overwrite writes the target bytes.
+OVERWRITE_SETTLE_SECONDS = 0.5
+OVERWRITE_SETTLE_SAMPLE_INTERVAL_SECONDS = 0.05
 # The workspace home's file rows (`ui/welcome.rs` `workspace_home`), shown
 # while a workspace is open and no document is; the workspace holds one file.
 WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
@@ -494,6 +502,49 @@ class Goal02Harness(BaseNativeHarness):
         if app.process.poll() is not None:
             raise HarnessFailure(code)
 
+    def wait_guard_absent(self, app: RunningApp, heading: str, code: str) -> None:
+        """Wait until no guard card carries `heading`: a dismissed card that
+        lingers must not stand in for the card the next step raises. A query
+        that fails while the card fades is a poll that saw nothing yet, as in
+        `wait_name`; the timeout keeps the last failure's type."""
+        last_failure_type: str | None = None
+
+        def absent() -> bool:
+            nonlocal last_failure_type
+            try:
+                return not self.name_present(app, heading, "Text")
+            except HarnessFailure as error:
+                if error.code != "UIA_NAME_QUERY_FAILED":
+                    raise
+                last_failure_type = error.detail or None
+                return False
+
+        try:
+            wait_until(
+                absent,
+                self.ui_timeout,
+                code,
+                interval=0.05,
+                clock=self.clock,
+                sleep=self.sleep,
+            )
+        except HarnessFailure as error:
+            if error.code == code and last_failure_type is not None:
+                raise HarnessFailure(code, last_failure_type) from None
+            raise
+
+    def require_unchanged_disk(
+        self, document: Path, expected: Fingerprint, seconds: float, code: str
+    ) -> None:
+        """Sample `document` across `seconds`, failing on any observed write."""
+        deadline = self.clock() + seconds
+        while True:
+            if sha256_file(document) != expected:
+                raise HarnessFailure(code)
+            if self.clock() >= deadline:
+                return
+            self.sleep(min(OVERWRITE_SETTLE_SAMPLE_INTERVAL_SECONDS, deadline - self.clock()))
+
     def external_modification(self, app: RunningApp, document: Path) -> dict[str, Any]:
         """A same-length rewrite with the loaded mtime is refused, then overwritten."""
         loaded = sha256_file(document)
@@ -528,17 +579,41 @@ class Goal02Harness(BaseNativeHarness):
             "KEEP_MINE_UIA_CONTRACT_MISMATCH",
         )
         self.click_control(keep_mine, "KEEP_MINE_CLICK_FAILED")
-        # Keep mine opens the Overwrite guard card; its Overwrite is the only
-        # press that writes, proven by the file still holding the external
-        # rewrite while the card is up.
+        # Keep mine opens the Overwrite guard card; its Cancel dismisses it
+        # without writing. The card must leave before the card the confirmed
+        # overwrite uses is raised, so a stale card cannot answer for it.
         guard = self.guard_dialog(
             app,
             OVERWRITE_GUARD_HEADING,
             OVERWRITE_GUARD_BUTTON_NAMES,
             OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
         )
-        if sha256_file(document) != rewritten:
-            raise HarnessFailure("KEEP_MINE_WROTE_BEFORE_CONFIRMATION")
+        self.click_control(guard["Cancel"], "OVERWRITE_GUARD_CANCEL_CLICK_FAILED")
+        self.wait_guard_absent(
+            app, OVERWRITE_GUARD_HEADING, "GUARD_NOT_DISMISSED_AFTER_CANCEL"
+        )
+        # The no-write proof covers Keep mine's Cancel and the reopened card
+        # over the settle window; only then does Overwrite write the bytes.
+        keep_mine = self.find_control(
+            app,
+            KEEP_MINE_AUTOMATION_ID,
+            "Button",
+            "KEEP_MINE_UIA_TIMEOUT",
+            "KEEP_MINE_UIA_CONTRACT_MISMATCH",
+        )
+        self.click_control(keep_mine, "KEEP_MINE_CLICK_FAILED")
+        guard = self.guard_dialog(
+            app,
+            OVERWRITE_GUARD_HEADING,
+            OVERWRITE_GUARD_BUTTON_NAMES,
+            OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
+        )
+        self.require_unchanged_disk(
+            document,
+            rewritten,
+            OVERWRITE_SETTLE_SECONDS,
+            "KEEP_MINE_WROTE_BEFORE_CONFIRMATION",
+        )
         self.click_control(guard["Overwrite"], "OVERWRITE_GUARD_OVERWRITE_CLICK_FAILED")
         overwritten = self.wait_file(document, dirty, "OVERWRITE_SAVE_TIMEOUT")
         # The next phases start from a clean, conflict-free document.
@@ -562,6 +637,7 @@ class Goal02Harness(BaseNativeHarness):
         source = sha256_file(document)
         self.close_tab_by_pointer(app, document.name)
         self.click_lifecycle_decision(app, "Cancel")
+        self.wait_guard_absent(app, GUARD_HEADING, "GUARD_NOT_DISMISSED_AFTER_CANCEL")
         self.require_running(app, "CANCEL_CLOSED_PROCESS")
         kept_source = sha256_file(document)
         if kept_source != source:
@@ -600,6 +676,9 @@ class Goal02Harness(BaseNativeHarness):
         source = sha256_file(document)
         self.send_alt_f4(app)
         self.click_quit_decision(app, "Cancel")
+        # The dismissed quit card must leave before WM_CLOSE: its Save all must
+        # be the new card's, never the cancelled one's.
+        self.wait_guard_absent(app, QUIT_GUARD_HEADING, "GUARD_NOT_DISMISSED_AFTER_CANCEL")
         self.require_running(app, "ALT_F4_CANCEL_CLOSED_PROCESS")
         untouched = sha256_file(document)
         if untouched != source:
