@@ -311,6 +311,18 @@ pub const FIELD_READING_MAX_W: f32 = 440.0;
 /// The consent card's width, and the range it may use.
 pub const CONSENT_CARD_MIN_W: f32 = 520.0;
 pub const CONSENT_CARD_MAX_W: f32 = 640.0;
+/// The conflict banner label's floor: its longest word ("Changed") at
+/// [`TYPE_UI`]. Narrower than this the label breaks mid-word; the actions
+/// wrap below it instead.
+pub const CONFLICT_LABEL_MIN_W: f32 = SPACE_6;
+/// The least client size the app allows. The width holds the rail and the
+/// title row's lead-in ([`RAIL_W`] + [`COLUMN_GAP`]), the title row's
+/// trailing controls, the system's caption buttons and one editor column
+/// at [`FIELD_MIN_W`]; below it the title row overlaps the caption buttons
+/// and the column's Undo leaves the window. The height holds the title row
+/// and the field's status line.
+pub const WINDOW_MIN_W: f32 = 640.0;
+pub const WINDOW_MIN_H: f32 = 480.0;
 /// The consent card's controls.
 pub const CONSENT_BUTTON_W: f32 = 164.0;
 pub const CONSENT_BUTTON_H: f32 = 36.0;

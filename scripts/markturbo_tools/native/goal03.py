@@ -40,11 +40,14 @@ listed. A target that no longer exists stays listed, disabled, named
 replaces the welcome with the workspace home, whose file rows are Buttons
 sharing `workspace-home-file`. Save As runs from Ctrl+Shift+S through the
 native IFileSaveDialog, whose own overwrite confirmation is the only overwrite
-decision: Yes replaces the existing file. The app writes the file before it
-swaps the tab, so the harness waits for the title row's file name
-(`title-file`, a Button named after the active tab) before it edits the
-swapped tab. Each open tab has one mounted close control (`rail-close`) on its
-row in the expanded sidebar panel (`ensure_sidebar_open` before counting).
+decision: Yes replaces the existing file. nsh 0.7.1 owns that dialog by the
+hidden window its surface draws into, so the harness finds it among the
+process's task dialogs, not by main-window ownership. The app writes the file
+before it swaps the tab, so the harness waits for the title row's file name
+(`title-file`, a Button labeled `Show agent context for <name>` since Goal 20)
+before it edits the swapped tab. Each open tab has one mounted close control
+(`rail-close`) on its row in the expanded sidebar panel (`ensure_sidebar_open`
+before counting).
 Editor text is read with the editor's Select All + Copy (see
 `runtime.EDITOR_NAME`).
 """
@@ -105,6 +108,9 @@ WELCOME_ACTION_AUTOMATION_IDS = (
     WELCOME_SAMPLE_AUTOMATION_ID,
 )
 TITLE_FILE_AUTOMATION_ID = "title-file"
+# `ui/titlebar.rs` `file_name`: the Button's accessible label names its
+# Context action, not the bare file name.
+TITLE_FILE_NAME_LABEL = "Show agent context for {name}"
 # A file recent row is named `File <name>`; once its target is gone it is
 # disabled and named `File <name> — Missing` (`ui/welcome.rs` `recents`).
 RECENT_ROW_NAME = "File {name}"
@@ -453,37 +459,44 @@ class Goal03Harness(BaseNativeHarness):
         self.win32.send_shortcut(app.hwnd, VK_W)
 
     def common_file_dialog(self, app: Any) -> tuple[int, Any]:
+        """Wait for the Save As picker: the task dialog whose filename combo
+        holds exactly one ready Edit.
+
+        nsh 0.7.1 owns the picker by the hidden window its surface draws
+        into, not the visible main window, so it is found among the
+        process's own task dialogs; the picker's nested overwrite
+        confirmation holds no `FileNameControlHost` and is skipped.
+        """
         last_error: str | None = None
 
         def locate() -> tuple[int, Any] | None:
             nonlocal last_error
             try:
-                dialogs = self.win32.owned_task_dialogs(app.process.pid, app.hwnd)
-                if len(dialogs) > 1:
+                found: list[tuple[int, Any]] = []
+                for hwnd in self.win32.task_dialogs(app.process.pid):
+                    combo = self.control_by_id(
+                        hwnd,
+                        "FileNameControlHost",
+                        "ComboBox",
+                        "SAVE_AS_FILE_DIALOG_UIA_CONTRACT_MISMATCH",
+                    )
+                    if combo is None:
+                        continue
+                    edits = [
+                        control
+                        for control in combo.descendants()
+                        if control.element_info.automation_id == "1001"
+                        and control.element_info.control_type == "Edit"
+                    ]
+                    if len(edits) != 1:
+                        raise HarnessFailure("SAVE_AS_FILE_DIALOG_UIA_CONTRACT_MISMATCH")
+                    edit = edits[0]
+                    if not edit.is_visible() or not edit.is_enabled():
+                        continue
+                    found.append((hwnd, edit))
+                if len(found) > 1:
                     raise HarnessFailure("MULTIPLE_SAVE_AS_FILE_DIALOGS")
-                if not dialogs:
-                    return None
-                hwnd = dialogs[0]
-                combo = self.control_by_id(
-                    hwnd,
-                    "FileNameControlHost",
-                    "ComboBox",
-                    "SAVE_AS_FILE_DIALOG_UIA_CONTRACT_MISMATCH",
-                )
-                if combo is None:
-                    return None
-                edits = [
-                    control
-                    for control in combo.descendants()
-                    if control.element_info.automation_id == "1001"
-                    and control.element_info.control_type == "Edit"
-                ]
-                if len(edits) != 1:
-                    raise HarnessFailure("SAVE_AS_FILE_DIALOG_UIA_CONTRACT_MISMATCH")
-                edit = edits[0]
-                if not edit.is_visible() or not edit.is_enabled():
-                    return None
-                return hwnd, edit
+                return found[0] if found else None
             except HarnessFailure:
                 raise
             except Exception as error:
@@ -501,13 +514,11 @@ class Goal03Harness(BaseNativeHarness):
         """The IFileSaveDialog's own overwrite prompt: Yes and No."""
 
         def locate() -> dict[str, Any] | None:
-            nested = self.win32.owned_task_dialogs(app.process.pid, file_dialog_hwnd)
+            nested = self.win32.task_dialogs(app.process.pid, file_dialog_hwnd)
             if len(nested) > 1:
                 raise HarnessFailure("MULTIPLE_NATIVE_OVERWRITE_DIALOGS")
             if not nested:
-                if file_dialog_hwnd not in self.win32.owned_task_dialogs(
-                    app.process.pid, app.hwnd
-                ):
+                if file_dialog_hwnd not in self.win32.task_dialogs(app.process.pid):
                     raise HarnessFailure("NATIVE_OVERWRITE_CONFIRMATION_MISSING")
                 return None
             buttons = {}
@@ -538,7 +549,7 @@ class Goal03Harness(BaseNativeHarness):
 
     def wait_file_dialog_closed(self, app: Any, hwnd: int, code: str) -> None:
         wait_until(
-            lambda: hwnd not in self.win32.owned_task_dialogs(app.process.pid, app.hwnd),
+            lambda: hwnd not in self.win32.task_dialogs(app.process.pid),
             self.ui_timeout,
             code,
             interval=0.05,
@@ -560,12 +571,13 @@ class Goal03Harness(BaseNativeHarness):
 
     def wait_title_file(self, app: Any, name: str) -> None:
         """Wait until the title row names `name` as the active tab's file."""
+        expected = TITLE_FILE_NAME_LABEL.format(name=name)
 
         def named() -> bool:
             control = self.control_by_id(
                 app.hwnd, TITLE_FILE_AUTOMATION_ID, "Button", "TITLE_FILE_UIA_CONTRACT_MISMATCH"
             )
-            return control is not None and control.element_info.name == name
+            return control is not None and control.element_info.name == expected
 
         wait_until(named, self.ui_timeout, "TITLE_FILE_TIMEOUT", interval=0.025)
 

@@ -125,6 +125,14 @@
   consent-card and title-menu states if before/after captures of them are
   still wanted. See
   [goal-16-acceptance.md](goal-16-acceptance.md#desktop-acceptance-2026-11-24).
+- [ ] **goal-02 Overwrite confirmation residual** — the harness aims at
+  Overwrite, samples the disk over the settle window, samples once more
+  immediately before the press and presses without moving the pointer, so any
+  write an external observer can see before the press fails the confirmation.
+  A write the app itself schedules to land inside the press's own input latency
+  remains indistinguishable from the confirmed write. Fix direction: an
+  app-side, content-free write-cause marker in test builds naming which action
+  wrote the bytes.
 
 - [ ] **nextest gate follow-ups (PR #75 review, P3)**:
   - `.config/nextest.toml` is not in the PR workflow's `rust` path filter, so a PR that changes only the nextest

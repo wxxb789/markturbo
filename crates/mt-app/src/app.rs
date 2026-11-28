@@ -143,6 +143,10 @@ fn main_window_attributes() -> WindowAttributes {
     let mut attributes = WindowAttributes::default();
     attributes.close_on_press = Some(false);
     attributes.title_bar = Some(title_bar);
+    attributes.min_size = Some(Some(size(
+        px(ui::tokens::WINDOW_MIN_W),
+        px(ui::tokens::WINDOW_MIN_H),
+    )));
     attributes
 }
 
@@ -168,5 +172,23 @@ struct TickerGuard(Rc<Cell<bool>>);
 impl Drop for TickerGuard {
     fn drop(&mut self) {
         self.0.set(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::main_window_attributes;
+    use nsh_core::prelude::*;
+
+    #[test]
+    fn the_main_window_declares_the_minimum_size_token() {
+        assert_eq!(
+            main_window_attributes().min_size,
+            Some(Some(size(
+                px(crate::ui::tokens::WINDOW_MIN_W),
+                px(crate::ui::tokens::WINDOW_MIN_H),
+            ))),
+            "the main window's minimum is the layout token, not an ad-hoc size"
+        );
     }
 }

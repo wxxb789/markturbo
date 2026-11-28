@@ -41,8 +41,8 @@ from typing import Any
 from . import evidence
 from .evidence import credential_target, leak_codes
 from .runtime import (
-    GUARD_HEADING,
     INTEGRITY_NAMES,
+    QUIT_GUARD_HEADING,
     VK_A,
     VK_RETURN,
     HarnessFailure,
@@ -116,7 +116,7 @@ SAFE_STRINGS = (
 # `clean_close_ms` is how the document's clean state is measured: the title
 # row's unsaved mark (`title-dirty`) is a Text inside the `title-file` Button,
 # which nsh 0.7.1's UIA folds away, so a close request that ends the process
-# without the 'Close without saving?' guard is the native proof.
+# without the quit guard ('Quit without saving?') is the native proof.
 CONFIGURED_PHASES = ("document", "selection")
 OBSERVATIONS = {
     NOT_SET_UP_MODE: {
@@ -303,7 +303,7 @@ class Goal06Harness(BaseNativeHarness):
             if app.process.poll() is not None or not _window_exists(self.win32, app.hwnd):
                 return "closing"
             try:
-                return "guard" if self.name_present(app, GUARD_HEADING, "Text") else None
+                return "guard" if self.name_present(app, QUIT_GUARD_HEADING, "Text") else None
             except HarnessFailure:
                 return None
 

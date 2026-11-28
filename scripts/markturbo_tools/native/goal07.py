@@ -17,7 +17,9 @@ from .evidence import credential_target, leak_codes
 from .runtime import (
     EDITOR_NAME,
     INTEGRITY_NAMES,
+    PROCESS_IMAGE_FACT_CATEGORIES,
     VK_RETURN,
+    WINDOW_FACT_CATEGORIES,
     Fingerprint,
     HarnessFailure,
     NativeHarness,
@@ -293,6 +295,9 @@ OBSERVATION_KEYS = (
         "provider_request_count",
     }
 )
+# Recorded only when the visible window set is not exactly the main window,
+# so a PASS never carries it.
+EXTRA_WINDOW_OBSERVATION_KEY = "web_security_extra_windows"
 REQUIRED_OBSERVATIONS = {CASE_REVISION_SESSION: OBSERVATION_KEYS}
 
 
@@ -520,6 +525,29 @@ def validate_cell_results(value: Any) -> None:
 def validate_post_navigation_cell_results(value: Any) -> None:
     if not isinstance(value, list) or any(type(cell) is not bool for cell in value):
         raise ValueError("invalid post-navigation pixel-cell observations")
+
+
+# Extra-window diagnostics: the window category and the process-image
+# category (`runtime.window_facts`), the main window's ownership, and nothing
+# else. A raw class name or image path never reaches evidence, and a window
+# title is never read, because it can contain a document name.
+EXTRA_WINDOW_KEYS = frozenset({"category", "owned_by_main", "process_image"})
+
+
+def validate_extra_windows(value: Any) -> None:
+    if not isinstance(value, list):
+        raise ValueError("invalid extra-window observations")
+    for fact in value:
+        if not isinstance(fact, dict) or set(fact) != EXTRA_WINDOW_KEYS:
+            raise ValueError("invalid extra-window observations")
+        category = fact["category"]
+        if not isinstance(category, str) or category not in WINDOW_FACT_CATEGORIES:
+            raise ValueError("invalid extra-window category")
+        if type(fact["owned_by_main"]) is not bool:
+            raise ValueError("invalid extra-window owner")
+        process_image = fact["process_image"]
+        if not isinstance(process_image, str) or process_image not in PROCESS_IMAGE_FACT_CATEGORIES:
+            raise ValueError("invalid extra-window process image")
 
 
 def canonicalize_fixture_source(
@@ -762,7 +790,30 @@ def validate_runtime_scan(value: Any) -> None:
     evidence.validate_runtime_scan(value, require_config=True)
 
 
+def validate_extra_window_count(observations: dict[str, Any], reason: str | None) -> None:
+    """A window count that disagrees with the extra-window list is invalid
+    even when each part alone is well-formed; a FAIL record may omit the
+    count (the list itself fails the case), but never contradict it.
+
+    The main window can itself be missing from the visible list, so the
+    count is the extras plus zero or one main window. A record with only the
+    main window visible would have passed the collector's count check, so it
+    can never be the state a window-count failure records."""
+    windows = observations.get(EXTRA_WINDOW_OBSERVATION_KEY)
+    if not isinstance(windows, list):
+        return
+    count = observations.get("web_security_window_count")
+    if count is None:
+        return
+    if count not in (len(windows), len(windows) + 1):
+        raise ValueError("extra-window count does not match the window count")
+    if reason == "APP_WINDOW_COUNT_UNEXPECTED" and count == 1 and not windows:
+        raise ValueError("a window-count failure cannot observe the main window alone")
+
+
 def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
+    if EXTRA_WINDOW_OBSERVATION_KEY in observations:
+        raise ValueError("a passed case cannot carry extra windows")
     for key, expected in expected_observations().items():
         actual = (
             validate_fingerprint(observations[key])
@@ -781,14 +832,16 @@ def validate_passed_case(case_id: str, observations: dict[str, Any]) -> None:
 CONTRACT = evidence.EvidenceContract(
     schema=SCHEMA,
     case_flows=CASE_FLOWS,
-    observation_keys=OBSERVATION_KEYS,
+    observation_keys=OBSERVATION_KEYS | {EXTRA_WINDOW_OBSERVATION_KEY},
     fingerprint_keys=FINGERPRINT_OBSERVATION_KEYS,
     required_observations=REQUIRED_OBSERVATIONS,
     validate_runtime_scan=validate_runtime_scan,
     validate_passed_case=validate_passed_case,
+    validate_case_observations=validate_extra_window_count,
     structured={
         "web_security_cell_results": validate_cell_results,
         "web_security_post_navigation_cell_results": validate_post_navigation_cell_results,
+        EXTRA_WINDOW_OBSERVATION_KEY: validate_extra_windows,
     },
     private_sentinels=(
         DOCUMENT_SENTINEL,
@@ -1248,7 +1301,15 @@ class Goal07Harness(NativeHarness):
         record_network_contacts(observed, network_probes)
         windows = self.win32.visible_top_level_windows(app.process.active_process_ids())
         if windows != (app.hwnd,):
-            raise HarnessFailure("APP_WINDOW_COUNT_UNEXPECTED")
+            # The next run sees what the extra window is, without leaking a
+            # title that could name a document.
+            extras = [
+                self.win32.window_facts(hwnd, app.hwnd) for hwnd in windows if hwnd != app.hwnd
+            ]
+            raise HarnessFailure(
+                "APP_WINDOW_COUNT_UNEXPECTED",
+                observations={EXTRA_WINDOW_OBSERVATION_KEY: extras},
+            )
         if self.win32.foreground_window() != app.hwnd:
             raise HarnessFailure("APP_WINDOW_FOREGROUND_LOST")
         record(observed, "web_security_window_count", len(windows))
@@ -1350,7 +1411,7 @@ class Goal07Harness(NativeHarness):
                         observations.update(run(app, provider, source))
                 with phase("QUIT"):
                     self.quit_via_menu(app)
-                    self.click_lifecycle_decision(app, "Discard")
+                    self.click_quit_decision(app, "Discard")
                     self.wait_process_exit(app)
                 return self._finalize_observations(provider, case_root, app, observations)
             finally:

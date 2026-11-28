@@ -10,8 +10,10 @@ import ctypes
 import ctypes.wintypes as wt
 import datetime as dt
 import hashlib
+import itertools
 import json
 import math
+import ntpath
 import os
 import platform
 import re
@@ -97,11 +99,6 @@ INTEGRITY_NAMES = {
 #   editor's own Select All + Copy, which writes the exact text
 #   (system.rs `set_clipboard_text`). SetFocus supports inputs and focusable
 #   views (access/uia.rs and access.rs).
-# * UIA cannot inspect system alerts; Enter selects the last Default-styled
-#   button or the first, so callers verify the effect after `confirm_system_alert`.
-SYSTEM_ALERT_SETTLE_SECONDS = 0.5
-# How long one Enter's effect is awaited before the alert is answered again.
-SYSTEM_ALERT_ANSWER_SECONDS = 1.0
 EDITOR_NAME = "Markdown source"
 MENU_BUTTON_AUTOMATION_ID = "title-settings"
 MENU_SAVE_AUTOMATION_ID = "title-menu-save"
@@ -131,12 +128,26 @@ GUARD_BUTTON_AUTOMATION_IDS = {
     "Discard": "guard-dont-save",
     "Cancel": "guard-cancel",
 }
+# The window-close and quit guard (`GuardKind::QuitApp`): the tab's card with
+# the quit heading and Save label; the buttons keep their automation ids.
+QUIT_GUARD_HEADING = "Quit without saving?"
+QUIT_GUARD_BUTTON_NAMES = {"Save": "Save all", "Discard": "Don't save", "Cancel": "Cancel"}
+QUIT_GUARD_BUTTON_AUTOMATION_IDS = dict(GUARD_BUTTON_AUTOMATION_IDS)
 CONFLICT_HEADING = "Changed on disk"
 LIFECYCLE_CLICK_FAILURE_CODES = {
     "Save": "LIFECYCLE_SAVE_CLICK_FAILED",
     "Discard": "LIFECYCLE_DISCARD_CLICK_FAILED",
     "Cancel": "LIFECYCLE_CANCEL_CLICK_FAILED",
 }
+# The app's own class (`nsh-platform-windows` `window.rs`), the WebView2 host
+# popup pair, and the Windows dialog class. `window_facts` maps them to fixed
+# categories: a class name is a free-form string and an image is a local path.
+NSH_WINDOW_CLASS = "NshWindow"
+WEBVIEW2_POPUP_CLASS = "Chrome_WidgetWin_1"
+WEBVIEW2_POPUP_PROCESS_IMAGE = "msedgewebview2.exe"
+MARKTURBO_PROCESS_IMAGE = "markturbo.exe"
+WINDOW_FACT_CATEGORIES = frozenset({"webview2_popup", "dialog", "app_window", "unknown"})
+PROCESS_IMAGE_FACT_CATEGORIES = frozenset({"markturbo", "msedgewebview2", "other"})
 TASK_DIALOG_CLASS = "#32770"
 TASK_DIALOG_BUTTON_CLASS = "CCPushButton"
 CF_UNICODETEXT = 13
@@ -144,6 +155,10 @@ GMEM_MOVEABLE = 0x0002
 
 WM_CLOSE = 0x0010
 GW_OWNER = 4
+# `GetClassNameW`'s documented maximum class name, and a capacity above every
+# executable path's length.
+WINDOW_CLASS_CAPACITY = 256
+PROCESS_IMAGE_CAPACITY = 32768
 SW_RESTORE = 9
 VK_CONTROL = 0x11
 VK_MENU = 0x12
@@ -285,10 +300,18 @@ class HarnessBlocked(RuntimeError):
 
 
 class HarnessFailure(RuntimeError):
-    def __init__(self, code: str, detail: str = "") -> None:
+    def __init__(
+        self,
+        code: str,
+        detail: str = "",
+        observations: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.detail = detail
+        # Content-free facts for the failed case's evidence; the goal's own
+        # contract validates their shape like any other observation.
+        self.observations = observations or {}
 
 
 @dataclass(frozen=True)
@@ -865,6 +888,31 @@ class OwnedProcess:
             raise self._cleanup_failure
 
 
+def window_fact_category(class_name: str | None, process_image: str | None) -> str:
+    """The fixed category of one extra top-level window.
+
+    The WebView2 popup is the class and the process image together; a dialog
+    or the app's own class stands alone; any other class string -- the OS
+    accepts arbitrary ones -- is unknown.
+    """
+    if class_name == WEBVIEW2_POPUP_CLASS and process_image == WEBVIEW2_POPUP_PROCESS_IMAGE:
+        return "webview2_popup"
+    if class_name == TASK_DIALOG_CLASS:
+        return "dialog"
+    if class_name == NSH_WINDOW_CLASS:
+        return "app_window"
+    return "unknown"
+
+
+def process_image_category(process_image: str | None) -> str:
+    """The application family of one process image's executable base name."""
+    if process_image == MARKTURBO_PROCESS_IMAGE:
+        return "markturbo"
+    if process_image == WEBVIEW2_POPUP_PROCESS_IMAGE:
+        return "msedgewebview2"
+    return "other"
+
+
 class Win32:
     def __init__(self) -> None:
         self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -881,6 +929,13 @@ class Win32:
         self.kernel32.ProcessIdToSessionId.restype = wt.BOOL
         self.kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
         self.kernel32.OpenProcess.restype = wt.HANDLE
+        self.kernel32.QueryFullProcessImageNameW.argtypes = [
+            wt.HANDLE,
+            wt.DWORD,
+            wt.LPWSTR,
+            ctypes.POINTER(wt.DWORD),
+        ]
+        self.kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
         self.kernel32.CloseHandle.argtypes = [wt.HANDLE]
         self.kernel32.CloseHandle.restype = wt.BOOL
         self.kernel32.WTSGetActiveConsoleSessionId.restype = wt.DWORD
@@ -1293,23 +1348,39 @@ class Win32:
     def foreground_window(self) -> int:
         return int(self.user32.GetForegroundWindow() or 0)
 
-    def owned_task_dialogs(self, process_id: int, owner_hwnd: int) -> list[int]:
+    def task_dialogs(self, process_id: int, owner_hwnd: int | None = None) -> list[int]:
+        """Visible task dialogs (`#32770`) of `process_id`.
+
+        nsh 0.7.1 gives the IFileSaveDialog an owner of the hidden surface
+        window, not the visible main window, so a picker is found by its
+        process. `owner_hwnd` narrows the search to one owner, for the
+        nested dialog the picker itself owns (its overwrite confirmation).
+        """
         dialogs: list[int] = []
         failure_code: str | None = None
 
         @self._enum_windows_proc
         def collect(hwnd: int, _lparam: int) -> bool:
             nonlocal failure_code
-            if int(self.user32.GetWindow(hwnd, GW_OWNER) or 0) != owner_hwnd:
+            if (
+                owner_hwnd is not None
+                and int(self.user32.GetWindow(hwnd, GW_OWNER) or 0) != owner_hwnd
+            ):
                 return True
             process = wt.DWORD()
             if not self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process)):
-                failure_code = "TASK_DIALOG_PROCESS_QUERY_FAILED"
-                return False
+                # A window destroyed during enumeration has no process: skip
+                # it, the caller's poll re-enumerates. PID 0 is the idle
+                # process; no real window has it.
+                return True
+            if process.value == 0:
+                return True
             if process.value != process_id or not self.user32.IsWindowVisible(hwnd):
                 return True
             class_name = ctypes.create_unicode_buffer(256)
             if not self.user32.GetClassNameW(hwnd, class_name, len(class_name)):
+                if not self.user32.IsWindow(hwnd):
+                    return True
                 failure_code = "TASK_DIALOG_CLASS_QUERY_FAILED"
                 return False
             if class_name.value == TASK_DIALOG_CLASS:
@@ -1327,26 +1398,68 @@ class Win32:
         if not owned_processes:
             raise HarnessFailure("PROCESS_JOB_EMPTY")
         handles: list[int] = []
-        failure_code: str | None = None
 
         @self._enum_windows_proc
         def collect(hwnd: int, _lparam: int) -> bool:
-            nonlocal failure_code
             if not self.user32.IsWindowVisible(hwnd):
                 return True
             process = wt.DWORD()
             if not self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process)):
-                failure_code = "APP_WINDOW_PROCESS_QUERY_FAILED"
-                return False
+                # A window destroyed during enumeration has no process; the
+                # caller's next poll sees the remaining windows.
+                return True
+            if process.value == 0:
+                return True
             if process.value in owned_processes:
                 handles.append(int(hwnd))
             return True
 
-        if not self.user32.EnumWindows(collect, 0) and failure_code is None:
+        if not self.user32.EnumWindows(collect, 0):
             raise HarnessFailure("APP_WINDOW_ENUM_FAILED")
-        if failure_code is not None:
-            raise HarnessFailure(failure_code)
         return tuple(handles)
+
+    def window_facts(self, hwnd: int, main_hwnd: int) -> dict[str, Any]:
+        """Content-free identity of one extra top-level window.
+
+        Its class and process image are mapped to fixed categories; the raw
+        class name and image path never leave this method. Titles are never
+        read: they can contain document names.
+        """
+        process = wt.DWORD()
+        pid = (
+            int(process.value)
+            if self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process))
+            else None
+        )
+        class_buffer = ctypes.create_unicode_buffer(WINDOW_CLASS_CAPACITY)
+        class_name = (
+            class_buffer.value
+            if self.user32.GetClassNameW(hwnd, class_buffer, len(class_buffer))
+            else None
+        )
+        owner = int(self.user32.GetWindow(hwnd, GW_OWNER) or 0)
+        image = self.process_image_name(pid) if pid is not None else None
+        return {
+            "category": window_fact_category(class_name, image),
+            "owned_by_main": owner == main_hwnd,
+            "process_image": process_image_category(image),
+        }
+
+    def process_image_name(self, pid: int) -> str | None:
+        """A process's executable file name alone; None when it is unreadable."""
+        process = self.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            return None
+        try:
+            capacity = wt.DWORD(PROCESS_IMAGE_CAPACITY)
+            buffer = ctypes.create_unicode_buffer(capacity.value)
+            if not self.kernel32.QueryFullProcessImageNameW(
+                process, 0, buffer, ctypes.byref(capacity)
+            ):
+                return None
+            return ntpath.basename(buffer.value)
+        finally:
+            self.kernel32.CloseHandle(process)
 
     def post_close(self, hwnd: int) -> None:
         if not self.user32.PostMessageW(hwnd, WM_CLOSE, 0, 0):
@@ -1425,10 +1538,10 @@ class Win32:
 
 CLIPBOARD_OPEN_TIMEOUT_SECONDS = 3.0
 CLIPBOARD_OPEN_RETRY_SECONDS = 0.02
-# An editor read resends Ctrl+C once when the clipboard has not changed this
-# long after the copy, and polls its sequence number this often.
+# An editor read resends Ctrl+C once when the copy has not landed this long
+# after the first, and polls the clipboard text this often.
 COPY_RESEND_SECONDS = 0.3
-CLIPBOARD_SEQUENCE_POLL_SECONDS = 0.01
+CLIPBOARD_POLL_SECONDS = 0.01
 
 
 def open_clipboard_with_retry(
@@ -1485,7 +1598,6 @@ class _ClipboardApi:
         user32.EmptyClipboard.restype = wt.BOOL
         user32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
         user32.SetClipboardData.restype = wt.HANDLE
-        user32.GetClipboardSequenceNumber.restype = wt.DWORD
         kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
         kernel32.GlobalAlloc.restype = wt.HGLOBAL
         kernel32.GlobalFree.argtypes = [wt.HGLOBAL]
@@ -1510,9 +1622,17 @@ class _ClipboardApi:
         )
 
 
-def clipboard_sequence_number() -> int:
-    """The clipboard's change count; reading it does not open the clipboard."""
-    return int(_ClipboardApi.get().user32.GetClipboardSequenceNumber())
+_CLIPBOARD_SENTINEL_COUNTER = itertools.count(1)
+
+
+def clipboard_sentinel() -> str:
+    """A unique value an editor read puts on the clipboard before copying.
+
+    The read accepts only text that differs from this sentinel, so a copy
+    that never landed leaves a value it rejects; the Remote Desktop
+    clipboard relay can move the change count without the app copying.
+    """
+    return f"markturbo-harness-clipboard-{os.getpid()}-{next(_CLIPBOARD_SENTINEL_COUNTER)}"
 
 
 def read_clipboard_text() -> str | None:
@@ -1695,7 +1815,9 @@ def phase(prefix: str) -> Iterator[None]:
     except HarnessFailure as error:
         if error.code.startswith(f"{prefix}_"):
             raise
-        raise HarnessFailure(f"{prefix}_{error.code}", error.detail) from None
+        raise HarnessFailure(
+            f"{prefix}_{error.code}", error.detail, error.observations
+        ) from None
     finally:
         metrics = _ACTIVE_METRICS.get()
         if metrics is not None:
@@ -2311,62 +2433,11 @@ class NativeHarness:
         except Exception as error:
             raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
-    def confirm_system_alert(
-        self,
-        app: RunningApp,
-        still_undecided: Callable[[], bool],
-        early_code: str,
-        confirmed: Callable[[], bool] | None = None,
-    ) -> None:
-        """Answer the nsh system alert that the last press opened with Enter.
+    def settled_control_centre(self, control: Any, failure_code: str) -> tuple[int, int]:
+        """The control's centre, taken once two reads 50 ms apart agree.
 
-        The alert is invisible to UIA (see the mapping above), so it is proven
-        by effect: `still_undecided` must hold after the press alone (else
-        `early_code`: the action ran without its confirmation), and the caller
-        must then wait for the confirmed effect. The alert opens from an async
-        task after the press; the settle delay keeps Enter from reaching the
-        app's own views first, where it could at most open the alert again.
-        Keys reach the alert only through the main window's own keyboard focus,
-        not a WebView's.
-
-        With `confirmed` (the effect the alert's confirming button has), an
-        Enter sent before the alert showed is sent again until that effect
-        appears, within `ui_timeout`: the async task that opens the alert can
-        outlast the settle delay. A retry is only sent while the source editor
-        lacks the keyboard focus, where a lost Enter cannot edit the document.
-        """
-        time.sleep(SYSTEM_ALERT_SETTLE_SECONDS)
-        if not still_undecided():
-            raise HarnessFailure(early_code)
-        deadline = time.perf_counter() + self.ui_timeout
-        while True:
-            self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
-            wait_until(
-                lambda: self.win32.foreground_focus(app.hwnd) == app.hwnd,
-                self.ui_timeout,
-                "SYSTEM_ALERT_KEYBOARD_FOCUS_TIMEOUT",
-            )
-            self.win32.send_key(app.hwnd, VK_RETURN)
-            if confirmed is None:
-                return
-            try:
-                wait_until(confirmed, SYSTEM_ALERT_ANSWER_SECONDS, "SYSTEM_ALERT_UNANSWERED")
-                return
-            except HarnessFailure as error:
-                if error.code != "SYSTEM_ALERT_UNANSWERED":
-                    raise
-            if time.perf_counter() >= deadline:
-                raise HarnessFailure("SYSTEM_ALERT_UNANSWERED")
-            if self.source_editor_has_focus(app):
-                raise HarnessFailure("SYSTEM_ALERT_EDITOR_FOCUSED")
-
-    def hold_control(
-        self, app: RunningApp, control: Any, seconds: float, failure_code: str
-    ) -> None:
-        """Press and hold the pointer at the control's centre, then release.
-
-        A card glides in, so the centre is taken only once two reads 50 ms
-        apart agree: a hold aimed mid-glide can land beside the control.
+        A card glides in, so a centre taken mid-glide can leave a pointer
+        press beside the control.
         """
 
         def centre() -> tuple[int, int]:
@@ -2390,7 +2461,7 @@ class NativeHarness:
             previous = current
             return None
 
-        x, y = wait_until(
+        return wait_until(
             settled,
             self.ui_timeout,
             f"{failure_code}_TARGET_UNSETTLED",
@@ -2398,7 +2469,46 @@ class NativeHarness:
             clock=self.clock,
             sleep=self.sleep,
         )
+
+    def hold_control(
+        self, app: RunningApp, control: Any, seconds: float, failure_code: str
+    ) -> None:
+        """Press and hold the pointer at the control's centre, then release."""
+        x, y = self.settled_control_centre(control, failure_code)
         self.win32.press_and_hold(app.hwnd, x, y, seconds)
+
+    def aim_control(self, app: RunningApp, control: Any, failure_code: str) -> None:
+        """Move the pointer to the control's centre without pressing.
+
+        The move is separate from the press so the caller can sample state
+        after the move instead of during it.
+        """
+        x, y = self.settled_control_centre(control, failure_code)
+        self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
+        self.win32.move_cursor(x, y)
+
+    def click_aimed_control(
+        self,
+        app: RunningApp,
+        failure_code: str,
+        last_sample: Callable[[], None] | None = None,
+    ) -> None:
+        """Restore the foreground, run `last_sample`, then press the aimed point.
+
+        `last_sample` runs after the foreground is verified and with no wait
+        before the press: a write landing while the foreground is recovered
+        is seen by the sample, never hidden under the press that confirms
+        it. The press itself does not move the pointer.
+        """
+        self.win32.require_foreground(app.hwnd, FOREGROUND_TIMEOUT_SECONDS)
+        if last_sample is not None:
+            last_sample()
+        try:
+            self.win32.send_inputs(
+                [mouse_input(MOUSEEVENTF_LEFTDOWN), mouse_input(MOUSEEVENTF_LEFTUP)]
+            )
+        except Exception as error:
+            raise HarnessFailure(failure_code, safe_exception_name(error)) from None
 
     def _press_menu_anchor(self, app: RunningApp) -> None:
         anchor = self.find_control(
@@ -2602,19 +2712,21 @@ class NativeHarness:
     def read_text_clipboard(self) -> str | None:
         return read_clipboard_text()
 
-    def clipboard_sequence(self) -> int:
-        return clipboard_sequence_number()
+    def _clipboard_copy_seen(self, sentinel: str, timeout: float) -> bool:
+        """Whether the clipboard holds text other than `sentinel` within
+        `timeout` (checked at least once).
 
-    def _clipboard_changed_since(self, sequence: int, timeout: float) -> bool:
-        """Whether the clipboard changes after `sequence` within `timeout`
-        (checked at least once)."""
+        Only a landed copy hides the sentinel: the Remote Desktop clipboard
+        relay moves the change count without the app copying anything.
+        """
         deadline = self.clock() + timeout
         while True:
-            if self.clipboard_sequence() != sequence:
+            value = self.read_text_clipboard()
+            if value is not None and value != sentinel:
                 return True
             if self.clock() >= deadline:
                 return False
-            self.sleep(CLIPBOARD_SEQUENCE_POLL_SECONDS)
+            self.sleep(CLIPBOARD_POLL_SECONDS)
 
     def write_text_clipboard(self, value: str | None) -> None:
         write_clipboard_text(value)
@@ -2622,27 +2734,28 @@ class NativeHarness:
     def forget_clipboard_text(self, expected: Fingerprint) -> None:
         """Empties the clipboard when it already holds `expected`.
 
-        An editor read takes any sequence move as its copy landing, and
-        another writer (the Remote Desktop clipboard relay) can move it too.
-        A dropped copy would then read the text left from an earlier read,
-        which passes only when that text is the one awaited. Emptying the
-        clipboard then leaves a dropped copy nothing to pass on; any other
-        text only fails the comparison and is read again.
+        A dropped copy must not read back the awaited text an earlier read
+        left on the clipboard; emptied, it has nothing to pass on. Any
+        other text is left alone: its own comparison fails and retries.
         """
         current = self.read_text_clipboard()
         if current is not None and fingerprint_text(current) == expected:
             self.write_text_clipboard(None)
 
-    def wait_clipboard_text(self, timeout_code: str) -> str:
+    def wait_clipboard_text(self, timeout_code: str, reject: str | None = None) -> str:
         """The clipboard's text once something (even an empty text) arrives.
 
+        A `reject` value (an editor read's sentinel) never counts: while the
+        clipboard still holds it, the copy it preceded has not landed.
         Inside an outer wait (`bounded_by`) this is a nested step and waits at
         most `inner_timeout()`; on its own it waits `ui_timeout`.
         """
 
         def copied() -> tuple[str] | None:
             value = self.read_text_clipboard()
-            return None if value is None else (value,)
+            if value is None or value == reject:
+                return None
+            return (value,)
 
         timeout = self.inner_timeout()
         (value,) = wait_until(
@@ -2658,19 +2771,15 @@ class NativeHarness:
     def read_editor_text(self, app: RunningApp, editor: Any | None = None) -> str:
         """The editor's exact document through its own Select All + Copy.
 
-        Only copies and reads, never writes the clipboard: the session saved
-        the user's clipboard once and restores it when the run ends. The copy
-        is known to have landed when the clipboard's sequence number moves
-        past the one sampled before Ctrl+A Ctrl+C (one input batch); the text
-        is then read once. A copy that has not landed after
-        `COPY_RESEND_SECONDS` is resent once (`copy_resends`). Another
-        clipboard writer (the Remote Desktop clipboard relay) can move the
-        sequence too, so callers compare the fingerprint and retry, first
-        emptying a clipboard that already holds the text they await
-        (`forget_clipboard_text`). Nothing
-        read here is written to evidence except its fingerprint. `editor` is
-        the editor control a caller already found; without one it is looked
-        up here.
+        A unique sentinel replaces the clipboard before every copy, and the
+        read accepts only text that differs from it: a dropped copy leaves
+        the sentinel in place, whatever the Remote Desktop clipboard relay
+        does to the change count. The session saved the user's clipboard
+        once and restores it when the run ends. A copy still not on the
+        clipboard after `COPY_RESEND_SECONDS` is asked for once more
+        (`copy_resends`). Nothing read here is written to evidence except
+        its fingerprint. `editor` is the editor control a caller already
+        found; without one it is looked up here.
         """
         count("editor_reads")
         if editor is None:
@@ -2679,16 +2788,17 @@ class NativeHarness:
         timeout = self.inner_timeout()
         timeout = self.ui_timeout if timeout is None else timeout
         deadline = self.clock() + timeout
-        sequence = self.clipboard_sequence()
+        sentinel = clipboard_sentinel()
+        self.write_text_clipboard(sentinel)
         self.win32.send_shortcuts(app.hwnd, (VK_A, VK_C))
         self.last_editor_sample_at = self.clock()
-        if not self._clipboard_changed_since(sequence, min(COPY_RESEND_SECONDS, timeout)):
+        if not self._clipboard_copy_seen(sentinel, min(COPY_RESEND_SECONDS, timeout)):
             count("copy_resends")
             self.win32.send_shortcut(app.hwnd, VK_C)
             self.last_editor_sample_at = self.clock()
-            if not self._clipboard_changed_since(sequence, max(0.0, deadline - self.clock())):
+            if not self._clipboard_copy_seen(sentinel, max(0.0, deadline - self.clock())):
                 raise HarnessFailure("EDITOR_COPY_TIMEOUT")
-        return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT")
+        return self.wait_clipboard_text("EDITOR_COPY_TIMEOUT", sentinel)
 
     def read_editor_fingerprint(self, app: RunningApp) -> Fingerprint | None:
         """One editor read on one UIA query: the editor found here is the one
@@ -2720,8 +2830,20 @@ class NativeHarness:
         self.wait_editor_fingerprint(app, fingerprint_text("\n"), self.ui_timeout)
         return fingerprint_text("")
 
-    def lifecycle_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
-        """The in-window guard card (`ui/notices.rs` `guard_card`) and its decisions."""
+    def guard_dialog(
+        self,
+        app: RunningApp,
+        heading: str,
+        button_names: dict[str, str],
+        button_automation_ids: dict[str, str],
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """One in-window guard card (`ui/notices.rs` `guard_card`): its decisions.
+
+        The heading Text names the card's kind. Each decision is a Button with
+        its own AutomationId and label; `button_names` and
+        `button_automation_ids` share their keys.
+        """
         last_failure_type: str | None = None
 
         def locate() -> dict[str, Any] | None:
@@ -2730,17 +2852,17 @@ class NativeHarness:
                 raise HarnessFailure("PROCESS_EXITED_BEFORE_GUARD")
             try:
                 if self.control_by_name(
-                    app.hwnd, GUARD_HEADING, "Text", "GUARD_CARD_UIA_CONTRACT_MISMATCH"
+                    app.hwnd, heading, "Text", "GUARD_CARD_UIA_CONTRACT_MISMATCH"
                 ) is None:
                     return None
                 buttons = {}
-                for decision, automation_id in GUARD_BUTTON_AUTOMATION_IDS.items():
+                for decision, automation_id in button_automation_ids.items():
                     button = self.control_by_id(
                         app.hwnd,
                         automation_id,
                         "Button",
                         "GUARD_BUTTON_UIA_CONTRACT_MISMATCH",
-                        expected_name=GUARD_BUTTON_NAMES[decision],
+                        expected_name=button_names[decision],
                     )
                     if button is None:
                         return None
@@ -2763,8 +2885,29 @@ class NativeHarness:
                 raise HarnessFailure(error.code, last_failure_type) from None
             raise
 
+    def lifecycle_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
+        """The dirty tab's close guard card and its decisions."""
+        return self.guard_dialog(
+            app, GUARD_HEADING, GUARD_BUTTON_NAMES, GUARD_BUTTON_AUTOMATION_IDS, timeout
+        )
+
     def click_lifecycle_decision(self, app: RunningApp, name: str) -> None:
         button = self.lifecycle_dialog(app)[name]
+        self.click_control(button, LIFECYCLE_CLICK_FAILURE_CODES[name])
+
+    def quit_dialog(self, app: RunningApp, timeout: float | None = None) -> dict[str, Any]:
+        """The quit guard card (`GuardKind::QuitApp`) of every window close and
+        Quit; its Save is Save all, which saves every dirty tab."""
+        return self.guard_dialog(
+            app,
+            QUIT_GUARD_HEADING,
+            QUIT_GUARD_BUTTON_NAMES,
+            QUIT_GUARD_BUTTON_AUTOMATION_IDS,
+            timeout,
+        )
+
+    def click_quit_decision(self, app: RunningApp, name: str) -> None:
+        button = self.quit_dialog(app)[name]
         self.click_control(button, LIFECYCLE_CLICK_FAILURE_CODES[name])
 
     def wait_process_exit(self, app: RunningApp, timeout: float | None = None) -> None:
@@ -3173,6 +3316,10 @@ def _run_goal(
                     failure_code = (
                         error.code if isinstance(error, HarnessFailure) else "INTERNAL_FAILURE"
                     )
+                    if isinstance(error, HarnessFailure):
+                        # Content-free failure diagnostics; the goal's contract
+                        # validates them on evidence write.
+                        case["observations"].update(error.observations)
                     case.update(
                         status="FAIL",
                         reason_code=failure_code,
@@ -3362,7 +3509,7 @@ __all__ = [
     "Win32",
     "artifact_contains",
     "build_launch_spec",
-    "clipboard_sequence_number",
+    "clipboard_sentinel",
     "complete_evidence",
     "count",
     "elapsed_ms",
