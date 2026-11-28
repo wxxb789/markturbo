@@ -456,7 +456,7 @@ fn tab_groups(state: AppState) -> Memo<(Vec<Tab>, Vec<Tab>)> {
                 let mut outside = Vec::new();
                 let mut unlisted = Vec::new();
                 for tab in tabs {
-                    if state.outside_folder(tab) {
+                    if state.outside_folder(tab) || tab.disk_missing.get() {
                         outside.push(tab.clone());
                     } else if !files.contains(&tab.path) {
                         unlisted.push(tab.clone());
@@ -540,7 +540,10 @@ fn tree(
     let open_files = computed(move || {
         tabs.with(|tabs| {
             let mut open = HashMap::new();
-            for tab in tabs.iter().filter(|tab| !tab.untitled) {
+            for tab in tabs
+                .iter()
+                .filter(|tab| !tab.untitled && !tab.disk_missing.get())
+            {
                 // The first tab of a path is the one activation targets, so
                 // the row's dot, selected state and close share its id.
                 open.entry(tab.path.clone()).or_insert(tab.id);
@@ -581,7 +584,7 @@ fn tree(
                     })
                 })
             },
-            |entry| entry.path.clone(),
+            |entry| (entry.path.clone(), entry.is_dir),
             move |row: ReadSignal<Entry>, _| {
                 let entry = row.get_untracked();
                 let title = SharedString::from(entry.name);
@@ -755,6 +758,7 @@ fn file_line(
                     move || tab().is_some(),
                     move || {
                         view()
+                            .test_id("sidebar-tree-open")
                             .w(px(RAIL_DOT))
                             .h(px(RAIL_DOT))
                             .rounded(px(RAIL_DOT / 2.0))

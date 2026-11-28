@@ -43,15 +43,13 @@ fn edits_during_the_reload_read_stay_in_the_buffer() {
         .expect("wide viewport");
     app.wait_for("label:Markdown source")
         .expect("source editor");
-    app.type_text("label:Markdown source", "\n\nLocal edit.")
-        .expect("edit the buffer");
 
-    // An external write makes the save refuse, raising the conflict banner
-    // with its Use-disk choice.
+    // A local edit makes the tab dirty, then the external write raises the
+    // conflict banner with its Use-disk choice at once (Goal 22, decision 4:
+    // a dirty document conflicts on the event, not at save).
+    app.type_text("label:Markdown source", "\nLocal edit.")
+        .expect("edit the buffer");
     std::fs::write(&path, "# External change\n").expect("replace the file");
-    app.press("id:title-settings")
-        .expect("open the glyph's menu");
-    app.press("id:title-menu-save").expect("attempt save");
     app.wait_for("id:conflict-use-disk")
         .expect("the conflict banner's use-disk choice");
 
@@ -99,7 +97,7 @@ fn edits_during_the_reload_read_stay_in_the_buffer() {
             .expect("the recovery directory")
             .join(format!(
                 "{}.mtrecovery",
-                RecoveryKey::for_path(&path).as_str()
+                RecoveryKey::for_path(&mt_core::workspace::long_path(&path)).as_str()
             ));
         assert!(
             record.exists(),
@@ -138,12 +136,12 @@ fn a_stale_reload_answer_does_not_reconflict_a_synced_tab() {
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
-    // An external write makes the save refuse, raising the conflict banner
-    // with its Use-disk choice.
+    // A local edit makes the tab dirty, then the external write raises the
+    // conflict banner with its Use-disk choice at once (Goal 22, decision 4:
+    // a dirty document conflicts on the event, not at save).
+    app.type_text("label:Markdown source", "\nLocal edit.")
+        .expect("edit the buffer");
     std::fs::write(&path, "# External change\n").expect("replace the file");
-    app.press("id:title-settings")
-        .expect("open the glyph's menu");
-    app.press("id:title-menu-save").expect("attempt save");
     app.wait_for("id:conflict-use-disk")
         .expect("the conflict banner's use-disk choice");
 
@@ -238,12 +236,12 @@ fn a_stale_reload_failure_writes_no_notice() {
     app.wait_for("label:Markdown source")
         .expect("source editor");
 
-    // An external write makes the save refuse, raising the conflict banner
-    // with its Use-disk choice.
+    // A local edit makes the tab dirty, then the external write raises the
+    // conflict banner with its Use-disk choice at once (Goal 22, decision 4:
+    // a dirty document conflicts on the event, not at save).
+    app.type_text("label:Markdown source", "\nLocal edit.")
+        .expect("edit the buffer");
     std::fs::write(&path, "# External change\n").expect("replace the file");
-    app.press("id:title-settings")
-        .expect("open the glyph's menu");
-    app.press("id:title-menu-save").expect("attempt save");
     app.wait_for("id:conflict-use-disk")
         .expect("the conflict banner's use-disk choice");
 

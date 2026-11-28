@@ -19,8 +19,8 @@ use nsh_core::{Points, TouchEvent, TouchPhase, prelude::*};
 use crate::{
     state::{AppState, View as DocumentView},
     ui::{
-        consent, context, document, motion, notices, preview, rail, review, revision, settings,
-        titlebar,
+        consent, context, document, drop_screen, motion, notices, preview, rail, review, revision,
+        settings, titlebar,
         tokens::{self, Layout},
         welcome,
     },
@@ -80,6 +80,9 @@ pub(crate) fn shell_with_status(
     }
     let body_state = state.clone();
     let capture_state = state.clone();
+    let drag_state = state.clone();
+    let leave_state = state.clone();
+    let drop_state = state.clone();
     view()
         .test_id("shell")
         .flex_1()
@@ -102,6 +105,16 @@ pub(crate) fn shell_with_status(
             // that sizes the window before the first frame would otherwise get
             // the wrong breakpoint.
             client_width().set(frame.size.width.0);
+        })
+        // A drag anywhere over the window offers what its names confirm; the
+        // screen leaves on leave or drop. A platform that sends no enter
+        // position still gets the screen, which always comes from the right.
+        .on_file_drag_enter(move |event: &FileDragEvent| {
+            drag_state.drop_hover(&event.uris, &event.mime_types);
+        })
+        .on_file_drag_leave(move |_: &()| leave_state.drop_leave())
+        .on_file_drop(move |event: &FileDropEvent| {
+            drop_state.drop_files(&event.uris);
         })
         .bg(move || tokens::palette().room)
         .text_color(move || tokens::palette().ink)
@@ -892,6 +905,7 @@ pub(super) fn overlay_layer(state: AppState, language: Language) -> impl IntoEle
             },
             move || notices::guard(guard_state.clone(), language),
         ))
+        .child(drop_screen::screen(state, language))
 }
 
 /// Mount at the banner's current height; only changes to a mounted slot

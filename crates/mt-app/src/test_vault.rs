@@ -89,6 +89,13 @@ impl SecureCredentialStore for MemoryStore {
 
 static STORE: LazyLock<Arc<MemoryStore>> = LazyLock::new(Arc::default);
 
+/// Whether two paths name the one entry: the same spelling, or the file
+/// system's long spelling of both. A test names the path it asked the app to
+/// open; the app stores the long spelling, so the two still meet.
+fn same_path(left: &Path, right: &Path) -> bool {
+    left == right || mt_core::workspace::long_path(left) == mt_core::workspace::long_path(right)
+}
+
 type ReviewGenerationHook = Box<dyn Fn() + Send + 'static>;
 
 // One hook, run when a sent Review's task reaches its generation check. A
@@ -167,8 +174,58 @@ pub fn gate_reads_started(path: &Path) -> usize {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .find(|gate| gate.path == path)
+        .find(|gate| same_path(&gate.path, path))
         .map_or(0, |gate| gate.next)
+}
+
+static COMMIT_GATES: LazyLock<Mutex<Vec<PathGate>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Hold the next blocking read of `path` — a reload or a workspace scan —
+/// after its content was read and before its answer is committed, until the
+/// release path exists, so a test can let the disk change at the moment the
+/// answer is about to be applied.
+pub fn gate_commit(path: impl Into<PathBuf>, release: impl Into<PathBuf>) {
+    COMMIT_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(PathGate {
+            path: path.into(),
+            releases: vec![release.into()],
+            next: 0,
+        });
+}
+
+/// Whether a commit gate for `path` has been reached.
+pub fn commit_gate_reached(path: &Path) -> bool {
+    COMMIT_GATES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|gate| same_path(&gate.path, path))
+        .is_some_and(|gate| gate.next > 0)
+}
+
+pub(crate) fn wait_for_commit(path: &Path) {
+    let release = {
+        let mut gates = COMMIT_GATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(gate) = gates.iter_mut().find(|gate| same_path(&gate.path, path)) else {
+            return;
+        };
+        let release = gate
+            .releases
+            .get(gate.next)
+            .or_else(|| gate.releases.last())
+            .cloned();
+        gate.next += 1;
+        release
+    };
+    if let Some(release) = release {
+        while !release.exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
 }
 
 static SAVE_GATE_REACHED: AtomicBool = AtomicBool::new(false);
@@ -203,7 +260,7 @@ pub fn open_superseded(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .any(|seen| seen == path)
+        .any(|seen| same_path(seen, path))
 }
 
 pub(crate) fn note_superseded_open(path: &Path) {
@@ -222,7 +279,7 @@ pub fn duplicate_open_focused(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .any(|seen| seen == path)
+        .any(|seen| same_path(seen, path))
 }
 
 pub(crate) fn note_duplicate_open(path: &Path) {
@@ -242,7 +299,7 @@ pub fn reload_superseded(path: &Path) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .any(|seen| seen == path)
+        .any(|seen| same_path(seen, path))
 }
 
 pub(crate) fn note_superseded_reload(path: &Path) {
@@ -259,7 +316,7 @@ pub(crate) fn wait_for_read(path: &Path) {
         let mut gates = PATH_GATES
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(gate) = gates.iter_mut().find(|gate| gate.path == path) else {
+        let Some(gate) = gates.iter_mut().find(|gate| same_path(&gate.path, path)) else {
             return;
         };
         let release = gate

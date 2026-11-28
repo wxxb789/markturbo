@@ -1516,7 +1516,9 @@ mod tests {
             // are the ones their probe reads.
             let serial = crate::test_env::lock();
             let root = tempfile::tempdir().expect("fixture");
-            let root_path = root.path().to_path_buf();
+            // The app normalizes every opened path; the fixture hands the
+            // probes the same spelling so the root and the tab agree.
+            let root_path = mt_core::workspace::long_path(root.path());
             std::fs::create_dir_all(root_path.join("docs")).expect("docs");
             std::fs::create_dir_all(root_path.join(".git")).expect("root marker");
             std::fs::create_dir_all(root_path.join(".cursor/rules")).expect("cursor rules");

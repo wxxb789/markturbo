@@ -35,6 +35,9 @@ fn start(config: &std::path::Path) -> Headless {
 }
 
 fn recent(path: &std::path::Path) -> String {
+    // The app records the long spelling; the fixture writes the same one, so
+    // the two name one target.
+    let path = mt_core::workspace::long_path(path);
     format!(
         "[[recent-targets]]\npath = {:?}\nkind = \"file\"\ndisplay-name = {:?}\n\n",
         path.display().to_string(),

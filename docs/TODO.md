@@ -178,6 +178,21 @@
     (`FOCUS_RETRY_FRAMES`), not that a key typed at the exact frame the editor appears lands.
   - `reload_edit_race`'s no-notice assertion can still read the screen before a post-marker notice batch.
   - Tighten both only if nsh-testing gains a frame-exact or task-completion hook.
+- [ ] **Drops while a card or Settings is open (Goal 22 lane 22-B).** The drop handlers live on the
+  shell root, so a file dragged over an open consent card, the close guard, or the Settings page still
+  shows the drop screen (the overlay layer draws it above the card) and a drop opens documents behind
+  the open surface; the card's decision keeps referring to the tab it was opened for, so nothing is
+  misattributed. Decide whether those surfaces should swallow drags instead.
+- [ ] **`palette_folder::choosing_a_palette_file_focuses_the_opened_editor` fails on this workstation,
+  at the base commit `c049c0ed` too (not a Goal 22 lane 22-B regression).** A palette-row click opens
+  the file, and the plain key after it lands nowhere: `AppState::retry_editor_focus` reaches the new
+  editor's `api()` one frame before the editor's own input has a node, nsh drops the deferred
+  `focus()` call then, and the retry treats that first `api()` match as success. The app-side trace
+  shows a `Focus` for the palette input and none for the editor; a frame of extra work anywhere in
+  that window (an added `set_interval`, or the disk drain) flips the outcome. Verifying the focus
+  against the editor box's `on_focus_in` signal instead of `api()` breaks `focus_after_close`'s
+  "first focus" assertion, so the repair is a design decision for a Goal 20 follow-up (nsh may also
+  fix the dropped call upstream).
 - [ ] **Goal 22 lane 22-A residuals (implementation review, 2026-11-27).**
   - Two guards implement one rule: `state.rs::observe_view_stop` snaps the track under reduced motion and
     `TrackTween::to` does the same, so removing either alone is unobservable (the lane's mutation check had to
@@ -197,3 +212,42 @@
   - `document`'s new identity test mounts `document::column` directly, so it cannot catch a shell-level remount,
     and the old "a remounted editor cuts to the held line" oracle is gone; `shell`'s field-gap test measures the
     source screen rather than the Review column inside the dock.
+
+## Goal 22 lane 22-B residuals (owner accepted 2026-11-27)
+
+- [ ] **Registration-window recheck race** — when a document's watch is registered while its opening read's reload
+  is queued, the ticker's post-subscription recheck and the earlier recheck can commit out of order: one reads an
+  intermediate version and the other the final pre-registration write, and if the intermediate one commits later it
+  advances the generation and drops the final answer; no event remains to correct a clean tab. Fix by giving both
+  rechecks one generation so only the newest read commits.
+- [ ] **Symlink target inside an ignored directory** — `link.md` resolving into `.venv/target.md` (or another
+  `SKIP_DIRS` directory) inside the workspace: the recursive root covers the target's parent, so no separate document
+  watch is added, and the root's event for the target is discarded as noise. Editing the target never reloads the
+  clean tab or closes a stale Compare. Fix by registering the resolved target's parent as an exact context path when
+  it sits under an ignored directory.
+- [ ] **Directory rename holding a symlink's target** — a `Removed` event naming only the renamed parent of a link's
+  target (`drafts/`) does not match the link tab, which keeps its old content; moving the directory back reports only
+  a directory `Created`, which re-checks no child tabs, so the tab stays `Outside folder`. Fix by matching tabs whose
+  path or resolved target is a descendant of a directory event, and re-checking them on a directory creation.
+- [ ] **macOS FSEvents rename handling on the UI tick** — registration and `canonicalize` run on the worker, but the
+  UI ticker still calls `Watcher::poll`. notify 8.2.2's FSEvents backend reports renames as `RenameMode::Any`, whose
+  classification calls `path.exists()` synchronously; a queued event on a dropped network volume can still freeze the
+  window. Fix by moving the existence probe off the UI thread.
+- [ ] **Windows case-only directory spellings and reparse aliases still split one file's event spellings** — 8.3
+  short names are closed: an open expands a short spelling to the file system's long one. `GetLongPathNameW` keeps
+  the caller's case for a directory component, so a case-only spelling of a directory still names the same file with
+  a different spelling, and it resolves no junction or directory symbolic link, so an open through an alias keeps
+  the alias's spelling too. The mismatched event never marks the tab missing, and a symlink tab's `canonicalize`d
+  target under the real path reloads no clean tab and raises no conflict on a dirty one. Fix by identifying a file by
+  its file ID (volume serial number plus file index) at event and open matching instead of its path spelling.
+- [ ] **A directory alias shares an inotify descriptor with the real path** — on Linux, a tab opened through `alias/plan.md`
+  where `alias` (outside the workspace) points at `A/notes`, then `A` opened as the workspace: both registrations share one
+  inotify descriptor, and closing the last `alias` tab unwatches it, so `A/notes` loses live updates. Fix by keying watch
+  registrations by the resolved directory and reference-counting them.
+- [ ] **A failed recursive registration restores the old watch without a recheck** — if registering the new root fails, the
+  rollback re-registers the old document-directory watch with an unchanged generation, so a write made in the gap is never
+  read. Fix by advancing the generation on rollback so affected tabs re-check.
+- [ ] **A renamed symbolic link focuses its stale tab** — after `a.md`, a link to `real.md`, is renamed to `b.md`,
+  opening `b.md` focuses the old tab by its resolved target and discards the new read. No text is lost; Save on the
+  stale tab fails visibly. The fix needs a recovery key per tab instead of per path, so two tabs on one path cannot
+  share one record.

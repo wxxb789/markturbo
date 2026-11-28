@@ -726,6 +726,7 @@ mod tests {
         ArtifactLens, ByteRange, MAX_SKILL_FILE_BYTES, ReviewScope, SkillFilePayload, SourceAnchor,
         SourceLocation, SourceSnapshot,
     };
+    use crate::workspace::long_path;
     use std::fs;
     use std::path::Path;
 
@@ -1586,10 +1587,14 @@ Read [the guide](references/guide.md),
         assert_eq!(supporting_document.text, "first\nsecond\n");
         assert!(supporting_document.skill_origin().is_none());
 
+        let navigate_guide = long_path(&guide);
         let anchor =
             SourceAnchor::agent_skill_file("references/guide.md", SourceLocation::lines(2, 2))
                 .unwrap();
-        assert_eq!(frozen.resolve_anchor(&anchor), Some((guide.clone(), 6)));
+        assert_eq!(
+            frozen.resolve_anchor(&anchor),
+            Some((navigate_guide.clone(), 6))
+        );
         assert_eq!(
             frozen.resolve_anchor(
                 &SourceAnchor::agent_skill_file(
@@ -1598,13 +1603,13 @@ Read [the guide](references/guide.md),
                 )
                 .unwrap(),
             ),
-            Some((guide.clone(), 6))
+            Some((navigate_guide, 6))
         );
         assert_eq!(
             frozen.resolve_anchor(
                 &SourceAnchor::agent_skill_file("SKILL.md", SourceLocation::bytes(0, 0)).unwrap(),
             ),
-            Some((skill, 0))
+            Some((long_path(&skill), 0))
         );
         assert!(
             frozen
@@ -1663,18 +1668,19 @@ Read [the guide](references/guide.md),
         )
         .unwrap();
         let frozen = frozen_skill_package(directory.path(), "entrypoint", false).unwrap();
+        let navigate_guide = long_path(&guide);
 
         assert_eq!(
             frozen.resolve_anchor(
                 &SourceAnchor::agent_skill_file("guide.md", SourceLocation::bytes(10, 16)).unwrap(),
             ),
-            Some((guide.clone(), 6))
+            Some((navigate_guide.clone(), 6))
         );
         assert_eq!(
             frozen.resolve_anchor(
                 &SourceAnchor::agent_skill_file("guide.md", SourceLocation::lines(2, 2)).unwrap(),
             ),
-            Some((guide, 6))
+            Some((navigate_guide, 6))
         );
     }
 
@@ -1686,6 +1692,7 @@ Read [the guide](references/guide.md),
         let mixed = directory.path().join("mixed.md");
         fs::write(&mixed, "first\r\nsecond\nthird\n").unwrap();
         let frozen = frozen_skill_package(directory.path(), "entrypoint", false).unwrap();
+        let navigate_mixed = long_path(&mixed);
         let mixed_offset = "first\r\nsecond\nthird\n".find("second").unwrap();
         assert_eq!(
             frozen.resolve_anchor(
@@ -1695,7 +1702,7 @@ Read [the guide](references/guide.md),
                 )
                 .unwrap(),
             ),
-            Some((mixed, mixed_offset))
+            Some((navigate_mixed, mixed_offset))
         );
 
         let editor_text = "\u{feff}first\r\nsecond";
@@ -1704,7 +1711,7 @@ Read [the guide](references/guide.md),
             dirty.resolve_anchor(
                 &SourceAnchor::agent_skill_file("SKILL.md", SourceLocation::bytes(3, 8)).unwrap(),
             ),
-            Some((skill, 3))
+            Some((long_path(&skill), 3))
         );
     }
 

@@ -1112,8 +1112,9 @@ fn normalized_skill_origin_path(
     origin: &SkillOrigin,
     path: &Path,
 ) -> Result<String, ReviewRequestBuildError> {
-    normalized_skill_relative_path(origin.canonical_root(), path)
-        .or_else(|_| normalized_skill_relative_path(origin.lexical_root(), path))
+    let path = crate::workspace::long_path(path);
+    normalized_skill_relative_path(origin.canonical_root(), &path)
+        .or_else(|_| normalized_skill_relative_path(origin.lexical_root(), &path))
 }
 
 fn invalid_skill_path_error(error: ReviewRequestBuildError) -> std::io::Error {

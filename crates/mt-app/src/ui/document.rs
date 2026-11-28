@@ -35,6 +35,12 @@ use crate::{
     ui::{glow, motion, notices, review, revision, shell, titlebar, tokens},
 };
 
+/// How far the new text arrives from on a clean reload ("about 6 px", Goal 22
+/// decision 6).
+const RELOAD_SLIP_PX: f32 = 6.0;
+/// The ink the slip starts at before it fades back to full.
+const RELOAD_SLIP_DIM: f32 = 0.35;
+
 /// The text stage's source view. The shell keys the slot by tab identity;
 /// changing the view track never replaces the mounted editor.
 pub fn column(state: AppState) -> impl IntoElement {
@@ -191,6 +197,38 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
         titlebar::bind_mod_enter(&keys_state);
     });
 
+    // The clean-reload slip (Goal 22, decision 6, lane 22-B): the changed
+    // text arrives from a few points to the right with a short ink fade, over
+    // the motion tokens. The offset starts at zero, so a normal open and
+    // reduced motion never move the text; only a successful adoption sets the
+    // marker, so a conflict or a failed read never plays it, and a tab that
+    // mounts after an adoption never replays the last one.
+    let slip_offset = animated_value(0.0);
+    let slip_opacity = animated_value(1.0);
+    let slip_state = state.clone();
+    let slip_tab = tab.id;
+    let seen_slip = Cell::new(state.reload_slip.get_untracked());
+    effect(move || {
+        let marker = slip_state.reload_slip.get();
+        if seen_slip.replace(marker) == marker {
+            return;
+        }
+        if !matches!(marker, Some((id, _)) if id == slip_tab) {
+            return;
+        }
+        if motion::reduced_motion() {
+            // No movement under reduced motion: a crossfade alone.
+            slip_offset.set(0.0);
+            slip_opacity.set(RELOAD_SLIP_DIM);
+            slip_opacity.timing(1.0, motion::REDUCED_CROSSFADE_MS, motion::EASE_OUT);
+        } else {
+            slip_offset.set(RELOAD_SLIP_PX);
+            slip_offset.timing(0.0, motion::ENTER_MS, motion::EASE_OUT);
+            slip_opacity.set(RELOAD_SLIP_DIM);
+            slip_opacity.timing(1.0, motion::ENTER_MS, motion::EASE_OUT);
+        }
+    });
+
     let mount_focus = state.clone();
     let tab_id = tab.id;
     let first_layout = Cell::new(true);
@@ -206,12 +244,22 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                 mount_focus.focus_on_document_mount(tab_id);
             }
         })
-        .child(
+        .child({
             // The editor's element carries no `test_id` of its own; the box
             // around it does, and it is the editor's own box.
-            view()
+            let slip_box = view()
                 .test_id("source-editor")
                 .element_ref(&editor_box)
+                .bind_opacity(&slip_opacity);
+            // The slip's six points of travel are motion; under reduced
+            // motion its fade alone carries the marker, so the box binds no
+            // transform at all.
+            let slip_box = if motion::reduced_motion() {
+                slip_box
+            } else {
+                slip_box.bind_translate_x(&slip_offset)
+            };
+            slip_box
                 // The editor reaches back over the column's left gap: its
                 // gutter fills the gap and its text starts at the measure,
                 // where it would without a gutter.
@@ -305,8 +353,8 @@ fn source(state: AppState, tab: Tab) -> impl IntoElement {
                             edit_tab.revision.update(|revision| *revision += 1);
                             change_state.note_edit(edit_tab.id);
                         }),
-                ),
-        )
+                )
+        })
 }
 
 /// The camera's glide in flight, if any. A new target, the user's own scroll

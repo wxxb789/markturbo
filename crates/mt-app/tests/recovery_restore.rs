@@ -51,10 +51,10 @@ fn restore_reopens_the_checkpoint_and_dont_save_retires_it() {
 
     // The interrupted session's checkpoint, written through the production
     // store the app opens at startup.
-    let key = RecoveryKey::for_path(&path);
+    let loaded = io::load(&path).expect("load the file");
+    let key = RecoveryKey::for_path(&loaded.path);
     {
         let (store, _maintenance) = RecoveryStore::open().expect("open recovery store");
-        let loaded = io::load(&path).expect("load the file");
         store
             .checkpoint(
                 &RecoveryCheckpoint {
@@ -132,8 +132,8 @@ fn seed_two(dir: &std::path::Path) -> tempfile::TempDir {
     for (name, draft) in [("first.md", FIRST_DRAFT), ("second.md", SECOND_DRAFT)] {
         let path = dir.join(name);
         std::fs::write(&path, ON_DISK).expect("write seed");
-        let key = RecoveryKey::for_path(&path);
         let loaded = io::load(&path).expect("load seed");
+        let key = RecoveryKey::for_path(&loaded.path);
         let (store, _maintenance) = RecoveryStore::open().expect("open recovery store");
         store
             .checkpoint(

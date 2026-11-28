@@ -14,6 +14,8 @@ pub mod rendering;
 pub mod review;
 pub mod runtime_paths;
 pub mod settings;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_probe;
 pub mod translate;
 pub mod usage;
 pub mod workspace;

@@ -189,8 +189,22 @@ and curves, but keeps decision 6's spatial behaviour.
 
 Each lane is mergeable alone on `main`.
 
-## Lane 22-A decisions
+## Lane 22-B implementation notes (2026-11-27)
 
+Three choices the contract leaves to the lane, recorded here so the code and this file agree. They
+do not change a decision's requirement.
+
+1. **The clean-reload slip is one layer.** "The old text leaves and the new text arrives" is carried by the arriving
+   text: the editor box slips in from 6 px with an ink fade over `motion::ENTER_MS`, and under reduced motion only
+   its opacity moves. A ghost of the old text needs a second text view that cannot share the editor's wrapping,
+   scroll offset and gutter, so it would visibly mismatch the text it replaces. "About 6 px" and "plays only after a
+   successful adoption" are unchanged: `goal22_live_disk.rs` pins that a conflict or a failed read plays nothing.
+2. **Multi-folder drops.** The last folder in a drop becomes the workspace and earlier folders are ignored without a
+   notice, because a workspace is singular. The skipped-count notice counts files whose type cannot be opened only.
+3. **Drop-screen motion.** The screen enters and leaves over `motion::ENTER_MS`/`motion::EXIT_MS` with the ease-out
+   curve, like the app's other entering surfaces; decision 6 assigns the camera duration to the divider and the
+   rail-widen duration to the sidebar and leaves the screen's own duration to this lane.
+## Lane 22-A decisions
 The source and dock share a numeric track at 1, 0.5, or 0; a touch can drag
 the divider to the nearest stop, and Review, Revision, and Context keep the
 measured source and field instead of using the track. The sidebar and divider

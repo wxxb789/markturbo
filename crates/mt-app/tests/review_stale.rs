@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
+use mt_core::recovery::RecoveryKey;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 
@@ -125,6 +126,115 @@ fn editing_the_reviewed_document_marks_the_result_stale() {
                 "prohibited content entered usage data"
             );
         }
+    }
+}
+
+#[test]
+fn an_external_reload_marks_the_result_stale_without_dirtying_the_tab() {
+    let output = serde_json::json!({
+        "schema_version": "review-v1",
+        "scope": {"kind": "document"},
+        "understood_intent": {
+            "stated_goal": "keep the document intent",
+            "relevant_context": [],
+            "constraints": [],
+            "non_goals": [],
+            "expected_deliverable": "a reviewed document",
+            "success_evidence": [],
+            "inferred_assumptions": [],
+            "unresolved_decisions": []
+        },
+        "findings": [],
+        "clarification_questions": []
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let base_url = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let review_text = output.to_string();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return;
+        };
+        let _ = read_http_body(&mut stream);
+        write_review_json(&mut stream, &review_text);
+    });
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = tempfile::tempdir().expect("config dir");
+    let document = dir.path().join("plan.md");
+    std::fs::write(&document, "# Plan\n").expect("write fixture");
+    let endpoint = mt_core::model::EndpointIdentity::parse(
+        mt_core::model::Provider::OpenAiChat,
+        Some(&base_url),
+    )
+    .expect("endpoint");
+    let identity = endpoint.credential_target().to_string();
+    std::fs::write(
+        config.path().join("settings.toml"),
+        format!(
+            "model-provider = \"openai-chat\"\nmodel-name = \"review-model\"\nmodel-base-url = \"{base_url}\"\nmodel-environment-key-identity = \"{identity}\"\nusage-metrics-enabled = true\n"
+        ),
+    )
+    .expect("write settings");
+
+    // SAFETY: nextest runs each test in its own process.
+    unsafe {
+        std::env::set_var("MARKTURBO_OPEN", &document);
+        std::env::set_var("MARKTURBO_CONFIG_DIR", config.path());
+        std::env::set_var("MARKTURBO_DATA_DIR", config.path().join("data"));
+        std::env::set_var(
+            "MARKTURBO_TEST_LOCK_NAMESPACE",
+            std::process::id().to_string(),
+        );
+        std::env::set_var("OPENAI_API_KEY", "loopback-test-key");
+    }
+
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<mt_app::App>())).expect("start the app");
+    app.set_viewport(nsh_core::Size::new(
+        nsh_engine::Points(1280.0),
+        nsh_engine::Points(800.0),
+    ))
+    .expect("wide viewport");
+    app.wait_for("label:Markdown source")
+        .expect("source editor");
+    app.press("id:title-review").expect("open Review");
+    app.wait_for("id:consent-card").expect("Review disclosure");
+    support::hold_send(&mut app);
+    app.wait_for_within("id:review-prepare", Duration::from_secs(20))
+        .expect("Review result");
+    app.wait_for("text:keep the document intent")
+        .expect("the model's stated goal");
+
+    // A clean tab: an external write reloads it, and the result must stop
+    // presenting itself as current — without a dirty mark or a recovery
+    // record.
+    std::fs::write(&document, "# Plan\nexternal addition\n").expect("external write");
+    app.wait_for_within("id:review-stale", Duration::from_secs(20))
+        .expect("the reloaded Review result is stale");
+    app.wait_for("text:external addition")
+        .expect("the reloaded text");
+    assert!(
+        !app.screen().matches("id:title-dirty").expect("selector"),
+        "a reload does not dirty the tab: {:?}",
+        app.screen().texts()
+    );
+    app.wait_for_gone("id:review-prepare", Duration::from_secs(5))
+        .expect("a stale review offers no Prepare revision");
+    app.wait_for("id:review-again").expect("Review again stays");
+
+    if cfg!(windows) {
+        app.wait(Duration::from_secs(3))
+            .expect("let the checkpoint tick run");
+        let record = mt_core::runtime_paths::recovery_dir()
+            .expect("the recovery directory")
+            .join(format!(
+                "{}.mtrecovery",
+                RecoveryKey::for_path(&mt_core::workspace::long_path(&document)).as_str()
+            ));
+        assert!(
+            !record.exists(),
+            "a reload must not re-create a recovery record"
+        );
     }
 }
 
