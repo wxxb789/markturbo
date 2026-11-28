@@ -50,37 +50,16 @@ pub fn read_dir(path: &Path) -> std::io::Result<Vec<FileNode>> {
     let mut dirs = Vec::new();
     let mut files = Vec::new();
 
-    for entry in std::fs::read_dir(path)? {
-        let Ok(entry) = entry else { continue };
-        let entry_path = entry.path();
-        let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if walk::is_noise_dir(name) {
-            continue;
-        }
-        // `file_type` avoids a stat per entry on Windows; fall back to metadata
-        // only when it fails (broken symlink, permission).
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let is_symlink = file_type.is_symlink();
-        // A symlink's own type says only that it is a link; `is_dir` follows it
-        // to answer what the tree must show.
-        let is_dir = if is_symlink {
-            entry_path.is_dir()
-        } else {
-            file_type.is_dir()
-        };
-
-        let doc_type = (!is_dir).then(|| DocType::of(&entry_path));
+    for entry in walk::entries(path)? {
+        let is_dir = entry.lists_as_directory();
+        let doc_type = (!is_dir).then(|| DocType::of(&entry.path));
         let node = FileNode {
-            name: name.to_string(),
+            name: entry.name,
             is_dir,
-            is_symlink,
+            is_symlink: entry.is_symlink,
             doc_type,
             children: Vec::new(),
-            path: entry_path,
+            path: entry.path,
         };
         if is_dir {
             dirs.push(node)

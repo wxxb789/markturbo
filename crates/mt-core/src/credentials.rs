@@ -417,14 +417,15 @@ impl CredentialVault {
         Ok(())
     }
 
-    fn lock_operations(&self) -> Result<CredentialOperationGuard, CredentialError> {
+    fn lock_operations(&self) -> Result<crate::process_lock::Guard, CredentialError> {
         #[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
         if self.isolate_test_operations {
             let scope = Arc::as_ptr(&self.secure) as *const () as usize;
-            return lock_persistent_operations_for_test(scope);
+            return crate::process_lock::credential_operation_for_test(scope)
+                .map_err(credential_lock_error);
         }
 
-        lock_persistent_operations()
+        crate::process_lock::credential_operation().map_err(credential_lock_error)
     }
 
     fn pending_target(target: &str) -> String {
@@ -501,77 +502,8 @@ impl CredentialVault {
     }
 }
 
-#[cfg(target_os = "windows")]
-struct CredentialOperationGuard {
-    handle: windows::Win32::Foundation::HANDLE,
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for CredentialOperationGuard {
-    fn drop(&mut self) {
-        use windows::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
-
-        let _ = unsafe { ReleaseMutex(self.handle) };
-        let _ = unsafe { CloseHandle(self.handle) };
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn lock_persistent_operations() -> Result<CredentialOperationGuard, CredentialError> {
-    lock_persistent_operations_named("Global\\markturbo-model-credential-operation-v1")
-}
-
-#[cfg(all(any(test, feature = "test-support"), target_os = "windows"))]
-fn lock_persistent_operations_for_test(
-    scope: usize,
-) -> Result<CredentialOperationGuard, CredentialError> {
-    lock_persistent_operations_named(&format!(
-        "Local\\markturbo-model-credential-test-{}-{scope:x}",
-        std::process::id()
-    ))
-}
-
-#[cfg(target_os = "windows")]
-fn lock_persistent_operations_named(
-    name: &str,
-) -> Result<CredentialOperationGuard, CredentialError> {
-    use windows::Win32::{
-        Foundation::{CloseHandle, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::{CreateMutexW, WaitForSingleObject},
-    };
-    use windows::core::PCWSTR;
-
-    const WAIT_MILLISECONDS: u32 = 100;
-    let name = wide(name);
-    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }.map_err(|error| {
-        CredentialError::new(CredentialErrorKind::Unavailable, Some(error.code().0))
-    })?;
-    let wait = unsafe { WaitForSingleObject(handle, WAIT_MILLISECONDS) };
-    if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
-        return Ok(CredentialOperationGuard { handle });
-    }
-
-    let platform_code = (wait != WAIT_TIMEOUT).then(|| unsafe { GetLastError() }.0 as i32);
-    let _ = unsafe { CloseHandle(handle) };
-    Err(CredentialError::new(
-        CredentialErrorKind::Unavailable,
-        platform_code,
-    ))
-}
-
-#[cfg(not(target_os = "windows"))]
-struct CredentialOperationGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(not(target_os = "windows"))]
-fn lock_persistent_operations() -> Result<CredentialOperationGuard, CredentialError> {
-    static OPERATION: Mutex<()> = Mutex::new(());
-    Ok(CredentialOperationGuard {
-        _guard: OPERATION
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    })
+fn credential_lock_error(error: crate::process_lock::LockError) -> CredentialError {
+    CredentialError::new(CredentialErrorKind::Unavailable, error.platform_code())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1739,11 +1671,11 @@ mod tests {
     #[test]
     #[ignore = "Goal 05A Windows Credential Manager acceptance; run explicitly"]
     fn goal_05a_credential_lifecycle_global_lock_fails_closed_when_busy() {
-        let first = lock_persistent_operations().unwrap();
+        let first = crate::process_lock::credential_operation().unwrap();
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(0);
         let contender = std::thread::spawn(move || {
             result_sender
-                .send(lock_persistent_operations().map(drop))
+                .send(crate::process_lock::credential_operation().map(drop))
                 .unwrap();
         });
 
@@ -1751,11 +1683,11 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
             .unwrap_err();
-        assert_eq!(error.kind(), CredentialErrorKind::Unavailable);
+        assert_eq!(error, crate::process_lock::LockError::Busy);
         contender.join().unwrap();
 
         drop(first);
-        drop(lock_persistent_operations().unwrap());
+        drop(crate::process_lock::credential_operation().unwrap());
     }
 
     fn windows_credential_round_trip_enabled(

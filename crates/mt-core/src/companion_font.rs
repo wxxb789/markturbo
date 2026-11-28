@@ -320,11 +320,12 @@ impl CompanionFont {
         let runtime = crate::model::transport::runtime().map_err(|_| DownloadError::Network)?;
         fs::create_dir_all(&self.dir).map_err(|_| DownloadError::Disk)?;
         let lifecycle = self.lock_lifecycle().map_err(|_| DownloadError::Disk)?;
-        let mut part = tempfile::Builder::new()
-            .prefix(PARTIAL_PREFIX)
-            .suffix(PARTIAL_SUFFIX)
-            .tempfile_in(self.data_dir())
-            .map_err(|_| DownloadError::Disk)?;
+        let mut part = crate::atomic_file::StagedFile::create_in(
+            self.data_dir(),
+            PARTIAL_PREFIX,
+            PARTIAL_SUFFIX,
+        )
+        .map_err(|_| DownloadError::Disk)?;
         part.as_file().lock().map_err(|_| DownloadError::Disk)?;
         drop(lifecycle);
         let digest = runtime.block_on(self.fetch(part.as_file_mut(), progress, control))?;

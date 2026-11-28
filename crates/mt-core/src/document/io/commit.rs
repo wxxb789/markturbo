@@ -12,11 +12,11 @@ use sha2::{Digest, Sha256};
 use super::open_canonical_skill_directory;
 use super::{
     ConcurrentCommitOutcome, FileStamp, SaveError, SkillObjectIdentity, SkillOriginRoot,
-    SourceIdentity, file_object_id, open_skill_entrypoint, opened_skill_entrypoint_is_regular,
-    skill_object_identity, skill_source_changed_error, source_identity,
+    SourceIdentity, file_object_id, open_skill_entrypoint, skill_object_identity,
+    skill_source_changed_error, source_identity,
 };
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-use super::{UNIX_O_CLOEXEC, UNIX_O_NOFOLLOW, UNIX_O_NONBLOCK, openat_skill_file};
+use crate::fs_primitives::{O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK, open_at};
 
 /// The caller's already-authorized state of the destination.
 ///
@@ -148,7 +148,8 @@ impl CommitPlan<'_> {
                 None,
             ));
         }
-        run_save_commit_hook();
+        #[cfg(test)]
+        crate::test_faults::fire(&crate::test_faults::SAVE_COMMIT, ());
         let _source_guard = guard_source_path(self.source_path, self.expected_source_identity)?;
         let precheck = match self.verify_preconditions()? {
             Some(precheck) => precheck,
@@ -168,7 +169,8 @@ impl CommitPlan<'_> {
             self.recreates_missing,
             self.prepared_bytes,
         )?;
-        run_save_post_commit_hook();
+        #[cfg(test)]
+        crate::test_faults::fire(&crate::test_faults::SAVE_POST_COMMIT, ());
         if verify_skill_committed_entry(root, &stamp, identity).is_err() {
             return Err(skill_commit_indeterminate(root, &pending));
         }
@@ -186,7 +188,8 @@ impl CommitPlan<'_> {
         // a compare-and-swap primitive, so Windows additionally proves what it
         // put in its backup after the replace and retains uncertain artifacts.
         self.verify_preconditions()?;
-        run_save_commit_hook();
+        #[cfg(test)]
+        crate::test_faults::fire(&crate::test_faults::SAVE_COMMIT, ());
         // On Windows an open reparse point denies delete/retarget operations
         // on the link without holding the resolved target open across
         // ReplaceFileW. The guard remains live through final verification.
@@ -201,7 +204,8 @@ impl CommitPlan<'_> {
             self.recreates_missing,
             self.prepared_bytes,
         )?;
-        run_save_post_commit_hook();
+        #[cfg(test)]
+        crate::test_faults::fire(&crate::test_faults::SAVE_POST_COMMIT, ());
         let entrypoint = open_skill_entrypoint(root.directory(), root.canonical_root())
             .map_err(SaveError::Io)?;
         let identity = skill_object_identity(&entrypoint).map_err(SaveError::Io)?;
@@ -219,7 +223,8 @@ impl CommitPlan<'_> {
         staged: tempfile::NamedTempFile,
     ) -> Result<(FileStamp, SourceIdentity), SaveError> {
         self.verify_preconditions()?;
-        run_save_commit_hook();
+        #[cfg(test)]
+        crate::test_faults::fire(&crate::test_faults::SAVE_COMMIT, ());
         let _source_guard = guard_source_path(self.source_path, self.expected_source_identity)?;
         self.verify_preconditions()?;
         let stamp = commit(
@@ -229,7 +234,8 @@ impl CommitPlan<'_> {
             self.recreates_missing,
             self.prepared_bytes,
         )?;
-        run_save_post_commit_hook();
+        #[cfg(test)]
+        crate::test_faults::fire(&crate::test_faults::SAVE_POST_COMMIT, ());
         let source_identity = verify_committed_entry(
             self.source_path,
             self.expected_source_identity,
@@ -402,7 +408,7 @@ fn skill_root_entrypoint_snapshot(
     root: &SkillOriginRoot,
 ) -> std::io::Result<(FileStamp, SkillObjectIdentity, File)> {
     let mut file = open_skill_entrypoint(root.directory(), root.canonical_root())?;
-    if !opened_skill_entrypoint_is_regular(&file.metadata()?) {
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&file.metadata()?) {
         return Err(skill_source_changed_error());
     }
     let identity = skill_object_identity(&file)?;
@@ -537,12 +543,8 @@ fn open_skill_name_snapshot(
     root: &SkillOriginRoot,
     name: &std::ffi::OsStr,
 ) -> std::io::Result<(File, FileStamp, SkillObjectIdentity)> {
-    let mut file = openat_skill_file(
-        root.directory(),
-        name,
-        UNIX_O_NOFOLLOW | UNIX_O_NONBLOCK | UNIX_O_CLOEXEC,
-    )?;
-    if !opened_skill_entrypoint_is_regular(&file.metadata()?) {
+    let mut file = open_at(root.directory(), name, O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)?;
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&file.metadata()?) {
         return Err(skill_source_changed_error());
     }
     let identity = skill_object_identity(&file)?;
@@ -667,7 +669,7 @@ fn exchange_skill_names(
     use std::os::fd::AsRawFd as _;
 
     #[cfg(test)]
-    if SKILL_FORCE_UNSUPPORTED_EXCHANGE.with(|flag| flag.replace(false)) {
+    if crate::test_faults::skill_exchange_forced_unsupported() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "atomic Skill exchange was disabled for the test",
@@ -725,7 +727,7 @@ fn exchange_skill_names(
     use std::os::fd::AsRawFd as _;
 
     #[cfg(test)]
-    if SKILL_FORCE_UNSUPPORTED_EXCHANGE.with(|flag| flag.replace(false)) {
+    if crate::test_faults::skill_exchange_forced_unsupported() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "atomic Skill exchange was disabled for the test",
@@ -809,7 +811,7 @@ fn verify_skill_committed_entry(
 ) -> Result<(), SaveError> {
     let mut file = open_skill_entrypoint(root.directory(), root.canonical_root())
         .map_err(|_| SaveError::SourceIdentityChanged)?;
-    if !opened_skill_entrypoint_is_regular(
+    if !crate::fs_primitives::opened_metadata_is_regular_file(
         &file
             .metadata()
             .map_err(|_| SaveError::SourceIdentityChanged)?,
@@ -861,7 +863,10 @@ fn finish_skill_commit(
         return Err(skill_commit_indeterminate(root, &pending));
     }
     #[cfg(test)]
-    run_skill_before_cleanup_hook(root.canonical_root());
+    crate::test_faults::fire(
+        &crate::test_faults::SKILL_BEFORE_CLEANUP,
+        root.canonical_root().to_path_buf(),
+    );
     if !verify_retained() {
         return Err(skill_commit_indeterminate(root, &pending));
     }
@@ -954,7 +959,13 @@ fn commit_skill_staged_at_root(
     .map_err(|_| skill_commit_indeterminate_paths(root, &kept_staged_path, Some(&recovery_path)))?;
 
     #[cfg(test)]
-    run_skill_before_exchange_hook(root.canonical_root(), &kept_staged_path);
+    crate::test_faults::fire(
+        &crate::test_faults::SKILL_BEFORE_EXCHANGE,
+        (
+            root.canonical_root().to_path_buf(),
+            kept_staged_path.clone(),
+        ),
+    );
 
     // The staged name may have been replaced after its initial verification.
     verify_skill_name(
@@ -1182,7 +1193,15 @@ fn reserve_sibling_path(path: &Path, prefix: &str) -> Result<PathBuf, Reservatio
         }
     };
     drop(file);
-    if run_save_reservation_hook(&reserved)
+    #[cfg(test)]
+    let reservation_check = crate::test_faults::fire_with(
+        &crate::test_faults::SAVE_RESERVATION,
+        reserved.clone(),
+        Ok(()),
+    );
+    #[cfg(not(test))]
+    let reservation_check: std::io::Result<()> = Ok(());
+    if reservation_check
         .and_then(|_| std::fs::remove_file(&reserved))
         .is_err()
     {
@@ -1328,153 +1347,4 @@ fn remove_verified_backup(path: &Path, expected: &FileStamp) -> Result<(), std::
         )
     }
     .map_err(std::io::Error::other)
-}
-
-#[cfg(all(test, windows))]
-type SaveReservationHook = Box<dyn FnOnce(&Path) -> std::io::Result<()>>;
-
-#[cfg(test)]
-thread_local! {
-    static SAVE_COMMIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
-        std::cell::RefCell::new(None)
-    };
-    static SAVE_POST_COMMIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
-        std::cell::RefCell::new(None)
-    };
-    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-    static SKILL_BEFORE_EXCHANGE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path, &Path)>>> = const {
-        std::cell::RefCell::new(None)
-    };
-    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-    static SKILL_BEFORE_CLEANUP_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const {
-        std::cell::RefCell::new(None)
-    };
-    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-    static SKILL_FORCE_UNSUPPORTED_EXCHANGE: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-    #[cfg(windows)]
-    static SAVE_RESERVATION_HOOK: std::cell::RefCell<Option<SaveReservationHook>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
-#[cfg(test)]
-pub(super) fn install_save_commit_hook(hook: impl FnOnce() + 'static) {
-    SAVE_COMMIT_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a save commit hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(test)]
-pub(super) fn install_save_post_commit_hook(hook: impl FnOnce() + 'static) {
-    SAVE_POST_COMMIT_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a save post-commit hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(all(test, unix, any(target_os = "linux", target_os = "macos")))]
-pub(super) fn install_skill_before_exchange_hook(hook: impl FnOnce(&Path, &Path) + 'static) {
-    SKILL_BEFORE_EXCHANGE_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a Skill exchange hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(all(test, unix, any(target_os = "linux", target_os = "macos")))]
-pub(super) fn install_skill_before_cleanup_hook(hook: impl FnOnce(&Path) + 'static) {
-    SKILL_BEFORE_CLEANUP_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a Skill cleanup hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(all(test, unix, any(target_os = "linux", target_os = "macos")))]
-pub(super) fn force_skill_exchange_unsupported() {
-    SKILL_FORCE_UNSUPPORTED_EXCHANGE.with(|flag| flag.set(true));
-}
-
-#[cfg(all(test, windows))]
-pub(super) fn install_save_reservation_hook(
-    hook: impl FnOnce(&Path) -> std::io::Result<()> + 'static,
-) {
-    SAVE_RESERVATION_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a save reservation hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(test)]
-fn run_save_commit_hook() {
-    SAVE_COMMIT_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
-#[cfg(test)]
-fn run_save_post_commit_hook() {
-    SAVE_POST_COMMIT_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
-#[cfg(all(test, unix, any(target_os = "linux", target_os = "macos")))]
-fn run_skill_before_exchange_hook(root: &Path, staged: &Path) {
-    SKILL_BEFORE_EXCHANGE_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook(root, staged);
-        }
-    });
-}
-
-#[cfg(all(test, unix, any(target_os = "linux", target_os = "macos")))]
-fn run_skill_before_cleanup_hook(root: &Path) {
-    SKILL_BEFORE_CLEANUP_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook(root);
-        }
-    });
-}
-
-#[cfg(all(test, windows))]
-fn run_save_reservation_hook(path: &Path) -> std::io::Result<()> {
-    SAVE_RESERVATION_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook(path)
-        } else {
-            Ok(())
-        }
-    })
-}
-
-#[cfg(not(test))]
-fn run_save_commit_hook() {}
-
-#[cfg(not(test))]
-fn run_save_post_commit_hook() {}
-
-#[cfg(all(windows, not(test)))]
-fn run_save_reservation_hook(_path: &Path) -> std::io::Result<()> {
-    Ok(())
 }
