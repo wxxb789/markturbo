@@ -425,7 +425,10 @@ impl SkillOrigin {
     }
 
     pub(crate) fn matches_source_path(&self, path: &Path) -> bool {
-        absolute_lexical_path(path).is_ok_and(|path| path == self.lexical_entrypoint)
+        absolute_lexical_path(path).is_ok_and(|path| {
+            crate::workspace::long_path(&path)
+                == crate::workspace::long_path(&self.lexical_entrypoint)
+        })
     }
 
     pub(crate) fn matches_entrypoint(
@@ -489,7 +492,8 @@ impl SkillOrigin {
             return None;
         }
         let refreshed = try_capture_skill_origin(path)?;
-        (refreshed.lexical_entrypoint == self.lexical_entrypoint
+        (crate::workspace::long_path(&refreshed.lexical_entrypoint)
+            == crate::workspace::long_path(&self.lexical_entrypoint)
             && refreshed.canonical_root == self.canonical_root
             && refreshed.root_identity == self.root_identity
             && refreshed.entrypoint_stamp == *expected)
@@ -2807,7 +2811,7 @@ mod tests {
         };
         assert_eq!(outcome, ConcurrentCommitOutcome::Indeterminate);
         assert_eq!(std::fs::read(&path).unwrap(), b"external after commit\n");
-        assert!(preserved_paths.contains(&path));
+        assert!(preserved_paths.contains(&file.path));
     }
 
     #[cfg(any(target_os = "windows", unix))]
