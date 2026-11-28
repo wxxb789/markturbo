@@ -46,8 +46,6 @@ from . import evidence
 from .evidence import leak_codes, validate_exact_fingerprint
 from .runtime import (
     INTEGRITY_NAMES,
-    SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID,
-    SIDEBAR_ROW_AUTOMATION_ID,
     TAB_CLOSE_AUTOMATION_ID,
     VK_MENU,
     VK_W,
@@ -73,6 +71,14 @@ from .runtime import (
     validate_fingerprint,
     wait_until,
     write_durable,
+)
+from .selectors import (
+    CONFLICT_KEEP_MINE_AUTOMATION_ID as KEEP_MINE_AUTOMATION_ID,
+    OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
+    RESTORE_AUTOMATION_ID,
+    SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID,
+    SIDEBAR_ROW_AUTOMATION_ID,
+    WORKSPACE_HOME_FILE_AUTOMATION_ID,
 )
 
 SCHEMA = "markturbo.goal-02-native-acceptance"
@@ -154,15 +160,9 @@ PANIC_RE = re.compile(rb"\bpanic(?:ked)?\b")
 # own id and its label as Name. The one recovered record is row 0. Keep mine
 # opens the Overwrite guard card (`GuardKind::OverwriteDisk`), whose Overwrite
 # is the only thing that writes.
-KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
-RESTORE_AUTOMATION_ID = "recovery-restore-0"
 # The Overwrite guard card's heading, decisions and their own ids.
 OVERWRITE_GUARD_HEADING = "Overwrite external changes on disk?"
 OVERWRITE_GUARD_BUTTON_NAMES = {"Overwrite": "Overwrite", "Cancel": "Cancel"}
-OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS = {
-    "Overwrite": "guard-overwrite",
-    "Cancel": "guard-cancel",
-}
 # Each Keep mine must write nothing over this window; the disk is sampled
 # throughout it, not once, so a deferred write behind the guard is caught
 # before the confirmed Overwrite writes a second edit's bytes. The window
@@ -172,7 +172,6 @@ OVERWRITE_SETTLE_SECONDS = 1.5
 OVERWRITE_SETTLE_SAMPLE_INTERVAL_SECONDS = 0.05
 # The workspace home's file rows (`ui/welcome.rs` `workspace_home`), shown
 # while a workspace is open and no document is; the workspace holds one file.
-WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
 VK_F4 = 0x73
 DOCUMENT_SENTINEL = "MTG02-NATIVE-SENTINEL-\u4fdd\u5b58-\U0001f680"
 CANONICAL_RECOVERY_RECORD_RE = re.compile(r"^[0-9a-f]{64}\.mtrecovery$")

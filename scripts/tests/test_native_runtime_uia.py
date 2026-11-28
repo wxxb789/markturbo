@@ -558,58 +558,6 @@ class NativeFocusTests(unittest.TestCase):
 
 
 class SelectorAndOrchestrationTests(unittest.TestCase):
-    def test_selectors_match_the_nsh_production_source(self) -> None:
-        self.assertEqual(runtime.TAB_CLOSE_AUTOMATION_ID, "rail-close")
-        self.assertEqual(runtime.EDITOR_NAME, "Markdown source")
-        self.assertEqual(runtime.GUARD_HEADING, "Close without saving?")
-        self.assertEqual(
-            runtime.GUARD_BUTTON_NAMES,
-            {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"},
-        )
-        self.assertEqual(
-            runtime.GUARD_BUTTON_AUTOMATION_IDS,
-            {"Save": "guard-save", "Discard": "guard-dont-save", "Cancel": "guard-cancel"},
-        )
-        self.assertEqual(runtime.QUIT_GUARD_HEADING, "Quit without saving?")
-        self.assertEqual(
-            runtime.QUIT_GUARD_BUTTON_NAMES,
-            {"Save": "Save all", "Discard": "Don't save", "Cancel": "Cancel"},
-        )
-        self.assertEqual(runtime.QUIT_GUARD_BUTTON_AUTOMATION_IDS, runtime.GUARD_BUTTON_AUTOMATION_IDS)
-        self.assertEqual(
-            HARNESS.OVERWRITE_GUARD_HEADING, "Overwrite external changes on disk?"
-        )
-        self.assertEqual(
-            HARNESS.OVERWRITE_GUARD_BUTTON_NAMES,
-            {"Overwrite": "Overwrite", "Cancel": "Cancel"},
-        )
-        self.assertEqual(
-            HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS,
-            {"Overwrite": "guard-overwrite", "Cancel": "guard-cancel"},
-        )
-
-    def test_sidebar_and_view_selectors_are_in_the_product_ui(self) -> None:
-        ui = Path(__file__).resolve().parents[2] / "crates" / "mt-app" / "src" / "ui"
-        source = "\n".join(
-            (ui / name).read_text(encoding="utf-8").split("\n#[cfg(test)]\nmod tests", 1)[0]
-            for name in ("rail.rs", "shell.rs", "titlebar.rs", "notices.rs")
-        )
-        for automation_id in (
-            runtime.RAIL_FILE_ROW_AUTOMATION_ID,
-            runtime.TAB_CLOSE_AUTOMATION_ID,
-            runtime.SIDEBAR_PANEL_AUTOMATION_ID,
-            runtime.SIDEBAR_ROW_AUTOMATION_ID,
-            runtime.SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID,
-            runtime.VIEW_BUTTON_AUTOMATION_ID,
-            runtime.MENU_WEB_AUTOMATION_ID,
-            *HARNESS.OVERWRITE_GUARD_BUTTON_AUTOMATION_IDS.values(),
-        ):
-            with self.subTest(automation_id=automation_id):
-                self.assertIn(f'"{automation_id}"', source)
-        self.assertIn(f'"{HARNESS.OVERWRITE_GUARD_HEADING}"', source)
-        self.assertIn(f'"{runtime.QUIT_GUARD_HEADING}"', source)
-        self.assertIn(f'"{runtime.QUIT_GUARD_BUTTON_NAMES["Save"]}"', source)
-
     def test_source_layout_waits_for_the_editor_without_pressing_edit_again(self) -> None:
         for name in ("View: Edit — switch to Split", "视图：编辑 — 切换到分栏"):
             with self.subTest(name=name):

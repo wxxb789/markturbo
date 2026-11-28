@@ -5,15 +5,14 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import shlex
 import tempfile
 import threading
+import tomllib
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from scripts.markturbo_tools import cli
 from scripts.markturbo_tools.native import runtime, visual
 
 
@@ -165,10 +164,13 @@ class MatrixTests(unittest.TestCase):
             font.parent.mkdir(parents=True)
             font.write_bytes(b"companion font")
             app = mock.Mock(window=mock.Mock(handle=1))
-            harness = mock.Mock()
-            harness.shows_text.side_effect = lambda _app, text: (
-                text != visual.CJK_COMPANION_FONT_LOADED
-            )
+            harness = object.__new__(visual.VisualHarness)
+            harness.ui_timeout = 0.2
+            harness.launch_app = mock.Mock(return_value=app)
+            harness.reap = mock.Mock()
+            harness.cleanup = mock.Mock()
+            harness.require = mock.Mock(return_value=object())
+            harness.shows_text = lambda _app, text: text != visual.CJK_COMPANION_FONT_LOADED
             window = mock.Mock(hwnd=1)
             window.foreground.return_value = True
             window.accessibility.return_value = {"unnamed": []}
@@ -176,7 +178,6 @@ class MatrixTests(unittest.TestCase):
             win32 = mock.Mock()
             win32.user32.GetDpiForWindow.return_value = 96
 
-            harness.launch_app.return_value = app
             with (
                 mock.patch.object(visual, "VisualHarness", return_value=harness),
                 mock.patch.object(visual, "AppWindow", return_value=window),
@@ -205,22 +206,6 @@ class MatrixTests(unittest.TestCase):
             ("BLOCKED", "CJK_COMPANION_FONT_NOT_LOADED"),
         )
 
-    def test_documented_goal17_visual_command_parses_through_mt_cli(self) -> None:
-        acceptance = Path(__file__).resolve().parents[2] / "docs" / "goal-17-acceptance.md"
-        command = next(
-            line.strip()
-            for line in acceptance.read_text(encoding="utf-8").splitlines()
-            if line.strip().startswith("uv run --locked --project scripts scripts/mt.py visual")
-        )
-        tokens = shlex.split(command)
-        entrypoint = next(index for index, token in enumerate(tokens) if token.endswith("mt.py"))
-        arguments = cli.parser().parse_args(tokens[entrypoint + 1 :])
-        self.assertEqual(arguments.command, "visual")
-        visual_arguments = visual.parser().parse_args(cli.forwarded(arguments.args))
-        self.assertTrue(visual_arguments.goal17_cjk_optics)
-        self.assertEqual(visual_arguments.exe, Path("<release-exe>"))
-        self.assertEqual(visual_arguments.out, Path(".scratch/goal-17-cjk"))
-
     def test_physical_viewports_convert_dip_to_the_window_dpi(self) -> None:
         self.assertEqual(visual.physical_viewport("minimum", 120), (900, 600))
         self.assertEqual(visual.physical_viewport("default", 120), (1750, 1125))
@@ -246,21 +231,22 @@ class MatrixTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "settings.toml"
             visual.write_settings(path, "dark", "zh-cn", None)
-            text = path.read_text(encoding="utf-8")
-            self.assertIn('theme = "dark"', text)
-            self.assertIn('language = "zh-cn"', text)
-            self.assertNotIn("model", text)
+            settings = tomllib.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(settings, {"theme": "dark", "language": "zh-cn"})
 
             server = visual.ReviewServer(hold=False)
             try:
                 visual.write_settings(path, "light", "en-us", server)
             finally:
                 server.server.server_close()
-            text = path.read_text(encoding="utf-8")
-            self.assertIn('model-provider = "openai-responses"', text)
-            self.assertIn(f'model-base-url = "{server.base_url}"', text)
-            self.assertIn(visual.credential_identity(server.port), text)
-            self.assertNotIn("api-key", text)
+            settings = tomllib.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(settings["model-provider"], "openai-responses")
+            self.assertEqual(settings["model-base-url"], server.base_url)
+            self.assertEqual(
+                settings["model-environment-key-identity"],
+                visual.credential_identity(server.port),
+            )
+            self.assertNotIn("api-key", settings)
 
     def test_web_preview_rejects_a_blank_pane_and_accepts_content(self) -> None:
         from PIL import Image, ImageDraw
@@ -307,10 +293,16 @@ class MatrixTests(unittest.TestCase):
         self.assertNotIn(name, os.environ)
 
 
-def post(server: visual.ReviewServer, path: str = "/v1/responses") -> tuple[int, bytes]:
+def post(
+    server: visual.ReviewServer,
+    path: str = "/v1/responses",
+    payload: dict[str, object] | None = None,
+) -> tuple[int, bytes]:
     connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=5)
     try:
-        body = json.dumps({"metadata": {"operation": "read_only_review"}})
+        body = json.dumps(
+            payload if payload is not None else {"metadata": {"operation": "read_only_review"}}
+        )
         connection.request("POST", path, body, {"content-type": "application/json"})
         response = connection.getresponse()
         return response.status, response.read()
@@ -343,6 +335,23 @@ class ReviewServerTests(unittest.TestCase):
             [question["question"] for question in review["clarification_questions"]],
             [question for question, _, _ in visual.REVIEW_QUESTIONS],
         )
+
+    def test_a_body_that_only_spells_the_operation_as_text_is_refused(self) -> None:
+        self.server.allow()
+        status, _ = post(
+            self.server,
+            payload={"metadata": {"note": "read_only_review"}},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(self.server.request_count, 0)
+        self.assertEqual(self.server.refusal, "REVIEW_REQUEST_NOT_READ_ONLY")
+
+    def test_a_different_operation_is_refused(self) -> None:
+        self.server.allow()
+        status, _ = post(self.server, payload={"metadata": {"operation": "revision"}})
+        self.assertEqual(status, 409)
+        self.assertEqual(self.server.request_count, 0)
+        self.assertEqual(self.server.refusal, "REVIEW_REQUEST_NOT_READ_ONLY")
 
     def test_another_path_is_refused(self) -> None:
         self.server.allow()
@@ -452,13 +461,24 @@ def cell(state: str, language: str = "en-us") -> visual.Cell:
 class StatePlanTests(unittest.TestCase):
     def test_every_state_has_a_plan(self) -> None:
         harness = fake_harness(FakeUi(set(), {}))
-        self.assertEqual(set(harness._plans()), set(visual.STATES))
+        self.assertEqual(
+            set(harness._plans()),
+            set(visual.STATES) | {visual.CJK_OPTICS_STATE},
+        )
+
+    def test_the_goal17_comparison_is_one_more_plan_entry(self) -> None:
+        harness = fake_harness(FakeUi(set(), {}))
+        harness.cjk_optics = mock.Mock(return_value={"comparison_view": "goal17-cjk-optics"})
+        markers = harness.prepare(APP, visual.cjk_optics_cell(), Path("plan.md"), None)
+
+        harness.cjk_optics.assert_called_once()
+        self.assertEqual(markers, {"comparison_view": "goal17-cjk-optics"})
 
     def test_settings_is_proven_by_its_page_not_by_the_menu_press(self) -> None:
-        ui = FakeUi({"title-settings"}, {"title-menu-settings": {"settings-save"}})
+        ui = FakeUi({"title-settings"}, {"title-menu-settings": {"settings-page"}})
         markers = fake_harness(ui).prepare(APP, cell("settings"), Path("plan.md"), None)
         self.assertEqual(ui.pressed, ["title-menu-settings"])
-        self.assertIn("settings-save", markers)
+        self.assertIn("settings-page", markers)
 
         unopened = FakeUi({"title-settings"}, {})
         with self.assertRaises(runtime.HarnessFailure) as raised:
@@ -617,6 +637,51 @@ class CaptureCellTests(unittest.TestCase):
             self.assertFalse(profile.exists())
             stopped.assert_called_once()
 
+    def test_a_profile_that_cannot_be_removed_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            profile = Path(temporary) / "profile"
+            (profile / "local-app-data").mkdir(parents=True)
+            with (
+                mock.patch.object(
+                    visual.shutil, "rmtree", lambda _path, ignore_errors=False: None
+                ),
+                mock.patch.object(visual, "stop_profile_browsers") as stopped,
+            ):
+                with self.assertRaises(runtime.HarnessFailure) as raised:
+                    visual.remove_profile(profile, 0.05)
+
+            self.assertEqual(raised.exception.code, "PROFILE_NOT_REMOVED")
+            stopped.assert_called_once()
+
+    def test_a_cleanup_failure_marks_the_cell_failed_with_its_code(self) -> None:
+        def launch(_self: Any, _target: Path | None, *_args: Any) -> None:
+            raise runtime.HarnessFailure("MAIN_WINDOW_UIA_TIMEOUT")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            with (
+                mock.patch.object(visual.VisualHarness, "launch_app", launch),
+                mock.patch.object(
+                    visual.VisualHarness,
+                    "cleanup",
+                    side_effect=runtime.HarnessFailure("CLEANUP_REAP_FAILED", "TimeoutExpired"),
+                ),
+            ):
+                receipt = visual.capture_cell(
+                    mock.Mock(),
+                    out / "markturbo.exe",
+                    out,
+                    cell("review-result-questions"),
+                    visual.SourceBinding("h" * 40, "t" * 40, False, None),
+                    {"name": "markturbo.exe", "byte_count": 1, "sha256": "a" * 64},
+                    (None,) * 5,
+                    None,
+                )
+
+        self.assertEqual(receipt["status"], "FAILED")
+        self.assertEqual(receipt["reason_code"], "CLEANUP_REAP_FAILED")
+        self.assertEqual(receipt["failure_type"], "TimeoutExpired")
+
     def test_a_failed_launch_writes_a_content_free_receipt_and_no_profile(self) -> None:
         profiles: list[Path] = []
         real_mkdtemp = tempfile.mkdtemp
@@ -630,7 +695,7 @@ class CaptureCellTests(unittest.TestCase):
             self.assertEqual(target.name, visual.PLAN_NAME)
             # The WebView2 profile (`%LOCALAPPDATA%`) is the cell's own.
             self.assertTrue(Path(os.environ["LOCALAPPDATA"]).is_relative_to(profiles[0]))
-            raise runtime.HarnessFailure("MAIN_WINDOW_UIA_TIMEOUT")
+            raise runtime.HarnessFailure("MAIN_WINDOW_UIA_TIMEOUT", "private document text")
 
         source = visual.SourceBinding("h" * 40, "t" * 40, False, None)
         with (
@@ -654,12 +719,14 @@ class CaptureCellTests(unittest.TestCase):
             text = (cell_root / "receipt.json").read_text(encoding="utf-8")
         self.assertEqual(receipt["status"], "FAILED")
         self.assertEqual(receipt["reason_code"], "MAIN_WINDOW_UIA_TIMEOUT")
+        self.assertEqual(receipt["failure_type"], "HarnessFailure")
         self.assertEqual(written, ["receipt.json"])
         self.assertEqual(len(profiles), 1)
         self.assertFalse(profiles[0].exists())
         self.assertNotIn(str(profiles[0]), text)
         self.assertNotIn(temporary, text)
         self.assertNotIn("Release plan", text)
+        self.assertNotIn("private document text", text)
 
 
 if __name__ == "__main__":

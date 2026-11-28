@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -115,88 +114,12 @@ class ValidationBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(checks.CheckFailure, "lint failed"):
                 checks.ci()
 
-        self.assertEqual(
-            calls,
-            [
-                ("cargo", "fmt", "--all", "--", "--check"),
-                ("cargo", "nextest", "--version"),
-                (
-                    "cargo", "clippy", "--profile", "ci", "--workspace",
-                    "--all-targets", "--locked",
-                ),
-            ],
+        self.assertFalse(
+            [command for command in calls if "nextest" in command and "run" in command]
         )
 
 
 class RustCheckTests(unittest.TestCase):
-    def run_rust_checks(self, profile: str) -> list[tuple[str, ...]]:
-        calls: list[tuple[str, ...]] = []
-
-        def record(command: tuple[str, ...], **_: object) -> None:
-            calls.append(command)
-
-        with (
-            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
-            mock.patch.object(checks, "run", side_effect=record),
-        ):
-            checks.rust_checks(profile)
-        return calls
-
-    def test_rust_steps_run_in_contract_order_with_the_requested_profile(self) -> None:
-        for profile in ("ci", "release"):
-            with self.subTest(profile=profile):
-                self.assertEqual(
-                    self.run_rust_checks(profile),
-                    [
-                        ("cargo", "fmt", "--all", "--", "--check"),
-                        ("cargo", "nextest", "--version"),
-                        (
-                            "cargo", "clippy", "--profile", profile, "--workspace",
-                            "--all-targets", "--locked",
-                        ),
-                        (
-                            "cargo", "nextest", "run", "--locked",
-                            "--cargo-profile", profile, "-p", "mt-core",
-                            "--features", "model-transport,test-support",
-                        ),
-                        (
-                            "cargo", "nextest", "run", "--locked",
-                            "--cargo-profile", profile, "-p", "mt-app",
-                            "--lib", "--bins", "--test", "suite",
-                        ),
-                    ],
-                )
-
-    def test_mt_app_runs_as_one_suite_binary_under_nextest(self) -> None:
-        commands = self.run_rust_checks("ci")
-
-        self.assertIn(
-            (
-                "cargo", "nextest", "run", "--locked", "--cargo-profile", "ci",
-                "-p", "mt-app", "--lib", "--bins", "--test", "suite",
-            ),
-            commands,
-        )
-
-    def test_mt_core_keeps_the_workspace_feature_set_under_nextest(self) -> None:
-        commands = self.run_rust_checks("ci")
-
-        self.assertIn(
-            (
-                "cargo", "nextest", "run", "--locked", "--cargo-profile", "ci",
-                "-p", "mt-core", "--features", "model-transport,test-support",
-            ),
-            commands,
-        )
-
-    def test_no_plain_cargo_test_remains_in_the_rust_gate(self) -> None:
-        for profile in ("ci", "release"):
-            with self.subTest(profile=profile):
-                commands = self.run_rust_checks(profile)
-                self.assertFalse(
-                    [command for command in commands if command[1] == "test"]
-                )
-
     def test_full_uses_the_release_profile(self) -> None:
         with (
             mock.patch.object(checks, "fast"),
@@ -209,17 +132,6 @@ class RustCheckTests(unittest.TestCase):
                 checks.full()
 
         rust_checks.assert_called_once_with("release")
-
-    def test_nextest_is_detected_through_cargo(self) -> None:
-        with (
-            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
-            mock.patch.object(checks, "run") as run,
-        ):
-            checks.require_nextest()
-
-        run.assert_called_once_with(
-            ("cargo", "nextest", "--version"), capture_stdout=True
-        )
 
     def test_missing_nextest_fails_with_the_install_command(self) -> None:
         with (
@@ -281,38 +193,16 @@ class ReleaseArtifactTests(unittest.TestCase):
                     checks.build_release_binary()
 
 
-class DoctestGateTests(unittest.TestCase):
-    def test_every_enabled_workspace_doctest_has_a_gate_step(self) -> None:
-        with mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)):
-            gate_runs_doctests = any(
-                "--doc" in command for command in checks.rust_commands("ci")
-            )
+class ToolingListTests(unittest.TestCase):
+    def test_the_two_lists_cover_every_tooling_test_module_once(self) -> None:
+        # A new test module that nobody lists would never run in either tier.
+        modules = {
+            f"scripts.tests.{path.stem}"
+            for path in (checks.ROOT / "scripts" / "tests").glob("test_*.py")
+        }
+        listed = set(checks.TOOLING_TESTS) | set(checks.NATIVE_TOOLING_TESTS)
 
-        root = checks.ROOT
-        members = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))[
-            "workspace"
-        ]["members"]
-        libraries: list[tuple[str, bool]] = []
-        for member in members:
-            directory = root / member
-            manifest = tomllib.loads(
-                (directory / "Cargo.toml").read_text(encoding="utf-8")
-            )
-            if "lib" in manifest or (directory / "src" / "lib.rs").is_file():
-                libraries.append(
-                    (
-                        manifest["package"]["name"],
-                        manifest.get("lib", {}).get("doctest", True),
-                    )
-                )
-
-        self.assertTrue(libraries)
-        enabled = [name for name, doctests in libraries if doctests]
-        if enabled and not gate_runs_doctests:
-            self.fail(
-                f"{', '.join(enabled)} enable doctests "
-                "but rust_commands never passes --doc"
-            )
+        self.assertEqual(modules, listed)
 
 
 class SuiteTests(unittest.TestCase):

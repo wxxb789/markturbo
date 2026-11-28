@@ -8,6 +8,7 @@ import json
 import threading
 from typing import Any
 
+from .evidence import nested_json_values
 from .runtime import HarnessFailure
 
 ANSWER_SENTINEL = "MTG07-NATIVE-ANSWER-SENTINEL"
@@ -176,25 +177,6 @@ class LoopbackRevisionServer:
             return len(self.requests)
 
     @staticmethod
-    def _nested_values(value: Any, key: str) -> list[Any]:
-        values: list[Any] = []
-        if isinstance(value, dict):
-            if key in value:
-                values.append(value[key])
-            for nested in value.values():
-                values.extend(LoopbackRevisionServer._nested_values(nested, key))
-        elif isinstance(value, list):
-            for nested in value:
-                values.extend(LoopbackRevisionServer._nested_values(nested, key))
-        elif isinstance(value, str) and value[:1] in {"{", "["}:
-            try:
-                decoded = json.loads(value)
-            except (json.JSONDecodeError, RecursionError):
-                return values
-            values.extend(LoopbackRevisionServer._nested_values(decoded, key))
-        return values
-
-    @staticmethod
     def _contains_exact_string(value: Any, expected: str) -> bool:
         if isinstance(value, str):
             if value == expected:
@@ -246,7 +228,7 @@ class LoopbackRevisionServer:
     def _operations(value: Any) -> list[str]:
         return [
             operation
-            for operation in LoopbackRevisionServer._nested_values(value, "operation")
+            for operation in nested_json_values(value, "operation")
             if isinstance(operation, str)
         ]
 
@@ -271,7 +253,9 @@ class LoopbackRevisionServer:
         self._consent_click_sequence[operation] = self._event_sequence
 
     def dispatch_consent_click(self, expected_request_count: int, click: Any) -> None:
-        """Linearize UIA click dispatch and provider request arrival."""
+        """Record the click marker under the lock, then run the hold outside
+        it, so the hold can read the request state it produces; a request that
+        arrives after the marker still validates against it."""
         operation = {
             0: "read_only_review",
             1: "revision",
@@ -280,7 +264,7 @@ class LoopbackRevisionServer:
             raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
         with self._lock:
             self._begin_consent_click_locked(operation, expected_request_count)
-            click()
+        click()
 
     def _next_event_sequence(self) -> int:
         with self._lock:
@@ -333,10 +317,10 @@ class LoopbackRevisionServer:
         if stream is not expected_stream:
             return None, "LOOPBACK_STREAM_MODE_MISMATCH"
 
-        canonical_hashes = self._nested_values(parsed, "canonical_source_sha256")
-        canonical_sizes = self._nested_values(parsed, "canonical_source_bytes")
-        source_hashes = self._nested_values(parsed, "source_sha256")
-        snapshots = self._nested_values(parsed, "source_snapshot")
+        canonical_hashes = nested_json_values(parsed, "canonical_source_sha256")
+        canonical_sizes = nested_json_values(parsed, "canonical_source_bytes")
+        source_hashes = nested_json_values(parsed, "source_sha256")
+        snapshots = nested_json_values(parsed, "source_snapshot")
         source_present = self._contains_exact_string(parsed, self.source)
         expected_size = len(self.source.encode("utf-8"))
         if operation == "read_only_review":

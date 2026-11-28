@@ -139,8 +139,6 @@
     config skips the jobs that use it.
   - The `serial` test group keeps the mt-core timing tests off each other, but they can still run beside other test
     binaries. `crates/mt-core/tests/performance.rs` asserts wall-clock bounds, so give those tests the whole pool.
-  - The doctest guard in `scripts/tests/test_checks.py` checks only that `--doc` appears. If doctests are enabled
-    again, verify which crates the command actually covers.
 - [ ] **Goal 20 lane 20-A test hardening (PR #71 review P3s)**:
   - `nsh-testing` 0.7.1 `Headless::react()` answers a `SaveDialog` at once. The Quit test in `translation_flow.rs` can
     gate only the app's read of the answer, not the platform's reply, so it does not prove the translation lands while
@@ -197,9 +195,6 @@
   - Two guards implement one rule: `state.rs::observe_view_stop` snaps the track under reduced motion and
     `TrackTween::to` does the same, so removing either alone is unobservable (the lane's mutation check had to
     remove both to redden the reduced-motion acceptance test). Keep one guard when either is refactored.
-  - `scripts/tests/test_native_runtime_uia.py::test_sidebar_and_view_selectors_are_in_the_product_ui` cuts each
-    Rust file at `"\n#[cfg(test)]\nmod tests"` without asserting the marker was found, so a renamed test module
-    would let test-only literals satisfy it. Assert the split produced two parts.
   - The stage's real width comes from flex layout while its children compute `client_width - sidebar_width`; the
     two agree today but one source of truth would be better. `Pane::web()` also duplicates `Tab::web_preference`
     outside Edit, and `chosen_pane`/`chosen_web` mirror each other.

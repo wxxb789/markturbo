@@ -18,6 +18,7 @@ from .runtime import (
     EDITOR_NAME,
     INTEGRITY_NAMES,
     PROCESS_IMAGE_FACT_CATEGORIES,
+    REQUEST_SENT_TIMEOUT_SECONDS,
     VK_RETURN,
     WINDOW_FACT_CATEGORIES,
     Fingerprint,
@@ -36,37 +37,36 @@ from .runtime import (
     wait_until,
     write_durable,
 )
+from .selectors import (
+    CONSENT_HOLD_SECONDS,
+    CONSENT_SEND_AUTOMATION_ID,
+    PREPARE_REVISION_AUTOMATION_ID,
+    REVIEW_ANSWER_AUTOMATION_ID,
+    REVIEW_ANSWER_INPUT_AUTOMATION_ID,
+    REVISION_ACCEPT_AUTOMATION_ID,
+    REVISION_COPY_AUTOMATION_ID,
+    REVISION_DONE_AUTOMATION_ID,
+    REVISION_PROPOSAL_AFTER_AUTOMATION_ID,
+    REVISION_REJECT_AUTOMATION_ID,
+    REVISION_UNDO_AUTOMATION_ID,
+)
 
 
 SCHEMA = "markturbo.goal-07-native-acceptance"
 MAX_EDIT_OUTPUT_BYTES = 4 * 1024 * 1024
 TRANSPORT_KEYS = frozenset({"mode", "provider", "deterministic", "request_count"})
 
-# `ui/review.rs`: the structured result's first line, the answer input, and
-# the Buttons, each carrying its own AutomationId (`prims` actions).
+# `ui/review.rs`: the structured result's first line and the Buttons, each
+# carrying its own AutomationId (`prims` actions).
 REVIEW_RESULT_MARKER = "Understood:"
-REVIEW_ANSWER_INPUT_AUTOMATION_ID = "review-answer-input"
-REVIEW_ANSWER_AUTOMATION_ID = "review-answer-submit"
-PREPARE_REVISION_AUTOMATION_ID = "review-prepare"
-# `ui/consent.rs` `send_button`: only a pointer hold past `FILAMENT_CHARGE_MS` sends.
-CONSENT_SEND_AUTOMATION_ID = "consent-send"
-CONSENT_HOLD_SECONDS = 1.8
-# How long a request may take to reach the loopback after its consent hold
-# returns; a hold that sent nothing fails here, not at the answer's wait.
-REQUEST_SENT_TIMEOUT_SECONDS = 5.0
 # The answer's wait once its request has arrived.
 ANSWER_TIMEOUT_SECONDS = 60.0
 # `ui/revision.rs`: the docked hunk's decisions, the count, Undo, Copy and Done.
 # A decided docked hunk shows its decision word until the next undecided one
 # is docked.
-REVISION_ACCEPT_AUTOMATION_ID = "revision-accept"
-REVISION_REJECT_AUTOMATION_ID = "revision-reject"
-REVISION_DONE_AUTOMATION_ID = "revision-done"
-REVISION_UNDO_AUTOMATION_ID = "revision-undo"
 REVISION_DECISION_WORDS = ("Accepted", "Rejected")
 REVISION_PART_CHANGED_TEXT = "Can't apply \u2014 this section was edited since the review."
-REVISION_COPY_AUTOMATION_ID = "revision-copy"
-REVISION_PROPOSAL_AFTER_AUTOMATION_ID = "revision-proposal-after"
+# `ui/revision.rs`: the proposal row's accessible name.
 REVISION_PROPOSAL_AFTER_NAME = "Proposed text"
 # `state.rs` `finish_revision`: Done's outcome line with an accepted hunk.
 REVISION_APPLIED = "Approved changes applied to the document \u2014 press Ctrl+S to save to disk."
@@ -885,14 +885,17 @@ def scan_case_artifacts(case_root: Path, ephemeral_credential: str) -> dict[str,
 
 
 def review_settings_document(endpoint: str) -> bytes:
-    identity = credential_target(endpoint, "openai-responses")
-    return (
-        "show-welcome-on-startup = false\n"
-        'model-provider = "openai-responses"\n'
-        'model-name = "goal07-loopback-model"\n'
-        f"model-base-url = {json.dumps(endpoint)}\n"
-        f"model-environment-key-identity = {json.dumps(identity)}\n"
-    ).encode("utf-8")
+    return evidence.settings_document(
+        {
+            "show-welcome-on-startup": False,
+            "model-provider": "openai-responses",
+            "model-name": "goal07-loopback-model",
+            "model-base-url": endpoint,
+            "model-environment-key-identity": credential_target(
+                endpoint, "openai-responses"
+            ),
+        }
+    )
 
 
 @functools.cache
@@ -1062,9 +1065,29 @@ class Goal07Harness(NativeHarness):
         if expected_request_count is None or open_gate is None:
             raise HarnessFailure("CONSENT_GATE_CONFIGURATION_INVALID")
         self._open_consent_gate(provider, expected_request_count, open_gate)
-        hold = lambda: self.hold_control(app, send, CONSENT_HOLD_SECONDS, failure_code)
+
+        def card_open() -> bool:
+            return self.control_by_id(
+                app.hwnd,
+                CONSENT_SEND_AUTOMATION_ID,
+                "Button",
+                "CONSENT_SEND_UIA_CONTRACT_MISMATCH",
+            ) is not None
+
+        def hold() -> None:
+            self.hold_consent_until_sent(
+                app,
+                send,
+                CONSENT_HOLD_SECONDS,
+                failure_code,
+                await_sent=lambda: self._wait_request_sent(
+                    provider, expected_request_count
+                ),
+                card_open=card_open,
+                not_sent_code=f"{_operation(expected_request_count)}_REQUEST_NOT_SENT",
+            )
+
         provider.dispatch_consent_click(expected_request_count, hold)
-        self._wait_request_sent(provider, expected_request_count)
 
     def run_review(self, app: Any, provider: provider_fixtures.LoopbackRevisionServer) -> None:
         """Ctrl+Enter reaches the editor the Web pane handed the keyboard back

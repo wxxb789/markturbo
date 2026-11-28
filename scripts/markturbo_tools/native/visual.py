@@ -71,14 +71,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from .evidence import credential_target
-from .goal07 import (
-    CONSENT_HOLD_SECONDS,
-    CONSENT_SEND_AUTOMATION_ID,
-    REQUEST_SENT_TIMEOUT_SECONDS,
-    REVIEW_ANSWER_INPUT_AUTOMATION_ID,
-)
+from .evidence import credential_target, nested_json_values, settings_document
 from .runtime import (
+    REQUEST_SENT_TIMEOUT_SECONDS,
     MENU_SAVE_AUTOMATION_ID,
     MENU_WEB_AUTOMATION_ID,
     VIEW_BUTTON_AUTOMATION_ID,
@@ -90,8 +85,27 @@ from .runtime import (
     load_pywinauto,
     phase,
     safe_exception_name,
+    safe_failure_type,
     sha256_file,
     wait_until,
+)
+from .selectors import (
+    CJK_OPTICS_AUTOMATION_ID,
+    CJK_OPTICS_VARIANTS,
+    CONSENT_HOLD_SECONDS,
+    CONSENT_SEND_AUTOMATION_ID,
+    CONTEXT_CLOSE_AUTOMATION_ID,
+    CONFLICT_KEEP_MINE_AUTOMATION_ID,
+    MENU_CONTEXT_AUTOMATION_ID,
+    MENU_SETTINGS_AUTOMATION_ID,
+    REVIEW_AGAIN_AUTOMATION_ID,
+    REVIEW_ANSWER_INPUT_AUTOMATION_ID,
+    REVIEW_CANCEL_AUTOMATION_ID,
+    SETTINGS_PAGE_AUTOMATION_ID,
+    TITLE_FILE_AUTOMATION_ID,
+    TITLE_REVIEW_AUTOMATION_ID,
+    WEB_VIEW_AUTOMATION_ID,
+    WELCOME_NEW_FILE_AUTOMATION_ID,
 )
 
 SCHEMA = "markturbo.goal-09-visual-matrix"
@@ -101,11 +115,6 @@ CJK_OPTICS_ENV = "MARKTURBO_GOAL17_CJK_OPTICS"
 CJK_COMPANION_FONT_NAME = "SourceHanSansCN-VF.otf"
 CJK_COMPANION_FONT_LOADED = "CJK companion font loaded"
 CJK_COMPANION_FONT_UNAVAILABLE = "CJK companion font unavailable"
-CJK_OPTICS_VARIANTS = (
-    ("cjk-optics-plus-0", "+0"),
-    ("cjk-optics-plus-1px", "+1px"),
-    ("cjk-optics-plus-1px-next-weight", "+1px / next companion weight"),
-)
 STATES = (
     "clean-profile-welcome",
     "new-unsaved-document",
@@ -156,21 +165,9 @@ ACTIONABLE_ROLES = frozenset(
     }
 )
 
-# The AutomationIds (the views' `test_id`s) that drive and prove each state.
-# They are language-independent, so one plan drives both interface languages.
-WELCOME_NEW_FILE_AUTOMATION_ID = "welcome-new-file"
-TITLE_FILE_AUTOMATION_ID = "title-file"
-TITLE_REVIEW_AUTOMATION_ID = "title-review"
-MENU_CONTEXT_AUTOMATION_ID = "title-menu-context"
-MENU_SETTINGS_AUTOMATION_ID = "title-menu-settings"
-WEB_VIEW_AUTOMATION_ID = "web-view"
-CONTEXT_CLOSE_AUTOMATION_ID = "context-close"
-CONFLICT_KEEP_MINE_AUTOMATION_ID = "conflict-keep-mine"
-# The page's primary action. (Its `settings-close` is off screen in UIA and
-# unpainted at rest, so it cannot prove the page.)
-SETTINGS_SAVE_AUTOMATION_ID = "settings-save"
-REVIEW_CANCEL_AUTOMATION_ID = "review-cancel"
-REVIEW_AGAIN_AUTOMATION_ID = "review-again"
+# The AutomationIds (the views' `test_id`s) that drive and prove each state
+# are in `native.selectors`; they are language-independent, so one plan drives
+# both interface languages.
 # `state.rs` names a new document's tab with `Key::Untitled`.
 UNTITLED = {"en-us": "Untitled", "zh-cn": "未命名"}
 # `i18n::effective_context_choice_label(language, false)`: a source's include
@@ -664,7 +661,14 @@ class ReviewServer:
                     outer._refuse("REVIEW_REQUEST_BEFORE_CONSENT")
                     self._reply(409)
                     return
-                if b"read_only_review" not in body:
+                try:
+                    parsed = json.loads(body)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    parsed = None
+                operations = (
+                    nested_json_values(parsed, "operation") if parsed is not None else []
+                )
+                if operations != ["read_only_review"]:
                     outer._refuse("REVIEW_REQUEST_NOT_READ_ONLY")
                     self._reply(409)
                     return
@@ -924,6 +928,10 @@ class VisualHarness(NativeHarness):
         # Pointer holds on `consent-send` a Review cell needed (0 elsewhere).
         self.consent_holds = 0
 
+    def record_consent_attempt(self, attempt: int) -> None:
+        """The receipt's content-free count of pointer holds a Review needed."""
+        self.consent_holds = attempt
+
     def openai_api_key_for_child(self) -> str | None:
         return self._credential
 
@@ -1009,11 +1017,11 @@ class VisualHarness(NativeHarness):
 
     def prepare(
         self, app: RunningApp, cell: Cell, plan: Path, server: ReviewServer | None
-    ) -> list[str]:
+    ) -> list[str] | dict[str, Any]:
         with phase(state_code(cell.state)):
             return self._plans()[cell.state](app, cell, plan, server)
 
-    def _plans(self) -> dict[str, Callable[..., list[str]]]:
+    def _plans(self) -> dict[str, Callable[..., list[str] | dict[str, Any]]]:
         return {
             "clean-profile-welcome": self.welcome,
             "new-unsaved-document": self.new_unsaved_document,
@@ -1026,6 +1034,7 @@ class VisualHarness(NativeHarness):
             "effective-agent-context": self.context,
             "external-change-conflict": self.conflict,
             "settings": self.settings_page,
+            CJK_OPTICS_STATE: self.cjk_optics,
         }
 
     def welcome(self, app: RunningApp, *_: Any) -> list[str]:
@@ -1091,8 +1100,38 @@ class VisualHarness(NativeHarness):
 
     def settings_page(self, app: RunningApp, *_: Any) -> list[str]:
         self.menu_command(app, MENU_SETTINGS_AUTOMATION_ID)
-        self.require(app, SETTINGS_SAVE_AUTOMATION_ID, "SETTINGS_PAGE_MISSING")
-        return [MENU_SETTINGS_AUTOMATION_ID, SETTINGS_SAVE_AUTOMATION_ID]
+        self.require(app, SETTINGS_PAGE_AUTOMATION_ID, "SETTINGS_PAGE_MISSING", "Group")
+        return [MENU_SETTINGS_AUTOMATION_ID, SETTINGS_PAGE_AUTOMATION_ID]
+
+    def cjk_optics(
+        self, app: RunningApp, _cell: Cell, _plan: Path, _server: Any
+    ) -> dict[str, Any]:
+        """The Goal 17 comparison view, proven by its own ids and font."""
+        self.require(app, CJK_OPTICS_AUTOMATION_ID, "CJK_OPTICS_VIEW_MISSING", "Group")
+        for variant_id, _ in CJK_OPTICS_VARIANTS:
+            self.require(app, variant_id, "CJK_OPTICS_VARIANT_GROUP_MISSING", "Group")
+        wait_until(
+            lambda: self.shows_text(app, "CJK optical sizing"),
+            UI_TIMEOUT,
+            "CJK_OPTICS_VIEW_MISSING",
+            interval=0.1,
+        )
+        require_companion_font_loaded(self, app)
+        expected_names = (
+            "中文",
+            "Latin",
+            "かな",
+            "한글",
+            *(label for _, label in CJK_OPTICS_VARIANTS),
+        )
+        visible = lambda: all(self.shows_text(app, name) for name in expected_names)
+        wait_until(visible, UI_TIMEOUT, "CJK_OPTICS_VARIANTS_MISSING", interval=0.1)
+        return {
+            "comparison_view": CJK_OPTICS_AUTOMATION_ID,
+            "variant_ids": [variant_id for variant_id, _ in CJK_OPTICS_VARIANTS],
+            "paragraph_visible": True,
+            "companion_font_loaded": True,
+        }
 
     def review(
         self, app: RunningApp, cell: Cell, _plan: Path, server: ReviewServer | None
@@ -1107,24 +1146,28 @@ class VisualHarness(NativeHarness):
         if server.request_count or server.refusal:
             raise HarnessFailure("REVIEW_REQUEST_BEFORE_CONSENT")
         server.allow()
+
+        def sent() -> None:
+            wait_until(
+                lambda: server.request_count > 0 or server.refusal,
+                REQUEST_SENT_TIMEOUT_SECONDS,
+                "REVIEW_REQUEST_NOT_SENT",
+            )
+
         # A hold that lands as the card settles can go unseen (about one cell
-        # in twenty): while the card is still open and nothing was sent, hold
-        # once more. The receipt keeps the count, so a second hold is visible.
-        for attempt in (1, 2):
-            self.consent_holds = attempt
-            self.hold_control(app, send, CONSENT_HOLD_SECONDS, "CONSENT_HOLD")
-            try:
-                wait_until(
-                    lambda: server.request_count > 0 or server.refusal,
-                    REQUEST_SENT_TIMEOUT_SECONDS,
-                    "REVIEW_REQUEST_NOT_SENT",
-                )
-                break
-            except HarnessFailure as error:
-                if attempt == 2 or error.code != "REVIEW_REQUEST_NOT_SENT":
-                    raise
-                if not self.present(app, CONSENT_SEND_AUTOMATION_ID):
-                    raise
+        # in twenty): the shared step holds once more while the card is still
+        # open and nothing was sent. The receipt keeps the count, so a second
+        # hold is visible.
+        self.consent_holds = self.hold_consent_until_sent(
+            app,
+            send,
+            CONSENT_HOLD_SECONDS,
+            "CONSENT_HOLD",
+            await_sent=sent,
+            card_open=lambda: self.present(app, CONSENT_SEND_AUTOMATION_ID),
+            not_sent_code="REVIEW_REQUEST_NOT_SENT",
+            on_attempt=self.record_consent_attempt,
+        )
         if server.refusal:
             raise HarnessFailure(server.refusal)
         markers = [TITLE_REVIEW_AUTOMATION_ID, CONSENT_SEND_AUTOMATION_ID]
@@ -1146,20 +1189,17 @@ class VisualHarness(NativeHarness):
 
 
 def write_settings(path: Path, mode: str, language: str, server: ReviewServer | None) -> None:
-    lines = [
-        f'theme = "{mode}"',
-        f'language = "{language}"',
-    ]
+    scalars: dict[str, str | bool] = {"theme": mode, "language": language}
     if server is not None:
-        lines.extend(
-            [
-                f'model-provider = "{REVIEW_PROVIDER}"',
-                f'model-name = "{REVIEW_MODEL}"',
-                f'model-base-url = "{server.base_url}"',
-                f'model-environment-key-identity = "{credential_identity(server.port)}"',
-            ]
+        scalars.update(
+            {
+                "model-provider": REVIEW_PROVIDER,
+                "model-name": REVIEW_MODEL,
+                "model-base-url": server.base_url,
+                "model-environment-key-identity": credential_identity(server.port),
+            }
         )
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_bytes(settings_document(scalars))
 
 
 def fixture(workspace: Path) -> Path:
@@ -1275,6 +1315,8 @@ def remove_profile(profile: Path, timeout: float = PROFILE_REMOVAL_SECONDS) -> N
         except HarnessFailure:
             if attempt == 1:
                 stop_profile_browsers(profile)
+                continue
+            raise
 
 
 def companion_font_data_dir() -> Path:
@@ -1442,44 +1484,7 @@ def capture_cell(
         dpi = int(win32.user32.GetDpiForWindow(window.hwnd))
         width, height = physical_viewport(cell.viewport, dpi)
         window.resize_client(width, height, dpi_awareness()[2])
-        if cjk_optics:
-            harness.require(
-                app,
-                "goal17-cjk-optics",
-                "CJK_OPTICS_VIEW_MISSING",
-                control_type="Group",
-            )
-            for variant_id, _ in CJK_OPTICS_VARIANTS:
-                harness.require(
-                    app,
-                    variant_id,
-                    "CJK_OPTICS_VARIANT_GROUP_MISSING",
-                    control_type="Group",
-                )
-            wait_until(
-                lambda: harness.shows_text(app, "CJK optical sizing"),
-                UI_TIMEOUT,
-                "CJK_OPTICS_VIEW_MISSING",
-                interval=0.1,
-            )
-            require_companion_font_loaded(harness, app)
-            expected_names = (
-                "中文",
-                "Latin",
-                "かな",
-                "한글",
-                *(label for _, label in CJK_OPTICS_VARIANTS),
-            )
-            visible = lambda: all(harness.shows_text(app, name) for name in expected_names)
-            wait_until(visible, UI_TIMEOUT, "CJK_OPTICS_VARIANTS_MISSING", interval=0.1)
-            markers = {
-                "comparison_view": "goal17-cjk-optics",
-                "variant_ids": [variant_id for variant_id, _ in CJK_OPTICS_VARIANTS],
-                "paragraph_visible": True,
-                "companion_font_loaded": True,
-            }
-        else:
-            markers = harness.prepare(app, cell, plan, server)
+        markers = harness.prepare(app, cell, plan, server)
         # Kept on a later failure too: the state was reached, and the
         # `failure.png` shows it.
         receipt["state_markers"] = markers
@@ -1565,7 +1570,7 @@ def capture_cell(
         )
         receipt["reason_code"] = error.code
         if error.detail:
-            receipt["failure_type"] = error.detail
+            receipt["failure_type"] = safe_failure_type(error)
         if DEBUG:
             print(f"  {error.code}: {error.detail}", file=sys.stderr, flush=True)
         if window is not None:
@@ -1579,15 +1584,34 @@ def capture_cell(
         if DEBUG:
             print(f"  {type(error).__name__}: {error}", file=sys.stderr, flush=True)
     finally:
+        cleanup_code: str | None = None
+        cleanup_type: str | None = None
         try:
             if app is not None:
                 harness.reap(app)
             harness.cleanup()
-        except Exception:  # noqa: BLE001 - the job object still ends the app
-            pass
+        except HarnessFailure as error:
+            cleanup_code = error.code
+            cleanup_type = safe_failure_type(error)
+        except Exception as error:  # noqa: BLE001 - the job object still ends the app
+            cleanup_code = "CLEANUP_INTERNAL_FAILURE"
+            cleanup_type = safe_exception_name(error)
         if server is not None:
             server.close()
-        remove_profile(profile)
+        try:
+            remove_profile(profile)
+        except HarnessFailure as error:
+            cleanup_code = cleanup_code or error.code
+            cleanup_type = cleanup_type or safe_failure_type(error)
+        except Exception as error:  # noqa: BLE001 - the receipt still records the cell
+            cleanup_code = cleanup_code or "PROFILE_REMOVAL_FAILED"
+            cleanup_type = cleanup_type or safe_exception_name(error)
+        if cleanup_code is not None:
+            # The runtime's cleanup policy: a cell whose app or profile could
+            # not be retired is a failure, not a silent capture.
+            receipt["status"] = "FAILED"
+            receipt["reason_code"] = cleanup_code
+            receipt["failure_type"] = cleanup_type
         receipt.setdefault("completed_at", utc_now())
         (case_root / "receipt.json").write_text(
             json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=True) + "\n",

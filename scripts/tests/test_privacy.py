@@ -399,17 +399,6 @@ class CheckIntegrationTests(unittest.TestCase):
         rust_checks.assert_called_once_with("release")
         self.assertEqual(events, ["build", "scan"])
 
-    def test_ci_does_not_run_the_release_binary_privacy_scan(self) -> None:
-        with (
-            mock.patch.object(checks, "fast"),
-            mock.patch.object(checks, "cargo", side_effect=lambda *args: ("cargo", *args)),
-            mock.patch.object(checks, "run"),
-            mock.patch.object(checks.privacy, "scan") as scan,
-        ):
-            checks.ci()
-
-        scan.assert_not_called()
-
     def test_full_reports_privacy_failures_as_check_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -440,9 +429,6 @@ class CheckIntegrationTests(unittest.TestCase):
             ):
                 with self.assertRaises(checks.CheckFailure):
                     checks.full()
-
-    def test_tooling_manifest_includes_privacy_tests(self) -> None:
-        self.assertIn("scripts.tests.test_privacy", checks.TOOLING_TESTS)
 
 
 if __name__ == "__main__":

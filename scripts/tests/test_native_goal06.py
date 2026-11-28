@@ -555,8 +555,11 @@ class ConfiguredReviewTests(unittest.TestCase):
     def consent_harness(events: list[tuple[str, object]], *, scope_shown: bool = True):
         button = object()
 
-        class FakeHarness:
+        class FakeHarness(HARNESS.Goal06Harness):
             ui_timeout = 1.0
+
+            def __init__(self) -> None:
+                self.card_open = True
 
             def find_control(self, app, automation_id, control_type, timeout_code, mismatch_code):
                 events.append(("control", (automation_id, control_type, timeout_code)))
@@ -566,8 +569,12 @@ class ConfiguredReviewTests(unittest.TestCase):
                 events.append(("scope", (name, control_type)))
                 return scope_shown
 
+            def control_absent(self, app, automation_id, control_type, query_code, mismatch_code):
+                return not self.card_open
+
             def hold_control(self, app, control, seconds, failure_code):
                 events.append(("hold", (control, seconds, failure_code)))
+                self.card_open = False
 
             def click_control(self, *_args):
                 events.append(("click", None))
@@ -596,6 +603,39 @@ class ConfiguredReviewTests(unittest.TestCase):
         self.assertNotIn("invoke", [event[0] for event in events])
         # The control's own hold threshold is 1.2s; the harness must exceed it.
         self.assertGreater(HARNESS.CONSENT_HOLD_SECONDS, 1.2)
+
+    def test_an_unseen_hold_is_repeated_once_while_the_card_stays_open(self) -> None:
+        events: list[tuple[str, object]] = []
+        harness, _button = self.consent_harness(events)
+        holds: list[object] = []
+
+        def delayed_hold(app, control, seconds, failure_code):
+            events.append(("hold", (control, seconds, failure_code)))
+            holds.append(control)
+            if len(holds) == 2:
+                harness.card_open = False
+
+        harness.hold_control = delayed_hold
+        app = type("App", (), {"hwnd": 42})()
+        with mock.patch.object(HARNESS, "REQUEST_SENT_TIMEOUT_SECONDS", 0.05):
+            HARNESS.Goal06Harness.approve_review_consent(harness, app, False)
+
+        self.assertEqual(len(holds), 2)
+        self.assertFalse(harness.card_open)
+
+    def test_a_hold_that_never_sends_fails_with_its_operation(self) -> None:
+        events: list[tuple[str, object]] = []
+        harness, _button = self.consent_harness(events)
+        holds: list[object] = []
+        harness.hold_control = lambda app, control, seconds, failure: holds.append(control)
+        app = type("App", (), {"hwnd": 42})()
+        with (
+            mock.patch.object(HARNESS, "REQUEST_SENT_TIMEOUT_SECONDS", 0.05),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^REVIEW_REQUEST_NOT_SENT$"),
+        ):
+            HARNESS.Goal06Harness.approve_review_consent(harness, app, False)
+
+        self.assertEqual(len(holds), 2)
 
     def test_selection_consent_measures_its_scope_before_holding(self) -> None:
         events: list[tuple[str, object]] = []

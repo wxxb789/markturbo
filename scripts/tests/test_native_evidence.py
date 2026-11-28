@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import re
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -438,6 +440,51 @@ class CredentialTargetTests(unittest.TestCase):
         for endpoint in ("ftp://host/", "http://user:secret@host/", "http://host/?q=1", "http://host:99999/"):
             with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
                 evidence.credential_target(endpoint, "openai-chat")
+
+
+class SettingsDocumentTests(unittest.TestCase):
+    def test_escapes_every_value_and_keeps_the_insertion_order(self) -> None:
+        values = {
+            "theme": 'dark "theme"',
+            "path": "C:\\work\\待办.md",
+            "note": "tab\treturn\rnewline\nbell\x07 delete\x7f rocket\U0001f680",
+            "enabled": False,
+        }
+        document = evidence.settings_document(values)
+
+        lines = document.decode("utf-8").splitlines()
+        self.assertEqual([line.split(" = ", 1)[0] for line in lines], list(values))
+        self.assertEqual(tomllib.loads(document.decode("utf-8")), values)
+
+    def test_writes_an_array_of_tables(self) -> None:
+        rows = [
+            {"path": "C:\\a.md", "kind": "file", "display-name": "a.md"},
+            {"path": "C:\\b.md", "kind": "file", "display-name": "b.md"},
+        ]
+        document = evidence.settings_document(
+            {"show-welcome-on-startup": True}, {"recent-targets": rows}
+        )
+
+        parsed = tomllib.loads(document.decode("utf-8"))
+        self.assertEqual(parsed["show-welcome-on-startup"], True)
+        self.assertEqual(parsed["recent-targets"], rows)
+
+    def test_nested_json_values_walks_objects_arrays_and_json_strings(self) -> None:
+        value = {
+            "metadata": {"operation": "read_only_review"},
+            "items": [json.loads('{"operation": "revision"}')],
+            "answer": "read_only_review",
+        }
+
+        self.assertEqual(
+            evidence.nested_json_values(value, "operation"),
+            ["read_only_review", "revision"],
+        )
+        self.assertEqual(evidence.nested_json_values(value, "missing"), [])
+        self.assertEqual(
+            evidence.nested_json_values('{"operation": "read_only_review"}', "operation"),
+            ["read_only_review"],
+        )
 
 
 class ParserTests(unittest.TestCase):
