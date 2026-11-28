@@ -133,9 +133,19 @@ fn focus_request() -> Signal<Option<Focus>> {
 
 /// A one-shot focus, kept alive until it fires: an effect runs before the
 /// commit that carries the control is in, so the ref reaches it only at the
-/// next step of the executor.
-fn focus_step() -> Signal<Option<Spawned<()>>> {
-    global::<Option<Spawned<()>>>()
+/// next step of the executor. `global` keys on the type, so this newtype
+/// gives the focus step a slot of its own; the UI timers once shared one
+/// `Option<Spawned<()>>` and one timer's write displaced another timer's
+/// handle.
+#[allow(
+    dead_code,
+    reason = "a keep-alive handle: the slot's occupancy is the whole contract"
+)]
+#[derive(Default)]
+pub(crate) struct FocusStep(pub(crate) Option<Spawned<()>>);
+
+pub(crate) fn focus_step() -> Signal<FocusStep> {
+    global::<FocusStep>()
 }
 
 /// A question never takes the keyboard from the source editor the user is
@@ -163,7 +173,7 @@ fn arrival_focus(
 
 fn focus_soon(reference: ElementRef) {
     let step = set_timeout(Duration::from_millis(0), move || reference.focus());
-    focus_step().set(Some(step));
+    focus_step().set(FocusStep(Some(step)));
 }
 
 fn session() -> Signal<Session> {
@@ -219,8 +229,18 @@ fn emitters() -> Signal<Emitters> {
 }
 
 /// The step that will show the seconds hint, kept alive until it fires.
-fn hint_step() -> Signal<Option<Spawned<()>>> {
-    global::<Option<Spawned<()>>>()
+/// `global` keys on the type, so this newtype gives the hint a slot of its
+/// own; the UI timers once shared one `Option<Spawned<()>>` and one timer's
+/// write displaced another timer's handle.
+#[allow(
+    dead_code,
+    reason = "a keep-alive handle: the slot's occupancy is the whole contract"
+)]
+#[derive(Default)]
+pub(crate) struct HintStep(pub(crate) Option<Spawned<()>>);
+
+pub(crate) fn hint_step() -> Signal<HintStep> {
+    global::<HintStep>()
 }
 
 fn observe(state: &AppState, session: Signal<Session>) {
@@ -308,13 +328,16 @@ fn loading_hint(state: &AppState, session: Signal<Session>) {
     effect(move || {
         if busy.get() {
             session.update(|session| session.slow = false);
-            step.set(Some(set_timeout(Duration::from_secs(1), move || {
-                if busy.get_untracked() {
-                    session.update(|session| session.slow = true);
-                }
-            })));
+            step.set(HintStep(Some(set_timeout(
+                Duration::from_secs(1),
+                move || {
+                    if busy.get_untracked() {
+                        session.update(|session| session.slow = true);
+                    }
+                },
+            ))));
         } else {
-            step.set(None);
+            step.set(HintStep(None));
             session.update(|session| session.slow = false);
         }
     });

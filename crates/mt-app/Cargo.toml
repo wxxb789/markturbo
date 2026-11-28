@@ -71,3 +71,10 @@ nsh-engine = "=0.7.1"
 nsh-testing = "=0.7.1"
 serde_json.workspace = true
 tempfile.workspace = true
+# The preview tests parse what the app builds instead of matching substrings:
+# html5ever + markup5ever_rcdom for the host/frame structure and roxmltree for
+# the embedded SVG. The versions are the ones `nsh-base` already brings into
+# `Cargo.lock`; these edges are test-only.
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+roxmltree = "0.20"

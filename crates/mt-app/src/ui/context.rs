@@ -624,46 +624,16 @@ fn source_text(
                 )
             },
         ))
-        .child(quiet_action_named(
+        .child(prims::action(
             &format!("context-open-{index}"),
             i18n::t(language, Key::Open),
-            name,
+            prims::ActionTone::Quiet,
+            prims::ActionOptions {
+                name: Some(name.into_reactive()),
+                ..Default::default()
+            },
             move || state.open_file(path.clone()),
         ))
-}
-
-/// `prims::quiet_action` with an accessible name of its own: the primitive
-/// takes the name from the visible label, which is the same 'Open' in every
-/// row. (A primitive taking both apart belongs in `prims`.)
-fn quiet_action_named(
-    test_id: &str,
-    label: impl Into<SharedString>,
-    name: SharedString,
-    on_press: impl Fn() + 'static,
-) -> impl IntoElement {
-    let label: SharedString = label.into();
-    prims::press_feedback(
-        view()
-            .test_id(test_id)
-            .role(AccessibilityRole::Button)
-            .optional_label(Some(name))
-            .window_drag(false)
-            .px(px(2.0))
-            .py(px(4.0))
-            .bg(Color::TRANSPARENT)
-            .cursor_pointer()
-            .rounded(px(0.0))
-            .hover(|style| style.text_color(|| tokens::palette().ink).underline())
-            .focus_visible(|style| style.text_color(|| tokens::palette().ink).underline())
-            .on_press(move |_: &PressEvent| on_press()),
-    )
-    .child(
-        text(label)
-            .font_family(FONT_UI)
-            .text_size(px(TYPE_UI))
-            .line_height(px(TYPE_UI_LINE))
-            .text_color(move || tokens::palette().ink_rest),
-    )
 }
 
 /// The `Include in review` toggle: a checked square and a full-ink label,
@@ -1464,10 +1434,14 @@ mod tests {
         let presses = signal(0u32);
         view()
             .flex_col()
-            .child(quiet_action_named(
+            .child(prims::action(
                 "harness-open",
                 "Open",
-                SharedString::from("Open plan.md"),
+                prims::ActionTone::Quiet,
+                prims::ActionOptions {
+                    name: Some(SharedString::from("Open plan.md").into_reactive()),
+                    ..Default::default()
+                },
                 move || presses.update(|n| *n += 1),
             ))
             .child(text(move || format!("{} presses", presses.get())))

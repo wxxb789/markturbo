@@ -22,7 +22,7 @@ use mt_core::{
     model::{EndpointIdentity, EndpointIdentityError, Provider},
     settings::{Language, SettingsData, ThemePreference},
 };
-use nsh_base::{button, input};
+use nsh_base::input;
 use nsh_core::{Color, element::ScrollEvent, keymap::When, prelude::*};
 
 use crate::{
@@ -30,11 +30,11 @@ use crate::{
     state::{AppState, CredentialStatus},
     ui::{
         fonts::{Companion, CompanionAction, CompanionFailure, CompanionStatus},
-        motion, notices, prims,
+        notices, prims,
         tokens::{
             self, COLUMN_GAP, FONT_INPUT, FONT_UI, HAIRLINE, MEASURE_NARROW, MEASURE_WIDE, RAIL_W,
-            SELECTION_UNDERLINE, SETTINGS_HEADER_H, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5,
-            TYPE_PREVIEW, TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MEDIUM,
+            SETTINGS_HEADER_H, SPACE_1, SPACE_2, SPACE_3, SPACE_4, SPACE_5, TYPE_PREVIEW,
+            TYPE_PREVIEW_LINE, TYPE_UI, TYPE_UI_LINE, WEIGHT_MEDIUM,
         },
     },
 };
@@ -594,25 +594,32 @@ fn credential_actions(
             move || {
                 let label_state = label_state.clone();
                 let store_enabled_state = store_enabled_state.clone();
-                reactive_action(
+                prims::action(
                     "settings-credential-store",
                     move || {
                         if current_credential_status(&label_state) == CredentialStatus::Stored {
-                            s(S::Replace, language).into()
+                            SharedString::from(s(S::Replace, language))
                         } else {
                             SharedString::from(i18n::t(language, Key::StoreCredentialSecurely))
                         }
                     },
-                    move || {
-                        current_credential_status(&store_enabled_state)
-                            != CredentialStatus::Unconfigured
+                    prims::ActionTone::Quiet,
+                    prims::ActionOptions {
+                        disabled: Some(
+                            (move || {
+                                current_credential_status(&store_enabled_state)
+                                    == CredentialStatus::Unconfigured
+                            })
+                            .into_reactive(),
+                        ),
+                        reference: Some(store_ref),
+                        ..Default::default()
                     },
                     {
                         let state = store_state.clone();
                         move || store_key(&state, language, false)
                     },
                 )
-                .element_ref(&store_ref)
                 .into_element()
             },
         ))
@@ -713,10 +720,16 @@ fn theme_row(state: AppState, language: Language) -> impl IntoElement {
                 .items_center()
                 .gap(px(SPACE_2))
                 .child(swatch(choice))
-                .child(choice_button(
+                .child(prims::action(
                     id,
                     name,
-                    move || read_state.settings.get().theme == choice,
+                    prims::ActionTone::Quiet,
+                    prims::ActionOptions {
+                        chosen: Some(
+                            (move || read_state.settings.get().theme == choice).into_reactive(),
+                        ),
+                        ..Default::default()
+                    },
                     move || {
                         if press_state.settings.get().theme != choice {
                             press_state.set_theme(choice);
@@ -942,7 +955,7 @@ fn usage_section(state: AppState, language: Language) -> impl IntoElement {
                 .flex_row()
                 .items_center()
                 .gap(px(SPACE_3))
-                .child(reactive_action(
+                .child(prims::action(
                     "usage-inspect",
                     move || {
                         let language = inspection_state.settings.get().language;
@@ -952,7 +965,8 @@ fn usage_section(state: AppState, language: Language) -> impl IntoElement {
                             SharedString::from(i18n::t(language, Key::UsageInspect))
                         }
                     },
-                    || true,
+                    prims::ActionTone::Quiet,
+                    prims::ActionOptions::default(),
                     move || inspect_state.inspect_usage(),
                 ))
                 .child(prims::quiet_action(
@@ -1018,10 +1032,16 @@ fn choice_row<T: Copy + PartialEq + 'static>(
         let value = *value;
         let current_state = state.clone();
         let press_state = state.clone();
-        row = row.child(choice_button(
+        row = row.child(prims::action(
             id,
             name,
-            move || read(&current_state.settings.get()) == value,
+            prims::ActionTone::Quiet,
+            prims::ActionOptions {
+                chosen: Some(
+                    (move || read(&current_state.settings.get()) == value).into_reactive(),
+                ),
+                ..Default::default()
+            },
             move || {
                 if read(&press_state.settings.get()) != value {
                     set(&press_state, value);
@@ -1030,110 +1050,6 @@ fn choice_row<T: Copy + PartialEq + 'static>(
         ));
     }
     row
-}
-
-/// One choice of a mutually exclusive row: the current one carries full ink and
-/// the selected state for screen readers, the others rest, and every one of
-/// them is the same pressable control — so a choice made with the keyboard
-/// keeps the focus where it was.
-fn choice_button(
-    test_id: &'static str,
-    label: &'static str,
-    current: impl Fn() -> bool + Clone + 'static,
-    on_press: impl Fn() + 'static,
-) -> impl Interactive + ParentElement {
-    let duration = prims::press_color_duration();
-    let label: SharedString = label.into();
-    let colour = {
-        let current = current.clone();
-        move || {
-            if current() {
-                tokens::palette().ink
-            } else {
-                tokens::palette().ink_rest
-            }
-        }
-    };
-    prims::press_feedback(
-        view()
-            .test_id(test_id)
-            .role(AccessibilityRole::Button)
-            .optional_label(Some(label.clone()))
-            .accessibility_state(move || AccessibilityState {
-                selected: current(),
-                ..AccessibilityState::default()
-            })
-            .selected_style(|| {
-                nsh_core::element::StyleRefinement::default()
-                    .text_color(tokens::palette().ink)
-                    .underline()
-                    .text_decoration_color(tokens::palette().ink)
-                    .text_decoration_thickness(px(SELECTION_UNDERLINE))
-            })
-            .window_drag(false)
-            .px(px(2.0))
-            .py(px(4.0))
-            .bg(Color::TRANSPARENT)
-            .cursor_pointer()
-            .rounded(px(0.0))
-            .group()
-            .on_press(move |_: &PressEvent| on_press()),
-    )
-    .child(
-        motion::ease_out(
-            text(label)
-                .font_family(FONT_UI)
-                .text_size(px(TYPE_UI))
-                .line_height(px(prims::UI_TEXT_BOX_H))
-                .text_color(colour)
-                .transition_colors()
-                .duration(move || duration.get()),
-        )
-        .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
-        .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
-    )
-}
-
-fn reactive_action(
-    test_id: &'static str,
-    label: impl Fn() -> SharedString + Clone + 'static,
-    enabled: impl Fn() -> bool + 'static,
-    on_press: impl Fn() + 'static,
-) -> impl Interactive + ParentElement {
-    let duration = prims::press_color_duration();
-    view().bg(Color::TRANSPARENT).window_drag(false).child(
-        prims::press_feedback(
-            button()
-                .test_id(test_id)
-                .accessibility_label({
-                    let label = label.clone();
-                    move || Some(label())
-                })
-                .px(px(2.0))
-                .py(px(4.0))
-                .bg(Color::TRANSPARENT)
-                .cursor_pointer()
-                .rounded(px(0.0))
-                .disabled(move || !enabled())
-                .disabled_style(|style| style.opacity(0.45))
-                .group()
-                .on_press(on_press),
-        )
-        .child(
-            motion::ease_out(
-                text(label)
-                    .font_family(FONT_UI)
-                    .text_size(px(TYPE_UI))
-                    .line_height(px(TYPE_UI_LINE))
-                    .h(px(prims::UI_TEXT_BOX_H))
-                    .text_color(move || tokens::palette().ink_rest)
-                    .transition_colors()
-                    .duration(move || duration.get()),
-            )
-            .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
-            .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
-        ),
-    )
 }
 
 /// The settings page's own copy. New strings live here rather than in
@@ -1259,6 +1175,7 @@ mod tests {
         },
     };
 
+    use crate::ui::motion;
     use mt_core::credentials::{CredentialError, Secret, SecureCredentialStore};
 
     /// One choice, current, and a line that counts the presses it hears.
@@ -1267,10 +1184,14 @@ mod tests {
         let presses = signal(0u32);
         view()
             .flex_col()
-            .child(choice_button(
+            .child(prims::action(
                 "harness-choice",
                 "Light",
-                || true,
+                prims::ActionTone::Quiet,
+                prims::ActionOptions {
+                    chosen: Some((|| true).into_reactive()),
+                    ..Default::default()
+                },
                 move || presses.update(|n| *n += 1),
             ))
             .child(view().test_id("harness-presses").child(prims::ink(move || {
@@ -1292,7 +1213,16 @@ mod tests {
                     view()
                         .flex_col()
                         .child(prims::quiet_action("probe-quiet", "Quiet", || {}))
-                        .child(choice_button("probe-choice", "Choice", || true, || {}))
+                        .child(prims::action(
+                            "probe-choice",
+                            "Choice",
+                            prims::ActionTone::Quiet,
+                            prims::ActionOptions {
+                                chosen: Some((|| true).into_reactive()),
+                                ..Default::default()
+                            },
+                            || {},
+                        ))
                         .into_element()
                 },
             ))
