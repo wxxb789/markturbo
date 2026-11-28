@@ -378,31 +378,21 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > MAX_WALK_DEPTH {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = crate::workspace::walk::entries(dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        // A symlinked directory is not followed. `file_type` does not traverse
+    for entry in entries {
+        // A symlinked directory is not followed: `file_type` does not traverse
         // the link, so a symlink reports `is_dir() == false` and simply falls
         // through to the file arm below, where `DocType::of` rejects it unless
         // it happens to look like a document — at which point it is one path,
         // not a subtree. That is what bounds a junction pointing at an
         // ancestor, which would otherwise be walked to the depth cap on every
         // branch.
-        if file_type.is_dir() {
-            if crate::workspace::walk::is_noise_dir(name) {
-                continue;
-            }
-            walk(&path, depth + 1, out);
-        } else if DocType::of(&path).is_document() {
-            out.push(path);
+        if entry.descends() {
+            walk(&entry.path, depth + 1, out);
+        } else if !entry.file_type.is_dir() && DocType::of(&entry.path).is_document() {
+            out.push(entry.path);
         }
     }
 }

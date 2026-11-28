@@ -23,17 +23,10 @@ use encoding_rs::{Encoding, UTF_8};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-mod commit;
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+use crate::fs_primitives::{O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, open_at};
 
-#[cfg(all(test, windows))]
-use self::commit::install_save_reservation_hook;
-#[cfg(all(test, unix, any(target_os = "linux", target_os = "macos")))]
-use self::commit::{
-    force_skill_exchange_unsupported, install_skill_before_cleanup_hook,
-    install_skill_before_exchange_hook,
-};
-#[cfg(test)]
-use self::commit::{install_save_commit_hook, install_save_post_commit_hook};
+mod commit;
 
 /// Stable identity for one filesystem object.
 ///
@@ -153,7 +146,7 @@ fn read_snapshot_once(path: &Path) -> std::io::Result<Option<FileSnapshot>> {
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.read_to_end(&mut bytes)?;
     #[cfg(test)]
-    run_read_race_hook();
+    crate::test_faults::fire(&crate::test_faults::READ_RACE, ());
     let stamp = FileStamp::from_bytes(&metadata, &bytes, object_id);
 
     // An in-place overwrite keeps the object, the length and the modification
@@ -166,7 +159,7 @@ fn read_snapshot_once(path: &Path) -> std::io::Result<Option<FileSnapshot>> {
         return Ok(None);
     }
     #[cfg(test)]
-    run_read_reread_hook();
+    crate::test_faults::fire(&crate::test_faults::READ_REREAD, ());
 
     // The read handle is still open, which is exactly the state another
     // editor's rename-over must survive. The path check comes after the last
@@ -245,12 +238,7 @@ fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
     // anything that is not a regular file, and the flag is cleared before the
     // read.
     // SAFETY: `path` is a NUL-terminated path string.
-    let descriptor = unsafe {
-        open(
-            path.as_ptr(),
-            UNIX_O_RDONLY | UNIX_O_NONBLOCK | UNIX_O_CLOEXEC,
-        )
-    };
+    let descriptor = unsafe { open(path.as_ptr(), UNIX_O_RDONLY | O_NONBLOCK | O_CLOEXEC) };
     if descriptor < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -265,7 +253,7 @@ fn open_snapshot_file(path: &Path) -> std::io::Result<File> {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `file` owns a live descriptor and `flags` came from `F_GETFL`.
-    if unsafe { fcntl(file.as_raw_fd(), UNIX_F_SETFL, flags & !UNIX_O_NONBLOCK) } < 0 {
+    if unsafe { fcntl(file.as_raw_fd(), UNIX_F_SETFL, flags & !O_NONBLOCK) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
     Ok(file)
@@ -733,7 +721,7 @@ fn try_load_skill_source(path: &Path) -> Option<(FileSnapshot, SourceIdentity, S
 
     let mut entrypoint = open_skill_entrypoint(&root.directory, &canonical_root).ok()?;
     let before = entrypoint.metadata().ok()?;
-    if !opened_skill_entrypoint_is_regular(&before) {
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&before) {
         return None;
     }
     let entrypoint_identity = skill_object_identity(&entrypoint).ok()?;
@@ -741,9 +729,9 @@ fn try_load_skill_source(path: &Path) -> Option<(FileSnapshot, SourceIdentity, S
     let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
     entrypoint.read_to_end(&mut bytes).ok()?;
     #[cfg(test)]
-    run_read_race_hook();
+    crate::test_faults::fire(&crate::test_faults::READ_RACE, ());
     let after = entrypoint.metadata().ok()?;
-    if !opened_skill_entrypoint_is_regular(&after)
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&after)
         || before.len() != bytes.len() as u64
         || after.len() != bytes.len() as u64
         || before.modified().ok() != after.modified().ok()
@@ -763,14 +751,14 @@ fn try_load_skill_source(path: &Path) -> Option<(FileSnapshot, SourceIdentity, S
         return None;
     }
     #[cfg(test)]
-    run_read_reread_hook();
+    crate::test_faults::fire(&crate::test_faults::READ_REREAD, ());
 
     // Prove the directory entry still names the file read through this root,
     // after the last content read: a replacement during the second read would
     // otherwise pass it because this handle kept returning the old bytes.
     let reopened = open_skill_entrypoint(&root.directory, &canonical_root).ok()?;
     let reopened_metadata = reopened.metadata().ok()?;
-    if !opened_skill_entrypoint_is_regular(&reopened_metadata)
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&reopened_metadata)
         || skill_object_identity(&reopened).ok()? != entrypoint_identity
         || reopened_metadata.len() != after.len()
         || reopened_metadata.modified().ok() != after.modified().ok()
@@ -847,18 +835,9 @@ fn open_skill_directory_for_save(path: &Path) -> std::io::Result<File> {
 
 #[cfg(windows)]
 fn open_skill_directory_with_share(path: &Path, share_mode: u32) -> std::io::Result<File> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
-
-    let directory = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(share_mode)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)?;
+    let directory = crate::fs_primitives::open_directory_no_follow(path, share_mode)?;
     let metadata = directory.metadata()?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    if !crate::fs_primitives::opened_metadata_is_regular_directory(&metadata) {
         return Err(skill_source_changed_error());
     }
     Ok(directory)
@@ -918,9 +897,8 @@ fn open_canonical_skill_directory_with(
 
 #[cfg(windows)]
 fn open_skill_entrypoint(root: &File, canonical_root: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
     use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let _ = root;
@@ -928,72 +906,10 @@ fn open_skill_entrypoint(root: &File, canonical_root: &Path) -> std::io::Result<
     // save of `SKILL.md` fail while it was read; the entrypoint identity and
     // the directory-entry re-check in `try_load_skill_source` still prove the
     // bytes came from this package.
-    std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(canonical_root.join("SKILL.md"))
-}
-
-#[cfg(windows)]
-fn opened_skill_entrypoint_is_regular(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
-}
-
-// `OpenOptionsExt::custom_flags` exposes raw fcntl flags but std has no named
-// constants; these values are the Linux and Darwin `<fcntl.h>` definitions.
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_O_NOFOLLOW: i32 = if cfg!(target_os = "linux") {
-    0o400000
-} else {
-    0x100
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_O_DIRECTORY: i32 = if cfg!(target_os = "linux") {
-    0o200000
-} else {
-    0x100000
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_O_CLOEXEC: i32 = if cfg!(target_os = "linux") {
-    0o2000000
-} else {
-    0x1000000
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_O_NONBLOCK: i32 = if cfg!(target_os = "linux") {
-    0o4000
-} else {
-    0x4
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn openat_skill_file(parent: &File, name: &std::ffi::OsStr, flags: i32) -> std::io::Result<File> {
-    use std::ffi::{CString, c_char, c_int};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::ffi::OsStrExt as _;
-
-    unsafe extern "C" {
-        fn openat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
-    }
-
-    let name = CString::new(name.as_bytes()).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in Agent Skill path")
-    })?;
-    // SAFETY: `parent` owns a live directory descriptor and `name` is a
-    // NUL-terminated single path component.
-    let descriptor = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `openat` returned a new owned descriptor.
-    Ok(unsafe { File::from_raw_fd(descriptor) })
+    crate::fs_primitives::open_entry_no_follow(
+        &canonical_root.join("SKILL.md"),
+        (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+    )
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
@@ -1002,7 +918,7 @@ fn open_lexical_skill_directory(path: &Path) -> std::io::Result<File> {
 
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(UNIX_O_NOFOLLOW | UNIX_O_DIRECTORY)
+        .custom_flags(O_NOFOLLOW | O_DIRECTORY)
         .open(path)
 }
 
@@ -1018,18 +934,14 @@ fn open_canonical_skill_directory(path: &Path) -> std::io::Result<OpenedSkillDir
     }
     let mut directory = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(UNIX_O_NOFOLLOW | UNIX_O_DIRECTORY)
+        .custom_flags(O_NOFOLLOW | O_DIRECTORY)
         .open(Path::new("/"))?;
     let mut guards = Vec::new();
     for component in path.components() {
         match component {
             std::path::Component::RootDir | std::path::Component::CurDir => {}
             std::path::Component::Normal(name) => {
-                let next = openat_skill_file(
-                    &directory,
-                    name,
-                    UNIX_O_NOFOLLOW | UNIX_O_DIRECTORY | UNIX_O_CLOEXEC,
-                )?;
+                let next = open_at(&directory, name, O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)?;
                 if !next.metadata()?.is_dir() {
                     return Err(skill_source_changed_error());
                 }
@@ -1049,16 +961,11 @@ fn open_canonical_skill_directory(path: &Path) -> std::io::Result<OpenedSkillDir
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
 fn open_skill_entrypoint(root: &File, _canonical_root: &Path) -> std::io::Result<File> {
-    openat_skill_file(
+    open_at(
         root,
         std::ffi::OsStr::new("SKILL.md"),
-        UNIX_O_NOFOLLOW | UNIX_O_NONBLOCK | UNIX_O_CLOEXEC,
+        O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
     )
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn opened_skill_entrypoint_is_regular(metadata: &std::fs::Metadata) -> bool {
-    metadata.is_file()
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -1085,11 +992,6 @@ fn open_skill_entrypoint(_: &File, _: &Path) -> std::io::Result<File> {
     ))
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn opened_skill_entrypoint_is_regular(_: &std::fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(not(any(windows, unix)))]
 fn open_lexical_skill_directory(_: &Path) -> std::io::Result<File> {
     Err(std::io::Error::new(
@@ -1114,24 +1016,14 @@ fn open_skill_entrypoint(_: &File, _: &Path) -> std::io::Result<File> {
     ))
 }
 
-#[cfg(not(any(windows, unix)))]
-fn opened_skill_entrypoint_is_regular(_: &std::fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(windows)]
 fn open_source_entry_guard(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
     // FILE_FLAG_OPEN_REPARSE_POINT opens the final entry itself. Sharing only
     // reads prevents DeleteFile/rename or a reparse-data write until this guard
     // drops, while allowing ordinary readers.
-    std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ.0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)
+    crate::fs_primitives::open_entry_no_follow(path, FILE_SHARE_READ.0)
 }
 
 /// Check whether a recovery record still describes the source on disk.
@@ -1171,7 +1063,7 @@ pub fn recovery_source_matches(
     let matches =
         loaded.stamp == *expected_stamp && loaded.source_identity == *expected_source_identity;
     #[cfg(all(test, windows))]
-    run_recovery_source_match_hook();
+    crate::test_faults::fire(&crate::test_faults::RECOVERY_SOURCE_MATCH, ());
     Ok(matches)
 }
 
@@ -1515,7 +1407,7 @@ fn current_save_destination_with_root(
         let metadata = entrypoint
             .metadata()
             .map_err(|_| SaveError::SourceIdentityChanged)?;
-        if !opened_skill_entrypoint_is_regular(&metadata)
+        if !crate::fs_primitives::opened_metadata_is_regular_file(&metadata)
             || (require_loaded_entrypoint_identity
                 && skill_object_identity(&entrypoint)
                     .map_err(|_| SaveError::SourceIdentityChanged)?
@@ -1816,96 +1708,18 @@ fn stage(path: &Path, bytes: &[u8]) -> Result<tempfile::NamedTempFile, SaveError
     // A sibling temporary file keeps the eventual rename/replace atomic. The
     // randomized name avoids collisions between concurrent saves.
     let dir = path.parent().unwrap_or(Path::new("."));
-    let mut temp = tempfile::Builder::new()
-        .prefix(".markturbo-")
-        .tempfile_in(dir)
-        .map_err(SaveError::Io)?;
-    std::io::Write::write_all(&mut temp, bytes).map_err(SaveError::Io)?;
-    temp.as_file_mut().sync_all().map_err(SaveError::Io)?;
-    Ok(temp)
-}
-
-#[cfg(test)]
-thread_local! {
-    static READ_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
-        std::cell::RefCell::new(None)
-    };
-    static READ_REREAD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
-        std::cell::RefCell::new(None)
-    };
-    #[cfg(windows)]
-    static RECOVERY_SOURCE_MATCH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
-/// Run `hook` once, between a read and the verification that follows it, so a
-/// test can rename a file over the path while the snapshot is live.
-#[cfg(test)]
-fn install_read_race_hook(hook: impl FnOnce() + 'static) {
-    READ_RACE_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a read race hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(test)]
-fn run_read_race_hook() {
-    READ_RACE_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
-/// Run `hook` once, after the second content read and before the path check
-/// that follows it, so a test can replace the path inside that window.
-#[cfg(test)]
-fn install_read_reread_hook(hook: impl FnOnce() + 'static) {
-    READ_REREAD_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a read reread hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(test)]
-fn run_read_reread_hook() {
-    READ_REREAD_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
-}
-
-#[cfg(all(test, windows))]
-fn install_recovery_source_match_hook(hook: impl FnOnce() + 'static) {
-    RECOVERY_SOURCE_MATCH_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a recovery source match hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(all(test, windows))]
-fn run_recovery_source_match_hook() {
-    RECOVERY_SOURCE_MATCH_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
+    let mut staged =
+        crate::atomic_file::StagedFile::create_in(dir, ".markturbo-", "").map_err(SaveError::Io)?;
+    staged.write_all(bytes).map_err(SaveError::Io)?;
+    staged.sync_all().map_err(SaveError::Io)?;
+    Ok(staged.into_tempfile())
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
+
+    use crate::test_faults as faults;
 
     use super::*;
 
@@ -1926,7 +1740,7 @@ mod tests {
         let recorded = outcome.clone();
         let target = target.to_path_buf();
         let replacement = replacement.to_path_buf();
-        install_read_race_hook(move || {
+        faults::install(&faults::READ_RACE, move |()| {
             *recorded.borrow_mut() = Some(std::fs::rename(&replacement, &target));
         });
         outcome
@@ -1984,7 +1798,7 @@ mod tests {
         let recorded = outcome.clone();
         let target = target.to_path_buf();
         let replacement = replacement.to_path_buf();
-        install_read_reread_hook(move || {
+        faults::install(&faults::READ_REREAD, move |()| {
             *recorded.borrow_mut() = Some(std::fs::rename(&replacement, &target));
         });
         outcome
@@ -2065,7 +1879,7 @@ mod tests {
         let path = path.to_path_buf();
         let bytes = bytes.to_vec();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        install_read_race_hook(move || {
+        faults::install(&faults::READ_RACE, move |()| {
             let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.write_all(&bytes).unwrap();
             file.set_times(std::fs::FileTimes::new().set_modified(modified))
@@ -2252,7 +2066,7 @@ mod tests {
         let retained_tree = directory.path().join("retained-original");
         let retained_tree_for_hook = retained_tree.clone();
         let late_writer_for_hook = late_writer.clone();
-        install_save_post_commit_hook(move || {
+        faults::install(&faults::SAVE_POST_COMMIT, move |()| {
             std::fs::rename(&original_tree_for_hook, &retained_tree_for_hook).unwrap();
             std::fs::rename(&alternate_tree_for_hook, &original_tree_for_hook).unwrap();
             std::fs::rename(
@@ -2303,7 +2117,7 @@ mod tests {
         let identical = write_file(external.path(), "same.md", b"same source\n");
         let loaded = load(&skill).unwrap();
         let skill_for_hook = skill.clone();
-        install_save_commit_hook(move || {
+        faults::install(&faults::SAVE_COMMIT, move |()| {
             std::fs::remove_file(&skill_for_hook).unwrap();
             std::fs::hard_link(&identical, &skill_for_hook).unwrap();
         });
@@ -2342,8 +2156,8 @@ mod tests {
         let external_for_hook = external.clone();
         let editor_identity = std::rc::Rc::new(std::cell::Cell::new(None));
         let editor_identity_for_hook = editor_identity.clone();
-        install_skill_before_exchange_hook(move |_, staged_path| {
-            let staged = std::fs::File::open(staged_path).unwrap();
+        faults::install(&faults::SKILL_BEFORE_EXCHANGE, move |(_, staged_path)| {
+            let staged = std::fs::File::open(&staged_path).unwrap();
             editor_identity_for_hook.set(Some(skill_object_identity(&staged).unwrap()));
             std::fs::rename(&external_for_hook, &skill_for_hook).unwrap();
         });
@@ -2375,7 +2189,7 @@ mod tests {
         let skill = write_file(directory.path(), "SKILL.md", b"loaded version\n");
         let loaded = load(&skill).unwrap();
         let skill_for_hook = skill.clone();
-        install_skill_before_exchange_hook(move |_, _| {
+        faults::install(&faults::SKILL_BEFORE_EXCHANGE, move |(_, _)| {
             std::fs::write(&skill_for_hook, b"concurrent in-place version\n").unwrap();
         });
 
@@ -2408,11 +2222,11 @@ mod tests {
         let editor_identity = std::rc::Rc::new(std::cell::Cell::new(None));
         let editor_identity_for_hook = editor_identity.clone();
         let substitute_for_hook = staged_substitute.clone();
-        install_skill_before_exchange_hook(move |_, staged_path| {
-            let staged = std::fs::File::open(staged_path).unwrap();
+        faults::install(&faults::SKILL_BEFORE_EXCHANGE, move |(_, staged_path)| {
+            let staged = std::fs::File::open(&staged_path).unwrap();
             editor_identity_for_hook.set(Some(skill_object_identity(&staged).unwrap()));
-            std::fs::rename(staged_path, &substitute_for_hook).unwrap();
-            std::fs::write(staged_path, b"substituted staged name\n").unwrap();
+            std::fs::rename(&staged_path, &substitute_for_hook).unwrap();
+            std::fs::write(&staged_path, b"substituted staged name\n").unwrap();
         });
 
         let error =
@@ -2437,7 +2251,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let skill = write_file(directory.path(), "SKILL.md", b"loaded version\n");
         let loaded = load(&skill).unwrap();
-        force_skill_exchange_unsupported();
+        faults::force_skill_exchange_unsupported();
 
         let error =
             save_with(&loaded, "editor version\n", &SaveAuthorization::normal()).unwrap_err();
@@ -2466,7 +2280,7 @@ mod tests {
             .authorize_missing_recreation(&loaded)
             .unwrap();
         let skill_for_hook = skill.clone();
-        install_skill_before_exchange_hook(move |_, _| {
+        faults::install(&faults::SKILL_BEFORE_EXCHANGE, move |(_, _)| {
             std::fs::write(&skill_for_hook, b"concurrent creator\n").unwrap();
         });
 
@@ -2494,7 +2308,7 @@ mod tests {
         let external = write_file(external_directory.path(), "writer.md", b"late writer\n");
         let skill_for_hook = skill.clone();
         let external_for_hook = external.clone();
-        install_save_post_commit_hook(move || {
+        faults::install(&faults::SAVE_POST_COMMIT, move |()| {
             std::fs::rename(&external_for_hook, &skill_for_hook).unwrap();
         });
         let loaded = load(&skill).unwrap();
@@ -2528,7 +2342,7 @@ mod tests {
         );
         let external_for_hook = external.clone();
         let skill_parent_for_hook = directory.path().to_path_buf();
-        install_skill_before_cleanup_hook(move |_| {
+        faults::install(&faults::SKILL_BEFORE_CLEANUP, move |_| {
             std::fs::rename(&external_for_hook, skill_parent_for_hook.join("SKILL.md")).unwrap();
         });
         let loaded = load(&skill).unwrap();
@@ -2633,7 +2447,7 @@ mod tests {
         let retarget_failure = std::rc::Rc::new(std::cell::RefCell::new(None));
         let retarget_failure_for_hook = retarget_failure.clone();
         let guarded_link = link.clone();
-        install_recovery_source_match_hook(move || {
+        faults::install(&faults::RECOVERY_SOURCE_MATCH, move |()| {
             let error = std::fs::remove_file(&guarded_link)
                 .expect_err("the live recovery guard must reject a retarget");
             *retarget_failure_for_hook.borrow_mut() = Some(error.kind());
@@ -2774,7 +2588,9 @@ mod tests {
         let external = b"newer external writer\n";
         let editor = "my exact editor text\n";
         let rewritten_path = path.clone();
-        install_save_commit_hook(move || std::fs::write(rewritten_path, external).unwrap());
+        faults::install(&faults::SAVE_COMMIT, move |()| {
+            std::fs::write(rewritten_path, external).unwrap()
+        });
 
         let error = save(&file, editor, true).unwrap_err();
         assert!(matches!(error, SaveError::Conflict));
@@ -2795,7 +2611,7 @@ mod tests {
         let path = write_file(dir.path(), "a.md", b"original\n");
         let file = load(&path).unwrap();
         let replaced_path = path.clone();
-        install_save_post_commit_hook(move || {
+        faults::install(&faults::SAVE_POST_COMMIT, move |()| {
             let aside = replaced_path.with_extension("committed-by-markturbo");
             std::fs::rename(&replaced_path, aside).unwrap();
             std::fs::write(&replaced_path, b"external after commit\n").unwrap();
@@ -2836,7 +2652,7 @@ mod tests {
         let retarget_failure = std::rc::Rc::new(std::cell::RefCell::new(None));
         #[cfg(windows)]
         let retarget_failure_for_hook = retarget_failure.clone();
-        install_save_post_commit_hook(move || {
+        faults::install(&faults::SAVE_POST_COMMIT, move |()| {
             #[cfg(windows)]
             {
                 let error = std::fs::remove_file(&retargeted_link)
@@ -2913,7 +2729,7 @@ mod tests {
 
         let file = load(&link).unwrap();
         let retargeted_link = link.clone();
-        install_save_commit_hook(move || {
+        faults::install(&faults::SAVE_COMMIT, move |()| {
             std::fs::remove_file(&retargeted_link).unwrap();
             #[cfg(target_os = "windows")]
             std::os::windows::fs::symlink_file(&alternate, &retargeted_link).unwrap();
@@ -2933,7 +2749,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_file(dir.path(), "a.md", b"original\n");
         let file = load(&path).unwrap();
-        install_save_reservation_hook(|_| {
+        faults::install(&faults::SAVE_RESERVATION, |_| {
             Err(std::io::Error::other(
                 "injected placeholder deletion failure",
             ))
@@ -3184,7 +3000,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_file(dir.path(), "existing.md", b"confirmed version\n");
         let external_path = path.clone();
-        install_save_commit_hook(move || {
+        faults::install(&faults::SAVE_COMMIT, move |()| {
             std::fs::write(external_path, b"later external version\n").unwrap();
         });
 
@@ -3199,7 +3015,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.md");
         let external_path = path.clone();
-        install_save_commit_hook(move || {
+        faults::install(&faults::SAVE_COMMIT, move |()| {
             std::fs::write(external_path, b"external version\n").unwrap();
         });
 
@@ -3230,7 +3046,7 @@ mod tests {
         let retarget_failure = std::rc::Rc::new(std::cell::RefCell::new(None));
         #[cfg(windows)]
         let retarget_failure_for_hook = retarget_failure.clone();
-        install_save_post_commit_hook(move || {
+        faults::install(&faults::SAVE_POST_COMMIT, move |()| {
             #[cfg(windows)]
             {
                 let error = std::fs::remove_file(&retargeted_link)
@@ -3619,7 +3435,9 @@ mod tests {
             .authorize_missing_recreation(&file)
             .unwrap();
         let reappeared_path = path.clone();
-        install_save_commit_hook(move || std::fs::write(reappeared_path, "external\n").unwrap());
+        faults::install(&faults::SAVE_COMMIT, move |()| {
+            std::fs::write(reappeared_path, "external\n").unwrap()
+        });
 
         let error = save_with(&file, "my edit\n", &recreate).unwrap_err();
 

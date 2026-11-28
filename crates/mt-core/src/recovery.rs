@@ -6,8 +6,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt, fs,
-    io::{self, Write},
+    fmt, fs, io,
     path::{Path, PathBuf},
     process,
     sync::{
@@ -16,9 +15,6 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-
-#[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::AtomicUsize;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -574,8 +570,8 @@ pub struct RecoveryStore {
     retirement_marker_lock: Arc<Mutex<()>>,
     #[cfg(windows)]
     root_guard: Option<Arc<ProductionRootGuard>>,
-    #[cfg(any(test, feature = "test-support"))]
-    failures: Arc<TestFailurePoints>,
+    #[cfg(test)]
+    failures: Arc<faults::TestFailurePoints>,
     #[cfg(test)]
     test_worker_limit: Option<usize>,
 }
@@ -591,64 +587,6 @@ struct ProductionRootGuard {
     object_id: FileObjectId,
     _directory: fs::File,
     _lease: fs::File,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Default)]
-struct TestFailurePoints {
-    persist: AtomicBool,
-    #[cfg(test)]
-    retirement_marker_sync: AtomicBool,
-    #[cfg(test)]
-    rename: AtomicBool,
-    delete: AtomicBool,
-    #[cfg(test)]
-    presence: Mutex<Option<PathBuf>>,
-    retention_scans: AtomicUsize,
-    checkpoint_batches: AtomicUsize,
-    #[cfg(test)]
-    after_checkpoint_prepare: Mutex<Option<TestPause>>,
-    after_checkpoint_final_check: Mutex<Option<TestPause>>,
-    #[cfg(test)]
-    after_retirement_marker: Mutex<Option<TestPause>>,
-    #[cfg(test)]
-    before_transaction_journal: Mutex<Option<TestPause>>,
-    #[cfg(test)]
-    after_transaction_journal: Mutex<Option<TestPause>>,
-    after_eviction_reservation: Mutex<Option<TestPause>>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-struct TestPause {
-    started: std::sync::mpsc::Sender<()>,
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
-}
-
-#[cfg(all(test, windows))]
-thread_local! {
-    static ROOT_ACQUISITION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
-#[cfg(all(test, windows))]
-fn set_root_acquisition_hook(hook: impl FnOnce() + 'static) {
-    ROOT_ACQUISITION_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a recovery root acquisition hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(all(test, windows))]
-fn run_root_acquisition_hook() {
-    ROOT_ACQUISITION_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
 }
 
 #[derive(Default)]
@@ -732,14 +670,11 @@ impl PendingCleanup {
 #[cfg(windows)]
 impl ProductionRootGuard {
     fn acquire(root: &Path) -> Result<Self, RecoveryError> {
-        use std::os::windows::fs::MetadataExt as _;
-        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
         let directory = open_root_guard_handle(root)?;
         #[cfg(all(test, windows))]
-        run_root_acquisition_hook();
+        crate::test_faults::fire(&crate::test_faults::ROOT_ACQUISITION, ());
         let metadata = directory.metadata()?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        if crate::fs_primitives::opened_metadata_is_reparse(&metadata) {
             return Err(RecoveryError::Unavailable(
                 "recovery root must not be a reparse point",
             ));
@@ -751,7 +686,7 @@ impl ProductionRootGuard {
         ensure_local_canonical_production_root(&canonical_root)?;
         let canonical_directory = open_root_guard_handle(&canonical_root)?;
         let canonical_metadata = canonical_directory.metadata()?;
-        if canonical_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        if crate::fs_primitives::opened_metadata_is_reparse(&canonical_metadata) {
             return Err(RecoveryError::Unavailable(
                 "recovery root must not be a reparse point",
             ));
@@ -774,12 +709,9 @@ impl ProductionRootGuard {
     }
 
     fn verify(&self) -> Result<(), RecoveryError> {
-        use std::os::windows::fs::MetadataExt as _;
-        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
         let current = open_root_guard_handle(&self.canonical_root)?;
         let metadata = current.metadata()?;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        if crate::fs_primitives::opened_metadata_is_reparse(&metadata) {
             return Err(RecoveryError::Unavailable(
                 "recovery root changed while recovery was active",
             ));
@@ -934,24 +866,16 @@ fn is_local_recovery_drive_type(drive_type: u32) -> bool {
 
 #[cfg(windows)]
 fn open_root_guard_handle(root: &Path) -> io::Result<fs::File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
+    use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
-    std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
-        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
-        .open(root)
+    crate::fs_primitives::open_directory_no_follow(root, (FILE_SHARE_READ | FILE_SHARE_WRITE).0)
 }
 
 #[cfg(windows)]
 fn open_recovery_lease(root: &Path) -> Result<fs::File, RecoveryError> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::fs::OpenOptionsExt as _;
     use windows::Win32::{
-        Foundation::ERROR_SHARING_VIOLATION,
-        Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT},
+        Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
     };
 
     let lease = std::fs::OpenOptions::new()
@@ -970,7 +894,7 @@ fn open_recovery_lease(root: &Path) -> Result<fs::File, RecoveryError> {
                 RecoveryError::Io(error)
             }
         })?;
-    if lease.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    if crate::fs_primitives::opened_metadata_is_reparse(&lease.metadata()?) {
         return Err(RecoveryError::Unavailable(
             "recovery lease must not be a reparse point",
         ));
@@ -1067,8 +991,8 @@ impl RecoveryStore {
             retirement_marker_lock: Arc::new(Mutex::new(())),
             #[cfg(windows)]
             root_guard: None,
-            #[cfg(any(test, feature = "test-support"))]
-            failures: Arc::new(TestFailurePoints::default()),
+            #[cfg(test)]
+            failures: Arc::new(faults::TestFailurePoints::default()),
             #[cfg(test)]
             test_worker_limit: None,
         }
@@ -1182,10 +1106,6 @@ impl RecoveryStore {
         attempts: impl IntoIterator<Item = CancellableRecoveryCheckpointAttempt<'a>>,
         active_keys: &HashSet<RecoveryKey>,
     ) -> CheckpointBatchReceipt {
-        #[cfg(any(test, feature = "test-support"))]
-        self.failures
-            .checkpoint_batches
-            .fetch_add(1, Ordering::SeqCst);
         let attempts: Vec<_> = attempts.into_iter().collect();
         if attempts.is_empty() {
             return CheckpointBatchReceipt::default();
@@ -1838,7 +1758,7 @@ impl RecoveryStore {
             if recovery_cancelled(cancelled) {
                 return Ok(CheckpointWriteResult::Superseded);
             }
-            #[cfg(any(test, feature = "test-support"))]
+            #[cfg(test)]
             self.pause_once_for_test(&self.failures.after_checkpoint_final_check);
             self.persist_prepared_write(prepared, &target_path)
                 .map_err(CheckpointWriteError::Uncertain)?;
@@ -2050,7 +1970,7 @@ impl RecoveryStore {
                 .extend(scan.apply_pending_cleanup(cleanup));
             return Ok(CheckpointWriteResult::Deferred);
         }
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         self.pause_once_for_test(&self.failures.after_eviction_reservation);
 
         for entry in &transaction.staged {
@@ -2473,7 +2393,7 @@ impl RecoveryStore {
         replacement_keys: &HashSet<RecoveryKey>,
         marked_keys: &HashSet<RecoveryKey>,
     ) -> Result<ScanState, RecoveryError> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         self.failures.retention_scans.fetch_add(1, Ordering::SeqCst);
         self.scan_locked(
             now,
@@ -2490,7 +2410,7 @@ impl RecoveryStore {
         marked_keys: &HashSet<RecoveryKey>,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<CancellableScan, RecoveryError> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         self.failures.retention_scans.fetch_add(1, Ordering::SeqCst);
         self.scan_locked_cancellable(
             now,
@@ -2687,12 +2607,11 @@ impl RecoveryStore {
     fn prepare_atomic_write(
         &self,
         ciphertext: &[u8],
-    ) -> Result<tempfile::NamedTempFile, RecoveryError> {
-        let mut temp = tempfile::Builder::new()
-            .prefix(".markturbo-recovery-")
-            .tempfile_in(&self.root)?;
+    ) -> Result<crate::atomic_file::StagedFile, RecoveryError> {
+        let mut temp =
+            crate::atomic_file::StagedFile::create_in(&self.root, ".markturbo-recovery-", "")?;
         temp.write_all(ciphertext)?;
-        temp.as_file_mut().sync_all()?;
+        temp.sync_all()?;
         Ok(temp)
     }
 
@@ -2726,32 +2645,28 @@ impl RecoveryStore {
 
     fn persist_prepared_write(
         &self,
-        temp: tempfile::NamedTempFile,
+        temp: crate::atomic_file::StagedFile,
         path: &Path,
     ) -> Result<(), RecoveryError> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         if self.failures.persist.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("injected recovery checkpoint persist failure").into());
         }
-        let file = temp
-            .persist(path)
-            .map_err(|error| RecoveryError::Io(error.error))?;
+        let file = temp.persist(path).map_err(RecoveryError::Io)?;
         file.sync_all()?;
         Ok(())
     }
 
     fn persist_prepared_write_noclobber(
         &self,
-        temp: tempfile::NamedTempFile,
+        temp: crate::atomic_file::StagedFile,
         path: &Path,
     ) -> Result<(), RecoveryError> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         if self.failures.persist.swap(false, Ordering::SeqCst) {
             return Err(io::Error::other("injected recovery checkpoint persist failure").into());
         }
-        let file = temp
-            .persist_noclobber(path)
-            .map_err(|error| RecoveryError::Io(error.error))?;
+        let file = temp.persist_noclobber(path).map_err(RecoveryError::Io)?;
         #[cfg(test)]
         if self
             .failures
@@ -2775,7 +2690,7 @@ impl RecoveryStore {
     }
 
     fn remove_path(&self, path: &Path) -> io::Result<()> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(test)]
         if self.failures.delete.load(Ordering::SeqCst)
             && self.path_is_present(path)?
             && self.failures.delete.swap(false, Ordering::SeqCst)
@@ -2804,126 +2719,6 @@ impl RecoveryStore {
         }
     }
 
-    #[cfg(test)]
-    fn atomic_write(&self, path: &Path, ciphertext: &[u8]) -> Result<(), RecoveryError> {
-        let temp = self.prepare_atomic_write(ciphertext)?;
-        self.persist_prepared_write(temp, path)
-    }
-
-    #[cfg(test)]
-    fn fail_next_retirement_marker_sync_for_test(&self) {
-        self.failures
-            .retirement_marker_sync
-            .store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn fail_next_persist_for_test(&self) {
-        self.failures.persist.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_next_rename_for_test(&self) {
-        self.failures.rename.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn fail_next_delete_for_test(&self) {
-        self.failures.delete.store(true, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn fail_next_presence_for_test(&self, path: PathBuf) {
-        *self.failures.presence.lock().unwrap() = Some(path);
-    }
-
-    #[cfg(test)]
-    fn pause_after_checkpoint_prepare_for_test(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        self.install_test_pause(&self.failures.after_checkpoint_prepare)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn pause_after_checkpoint_final_check_for_test(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        self.install_test_pause(&self.failures.after_checkpoint_final_check)
-    }
-
-    #[cfg(test)]
-    fn pause_after_retirement_marker_for_test(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        self.install_test_pause(&self.failures.after_retirement_marker)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pause_before_transaction_journal_for_test(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        self.install_test_pause(&self.failures.before_transaction_journal)
-    }
-
-    #[cfg(test)]
-    fn pause_after_transaction_journal_for_test(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        self.install_test_pause(&self.failures.after_transaction_journal)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn pause_after_eviction_reservation_for_test(
-        &self,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        self.install_test_pause(&self.failures.after_eviction_reservation)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn install_test_pause(
-        &self,
-        slot: &Mutex<Option<TestPause>>,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        let (started_sender, started_receiver) = std::sync::mpsc::channel();
-        let (release_sender, release_receiver) = std::sync::mpsc::channel();
-        let mut slot = slot.lock().unwrap();
-        assert!(slot.is_none(), "a recovery test pause is already installed");
-        *slot = Some(TestPause {
-            started: started_sender,
-            release: Mutex::new(release_receiver),
-        });
-        (started_receiver, release_sender)
-    }
-
-    #[cfg(test)]
-    fn pause_checkpoint_write_for_test(&self, slot: &Mutex<Option<TestPause>>) {
-        let slot = slot.lock().unwrap();
-        let Some(pause) = slot.as_ref() else {
-            return;
-        };
-        pause.started.send(()).unwrap();
-        pause.release.lock().unwrap().recv().unwrap();
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    fn pause_once_for_test(&self, slot: &Mutex<Option<TestPause>>) {
-        let Some(pause) = slot.lock().unwrap().take() else {
-            return;
-        };
-        pause.started.send(()).unwrap();
-        pause.release.lock().unwrap().recv().unwrap();
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn retention_scan_count_for_test(&self) -> usize {
-        self.failures.retention_scans.load(Ordering::SeqCst)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn checkpoint_batch_count_for_test(&self) -> usize {
-        self.failures.checkpoint_batches.load(Ordering::SeqCst)
-    }
-
     fn record_path(&self, key: &RecoveryKey) -> PathBuf {
         self.root
             .join(format!("{}.{}", key.as_str(), RECORD_EXTENSION))
@@ -2938,11 +2733,6 @@ impl RecoveryStore {
         }
         self.root
             .join(format!("{RETIREMENT_MARKER_PREFIX}{:x}", hasher.finalize()))
-    }
-
-    #[cfg(test)]
-    fn retirement_marker_path_for_key(&self, key: &RecoveryKey) -> PathBuf {
-        self.retirement_marker_path(std::slice::from_ref(key))
     }
 
     fn transaction_journal_path(&self) -> PathBuf {
@@ -4179,10 +3969,152 @@ impl CheckpointSchedule {
     }
 }
 
+/// Fault injection for the recovery tests.
+///
+/// Only a child module may name the store's private fields, and the whole
+/// surface is compiled only for `cfg(test)`; a production build has neither
+/// the failure points nor the branches that consult them.
+#[cfg(test)]
+mod faults {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    #[derive(Default)]
+    pub(super) struct TestFailurePoints {
+        pub(super) persist: AtomicBool,
+        pub(super) retirement_marker_sync: AtomicBool,
+        pub(super) rename: AtomicBool,
+        pub(super) delete: AtomicBool,
+        pub(super) presence: Mutex<Option<PathBuf>>,
+        pub(super) retention_scans: AtomicUsize,
+        pub(super) after_checkpoint_prepare: Mutex<Option<TestPause>>,
+        pub(super) after_checkpoint_final_check: Mutex<Option<TestPause>>,
+        pub(super) after_retirement_marker: Mutex<Option<TestPause>>,
+        pub(super) before_transaction_journal: Mutex<Option<TestPause>>,
+        pub(super) after_transaction_journal: Mutex<Option<TestPause>>,
+        pub(super) after_eviction_reservation: Mutex<Option<TestPause>>,
+    }
+
+    pub(super) struct TestPause {
+        pub(super) started: std::sync::mpsc::Sender<()>,
+        pub(super) release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl RecoveryStore {
+        pub(super) fn atomic_write(
+            &self,
+            path: &Path,
+            ciphertext: &[u8],
+        ) -> Result<(), RecoveryError> {
+            let temp = self.prepare_atomic_write(ciphertext)?;
+            self.persist_prepared_write(temp, path)
+        }
+
+        pub(super) fn fail_next_retirement_marker_sync_for_test(&self) {
+            self.failures
+                .retirement_marker_sync
+                .store(true, Ordering::SeqCst);
+        }
+
+        pub(super) fn fail_next_persist_for_test(&self) {
+            self.failures.persist.store(true, Ordering::SeqCst);
+        }
+
+        pub(super) fn fail_next_rename_for_test(&self) {
+            self.failures.rename.store(true, Ordering::SeqCst);
+        }
+
+        pub(super) fn fail_next_delete_for_test(&self) {
+            self.failures.delete.store(true, Ordering::SeqCst);
+        }
+
+        pub(super) fn fail_next_presence_for_test(&self, path: PathBuf) {
+            *self.failures.presence.lock().unwrap() = Some(path);
+        }
+
+        pub(super) fn pause_after_checkpoint_prepare_for_test(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            self.install_test_pause(&self.failures.after_checkpoint_prepare)
+        }
+
+        pub(super) fn pause_after_checkpoint_final_check_for_test(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            self.install_test_pause(&self.failures.after_checkpoint_final_check)
+        }
+
+        pub(super) fn pause_after_retirement_marker_for_test(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            self.install_test_pause(&self.failures.after_retirement_marker)
+        }
+
+        pub(super) fn pause_before_transaction_journal_for_test(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            self.install_test_pause(&self.failures.before_transaction_journal)
+        }
+
+        pub(super) fn pause_after_transaction_journal_for_test(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            self.install_test_pause(&self.failures.after_transaction_journal)
+        }
+
+        pub(super) fn pause_after_eviction_reservation_for_test(
+            &self,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            self.install_test_pause(&self.failures.after_eviction_reservation)
+        }
+
+        pub(super) fn install_test_pause(
+            &self,
+            slot: &Mutex<Option<TestPause>>,
+        ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+            let (started_sender, started_receiver) = std::sync::mpsc::channel();
+            let (release_sender, release_receiver) = std::sync::mpsc::channel();
+            let mut slot = slot.lock().unwrap();
+            assert!(slot.is_none(), "a recovery test pause is already installed");
+            *slot = Some(TestPause {
+                started: started_sender,
+                release: Mutex::new(release_receiver),
+            });
+            (started_receiver, release_sender)
+        }
+
+        pub(super) fn pause_checkpoint_write_for_test(&self, slot: &Mutex<Option<TestPause>>) {
+            let slot = slot.lock().unwrap();
+            let Some(pause) = slot.as_ref() else {
+                return;
+            };
+            pause.started.send(()).unwrap();
+            pause.release.lock().unwrap().recv().unwrap();
+        }
+
+        pub(super) fn pause_once_for_test(&self, slot: &Mutex<Option<TestPause>>) {
+            let Some(pause) = slot.lock().unwrap().take() else {
+                return;
+            };
+            pause.started.send(()).unwrap();
+            pause.release.lock().unwrap().recv().unwrap();
+        }
+
+        pub(super) fn retention_scan_count_for_test(&self) -> usize {
+            self.failures.retention_scans.load(Ordering::SeqCst)
+        }
+
+        pub(super) fn retirement_marker_path_for_key(&self, key: &RecoveryKey) -> PathBuf {
+            self.retirement_marker_path(std::slice::from_ref(key))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        sync::{Arc, atomic::AtomicUsize},
         time::{Duration, Instant, SystemTime},
     };
 
@@ -5199,16 +5131,19 @@ mod tests {
         let hook_root = root.clone();
         let hook_moved = moved.clone();
         let hook_external = external.clone();
-        set_root_acquisition_hook(Box::new(move || {
-            let replacement = fs::rename(&hook_root, &hook_moved);
-            if replacement.is_ok() {
-                std::os::windows::fs::symlink_dir(&hook_external, &hook_root).unwrap();
-            }
-            assert!(
-                replacement.is_err(),
-                "the raw root must be guarded before canonicalization"
-            );
-        }));
+        crate::test_faults::install(
+            &crate::test_faults::ROOT_ACQUISITION,
+            Box::new(move |()| {
+                let replacement = fs::rename(&hook_root, &hook_moved);
+                if replacement.is_ok() {
+                    std::os::windows::fs::symlink_dir(&hook_external, &hook_root).unwrap();
+                }
+                assert!(
+                    replacement.is_err(),
+                    "the raw root must be guarded before canonicalization"
+                );
+            }),
+        );
 
         let store =
             RecoveryStore::open_production_at_for_test(root.clone(), Arc::new(TestProtector))

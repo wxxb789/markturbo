@@ -1,4 +1,6 @@
-use std::fs::{self as std_fs, File};
+#[cfg(windows)]
+use std::fs as std_fs;
+use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -9,6 +11,11 @@ use crate::document::io::{
     self as document_io, FileObjectId, SkillObjectIdentity, SkillOrigin, SkillOriginRoot,
 };
 use crate::review::{MAX_SKILL_FILE_BYTES, MAX_SKILL_PACKAGE_BYTES};
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+use crate::fs_primitives::{
+    DT_DIRECTORY, DT_REGULAR, O_CLOEXEC, O_NOFOLLOW, O_NONBLOCK, name_is_symlink_at, open_at,
+};
 
 use super::ReviewRequestBuildError;
 
@@ -90,7 +97,7 @@ pub(super) fn acquire_skill_inventory(
         .open_root()
         .map_err(|_| ReviewRequestBuildError::AgentSkillSourceChanged)?;
     #[cfg(test)]
-    run_skill_root_validated_hook();
+    crate::test_faults::fire(&crate::test_faults::SKILL_ROOT_VALIDATED, ());
 
     if let Some(byte_size) = dirty_entrypoint_byte_size
         && byte_size > MAX_SKILL_FILE_BYTES
@@ -241,10 +248,7 @@ fn collect_agent_skill_entry(
     validated_skill_relative_components(&relative_path)?;
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-    if allow_dirty_entrypoint
-        && relative_path == "SKILL.md"
-        && entry.kind == Some(UNIX_DT_DIRECTORY)
-    {
+    if allow_dirty_entrypoint && relative_path == "SKILL.md" && entry.kind == Some(DT_DIRECTORY) {
         return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
     }
 
@@ -262,7 +266,7 @@ fn collect_agent_skill_entry(
             }
             Err(_) => return Err(ReviewRequestBuildError::AgentSkillReadFailed),
         };
-        if windows_metadata_is_reparse(&metadata) {
+        if crate::fs_primitives::opened_metadata_is_reparse(&metadata) {
             push_skill_omission(
                 files,
                 omissions,
@@ -297,7 +301,7 @@ fn collect_agent_skill_entry(
             ensure_skill_inventory_room(files, omissions, allow_dirty_entrypoint)?;
             let file = open_regular_skill_file(&path)
                 .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-            if !opened_skill_file_is_regular(
+            if !crate::fs_primitives::opened_metadata_is_regular_file(
                 &file
                     .metadata()
                     .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?,
@@ -323,9 +327,9 @@ fn collect_agent_skill_entry(
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     {
-        let child = match open_skill_child_at(directory, &name) {
+        let child = match open_at(directory, &name, O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) {
             Ok(child) => child,
-            Err(_) if skill_child_is_symlink_at(directory, &name) => {
+            Err(_) if name_is_symlink_at(directory, &name) => {
                 push_skill_omission(
                     files,
                     omissions,
@@ -341,7 +345,7 @@ fn collect_agent_skill_entry(
                 if allow_dirty_entrypoint
                     && relative_path == "SKILL.md"
                     && (error.kind() == std::io::ErrorKind::NotFound
-                        || entry.kind == Some(UNIX_DT_REGULAR)) =>
+                        || entry.kind == Some(DT_REGULAR)) =>
             {
                 return Ok(());
             }
@@ -646,22 +650,14 @@ fn visit_skill_directory_entries(
 /// reached below the authenticated root remains held through file reads.
 #[cfg(windows)]
 fn hold_regular_skill_directory(path: &Path) -> Result<File, ReviewRequestBuildError> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_READ,
-    };
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-    let file = std_fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ.0)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)
+    let file = crate::fs_primitives::open_directory_no_follow(path, FILE_SHARE_READ.0)
         .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
     let metadata = file
         .metadata()
         .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    if !crate::fs_primitives::opened_metadata_is_regular_directory(&metadata) {
         return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
     }
     Ok(file)
@@ -684,7 +680,7 @@ fn read_opened_skill_supporting_file(
     let before = file
         .metadata()
         .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if !opened_skill_file_is_regular(&before) {
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&before) {
         return Err(ReviewRequestBuildError::AgentSkillSourceChanged);
     }
     if before.len() > MAX_SKILL_FILE_BYTES {
@@ -709,7 +705,7 @@ fn read_opened_skill_supporting_file(
     let after = file
         .metadata()
         .map_err(|_| ReviewRequestBuildError::AgentSkillReadFailed)?;
-    if !opened_skill_file_is_regular(&after)
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&after)
         || before.len() != bytes.len() as u64
         || after.len() != bytes.len() as u64
         || before.modified().ok() != after.modified().ok()
@@ -765,7 +761,7 @@ fn read_opened_frozen_source(
     let Ok(before) = file.metadata() else {
         return None;
     };
-    if !opened_skill_file_is_regular(&before)
+    if !crate::fs_primitives::opened_metadata_is_regular_file(&before)
         || before.len() != expected.byte_size
         || before.modified().ok() != expected.modified
     {
@@ -796,7 +792,7 @@ fn read_opened_frozen_source(
     };
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if byte_size != expected.byte_size
-        || !opened_skill_file_is_regular(&after)
+        || !crate::fs_primitives::opened_metadata_is_regular_file(&after)
         || after.len() != byte_size
         || after.modified().ok() != expected.modified
         || document_io::skill_object_identity(&file).ok() != Some(expected.object_identity)
@@ -835,101 +831,9 @@ fn open_skill_file_components(
 
 #[cfg(windows)]
 fn open_regular_skill_file(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt as _;
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
-    std_fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ.0)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
-        .open(path)
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_O_NOFOLLOW: i32 = if cfg!(target_os = "linux") {
-    0o400000
-} else {
-    0x100
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_O_CLOEXEC: i32 = if cfg!(target_os = "linux") {
-    0o2000000
-} else {
-    0x1000000
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_O_NONBLOCK: i32 = if cfg!(target_os = "linux") {
-    0o4000
-} else {
-    0x4
-};
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_DT_DIRECTORY: u8 = 4;
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-const UNIX_DT_REGULAR: u8 = 8;
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn open_skill_child_at(directory: &File, name: &std::ffi::OsStr) -> std::io::Result<File> {
-    use std::ffi::{CString, c_char, c_int};
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    use std::os::unix::ffi::OsStrExt as _;
-
-    unsafe extern "C" {
-        fn openat(directory: c_int, path: *const c_char, flags: c_int) -> c_int;
-    }
-
-    let name = CString::new(name.as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in Skill name"))?;
-    // O_NOFOLLOW makes the opened descriptor authoritative; O_NONBLOCK keeps
-    // a raced FIFO from stalling inventory before it can be classified.
-    // SAFETY: `directory` is a live directory fd and `name` is one component.
-    let descriptor = unsafe {
-        openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            UNIX_O_NOFOLLOW | UNIX_O_NONBLOCK | UNIX_O_CLOEXEC,
-        )
-    };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `openat` returned a new owned descriptor.
-    Ok(unsafe { File::from_raw_fd(descriptor) })
-}
-
-#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-fn skill_child_is_symlink_at(directory: &File, name: &std::ffi::OsStr) -> bool {
-    use std::ffi::{CString, c_char, c_int, c_void};
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    unsafe extern "C" {
-        fn readlinkat(
-            directory: c_int,
-            path: *const c_char,
-            buffer: *mut c_char,
-            size: usize,
-        ) -> isize;
-    }
-
-    let Ok(name) = CString::new(name.as_bytes()) else {
-        return false;
-    };
-    let mut probe = 0_u8;
-    // SAFETY: `directory` is a live directory fd, the name is NUL-terminated,
-    // and `probe` supplies one writable byte; no target is followed.
-    unsafe {
-        readlinkat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            (&raw mut probe).cast::<c_void>().cast::<c_char>(),
-            1,
-        ) >= 0
-    }
+    crate::fs_primitives::open_entry_no_follow(path, FILE_SHARE_READ.0)
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
@@ -939,17 +843,21 @@ fn open_skill_file_components(
 ) -> std::io::Result<File> {
     let mut directory = root.directory().try_clone()?;
     for (index, component) in components.iter().enumerate() {
-        let next = open_skill_child_at(&directory, std::ffi::OsStr::new(component))?;
+        let next = open_at(
+            &directory,
+            std::ffi::OsStr::new(component),
+            O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+        )?;
         let metadata = next.metadata()?;
         if index + 1 == components.len() {
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
+            if !metadata.is_file() || crate::fs_primitives::opened_metadata_is_reparse(&metadata) {
                 return Err(std::io::Error::other(
                     "Agent Skill source is not a regular file",
                 ));
             }
             return Ok(next);
         }
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        if !metadata.is_dir() || crate::fs_primitives::opened_metadata_is_reparse(&metadata) {
             return Err(std::io::Error::other(
                 "Agent Skill path component is not a directory",
             ));
@@ -979,57 +887,8 @@ fn open_skill_file_components(_: &SkillOriginRoot, _: &[&str]) -> std::io::Resul
 }
 
 #[cfg(windows)]
-fn windows_metadata_is_reparse(metadata: &std_fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
-}
-
-#[cfg(windows)]
-fn opened_skill_file_is_regular(metadata: &std_fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
-}
-
-#[cfg(not(windows))]
-fn opened_skill_file_is_regular(metadata: &std_fs::Metadata) -> bool {
-    metadata.is_file() && !metadata.file_type().is_symlink()
-}
-
-#[cfg(windows)]
 fn review_error_to_io(error: ReviewRequestBuildError) -> std::io::Error {
     std::io::Error::other(error.to_string())
-}
-
-#[cfg(test)]
-thread_local! {
-    static SKILL_ROOT_VALIDATED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
-#[cfg(test)]
-pub(super) fn install_skill_root_validated_hook(hook: impl FnOnce() + 'static) {
-    SKILL_ROOT_VALIDATED_HOOK.with(|slot| {
-        assert!(
-            slot.borrow().is_none(),
-            "a Skill root validation hook is already installed"
-        );
-        *slot.borrow_mut() = Some(Box::new(hook));
-    });
-}
-
-#[cfg(test)]
-fn run_skill_root_validated_hook() {
-    SKILL_ROOT_VALIDATED_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow_mut().take() {
-            hook();
-        }
-    });
 }
 
 pub(super) fn package_path(

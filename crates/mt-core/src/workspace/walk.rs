@@ -58,6 +58,76 @@ pub fn is_noise_path(path: &Path, root: &Path) -> bool {
         .any(is_noise_dir)
 }
 
+/// One directory entry passed to a walker's own policy.
+///
+/// The name filter, the unreadable-entry skip and the symlink bit are shared;
+/// how far to descend and what to collect are not. [`Entry::lists_as_directory`]
+/// follows a linked directory for display; [`Entry::descends`] never follows
+/// one — a junction pointing at an ancestor would otherwise be walked to the
+/// depth cap on every branch.
+#[derive(Debug, Clone)]
+pub(crate) struct Entry {
+    /// The entry's path as `read_dir` reported it.
+    pub(crate) path: std::path::PathBuf,
+    /// The entry's name, already known to be valid UTF-8.
+    pub(crate) name: String,
+    /// The type of the entry itself, without following a link.
+    pub(crate) file_type: std::fs::FileType,
+    /// True when the entry is a symlink or junction, whatever it points at.
+    pub(crate) is_symlink: bool,
+}
+
+impl Entry {
+    /// True when the file tree should show this entry as a directory. A
+    /// symlink's own type says only that it is a link, so a linked directory
+    /// is followed to answer what the tree must show; `read_dir_deep` still
+    /// refuses to descend it through [`Entry::descends`].
+    pub(crate) fn lists_as_directory(&self) -> bool {
+        if self.is_symlink {
+            self.path.is_dir()
+        } else {
+            self.file_type.is_dir()
+        }
+    }
+
+    /// True when a recursive walk may descend into this entry. A symlink is
+    /// never followed, so the shared rule and both walkers cannot drift again.
+    pub(crate) fn descends(&self) -> bool {
+        !self.is_symlink && self.file_type.is_dir()
+    }
+}
+
+/// Every usable entry in `dir`, with the shared noise names removed.
+///
+/// Entries whose name is not UTF-8 and entries whose type cannot be read are
+/// skipped: the rest of the workspace addresses entries by `str`, and one
+/// unreadable entry is not a reason to hide its siblings. Classifying here —
+/// once — is what keeps the tree and the folder search from growing two
+/// answers to what a symlinked directory is.
+pub(crate) fn entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if is_noise_dir(name) {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        entries.push(Entry {
+            is_symlink: file_type.is_symlink(),
+            name: name.to_owned(),
+            file_type,
+            path,
+        });
+    }
+    Ok(entries)
+}
+
 /// How much of a file is examined before deciding it is binary.
 const SNIFF_BYTES: usize = 8 * 1024;
 
@@ -269,5 +339,60 @@ mod tests {
         assert!(is_openable(&write("main.rs", b"fn main() {}\n")));
         assert!(!is_openable(&write("logo.png", b"\x89PNG\r\n\x1a\n\0")));
         assert!(!is_openable(&write("blob.log", b"gz\0\x01\x02binary")));
+    }
+
+    #[test]
+    fn one_entry_iterator_answers_both_walkers_directory_questions() {
+        // The tree and the folder search each classified entries themselves,
+        // and the symlink rule drifted between them once. Both now read
+        // `Entry`; the noise list is applied once, here.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::fs::write(root.join("note.md"), "x").unwrap();
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+
+        let mut entries = entries(root).unwrap();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["note.md", "real"], "got {names:?}");
+
+        let real = &entries[1];
+        assert!(real.descends(), "an ordinary directory is walked");
+        assert!(real.lists_as_directory());
+        let note = &entries[0];
+        assert!(!note.descends());
+        assert!(!note.lists_as_directory());
+    }
+
+    #[test]
+    fn a_linked_directory_is_listed_but_never_descended() {
+        // The shared symlink rule: the tree shows the link as a folder, the
+        // recursive walks refuse to follow it. A junction pointing at an
+        // ancestor would otherwise be walked to the depth cap on every branch.
+        // Creating a link needs Developer Mode or elevation on Windows, so
+        // report and return rather than fail on an unprivileged machine.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("real")).unwrap();
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(root.join("real"), root.join("link")).is_ok();
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(root.join("real"), root.join("link")).is_ok();
+        #[cfg(not(any(windows, unix)))]
+        let made = false;
+        if !made {
+            eprintln!("skipping: this session cannot create directory symlinks");
+            return;
+        }
+
+        let entries = entries(root).unwrap();
+        let link = entries
+            .iter()
+            .find(|entry| entry.name == "link")
+            .expect("the link is listed");
+        assert!(link.is_symlink);
+        assert!(link.lists_as_directory(), "the tree shows a folder icon");
+        assert!(!link.descends(), "a recursive walk must not follow it");
     }
 }

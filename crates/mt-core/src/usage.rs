@@ -7,8 +7,7 @@
 
 use std::{
     collections::BTreeMap,
-    fmt,
-    io::{self, Write},
+    fmt, io,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -362,16 +361,7 @@ impl UsageStore {
     /// overwritten. No destination path is retained in the aggregate or errors.
     pub fn export_to(&self, destination: &Path, now: SystemTime) -> Result<(), UsageError> {
         let bytes = self.export_json(now)?;
-        let parent = destination
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        temporary.write_all(&bytes)?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist_noclobber(destination)
-            .map_err(|error| UsageError::from(error.error))?;
+        crate::atomic_file::replace_noclobber(destination, STAGING_PREFIX, STAGING_SUFFIX, &bytes)?;
         Ok(())
     }
 
@@ -427,12 +417,12 @@ impl UsageStore {
         Self::save(path, &aggregate)
     }
 
-    fn lock_settings_writes(&self) -> io::Result<crate::settings::SettingsWriteGuard> {
+    fn lock_settings_writes(&self) -> io::Result<crate::process_lock::Guard> {
         #[cfg(test)]
         if let Some(path) = self.consent_path.as_deref() {
-            return crate::settings::lock_settings_writes_for_path(path);
+            return crate::process_lock::settings_write_for_path(path);
         }
-        crate::settings::lock_settings_writes()
+        crate::process_lock::settings_write()
     }
 
     fn persisted_consent(&self) -> bool {
@@ -492,16 +482,12 @@ impl UsageStore {
         let parent = path.parent().ok_or(UsageError::DataDirectoryUnavailable)?;
         std::fs::create_dir_all(parent)?;
         Self::clear_staging(parent)?;
-        let mut temporary = tempfile::Builder::new()
-            .prefix(STAGING_PREFIX)
-            .suffix(STAGING_SUFFIX)
-            .tempfile_in(parent)?;
-        serde_json::to_writer_pretty(&mut temporary, aggregate)
+        let mut staged =
+            crate::atomic_file::StagedFile::create_in(parent, STAGING_PREFIX, STAGING_SUFFIX)?;
+        serde_json::to_writer_pretty(staged.as_file_mut(), aggregate)
             .map_err(|_| UsageError::InvalidStore)?;
-        temporary.as_file().sync_all()?;
-        temporary
-            .persist(path)
-            .map_err(|error| UsageError::from(error.error))?;
+        staged.sync_all()?;
+        staged.persist(path)?;
         Ok(())
     }
 }

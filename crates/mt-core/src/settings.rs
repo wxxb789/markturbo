@@ -458,8 +458,8 @@ impl SettingsData {
         target: &str,
         path: &Path,
     ) -> Result<Self, LegacyCredentialMigrationSaveError> {
-        let _guard =
-            lock_settings_writes_for_path(path).map_err(LegacyCredentialMigrationSaveError::Io)?;
+        let _guard = crate::process_lock::settings_write_for_path(path)
+            .map_err(LegacyCredentialMigrationSaveError::Io)?;
         let latest = match std::fs::read_to_string(path) {
             Ok(contents) => toml::from_str::<Self>(&contents).map_err(|_| {
                 LegacyCredentialMigrationSaveError::Io(std::io::Error::new(
@@ -522,7 +522,7 @@ impl SettingsData {
         path: &Path,
         intent: SettingsWriteIntent,
     ) -> std::io::Result<Self> {
-        let _guard = lock_settings_writes_for_path(path)?;
+        let _guard = crate::process_lock::settings_write_for_path(path)?;
         let current = match std::fs::read_to_string(path) {
             Ok(current) => toml::from_str::<Self>(&current).map_err(|_| {
                 std::io::Error::new(
@@ -546,13 +546,10 @@ impl SettingsData {
     }
 
     fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = toml::to_string_pretty(self).map_err(|error| {
             std::io::Error::other(format!("cannot serialize settings: {error}"))
         })?;
-        std::fs::write(path, text)
+        crate::atomic_file::replace(path, SETTINGS_STAGING_PREFIX, ".tmp", text.as_bytes())
     }
 }
 
@@ -569,152 +566,7 @@ pub(crate) enum LegacyCredentialMigrationSaveError {
     Io(std::io::Error),
 }
 
-const SETTINGS_WRITE_LOCK: &str = "Global\\markturbo-settings-write-v1";
-const TEST_SETTINGS_WRITE_LOCK_PREFIX: &str = "Local\\markturbo-settings-write-test-";
-const TEST_LOCK_NAMESPACE_ENV: &str = "MARKTURBO_TEST_LOCK_NAMESPACE";
-const TEST_LOCK_NAMESPACE_MAX_LENGTH: usize = 64;
-
-#[derive(Debug)]
-enum SettingsWriteLockName {
-    Global,
-    Test(String),
-}
-
-impl SettingsWriteLockName {
-    fn from_process_environment() -> std::io::Result<Self> {
-        match std::env::var(TEST_LOCK_NAMESPACE_ENV) {
-            Ok(namespace) => Self::from_test_namespace(&namespace),
-            Err(std::env::VarError::NotPresent) => Ok(Self::Global),
-            Err(std::env::VarError::NotUnicode(_)) => Err(Self::invalid_test_namespace()),
-        }
-    }
-
-    fn from_test_namespace(namespace: &str) -> std::io::Result<Self> {
-        let length_is_valid = (1..=TEST_LOCK_NAMESPACE_MAX_LENGTH).contains(&namespace.len());
-        let characters_are_valid = namespace
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
-        if length_is_valid && characters_are_valid {
-            Ok(Self::Test(namespace.to_owned()))
-        } else {
-            Err(Self::invalid_test_namespace())
-        }
-    }
-
-    fn into_lock_name(self) -> String {
-        match self {
-            Self::Global => SETTINGS_WRITE_LOCK.to_owned(),
-            Self::Test(namespace) => format!("{TEST_SETTINGS_WRITE_LOCK_PREFIX}{namespace}"),
-        }
-    }
-
-    fn invalid_test_namespace() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{TEST_LOCK_NAMESPACE_ENV} must be 1-64 ASCII letters, digits, `_` or `-`"),
-        )
-    }
-}
-
-fn settings_write_lock_name() -> std::io::Result<String> {
-    SettingsWriteLockName::from_process_environment().map(SettingsWriteLockName::into_lock_name)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) struct SettingsWriteGuard {
-    handle: windows::Win32::Foundation::HANDLE,
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for SettingsWriteGuard {
-    fn drop(&mut self) {
-        use windows::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
-
-        let _ = unsafe { ReleaseMutex(self.handle) };
-        let _ = unsafe { CloseHandle(self.handle) };
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
-    lock_settings_writes_named(&settings_write_lock_name()?)
-}
-
-#[cfg(all(test, target_os = "windows"))]
-pub(crate) fn lock_settings_writes_for_test(root: &Path) -> std::io::Result<SettingsWriteGuard> {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.hash(&mut hasher);
-    lock_settings_writes_named(
-        &SettingsWriteLockName::from_test_namespace(&format!("{:016x}", hasher.finish()))?
-            .into_lock_name(),
-    )
-}
-
-#[cfg(all(test, not(target_os = "windows")))]
-pub(crate) fn lock_settings_writes_for_test(_root: &Path) -> std::io::Result<SettingsWriteGuard> {
-    lock_settings_writes()
-}
-
-#[cfg(test)]
-pub(crate) fn lock_settings_writes_for_path(path: &Path) -> std::io::Result<SettingsWriteGuard> {
-    let root = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(path);
-    lock_settings_writes_for_test(root)
-}
-
-#[cfg(not(test))]
-fn lock_settings_writes_for_path(_path: &Path) -> std::io::Result<SettingsWriteGuard> {
-    lock_settings_writes()
-}
-
-#[cfg(target_os = "windows")]
-fn lock_settings_writes_named(name: &str) -> std::io::Result<SettingsWriteGuard> {
-    use windows::Win32::{
-        Foundation::{CloseHandle, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::{CreateMutexW, WaitForSingleObject},
-    };
-    use windows::core::PCWSTR;
-
-    const WAIT_MILLISECONDS: u32 = 100;
-    let name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
-        .map_err(std::io::Error::other)?;
-    let wait = unsafe { WaitForSingleObject(handle, WAIT_MILLISECONDS) };
-    if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
-        return Ok(SettingsWriteGuard { handle });
-    }
-
-    let error = if wait == WAIT_TIMEOUT {
-        std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            "another markturbo process is writing settings",
-        )
-    } else {
-        std::io::Error::from_raw_os_error(unsafe { GetLastError() }.0 as i32)
-    };
-    let _ = unsafe { CloseHandle(handle) };
-    Err(error)
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) struct SettingsWriteGuard {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(not(target_os = "windows"))]
-pub(crate) fn lock_settings_writes() -> std::io::Result<SettingsWriteGuard> {
-    settings_write_lock_name()?;
-    static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    Ok(SettingsWriteGuard {
-        _guard: WRITES
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-    })
-}
+const SETTINGS_STAGING_PREFIX: &str = ".markturbo-settings-";
 
 /// Where settings live.
 ///
@@ -791,7 +643,7 @@ mod tests {
         let directory = tempfile::tempdir_in(".").unwrap();
         let consent_path = Path::new(directory.path().file_name().unwrap());
         // Check both writers against the expected lock from a different thread.
-        let settings_guard = lock_settings_writes_for_test(consent_path).unwrap();
+        let settings_guard = crate::process_lock::settings_write_for_test(consent_path).unwrap();
         let usage = crate::usage::UsageStore::open_in(directory.path(), consent_path, false);
 
         let (settings_write, usage_write) = std::thread::scope(|scope| {
@@ -935,147 +787,6 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(std::fs::read_to_string(path).unwrap(), malformed);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn settings_writes_fail_closed_while_the_global_lock_is_busy() {
-        let name = format!(
-            "Local\\markturbo-settings-write-test-{}",
-            std::process::id()
-        );
-        let _guard = lock_settings_writes_named(&name).unwrap();
-        let error = std::thread::spawn(move || {
-            lock_settings_writes_named(&name)
-                .err()
-                .expect("the lock is busy")
-        })
-        .join()
-        .unwrap();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-    }
-
-    #[test]
-    fn settings_write_lock_names_follow_the_global_and_test_contract() {
-        assert_eq!(
-            SettingsWriteLockName::Global.into_lock_name(),
-            "Global\\markturbo-settings-write-v1"
-        );
-        assert_eq!(
-            SettingsWriteLockName::from_test_namespace("alpha-1_B")
-                .expect("a valid namespace")
-                .into_lock_name(),
-            "Local\\markturbo-settings-write-test-alpha-1_B"
-        );
-        assert!(
-            SettingsWriteLockName::from_test_namespace(&"a".repeat(64)).is_ok(),
-            "64 characters is the maximum"
-        );
-    }
-
-    #[test]
-    fn invalid_test_lock_namespaces_fail_closed() {
-        for namespace in [
-            "",
-            "   ",
-            "with space",
-            "with\\slash",
-            "with/slash",
-            "unicode-é",
-        ] {
-            let error = SettingsWriteLockName::from_test_namespace(namespace)
-                .expect_err("an invalid namespace");
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::InvalidInput,
-                "{namespace:?}"
-            );
-        }
-        assert!(
-            SettingsWriteLockName::from_test_namespace(&"a".repeat(65)).is_err(),
-            "65 characters exceeds the maximum"
-        );
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn different_test_namespaces_do_not_contend() {
-        let process = std::process::id().to_string();
-        let first_name = SettingsWriteLockName::from_test_namespace(&format!("first-{process}"))
-            .unwrap()
-            .into_lock_name();
-        let second_name = SettingsWriteLockName::from_test_namespace(&format!("second-{process}"))
-            .unwrap()
-            .into_lock_name();
-        let first = lock_settings_writes_named(&first_name).unwrap();
-
-        let (second, first_error) = std::thread::scope(|scope| {
-            let second = scope.spawn(|| lock_settings_writes_named(&second_name).map(|_| ()));
-            let first_probe = scope.spawn(|| lock_settings_writes_named(&first_name).err());
-            (second.join().unwrap(), first_probe.join().unwrap())
-        });
-        assert!(second.is_ok(), "a different namespace must not contend");
-        assert_eq!(
-            first_error.expect("the same namespace is busy").kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        drop(first);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn the_test_namespace_environment_selects_an_isolated_write_lock() {
-        // SAFETY: no other test in this binary reads the variable.
-        unsafe { std::env::remove_var("MARKTURBO_TEST_LOCK_NAMESPACE") };
-        assert_eq!(
-            settings_write_lock_name().unwrap(),
-            "Global\\markturbo-settings-write-v1"
-        );
-        let global =
-            lock_settings_writes_named(&SettingsWriteLockName::Global.into_lock_name()).unwrap();
-        let global_error = std::thread::spawn(|| {
-            lock_settings_writes()
-                .err()
-                .expect("the global lock is busy")
-        })
-        .join()
-        .unwrap();
-        assert_eq!(global_error.kind(), std::io::ErrorKind::WouldBlock);
-
-        let namespace = format!("environment-selected-{}", std::process::id());
-        unsafe { std::env::set_var("MARKTURBO_TEST_LOCK_NAMESPACE", &namespace) };
-        assert_eq!(
-            settings_write_lock_name().unwrap(),
-            format!("Local\\markturbo-settings-write-test-{namespace}")
-        );
-        let selected_name = settings_write_lock_name().unwrap();
-        let uncontended = std::thread::spawn(|| lock_settings_writes().map(|_| ()))
-            .join()
-            .unwrap();
-        assert!(
-            uncontended.is_ok(),
-            "the selected namespace must be free while only the global lock is held: {uncontended:?}"
-        );
-
-        let selected = lock_settings_writes_named(&selected_name).unwrap();
-        drop(global);
-        let selected_error = std::thread::spawn(|| {
-            lock_settings_writes()
-                .err()
-                .expect("the selected lock is busy")
-        })
-        .join()
-        .unwrap();
-        assert_eq!(selected_error.kind(), std::io::ErrorKind::WouldBlock);
-        drop(selected);
-
-        unsafe { std::env::set_var("MARKTURBO_TEST_LOCK_NAMESPACE", "invalid value") };
-        let error = lock_settings_writes().err().expect("an invalid namespace");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-
-        // SAFETY: restore the environment for the rest of the binary.
-        unsafe { std::env::remove_var("MARKTURBO_TEST_LOCK_NAMESPACE") };
     }
 
     /// TOML cannot represent a scalar after an array table.

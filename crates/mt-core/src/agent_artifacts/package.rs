@@ -712,10 +712,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::source::{
-        MAX_AGENT_SKILL_INVENTORY_ENTRIES, install_skill_root_validated_hook,
-        read_regular_skill_supporting_file,
-    };
+    use super::source::{MAX_AGENT_SKILL_INVENTORY_ENTRIES, read_regular_skill_supporting_file};
     use super::{
         FrozenSkillPackage, ReviewRequestBuildError, ReviewRequestBuildRequest,
         ReviewRequestBuildResult, ReviewTarget, build_review_request,
@@ -1142,7 +1139,7 @@ Read [the guide](references/guide.md),
         #[cfg(unix)]
         {
             let alias_for_hook = alias.clone();
-            install_skill_root_validated_hook(move || {
+            crate::test_faults::install(&crate::test_faults::SKILL_ROOT_VALIDATED, move |()| {
                 fs::remove_file(&alias_for_hook).unwrap();
                 symlink(&alternate_tree, &alias_for_hook).unwrap();
             });
@@ -1154,7 +1151,7 @@ Read [the guide](references/guide.md),
         #[cfg(windows)]
         if uses_symlink {
             let alias_for_hook = alias.clone();
-            install_skill_root_validated_hook(move || {
+            crate::test_faults::install(&crate::test_faults::SKILL_ROOT_VALIDATED, move |()| {
                 fs::remove_dir(&alias_for_hook).unwrap();
                 std::os::windows::fs::symlink_dir(&alternate_tree, &alias_for_hook).unwrap();
             });
@@ -1165,7 +1162,7 @@ Read [the guide](references/guide.md),
         } else {
             let original_for_hook = original_root.clone();
             let retained_for_hook = directory.path().join("retained-original");
-            install_skill_root_validated_hook(move || {
+            crate::test_faults::install(&crate::test_faults::SKILL_ROOT_VALIDATED, move |()| {
                 assert!(fs::rename(&original_for_hook, &retained_for_hook).is_err());
             });
             assert!(frozen.revalidate().is_ok());

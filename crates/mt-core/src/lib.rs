@@ -4,16 +4,21 @@
 //! policy can run in headless tools or behind the desktop presentation layer.
 
 pub mod agent_artifacts;
+mod atomic_file;
 pub mod companion_font;
 pub mod credentials;
 pub mod diagnostic;
 pub mod document;
+mod fs_primitives;
 pub mod model;
+mod process_lock;
 pub mod recovery;
 pub mod rendering;
 pub mod review;
 pub mod runtime_paths;
 pub mod settings;
+#[cfg(test)]
+mod test_faults;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_probe;
 pub mod translate;

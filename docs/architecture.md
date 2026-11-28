@@ -600,11 +600,12 @@ and prompted for its current revision before the destructive action proceeds.
 
 Asynchronous text changes have a different boundary. A `BufferSnapshot`
 captures the editor revision and exact text used by destructive lifecycle
-decisions. An `AsyncSnapshot` adds a source generation that advances after a
-successful Save As. Translation and background reparsing use this stronger
-identity: a result may land only when the revision, text, and source generation
-still match. An edit or Save As while work is in flight therefore leaves the
-current document untouched and asks the user to run the operation again.
+decisions. Review's `SourceSnapshot` adds a source generation that advances
+after a successful Save As. Translation and background reparsing use this
+stronger identity: a result may land only when the revision, text, and source
+generation still match. An edit or Save As while work is in flight therefore
+leaves the current document untouched and asks the user to run the operation
+again.
 
 Recovery is optional application state, not a workspace format and not an
 autosave of the source file. On Windows, encrypted checkpoint records live by

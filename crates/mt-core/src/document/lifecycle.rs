@@ -40,36 +40,6 @@ impl BufferSnapshot {
     }
 }
 
-/// The source identity an asynchronous operation observed before leaving the
-/// UI thread. A Save As may preserve both buffer revision and exact text while
-/// changing the source document, so that boundary has its own generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AsyncSnapshot {
-    buffer: BufferSnapshot,
-    source_generation: u64,
-}
-
-impl AsyncSnapshot {
-    pub fn new(revision: u64, text: String, source_generation: u64) -> Self {
-        Self {
-            buffer: BufferSnapshot::new(revision, text),
-            source_generation,
-        }
-    }
-
-    pub fn matches(&self, revision: u64, text: &str, source_generation: u64) -> bool {
-        self.source_generation == source_generation && self.buffer.matches(revision, text)
-    }
-
-    pub fn text(&self) -> &str {
-        self.buffer.text()
-    }
-
-    pub fn source_generation(&self) -> u64 {
-        self.source_generation
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentLifecycle {
     pub id: DocumentId,
@@ -409,17 +379,6 @@ mod tests {
         assert!(
             !snapshot.matches(11, "draft"),
             "editing away and back still creates a newer source revision"
-        );
-    }
-
-    #[test]
-    fn an_async_result_cannot_cross_a_save_as_boundary_with_the_same_text() {
-        let snapshot = AsyncSnapshot::new(10, "draft".into(), 4);
-
-        assert!(snapshot.matches(10, "draft", 4));
-        assert!(
-            !snapshot.matches(10, "draft", 5),
-            "Save As changes the source even when its exact editor buffer survives"
         );
     }
 }
