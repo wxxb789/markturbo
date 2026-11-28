@@ -45,6 +45,10 @@ Ordering: this goal starts after Goal 22 lane 22-B merges, and Goal 21 starts af
 5. **Translation's model stays.** One global dispatcher for the API request (at most one in flight). Results are bound
    to their origin tab and are independent per tab. A3's state machine keeps exactly this split.
 6. **CI does not run the native harness unit tier.**
+7. **Every candidate is in scope (2026-11-28).** The owner chose all 48 improvements in the review (A1–A48),
+   including the Speculative A26, A46 and A48 and every Low-harm item. A candidate leaves scope only when evidence
+   shows it would change behaviour or break an invariant. Such a candidate is recorded with that evidence in the
+   findings document.
 
 ## Done when
 
@@ -115,7 +119,8 @@ the slice layout of decision 2.
 | T app integration tests | `mt-app/tests/**`, `test_vault.rs`, `test_env.rs` | delete the fragile tests, A28 (usage), A32 |
 | P Python tooling | `scripts/**` | delete the fragile tests, A39, A31, A29, A40, A41 |
 
-Waves 2 and 3 follow the findings document.
+Waves 2 and 3 follow the findings document. A48, which the findings document does not place in a wave, joins lane U
+in wave 3, after A26.
 
 The conductor owns `docs/architecture.md` (the slice map) and `CONCEPTS.md`.
 
