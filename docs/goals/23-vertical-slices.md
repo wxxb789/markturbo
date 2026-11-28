@@ -35,9 +35,10 @@ Ordering: this goal starts after Goal 22 lane 22-B merges, and Goal 21 starts af
    - A slice owns its `AppState` methods (in `state/<slice>.rs`), its UI module, its copy catalog and its tests.
    - Slices talk through narrow interfaces: request tickets, the layer stack, and per-tab records. They do not read
      each other's fields.
-3. **Fragile tests are deleted by default.** A test listed in the fragile-tests evidence, or found later, is deleted.
-   It is replaced only when the behaviour it guards is a product contract (for example the Goal 20 F3 recovery hit
-   test, or a privacy assertion). The replacement asserts behaviour and is deterministic: no wall-clock bounds, no
+3. **Fragile tests are deleted by default.** A test whose recommendation in the fragile-tests evidence is "delete",
+   or one later shown to be flaky, false-positive or implementation-pinned, is deleted. Tests that the evidence marks
+   "keep", fixture tests, and failures already fixed stay. A deleted test is replaced when the behaviour it guards is
+   a product contract (for example the Goal 20 F3 recovery hit test, or a privacy assertion). The replacement asserts behaviour and is deterministic: no wall-clock bounds, no
    fixed sleeps, no exact pixel literals, and no source-text scans when a parser or a Headless query can answer.
 4. **Dependencies:** html5ever, markup5ever_rcdom, libc, roxmltree, imara-diff, syn and schemars are allowed. Each PR
    names the provenance change it makes.
