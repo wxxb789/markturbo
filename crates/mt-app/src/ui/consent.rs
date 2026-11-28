@@ -235,9 +235,19 @@ fn waiting(state: &AppState) -> Waiting {
 
 /// The pending one-shot focus of an open card, kept alive until it fires: an
 /// effect runs before the commit that carries the card's node is in, so its
-/// ref reaches it only at the next step.
-fn card_focus_step() -> Signal<Option<Spawned<()>>> {
-    global::<Option<Spawned<()>>>()
+/// ref reaches it only at the next step. `global` keys on the type, so this
+/// newtype gives the card a slot of its own; the UI timers once shared one
+/// `Option<Spawned<()>>` and one timer's write displaced another timer's
+/// handle.
+#[allow(
+    dead_code,
+    reason = "a keep-alive handle: the slot's occupancy is the whole contract"
+)]
+#[derive(Default)]
+pub(crate) struct CardFocusStep(pub(crate) Option<Spawned<()>>);
+
+pub(crate) fn card_focus_step() -> Signal<CardFocusStep> {
+    global::<CardFocusStep>()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -395,9 +405,12 @@ pub fn card(state: AppState, language: Language) -> impl IntoElement {
     // node only then).
     let focus_step = card_focus_step();
     effect(move || {
-        focus_step.set(Some(set_timeout(Duration::from_millis(0), move || {
-            focus.focus();
-        })));
+        focus_step.set(CardFocusStep(Some(set_timeout(
+            Duration::from_millis(0),
+            move || {
+                focus.focus();
+            },
+        ))));
     });
     view()
         .test_id("consent-card")
@@ -917,66 +930,25 @@ fn cancel_button(
 ) -> impl IntoElement {
     let enabled = state.clone();
     let blur = hold.clone();
-    view().test_id("consent-cancel").child(cancel_action(
-        i18n::t(language, Key::Cancel),
-        move || cancel(&state, kind),
-        move || blur.release(),
-        move || !is_open(&enabled),
-        ring,
-    ))
-}
-
-/// `prims::quiet_action`'s look, as the Cancel control itself: resting ink
-/// that steps to full ink, underlined, on hover or keyboard focus (drawn by
-/// the text, which a style on the control would not reach). The control is
-/// one focusable view of its own: focus reaches it directly, and losing that
-/// focus cancels a `Ctrl+Enter` charge in flight.
-fn cancel_action(
-    label: &'static str,
-    on_press: impl Fn() + 'static,
-    on_blur: impl Fn() + 'static,
-    disabled: impl Fn() -> bool + 'static,
-    ring: Rc<CardFocus>,
-) -> AnyElement {
-    let duration = prims::press_color_duration();
     let focused = ring.clone();
-    let control = view()
-        .test_id("consent-cancel-button")
-        .flex_row()
-        .items_center()
-        .px(px(2.0))
-        .py(px(4.0))
-        .bg(Color::TRANSPARENT)
-        .cursor_pointer()
-        .group()
-        .focusable(true)
-        .disabled(disabled)
-        .element_ref(ring.at(RingStop::Cancel))
-        .role(AccessibilityRole::Button)
-        .label(SharedString::from(label))
-        .on_press(move |_: &PressEvent| on_press())
-        .on_blur(on_blur)
-        .on_focus(move || {
-            focused.land(RingStop::Cancel);
-            #[cfg(test)]
-            tests::record_focus(tests::FocusStop::Cancel);
-        });
-    prims::press_feedback_with_duration(
-        control.child(
-            text(label)
-                .font_family(tokens::FONT_UI)
-                .text_size(px(tokens::TYPE_UI))
-                .line_height(px(tokens::TYPE_UI_LINE))
-                .text_color(move || tokens::palette().ink_rest)
-                .underline_offset(px(4.0))
-                .transition_colors()
-                .duration(move || duration.get())
-                .group_hover(|s| s.text_color(|| tokens::palette().ink).underline())
-                .group_focus_visible(|s| s.text_color(|| tokens::palette().ink).underline()),
-        ),
-        duration,
-    )
-    .into_element()
+    view().test_id("consent-cancel").child(prims::action(
+        "consent-cancel-button",
+        i18n::t(language, Key::Cancel),
+        prims::ActionTone::Quiet,
+        prims::ActionOptions {
+            disabled: Some((move || !is_open(&enabled)).into_reactive()),
+            reference: Some(*ring.at(RingStop::Cancel)),
+            on_focus: Some(Rc::new(move || {
+                focused.land(RingStop::Cancel);
+                #[cfg(test)]
+                tests::record_focus(tests::FocusStop::Cancel);
+            })),
+            on_blur: Some(Rc::new(move || blur.release())),
+            underline_offset: Some(4.0),
+            ..Default::default()
+        },
+        move || cancel(&state, kind),
+    ))
 }
 
 /// Hold to send: a full [`motion::FILAMENT_CHARGE_MS`] of charge authorizes;

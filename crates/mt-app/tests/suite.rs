@@ -94,6 +94,8 @@ mod review_selection_stale;
 mod review_stale;
 #[path = "review_supersede.rs"]
 mod review_supersede;
+#[path = "review_timers.rs"]
+mod review_timers;
 #[path = "revision_flow.rs"]
 mod revision_flow;
 #[path = "save_as_overwrite.rs"]

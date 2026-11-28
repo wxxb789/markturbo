@@ -58,9 +58,7 @@ use std::{
 
 use mt_core::settings::Language;
 use nsh_base::editor::EditorDecoration;
-use nsh_core::{
-    Color, PropertyValue, StyleKey, TextDecoration, element::Style, keymap::When, prelude::*,
-};
+use nsh_core::{PropertyValue, StyleKey, TextDecoration, element::Style, keymap::When, prelude::*};
 
 use crate::{
     i18n::{self, Key},
@@ -961,7 +959,11 @@ fn decisions(
                 .w_full()
                 .gap(px(SPACE_3))
                 .child(done_action(done_state, language, hunks, now))
-                .child(copy_action(copy_state, language))
+                .child(prims::quiet_action(
+                    "revision-copy",
+                    S::Copy.text(language),
+                    move || copy_approved(&copy_state, language),
+                ))
                 .child(prims::quiet_action(
                     "revision-close",
                     i18n::t(language, Key::Close),
@@ -971,33 +973,6 @@ fn decisions(
                     },
                 )),
         )
-}
-
-/// `Copy`, a quiet action whose pressable view carries the test id itself,
-/// so a screen reader (and UI Automation) finds one button by it.
-fn copy_action(state: AppState, language: Language) -> impl IntoElement {
-    let label = SharedString::from(S::Copy.text(language));
-    prims::press_feedback(
-        view()
-            .test_id("revision-copy")
-            .role(AccessibilityRole::Button)
-            .label(label.clone())
-            .focusable(true)
-            .cursor_pointer()
-            .bg(Color::TRANSPARENT)
-            .px(px(2.0))
-            .py(px(4.0))
-            .hover(|s| s.text_color(|| tokens::palette().ink).underline())
-            .focus_visible(|s| s.text_color(|| tokens::palette().ink).underline())
-            .on_press(move || copy_approved(&state, language)),
-    )
-    .child(
-        text(label)
-            .font_family(tokens::FONT_UI)
-            .text_size(px(tokens::TYPE_UI))
-            .line_height(px(tokens::TYPE_UI_LINE))
-            .text_color(move || tokens::palette().ink_rest),
-    )
 }
 
 /// `Done`: absent while the proposal is stale (nothing here can apply), the

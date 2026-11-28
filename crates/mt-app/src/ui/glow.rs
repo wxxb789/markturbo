@@ -114,8 +114,30 @@ fn ticker_running() -> Signal<bool> {
     global::<bool>()
 }
 
-fn ticker_step() -> Signal<Option<Spawned<()>>> {
-    global::<Option<Spawned<()>>>()
+/// The stepped clock's pending step. `global` keys on the type, so this
+/// newtype gives the clock a slot of its own; the UI timers once shared one
+/// `Option<Spawned<()>>` and one timer's write displaced another timer's
+/// handle.
+#[allow(
+    dead_code,
+    reason = "a keep-alive handle: the slot's occupancy is the whole contract"
+)]
+#[derive(Default)]
+pub(crate) struct TickerStep(pub(crate) Option<Spawned<()>>);
+
+pub(crate) fn ticker_step() -> Signal<TickerStep> {
+    global::<TickerStep>()
+}
+
+/// How many stepped-clock repaints have run. A test observes the clock's
+/// liveness through this: a frozen clock draws no difference on a static
+/// screen, while the steps are what the clock is.
+#[cfg(any(test, feature = "test-vault"))]
+static TICK_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "test-vault"))]
+pub(crate) fn tick_count() -> u64 {
+    TICK_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Register the visible result from an effect; never write emission state during render.
@@ -524,10 +546,12 @@ fn ensure_ticker() {
 /// One step of the clock: repaints the decorations, then either waits for
 /// the next step or stops.
 fn tick() {
+    #[cfg(any(test, feature = "test-vault"))]
+    TICK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let signal = emission();
     let e = signal.get_untracked();
     if e.view.is_none() {
-        ticker_step().set(None);
+        ticker_step().set(TickerStep(None));
         ticker_running().set(false);
         return;
     }
@@ -549,7 +573,7 @@ fn tick() {
     );
     // Replacing the handle drops the step that just ran (its timer is
     // spent) and keeps this one alive under the detached owner.
-    ticker_step().set(Some(step));
+    ticker_step().set(TickerStep(Some(step)));
 }
 
 /// Whether anything in the column is still changing at `now`.

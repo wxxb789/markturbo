@@ -121,6 +121,13 @@ pub(crate) fn review_generation_checked() {
     }
 }
 
+/// How many stepped-clock repaints the glow clock has run, for a test that
+/// must observe the clock's liveness rather than its drawing: a frozen clock
+/// draws no difference on a static screen.
+pub fn glow_ticks() -> u64 {
+    crate::ui::glow::tick_count()
+}
+
 /// The vault [`AppState::new`](crate::state::AppState::new) uses in a test
 /// build.
 pub(crate) fn vault() -> CredentialVault {

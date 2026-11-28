@@ -15,6 +15,7 @@
 //!   hot/ember colours.
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use nsh_base::input;
 use nsh_core::{
@@ -22,7 +23,7 @@ use nsh_core::{
     element::effect,
     element::{
         Accessible, AdaptiveColor, AnimatedNode, ComponentBuilder, Element, Interactive,
-        IntoListener, IntoReactive, ParentElement, ReadSignal, SharedString, Signal,
+        IntoListener, IntoReactive, ParentElement, Reactive, ReadSignal, SharedString, Signal,
         StyleRefinement, Styled, Text,
     },
     prelude::*,
@@ -168,6 +169,51 @@ fn cjk_script(grapheme: &str) -> Option<bool> {
     }
 }
 
+/// The ink a flat action draws in. A local action never glows — it is lit by
+/// ambient light only.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActionTone {
+    /// Resting ink that steps to full ink, underlined, on hover or keyboard
+    /// focus.
+    #[default]
+    Quiet,
+    /// Resting ink that steps to danger ink, underlined, on hover or keyboard
+    /// focus.
+    QuietDanger,
+    /// Full ink that does not step (a card's control).
+    Full,
+    /// Danger ink that does not step (a card's destructive control).
+    Danger,
+}
+
+/// The extra choices an action makes beyond its test id, label and press
+/// handler. [`Default`] is the plain quiet action.
+#[derive(Default)]
+pub struct ActionOptions {
+    /// The accessible name, when it differs from the visible label.
+    pub name: Option<Reactive<SharedString>>,
+    /// The chosen one of a mutually exclusive set: full ink, underline and
+    /// the accessibility selected state.
+    pub chosen: Option<Reactive<bool>>,
+    /// Whether the control refuses presses; its label steps back while it
+    /// holds.
+    pub disabled: Option<Reactive<bool>>,
+    /// The control a card's Tab ring lands on.
+    pub reference: Option<ElementRef>,
+    /// What runs when the control takes the keyboard focus.
+    pub on_focus: Option<Rc<dyn Fn()>>,
+    /// What runs when it loses it.
+    pub on_blur: Option<Rc<dyn Fn()>>,
+    /// Draw the card frame around the control: the fixed 164×36 box with the
+    /// designed ring outside it.
+    pub framed: bool,
+    /// The card frame's ring follows it (no ring without it).
+    pub ring: Option<Reactive<bool>>,
+    /// The underline's distance below its text, when the tone's default does
+    /// not fit the control.
+    pub underline_offset: Option<f32>,
+}
+
 /// A quiet local action: resting ink that steps to full ink with an underline
 /// on hover, and a designed ring when it has the keyboard focus. It never
 /// glows — local actions are lit by ambient light only.
@@ -175,47 +221,173 @@ fn cjk_script(grapheme: &str) -> Option<bool> {
 /// `test_id` is required: every interactive control carries one.
 pub fn quiet_action(
     test_id: &str,
-    label: impl Into<SharedString>,
+    label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
-    ink_action(test_id, label, || tokens::palette().ink, on_press)
+    action(
+        test_id,
+        label,
+        ActionTone::Quiet,
+        ActionOptions::default(),
+        on_press,
+    )
 }
 
 pub fn danger_action(
     test_id: &str,
-    label: impl Into<SharedString>,
+    label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
-    ink_action(test_id, label, || tokens::palette().danger, on_press)
+    action(
+        test_id,
+        label,
+        ActionTone::QuietDanger,
+        ActionOptions::default(),
+        on_press,
+    )
 }
 
-fn ink_action(
+/// One flat action with every knob [`ActionOptions`] offers: the control, its
+/// label and the card frame the guard's controls draw. Callers that need
+/// none of them use [`quiet_action`], [`danger_action`] or
+/// [`primary_action`].
+pub fn action(
     test_id: &str,
-    label: impl Into<SharedString>,
-    hover_ink: fn() -> Color,
+    label: impl IntoReactive<SharedString>,
+    tone: ActionTone,
+    options: ActionOptions,
     on_press: impl Fn() + 'static,
 ) -> impl Interactive + ParentElement {
+    let ActionOptions {
+        name,
+        chosen,
+        disabled,
+        reference,
+        on_focus,
+        on_blur,
+        framed,
+        ring,
+        underline_offset,
+    } = options;
     let duration = press_color_duration();
-    let label: SharedString = label.into();
-    press_target(test_id, label.clone())
+    let label = label.into_reactive();
+    // The name the accessibility tree announces: its own, or the visible
+    // label.
+    let accessible = name.unwrap_or_else(|| label.clone()).map(Some);
+    let ink = {
+        let chosen = chosen.clone();
+        move || match tone {
+            ActionTone::Quiet if chosen.as_ref().is_some_and(Reactive::get) => {
+                tokens::palette().ink
+            }
+            ActionTone::Quiet => tokens::palette().ink_rest,
+            ActionTone::QuietDanger if chosen.as_ref().is_some_and(Reactive::get) => {
+                tokens::palette().danger
+            }
+            ActionTone::QuietDanger => tokens::palette().ink_rest,
+            ActionTone::Full => tokens::palette().ink,
+            ActionTone::Danger => tokens::palette().danger,
+        }
+    };
+    let mut control = press_target(test_id, accessible)
         .px(px(2.0))
         .py(px(4.0))
-        .group()
-        .on_press(on_press)
-        .child(
-            motion::ease_out(
-                text(label)
-                    .font_family(FONT_UI)
-                    .text_size(px(TYPE_UI))
-                    .line_height(px(TYPE_UI_LINE))
-                    .h(px(UI_TEXT_BOX_H))
-                    .text_color(move || tokens::palette().ink_rest)
-                    .transition_colors()
-                    .duration(move || duration.get()),
+        .group();
+    if framed {
+        control = control
+            .w_full()
+            .h_full()
+            .flex_col()
+            .items_center()
+            .justify_center();
+    }
+    if let Some(disabled) = disabled {
+        control = control
+            .disabled(move || disabled.get())
+            .disabled_style(|style| style.opacity(0.45));
+    }
+    if let Some(chosen) = chosen {
+        control = control
+            .accessibility_state(move || AccessibilityState {
+                selected: chosen.get(),
+                ..AccessibilityState::default()
+            })
+            .selected_style(|| {
+                StyleRefinement::default()
+                    .text_color(tokens::palette().ink)
+                    .underline()
+                    .text_decoration_color(tokens::palette().ink)
+                    .text_decoration_thickness(px(tokens::SELECTION_UNDERLINE))
+            });
+    }
+    if let Some(reference) = reference {
+        control = control.element_ref(&reference);
+    }
+    if let Some(on_focus) = on_focus {
+        control = control.on_focus(move || on_focus());
+    }
+    if let Some(on_blur) = on_blur {
+        control = control.on_blur(move || on_blur());
+    }
+    control = control.on_press(on_press);
+    let mut text = motion::ease_out(
+        text(label)
+            .font_family(FONT_UI)
+            .text_size(px(TYPE_UI))
+            .line_height(px(TYPE_UI_LINE))
+            .h(px(UI_TEXT_BOX_H))
+            .text_color(ink)
+            .transition_colors()
+            .duration(move || duration.get()),
+    );
+    if let Some(offset) = underline_offset {
+        text = text.underline_offset(px(offset));
+    }
+    if matches!(tone, ActionTone::Quiet | ActionTone::QuietDanger) {
+        // A deferred read: the theme the action sits in, at the moment the
+        // hover draws, never at build time.
+        let hover = move || match tone {
+            ActionTone::QuietDanger => tokens::palette().danger,
+            _ => tokens::palette().ink,
+        };
+        text = text
+            .group_hover(move |s| s.text_color(hover).underline())
+            .group_focus_visible(move |s| s.text_color(hover).underline());
+    }
+    let control = control.child(text);
+    if framed {
+        let ring = ring;
+        view()
+            .p(px(tokens::FOCUS_RING_OFFSET))
+            .border(px(tokens::FOCUS_RING))
+            .border_color(move || {
+                if ring.as_ref().is_some_and(Reactive::get) {
+                    tokens::palette().ink
+                } else {
+                    Color::TRANSPARENT
+                }
+            })
+            .child(
+                view()
+                    .w(px(tokens::CONSENT_BUTTON_W))
+                    .h(px(tokens::CONSENT_BUTTON_H))
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .bg(Color::TRANSPARENT)
+                    .border(px(HAIRLINE))
+                    .border_color(move || {
+                        if tone == ActionTone::Danger {
+                            tokens::palette().hairline
+                        } else {
+                            tokens::palette().ink_caption
+                        }
+                    })
+                    .child(control),
             )
-            .group_hover(move |s| s.text_color(hover_ink).underline())
-            .group_focus_visible(move |s| s.text_color(hover_ink).underline()),
-        )
+    } else {
+        control
+    }
 }
 
 /// The state's one next action: full ink, a designed ring, and no heat (it is
@@ -254,11 +426,11 @@ pub fn primary_action(
 /// The control both actions are: a plain view that is the button itself, so
 /// its test id — UI Automation's AutomationId — names the element a press
 /// reaches and screen readers announce, rather than a view around it.
-fn press_target(test_id: &str, label: SharedString) -> View {
+fn press_target(test_id: &str, name: impl IntoReactive<Option<SharedString>>) -> View {
     press_feedback(view())
         .test_id(test_id)
         .role(AccessibilityRole::Button)
-        .optional_label(Some(label))
+        .optional_label(name)
         // A control is never a drag handle: inside a `window_drag` region (the
         // title row) the innermost view decides, and a press here must reach
         // the control.
@@ -561,6 +733,154 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    /// One action of each option: a chosen one, a disabled one, one with its
+    /// own accessible name, and one in the card frame.
+    #[component]
+    fn OptionsHarness() -> impl IntoElement {
+        let chosen = signal(true);
+        let disabled = signal(true);
+        let ring = signal(true);
+        view()
+            .flex_col()
+            .child(prims_action(
+                "options-chosen",
+                "Chosen",
+                ActionTone::Quiet,
+                ActionOptions {
+                    chosen: Some(chosen.into_reactive()),
+                    ..Default::default()
+                },
+                move || chosen.set(!chosen.get_untracked()),
+            ))
+            .child(prims_action(
+                "options-disabled",
+                "Disabled",
+                ActionTone::Quiet,
+                ActionOptions {
+                    disabled: Some(disabled.into_reactive()),
+                    ..Default::default()
+                },
+                move || disabled.set(false),
+            ))
+            .child(prims_action(
+                "options-named",
+                "Named",
+                ActionTone::Quiet,
+                ActionOptions {
+                    name: Some(SharedString::from("Named action name").into_reactive()),
+                    ..Default::default()
+                },
+                || {},
+            ))
+            .child(prims_action(
+                "options-framed",
+                "Framed",
+                ActionTone::Full,
+                ActionOptions {
+                    framed: true,
+                    ring: Some(ring.into_reactive()),
+                    ..Default::default()
+                },
+                move || ring.set(!ring.get_untracked()),
+            ))
+    }
+
+    fn prims_action(
+        test_id: &str,
+        label: &'static str,
+        tone: ActionTone,
+        options: ActionOptions,
+        on_press: impl Fn() + 'static,
+    ) -> impl Interactive + ParentElement {
+        action(test_id, label, tone, options, on_press)
+    }
+
+    #[test]
+    fn a_chosen_action_announces_and_draws_as_selected() {
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            OptionsHarness,
+        >()))
+        .expect("start the options harness");
+        app.wait_for("id:options-chosen")
+            .expect("the chosen action");
+        let chosen = app
+            .screen()
+            .span_style("id:options-chosen >> text:/^Chosen$/")
+            .expect("the chosen label")
+            .color;
+        assert!(
+            [tokens::DARK.ink, tokens::LIGHT.ink].contains(&chosen),
+            "a chosen action draws in full ink: {chosen:?}"
+        );
+        assert!(
+            app.screen()
+                .accessibility_state("id:options-chosen")
+                .expect("the chosen state")
+                .selected,
+            "a chosen action announces its selected state"
+        );
+        app.press("id:options-chosen").expect("choose again");
+        let resting = app
+            .screen()
+            .span_style("id:options-chosen >> text:/^Chosen$/")
+            .expect("the resting label")
+            .color;
+        assert!(
+            [tokens::DARK.ink_rest, tokens::LIGHT.ink_rest].contains(&resting),
+            "an unchosen action rests: {resting:?}"
+        );
+        assert!(
+            !app.screen()
+                .accessibility_state("id:options-chosen")
+                .expect("the unchosen state")
+                .selected,
+            "an unchosen action stops announcing selected"
+        );
+    }
+
+    #[test]
+    fn a_disabled_action_refuses_the_press() {
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            OptionsHarness,
+        >()))
+        .expect("start the options harness");
+        app.wait_for("id:options-disabled")
+            .expect("the disabled action");
+        assert!(
+            !app.screen()
+                .enabled("id:options-disabled")
+                .expect("the disabled state"),
+            "the option starts disabled"
+        );
+        assert!(
+            app.press("id:options-disabled").is_err(),
+            "a disabled action takes no press"
+        );
+        assert!(
+            !app.screen()
+                .enabled("id:options-disabled")
+                .expect("the disabled state"),
+            "the refused press left it disabled"
+        );
+    }
+
+    #[test]
+    fn an_action_carries_its_own_accessible_name() {
+        let mut app = Headless::start(EngineConfig::new(nsh_testing::windowed_root::<
+            OptionsHarness,
+        >()))
+        .expect("start the options harness");
+        app.wait_for("id:options-named").expect("the named action");
+        let node = node_with(&app, "options-named");
+        assert_eq!(
+            app.screen()
+                .press_target("role:button[Named action name]")
+                .expect("selector"),
+            Some(node),
+            "the accessible name differs from the visible label"
+        );
     }
 
     /// One of each action, and a line that counts the presses they hear.

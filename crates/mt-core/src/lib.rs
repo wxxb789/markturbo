@@ -16,6 +16,7 @@ pub mod runtime_paths;
 pub mod settings;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_probe;
+pub mod text_diff;
 pub mod translate;
 pub mod usage;
 pub mod workspace;

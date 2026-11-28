@@ -1526,13 +1526,100 @@ img, svg { max-width: 100%; }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use html5ever::tendril::TendrilSink;
+    use markup5ever_rcdom::{Handle, NodeData, RcDom};
     use nsh_core::{Color, prelude::*};
 
     const DOCUMENT_POLICY: &str = r#"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:">"#;
-    const HOST_POLICY: &str = r#"<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:; frame-src 'self'">"#;
 
     fn registry() -> RendererRegistry {
         RendererRegistry::with_defaults()
+    }
+
+    /// The DOM the page goes through (html5ever, as a browser reads it).
+    fn parse(html: &str) -> RcDom {
+        html5ever::parse_document(RcDom::default(), Default::default())
+            .from_utf8()
+            .read_from(&mut html.as_bytes())
+            .expect("parse the page")
+    }
+
+    /// Every element named `name` (HTML names are lowercase) under `handle`,
+    /// in document order.
+    fn elements(handle: &Handle, name: &str) -> Vec<Handle> {
+        fn walk(handle: &Handle, name: &str, found: &mut Vec<Handle>) {
+            if let NodeData::Element { name: tag, .. } = &handle.data
+                && &*tag.local == name
+            {
+                found.push(handle.clone());
+            }
+            for child in handle.children.borrow().iter() {
+                walk(child, name, found);
+            }
+        }
+        let mut found = Vec::new();
+        walk(handle, name, &mut found);
+        found
+    }
+
+    /// The one element named `name` (the structure under test has exactly
+    /// one).
+    fn only(dom: &RcDom, name: &str) -> Handle {
+        let found = elements(&dom.document, name);
+        assert_eq!(found.len(), 1, "exactly one <{name}>");
+        found[0].clone()
+    }
+
+    fn attribute(handle: &Handle, name: &str) -> Option<String> {
+        let NodeData::Element { attrs, .. } = &handle.data else {
+            return None;
+        };
+        attrs
+            .borrow()
+            .iter()
+            .find(|attr| &*attr.name.local == name)
+            .map(|attr| attr.value.to_string())
+    }
+
+    /// The first element child of `handle` (a text node or a comment is not
+    /// a child the head's order is about).
+    fn first_element_child(handle: &Handle) -> Handle {
+        handle
+            .children
+            .borrow()
+            .iter()
+            .find(|child| matches!(child.data, NodeData::Element { .. }))
+            .cloned()
+            .expect("an element child")
+    }
+
+    fn is_csp_meta(handle: &Handle) -> bool {
+        matches!(&handle.data, NodeData::Element { name, .. } if &*name.local == "meta")
+            && attribute(handle, "http-equiv")
+                .is_some_and(|value| value.eq_ignore_ascii_case("content-security-policy"))
+    }
+
+    /// Every element's name, in document order.
+    fn element_order(handle: &Handle) -> Vec<String> {
+        fn walk(handle: &Handle, order: &mut Vec<String>) {
+            if let NodeData::Element { name, .. } = &handle.data {
+                order.push(name.local.to_string());
+            }
+            for child in handle.children.borrow().iter() {
+                walk(child, order);
+            }
+        }
+        let mut order = Vec::new();
+        walk(handle, &mut order);
+        order
+    }
+
+    /// The one `<svg>…</svg>` in `html`, parsed as XML (the last close is
+    /// the root's; an SVG may nest its own).
+    fn parse_svg(html: &str) -> roxmltree::Document<'_> {
+        let start = html.find("<svg").expect("an svg element");
+        let end = html.rfind("</svg>").expect("the svg's end") + "</svg>".len();
+        roxmltree::Document::parse(&html[start..end]).expect("well-formed svg")
     }
 
     /// The `<body>` content only. The stylesheet names every CSS class, so a
@@ -1615,7 +1702,8 @@ mod tests {
     #[test]
     fn math_renders_to_svg() {
         let html = page(&md("$$\n\\frac{a}{b}\n$$\n"), &registry(), false);
-        assert!(body(&html).contains("<svg"), "got {}", body(&html));
+        let svg = parse_svg(body(&html));
+        assert_eq!(svg.root_element().tag_name().name(), "svg");
     }
 
     #[test]
@@ -1719,16 +1807,44 @@ mod tests {
         let author = r#"<script>const text = '"</iframe>&lt;&quot;';</script>"#;
         let doc = Document::with_type(DocType::Html, author.into());
         let host = build_html(&doc, &registry(), false);
-        assert!(host.starts_with(&format!("<!doctype html><html><head>{HOST_POLICY}")));
-        assert_eq!(host.matches("<iframe ").count(), 1);
-        let (before_srcdoc, encoded) = host.split_once(" srcdoc=\"").unwrap();
-        assert!(!before_srcdoc.contains("<script"));
-        assert!(
-            encoded
-                .contains(r#"<script>const text = '&quot;</iframe>&amp;lt;&amp;quot;';</script>"#)
+        let dom = parse(&host);
+        let frame = only(&dom, "iframe");
+        assert_eq!(
+            attribute(&frame, "sandbox").as_deref(),
+            Some("allow-scripts")
         );
-        let (_, relay) = host.split_once("\"></iframe>").unwrap();
-        assert_eq!(relay, format!("{HOST_RELAY}</body></html>"));
+        assert_eq!(
+            elements(&dom.document, "script").len(),
+            1,
+            "the host page runs only the relay"
+        );
+        assert!(
+            is_csp_meta(&first_element_child(&only(&dom, "head"))),
+            "the host policy is the head's first element"
+        );
+        let order = element_order(&dom.document);
+        let frame_at = order
+            .iter()
+            .position(|name| name == "iframe")
+            .expect("the frame");
+        let script_at = order
+            .iter()
+            .position(|name| name == "script")
+            .expect("the relay");
+        assert!(
+            frame_at < script_at,
+            "the host runs no script before the frame"
+        );
+        // The author's script stays inside the frame: the host's bytes carry
+        // its exact escaped spelling.
+        assert!(
+            host.contains(r#"<script>const text = '&quot;</iframe>&amp;lt;&amp;quot;';</script>"#),
+            "{host}"
+        );
+        assert!(
+            host.ends_with(&format!("{HOST_RELAY}</body></html>")),
+            "the relay is the host's last script"
+        );
         let document = frame_document(&host);
         assert_eq!(
             document,
@@ -1748,11 +1864,18 @@ mod tests {
             &registry,
             false,
         );
-        let prefix = format!("<!doctype html><html><head>{DOCUMENT_POLICY}");
         for (page, author) in [(&markdown, script), (&mdx, "<div class=\"mt-mdx\">")] {
-            assert!(page.starts_with(&prefix), "{page}");
-            assert!(page[prefix.len()..].contains(author), "{page}");
-            assert_eq!(page.matches("Content-Security-Policy").count(), 1);
+            let dom = parse(page);
+            assert!(
+                is_csp_meta(&first_element_child(&only(&dom, "head"))),
+                "the policy is the head's first element: {page}"
+            );
+            let policies = elements(&dom.document, "meta")
+                .iter()
+                .filter(|meta| is_csp_meta(meta))
+                .count();
+            assert_eq!(policies, 1, "one policy per page: {page}");
+            assert!(page.contains(author), "{page}");
         }
         assert!(markdown.find(diagram).unwrap() < markdown.find(script).unwrap());
         assert!(mdx.contains("&lt;Chart /&gt;"));
@@ -1979,13 +2102,11 @@ mod tests {
     #[test]
     fn the_host_relays_only_strings_sent_by_the_document_frame() {
         let host = build_html(&md("# x\n"), &registry(), false);
-        let (host_before_frame, frame_and_after) = host.split_once(" srcdoc=\"").unwrap();
-        let (_, host_after_frame) = frame_and_after.split_once("\"></iframe>").unwrap();
-        let host_markup = format!("{host_before_frame} srcdoc=\"\"></iframe>{host_after_frame}");
+        let dom = parse(&host);
         assert_eq!(
-            host_markup.matches("<script").count(),
+            elements(&dom.document, "script").len(),
             1,
-            "the host page must run only the relay: {host_markup}"
+            "the host page must run only the relay"
         );
 
         let (_, relay) = host.split_once("\"></iframe>").unwrap();
@@ -2002,9 +2123,11 @@ mod tests {
     #[test]
     fn the_frame_sandbox_admits_scripts_and_no_escape_token() {
         let host = build_html(&md("# x\n"), &registry(), false);
-        let (_, after) = host.split_once("<iframe sandbox=\"").unwrap();
-        let (tokens, _) = after.split_once('"').unwrap();
-        assert_eq!(tokens, "allow-scripts");
+        let dom = parse(&host);
+        let frame = only(&dom, "iframe");
+        let sandbox = attribute(&frame, "sandbox").expect("the sandbox attribute");
+        let tokens: Vec<&str> = sandbox.split_whitespace().collect();
+        assert_eq!(tokens, ["allow-scripts"]);
         for forbidden in [
             "allow-popups",
             "allow-top-navigation",
@@ -2013,7 +2136,7 @@ mod tests {
             "allow-modals",
             "allow-downloads",
         ] {
-            assert!(!tokens.contains(forbidden), "{forbidden} in {tokens}");
+            assert!(!tokens.contains(&forbidden), "{forbidden} in {sandbox}");
         }
     }
 
@@ -2956,7 +3079,9 @@ mod tests {
             .find("<figure class=\"mt-render mt-math\">")
             .expect("math");
         assert!(diagram < math, "blocks out of order: {body}");
-        assert!(body[diagram..math].contains("<svg"), "{body}");
-        assert!(body[math..].contains("<svg"), "{body}");
+        for (name, region) in [("diagram", &body[diagram..math]), ("math", &body[math..])] {
+            let svg = parse_svg(region);
+            assert_eq!(svg.root_element().tag_name().name(), "svg", "{name}");
+        }
     }
 }
