@@ -42,6 +42,10 @@ mod duplicate_guard_names;
 mod focus_after_close;
 #[path = "folder_open_token.rs"]
 mod folder_open_token;
+#[path = "g23_s_search_ticket.rs"]
+mod g23_s_search_ticket;
+#[path = "g23_s_tab_close.rs"]
+mod g23_s_tab_close;
 #[path = "goal17_settings.rs"]
 mod goal17_settings;
 #[path = "goal20_settings_lane.rs"]

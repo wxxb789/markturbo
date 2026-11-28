@@ -73,6 +73,22 @@ use revision_ledger::{LedgerRefusal, RevisionLedger};
 
 static FIRST_LAUNCH_CHECKED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(any(test, feature = "test-vault"))]
+static SUPERSEDED_SEARCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many search answers were dropped because a newer request took the
+/// slot. A superseded answer writes nothing, so only this tells a test that
+/// the stale walk actually came back.
+#[cfg(any(test, feature = "test-vault"))]
+pub fn search_superseded() -> usize {
+    SUPERSEDED_SEARCHES.load(Ordering::Acquire)
+}
+
+#[cfg(any(test, feature = "test-vault"))]
+pub(crate) fn note_superseded_search() {
+    SUPERSEDED_SEARCHES.fetch_add(1, Ordering::Release);
+}
+
 /// The three stops on the document's view track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -524,6 +540,9 @@ pub struct AppState {
     /// The latest folder open's request token: a slower earlier scan must
     /// not commit its root, files, context, recents or status.
     folder_request: Rc<Cell<u64>>,
+    /// The latest search's request token: a slower earlier walk must not
+    /// commit its results over a newer query, nor refill a cleared palette.
+    search_request: Rc<Cell<u64>>,
     // Shared by the watcher's refresh and Save As: a slower earlier scan of
     // either kind must not commit its entries over a newer one.
     tree_refresh: Rc<Cell<u64>>,
@@ -1172,6 +1191,7 @@ impl AppState {
             palette_view: Rc::new(Cell::new(None)),
             settings_scroll_offset: Rc::new(Cell::new(0.0)),
             folder_request: Rc::new(Cell::new(0)),
+            search_request: Rc::new(Cell::new(0)),
             tree_refresh: Rc::new(Cell::new(0)),
             watcher_generations: Rc::new(Cell::new((0, 0))),
             watcher: Rc::new(RefCell::new(None)),
@@ -2734,6 +2754,8 @@ impl AppState {
     /// reads on a blocking thread; the result is content, never a file write.
     pub fn run_search(&self, text: &str) {
         let query = Query::new(text.to_owned());
+        let request = self.search_request.get().wrapping_add(1);
+        self.search_request.set(request);
         let Some(root) = self.root.get() else {
             // Nothing ran: the palette must not read as an empty result set.
             self.notify_held(SharedString::from(s::search_needs_folder(
@@ -2752,12 +2774,19 @@ impl AppState {
         let state = self.clone();
         self.spawn_task(async move {
             let result = blocking(move || {
+                #[cfg(any(test, feature = "test-vault"))]
+                crate::test_vault::wait_for_read(&root);
                 let paths = search::document_paths(&root);
                 let mut results = search::Results::default();
                 search::search_files(&paths, &query, search::DEFAULT_LIMIT, &mut results);
                 results
             })
             .await;
+            if state.search_request.get() != request {
+                #[cfg(any(test, feature = "test-vault"))]
+                note_superseded_search();
+                return;
+            }
             state.search_busy.set(false);
             match result {
                 Ok(results) => {
@@ -2784,6 +2813,9 @@ impl AppState {
     }
 
     pub fn clear_search(&self) {
+        self.search_request
+            .set(self.search_request.get().wrapping_add(1));
+        self.search_busy.set(false);
         self.search_query.set(String::new());
         self.search_results.set(Vec::new());
         self.search_ran.set(false);
@@ -3239,6 +3271,12 @@ impl AppState {
         self.review_views.borrow_mut().remove(&id);
         self.review_bindings.borrow_mut().remove(&id);
         self.review_open_tabs.borrow_mut().remove(&id);
+        self.clear_review_unavailable_for(id);
+        self.conflict_disks
+            .update(|disks| disks.retain(|(entry, ..)| *entry != id));
+        if self.conflict_compare.get_untracked() == Some(id) {
+            self.conflict_compare.set(None);
+        }
         self.tabs.update(|tabs| tabs.retain(|tab| tab.id != id));
         // The closed tab's directories lose their watches when no other tab
         // reads them.
