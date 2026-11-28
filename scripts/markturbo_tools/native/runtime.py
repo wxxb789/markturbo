@@ -28,6 +28,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .selectors import (
+    EDITOR_NAME,
+    GUARD_BUTTON_AUTOMATION_IDS,
+    MENU_BUTTON_AUTOMATION_ID,
+    MENU_QUIT_AUTOMATION_ID,
+    MENU_SAVE_AS_AUTOMATION_ID,
+    MENU_SAVE_AUTOMATION_ID,
+    MENU_WEB_AUTOMATION_ID,
+    QUIT_GUARD_BUTTON_AUTOMATION_IDS,
+    RAIL_FILE_ROW_AUTOMATION_ID,
+    SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID,
+    SIDEBAR_PANEL_AUTOMATION_ID,
+    SIDEBAR_ROW_AUTOMATION_ID,
+    TAB_CLOSE_AUTOMATION_ID,
+    VIEW_BUTTON_AUTOMATION_ID,
+)
 
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -99,18 +115,6 @@ INTEGRITY_NAMES = {
 #   editor's own Select All + Copy, which writes the exact text
 #   (system.rs `set_clipboard_text`). SetFocus supports inputs and focusable
 #   views (access/uia.rs and access.rs).
-EDITOR_NAME = "Markdown source"
-MENU_BUTTON_AUTOMATION_ID = "title-settings"
-MENU_SAVE_AUTOMATION_ID = "title-menu-save"
-MENU_SAVE_AS_AUTOMATION_ID = "title-menu-save-as"
-MENU_WEB_AUTOMATION_ID = "title-menu-web"
-MENU_QUIT_AUTOMATION_ID = "title-menu-quit"
-VIEW_BUTTON_AUTOMATION_ID = "title-view"
-SIDEBAR_PANEL_AUTOMATION_ID = "sidebar-panel"
-SIDEBAR_ROW_AUTOMATION_ID = "sidebar-file"
-SIDEBAR_OUTSIDE_ROW_AUTOMATION_ID = "sidebar-outside-row"
-RAIL_FILE_ROW_AUTOMATION_ID = "rail-file-row"
-TAB_CLOSE_AUTOMATION_ID = "rail-close"
 # The visual matrix drives both interface languages. Keep callers' view names
 # independent of the window's locale, but require the full accessible label.
 _VIEW_BUTTON_NAMES = {
@@ -123,16 +127,10 @@ _VIEW_BUTTON_NAMES = {
 }
 GUARD_HEADING = "Close without saving?"
 GUARD_BUTTON_NAMES = {"Save": "Save", "Discard": "Don't save", "Cancel": "Cancel"}
-GUARD_BUTTON_AUTOMATION_IDS = {
-    "Save": "guard-save",
-    "Discard": "guard-dont-save",
-    "Cancel": "guard-cancel",
-}
 # The window-close and quit guard (`GuardKind::QuitApp`): the tab's card with
 # the quit heading and Save label; the buttons keep their automation ids.
 QUIT_GUARD_HEADING = "Quit without saving?"
 QUIT_GUARD_BUTTON_NAMES = {"Save": "Save all", "Discard": "Don't save", "Cancel": "Cancel"}
-QUIT_GUARD_BUTTON_AUTOMATION_IDS = dict(GUARD_BUTTON_AUTOMATION_IDS)
 CONFLICT_HEADING = "Changed on disk"
 LIFECYCLE_CLICK_FAILURE_CODES = {
     "Save": "LIFECYCLE_SAVE_CLICK_FAILED",
@@ -228,6 +226,9 @@ TITLE_ROW_CLICK_POINT = (24, 16)
 # The longest a step nested inside an outer wait (one editor copy inside an
 # exact-bytes wait) may take, and never past the outer wait's deadline.
 INNER_WAIT_SECONDS = 2.0
+# How long a request may take to reach a loopback after its consent hold
+# returns; a hold that sent nothing fails here, not at the answer's wait.
+REQUEST_SENT_TIMEOUT_SECONDS = 5.0
 # How often a wait for a file's exact bytes hashes it.
 FILE_POLL_SECONDS = 0.1
 
@@ -2476,6 +2477,37 @@ class NativeHarness:
         """Press and hold the pointer at the control's centre, then release."""
         x, y = self.settled_control_centre(control, failure_code)
         self.win32.press_and_hold(app.hwnd, x, y, seconds)
+
+    def hold_consent_until_sent(
+        self,
+        app: RunningApp,
+        control: Any,
+        seconds: float,
+        failure_code: str,
+        *,
+        await_sent: Callable[[], None],
+        card_open: Callable[[], bool],
+        not_sent_code: str,
+        on_attempt: Callable[[int], None] | None = None,
+    ) -> int:
+        """Hold the consent control until its authorization lands.
+
+        A hold that lands as the card settles can go unseen, so while the
+        card is still open and nothing was sent, hold once more. `await_sent`
+        raises `not_sent_code` when the authorization did not arrive; any
+        other failure propagates at once.
+        """
+        for attempt in (1, 2):
+            if on_attempt is not None:
+                on_attempt(attempt)
+            self.hold_control(app, control, seconds, failure_code)
+            try:
+                await_sent()
+                return attempt
+            except HarnessFailure as error:
+                if attempt == 2 or error.code != not_sent_code or not card_open():
+                    raise
+        raise HarnessFailure(not_sent_code)
 
     def aim_control(self, app: RunningApp, control: Any, failure_code: str) -> None:
         """Move the pointer to the control's centre without pressing.

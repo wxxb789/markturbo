@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from typing import Any, Callable
@@ -2186,14 +2187,6 @@ class ConsentTests(unittest.TestCase):
     def test_consent_gate_opens_before_the_consent_hold(self) -> None:
         events: list[str] = []
         send = object()
-        harness = bare_harness(
-            find_control=lambda _app, automation_id, *_args: (
-                send if automation_id == HARNESS.CONSENT_SEND_AUTOMATION_ID else None
-            ),
-            hold_control=lambda _app, control, seconds, failure: events.append(
-                f"hold-{control is send}-{seconds}-{failure}"
-            ),
-        )
 
         class FakeProvider:
             requests = 0
@@ -2205,13 +2198,25 @@ class ConsentTests(unittest.TestCase):
             def dispatch_consent_click(self, count: int, click: Callable[[], None]) -> None:
                 events.append(f"marker-{count}")
                 click()
-                # The held send reaches the loopback after the hold.
-                self.requests += 1
+
+        provider = FakeProvider()
+
+        def hold(_app: Any, control: Any, seconds: float, failure: str) -> None:
+            events.append(f"hold-{control is send}-{seconds}-{failure}")
+            # The held send reaches the loopback while the hold runs.
+            provider.requests += 1
+
+        harness = bare_harness(
+            find_control=lambda _app, automation_id, *_args: (
+                send if automation_id == HARNESS.CONSENT_SEND_AUTOMATION_ID else None
+            ),
+            hold_control=hold,
+        )
 
         harness._approve_consent(
             mock.Mock(process=mock.Mock(pid=7), hwnd=8),
             "REVIEW_CONSENT_HOLD_FAILED",
-            provider=FakeProvider(),
+            provider=provider,
             expected_request_count=0,
             open_gate=lambda: events.append("gate"),
         )
@@ -2229,9 +2234,13 @@ class ConsentTests(unittest.TestCase):
         self.assertEqual(HARNESS.CONSENT_HOLD_SECONDS, 1.8)
 
     def test_a_hold_whose_request_never_arrives_fails_fast_with_its_operation(self) -> None:
-        # A real loopback that never receives the Review request.
+        # A real loopback that never receives the Review request; the card
+        # stays open, so the shared step holds once more before it fails.
+        holds: list[object] = []
         harness = bare_harness(
-            find_control=lambda *_args: object(), hold_control=lambda *_args: None
+            find_control=lambda *_args: object(),
+            hold_control=lambda _app, control, *_args: holds.append(control),
+            control_by_id=lambda *_args, **_kwargs: object(),
         )
         with (
             PROVIDER.LoopbackRevisionServer() as server,
@@ -2246,6 +2255,25 @@ class ConsentTests(unittest.TestCase):
                 expected_request_count=0,
                 open_gate=server.grant_review_consent,
             )
+
+        self.assertEqual(len(holds), 2)
+        # A card that closed without a request fails after one hold.
+        harness.control_by_id = lambda *_args, **_kwargs: None
+        holds.clear()
+        with (
+            PROVIDER.LoopbackRevisionServer() as server,
+            mock.patch.object(HARNESS, "REQUEST_SENT_TIMEOUT_SECONDS", 0.2),
+            self.assertRaisesRegex(runtime.HarnessFailure, "^REVIEW_REQUEST_NOT_SENT$"),
+        ):
+            server.begin_chain(HARNESS.EDITOR_SOURCE_TEXT)
+            harness._approve_consent(
+                mock.Mock(hwnd=8),
+                "REVIEW_CONSENT_HOLD_FAILED",
+                provider=server,
+                expected_request_count=0,
+                open_gate=server.grant_review_consent,
+            )
+        self.assertEqual(len(holds), 1)
 
         # The Revision hold counts from the Review already received.
         provider = mock.Mock()
@@ -2348,11 +2376,15 @@ class ProfileAndFixtureTests(unittest.TestCase):
                         )
 
     def test_loopback_profile_is_keyless_and_uses_only_a_process_synthetic_key(self) -> None:
-        settings = HARNESS.review_settings_document("http://127.0.0.1:4141/v1/").decode("utf-8")
-        self.assertIn('model-provider = "openai-responses"', settings)
-        self.assertNotIn("api-key", settings.casefold())
-        self.assertIn("model-environment-key-identity", settings)
-        self.assertIn(credential_target("http://127.0.0.1:4141/v1/"), settings)
+        settings = tomllib.loads(
+            HARNESS.review_settings_document("http://127.0.0.1:4141/v1/").decode("utf-8")
+        )
+        self.assertEqual(settings["model-provider"], "openai-responses")
+        self.assertNotIn("api-key", settings)
+        self.assertEqual(
+            settings["model-environment-key-identity"],
+            credential_target("http://127.0.0.1:4141/v1/"),
+        )
         harness = bare_harness(_credential="markturbo-goal07-loopback-key")
         self.assertEqual(harness.openai_api_key_for_child(), "markturbo-goal07-loopback-key")
 

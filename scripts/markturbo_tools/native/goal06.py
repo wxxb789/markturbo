@@ -32,7 +32,6 @@ process without the unsaved-changes guard).
 from __future__ import annotations
 
 import argparse
-import json
 import time
 import uuid
 from pathlib import Path
@@ -41,6 +40,7 @@ from typing import Any
 from . import evidence
 from .evidence import credential_target, leak_codes
 from .runtime import (
+    REQUEST_SENT_TIMEOUT_SECONDS,
     INTEGRITY_NAMES,
     QUIT_GUARD_HEADING,
     VK_A,
@@ -59,23 +59,21 @@ from .runtime import (
     wait_until,
     write_durable,
 )
+from .selectors import (
+    CONSENT_HOLD_SECONDS,
+    CONSENT_SEND_AUTOMATION_ID,
+    REVIEW_CLOSE_AUTOMATION_ID,
+    REVIEW_MENU_AUTOMATION_ID,
+)
 
 
 SCHEMA = "markturbo.goal-06-native-acceptance"
 # `ui/review.rs` `unavailable`: the explicit local diagnostic, an anonymous Text.
 NOT_SET_UP_MESSAGE = "No model set up"
-# `ui/review.rs`: the result card's Close, a Button with its own id.
-REVIEW_CLOSE_AUTOMATION_ID = "review-close"
 # `ui/review.rs` `intent`: the first line of a structured result.
 REVIEW_RESULT_MARKER = "Understood:"
-# `ui/consent.rs` `send_button`: the hold control carries its own test id.
-CONSENT_SEND_AUTOMATION_ID = "consent-send"
 # `ui/consent.rs` `scope_row`: the scope word a selection binding shows.
 CONSENT_SELECTION_SCOPE = "Selection"
-# Longer than the control's 900 ms hold (`FILAMENT_CHARGE_MS`), so a send completes.
-CONSENT_HOLD_SECONDS = 1.8
-# `ui/titlebar.rs`: the settings-glyph menu's Review row (`Review selection`).
-REVIEW_MENU_AUTOMATION_ID = "title-menu-review-selection"
 NOT_SET_UP_MODE = "fresh_endpoint_not_set_up"
 CONFIGURED_PROVIDER_MODE = "configured_provider_success"
 CONFIGURED_PROVIDER_ENDPOINT = "http://127.0.0.1:4141/v1/"
@@ -139,15 +137,15 @@ def review_settings_document(
     endpoint: str, environment_key_identity: str | None = None
 ) -> bytes:
     """Build the isolated non-secret Review profile."""
-    document = (
-        "show-welcome-on-startup = false\n"
-        'model-provider = "openai-responses"\n'
-        'model-name = "gpt-5.6-terra"\n'
-        f"model-base-url = {json.dumps(endpoint)}\n"
-    )
+    scalars: dict[str, str | bool] = {
+        "show-welcome-on-startup": False,
+        "model-provider": "openai-responses",
+        "model-name": "gpt-5.6-terra",
+        "model-base-url": endpoint,
+    }
     if environment_key_identity is not None:
-        document += f"model-environment-key-identity = {json.dumps(environment_key_identity)}\n"
-    return document.encode("utf-8")
+        scalars["model-environment-key-identity"] = environment_key_identity
+    return evidence.settings_document(scalars)
 
 
 def _contract(mode: str) -> evidence.EvidenceContract:
@@ -269,7 +267,10 @@ class Goal06Harness(BaseNativeHarness):
         self.menu_command(app, REVIEW_MENU_AUTOMATION_ID)
 
     def approve_review_consent(self, app: Any, selection: bool) -> None:
-        """Hold `consent-send`; a selection's card must first show its scope."""
+        """Hold `consent-send`; a selection's card must first show its scope.
+
+        The card closes when the hold authorizes its request; the shared step
+        repeats a hold that left it open."""
         send = self.find_control(
             app,
             CONSENT_SEND_AUTOMATION_ID,
@@ -279,7 +280,33 @@ class Goal06Harness(BaseNativeHarness):
         )
         if selection and not self.name_present(app, CONSENT_SELECTION_SCOPE, "Text"):
             raise HarnessFailure("REVIEW_CONSENT_SELECTION_SCOPE_MISSING")
-        self.hold_control(app, send, CONSENT_HOLD_SECONDS, "REVIEW_CONSENT_HOLD_FAILED")
+
+        def card_open() -> bool:
+            return not self.control_absent(
+                app,
+                CONSENT_SEND_AUTOMATION_ID,
+                "Button",
+                "REVIEW_CONSENT_CARD_UIA_QUERY_FAILED",
+                "REVIEW_CONSENT_CARD_UIA_CONTRACT_MISMATCH",
+            )
+
+        def sent() -> None:
+            wait_until(
+                lambda: not card_open(),
+                REQUEST_SENT_TIMEOUT_SECONDS,
+                "REVIEW_REQUEST_NOT_SENT",
+                interval=0.05,
+            )
+
+        self.hold_consent_until_sent(
+            app,
+            send,
+            CONSENT_HOLD_SECONDS,
+            "REVIEW_CONSENT_HOLD_FAILED",
+            await_sent=sent,
+            card_open=card_open,
+            not_sent_code="REVIEW_REQUEST_NOT_SENT",
+        )
 
     def read_only_phase(
         self, source: Path, before: dict[str, Any], phase: str

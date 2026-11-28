@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -523,6 +524,76 @@ def scan_case_artifacts(
         "app_logs_scanned": len(app_logs),
         "config_files_scanned": len(config_files),
     }
+
+
+def toml_string(value: str) -> str:
+    """One TOML 1.0 basic string with every escape made explicit."""
+    pieces: list[str] = []
+    for character in value:
+        code = ord(character)
+        if character in {'"', "\\"}:
+            pieces.append("\\" + character)
+        elif character == "\b":
+            pieces.append("\\b")
+        elif character == "\t":
+            pieces.append("\\t")
+        elif character == "\n":
+            pieces.append("\\n")
+        elif character == "\f":
+            pieces.append("\\f")
+        elif character == "\r":
+            pieces.append("\\r")
+        elif code < 0x20 or code == 0x7F:
+            pieces.append(f"\\u{code:04X}")
+        else:
+            pieces.append(character)
+    return '"' + "".join(pieces) + '"'
+
+
+def settings_document(
+    scalars: Mapping[str, str | bool] | None = None,
+    tables: Mapping[str, Sequence[Mapping[str, str]]] | None = None,
+) -> bytes:
+    """The one `settings.toml` encoder of the native harnesses.
+
+    Scalars first, then each array of tables; insertion order is kept, so a
+    caller sees a deterministic document. Every string is escaped by
+    `toml_string`.
+    """
+    lines: list[str] = []
+    for key, value in (scalars or {}).items():
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        else:
+            rendered = toml_string(value)
+        lines.append(f"{key} = {rendered}")
+    for name, rows in (tables or {}).items():
+        for row in rows:
+            lines.append("")
+            lines.append(f"[[{name}]]")
+            for key, value in row.items():
+                lines.append(f"{key} = {toml_string(value)}")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def nested_json_values(value: Any, key: str) -> list[Any]:
+    """Every value under `key` at any depth; a JSON string is decoded and walked."""
+    found: list[Any] = []
+    if isinstance(value, dict):
+        if key in value:
+            found.append(value[key])
+        for nested in value.values():
+            found.extend(nested_json_values(nested, key))
+    elif isinstance(value, list):
+        for nested in value:
+            found.extend(nested_json_values(nested, key))
+    elif isinstance(value, str) and value[:1] in {"{", "["}:
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, RecursionError):
+            return found
+        found.extend(nested_json_values(decoded, key))
+    return found
 
 
 def credential_target(endpoint: str, wire: str) -> str:

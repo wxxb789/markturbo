@@ -56,7 +56,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import re
 import tomllib
 from pathlib import Path
@@ -91,23 +90,21 @@ from .runtime import (
     wait_until,
     write_durable,
 )
+from .selectors import (
+    TITLE_FILE_AUTOMATION_ID,
+    WELCOME_ACTION_AUTOMATION_IDS,
+    WELCOME_NEW_FILE_AUTOMATION_ID as WELCOME_NEW_AUTOMATION_ID,
+    WELCOME_OPEN_FOLDER_AUTOMATION_ID,
+    WELCOME_PASTE_AUTOMATION_ID,
+    WELCOME_RECENT_AUTOMATION_ID,
+    WELCOME_SAMPLE_AUTOMATION_ID,
+    WORKSPACE_HOME_FILE_AUTOMATION_ID,
+)
 
 
 SCHEMA = "markturbo.goal-03-native-acceptance"
 VK_SHIFT = 0x10
 
-WELCOME_OPEN_FOLDER_AUTOMATION_ID = "welcome-open-folder"
-WELCOME_NEW_AUTOMATION_ID = "welcome-new-file"
-WELCOME_PASTE_AUTOMATION_ID = "welcome-paste"
-WELCOME_SAMPLE_AUTOMATION_ID = "welcome-open-sample"
-WELCOME_RECENT_AUTOMATION_ID = "welcome-recent"
-WELCOME_ACTION_AUTOMATION_IDS = (
-    WELCOME_OPEN_FOLDER_AUTOMATION_ID,
-    WELCOME_NEW_AUTOMATION_ID,
-    WELCOME_PASTE_AUTOMATION_ID,
-    WELCOME_SAMPLE_AUTOMATION_ID,
-)
-TITLE_FILE_AUTOMATION_ID = "title-file"
 # `ui/titlebar.rs` `file_name`: the Button's accessible label names its
 # Context action, not the bare file name.
 TITLE_FILE_NAME_LABEL = "Show agent context for {name}"
@@ -115,7 +112,6 @@ TITLE_FILE_NAME_LABEL = "Show agent context for {name}"
 # disabled and named `File <name> — Missing` (`ui/welcome.rs` `recents`).
 RECENT_ROW_NAME = "File {name}"
 STALE_RECENT_NAME = "File {name} — Missing"
-WORKSPACE_HOME_FILE_AUTOMATION_ID = "workspace-home-file"
 # The welcome lists the first five recent targets (`ui/welcome.rs` `RECENTS`);
 # the persisted history holds ten (mt-core `settings::MAX_RECENT_TARGETS`).
 WELCOME_RECENT_ROWS = 5
@@ -195,18 +191,15 @@ def require(condition: bool, code: str) -> None:
 
 
 def recent_settings_document(documents: list[Path]) -> bytes:
-    lines = ["show-welcome-on-startup = true", ""]
-    for path in documents:
-        lines.extend(
-            [
-                "[[recent-targets]]",
-                f"path = {json.dumps(str(path))}",
-                'kind = "file"',
-                f"display-name = {json.dumps(path.name)}",
-                "",
+    return evidence.settings_document(
+        {"show-welcome-on-startup": True},
+        {
+            "recent-targets": [
+                {"path": str(path), "kind": "file", "display-name": path.name}
+                for path in documents
             ]
-        )
-    return "\n".join(lines).encode("utf-8")
+        },
+    )
 
 
 def validate_runtime_scan(value: Any) -> None:
